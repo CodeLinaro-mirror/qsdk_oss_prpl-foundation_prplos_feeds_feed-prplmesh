@@ -3,13 +3,14 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=pwhm
-PKG_VERSION:=v7.8.3
+PKG_VERSION:=bugfix_PPM-3028-wifi6-caps-related-fixes
 SHORT_DESCRIPTION:=prplMesh WHM
 
-PKG_SOURCE:=pwhm-v7.8.3.tar.gz
-PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/pwhm/plugins/pwhm/-/archive/v7.8.3
-PKG_HASH:=e59e193c4d905dd338744ee53834683fdc9944c03594ac39326e380ca2aef55a
-PKG_BUILD_DIR:=$(BUILD_DIR)/pwhm-v7.8.3
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_VERSION:=bugfix/PPM-3028-wifi6-caps-related-fixes
+PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/pwhm/plugins/pwhm.git
+PKG_MIRROR_HASH:=skip
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 PKG_MAINTAINER:=Soft At Home <support.opensource@softathome.com>
 PKG_LICENSE:=BSD-2-Clause-Patent
 PKG_LICENSE_FILES:=LICENSE
