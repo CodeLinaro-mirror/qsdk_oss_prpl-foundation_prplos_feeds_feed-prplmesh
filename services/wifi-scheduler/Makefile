@@ -1,13 +1,15 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=wifi-scheduler
-PKG_VERSION:=v0.5.6
+PKG_VERSION:=dev_ppw656
 SHORT_DESCRIPTION:=WiFi Scheduler
 
-PKG_SOURCE:=wifi-scheduler-v0.5.6.tar.gz
-PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/wifi-scheduler/-/archive/v0.5.6
-PKG_HASH:=66bb5cb8f065408dd73c4d35a6d386734ea1d373f07f3708fbae39a15c135e4e
-PKG_BUILD_DIR:=$(BUILD_DIR)/wifi-scheduler-v0.5.6
+PKG_SOURCE:=wifi-scheduler-dev_ppw656.tar.gz
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_VERSION:=dev_ppw656
+PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/wifi-scheduler.git
+PKG_MIRROR_HASH:=9d4ce0d536da37246bde26d9b02807449caac34b87aac8a852f3fb959be45880
+PKG_BUILD_DIR:=$(BUILD_DIR)/wifi-scheduler-dev_ppw656
 PKG_MAINTAINER:=Soft At Home <support.opensource@softathome.com>
 PKG_LICENSE:=BSD-2-Clause-Patent
 PKG_LICENSE_FILES:=LICENSE
