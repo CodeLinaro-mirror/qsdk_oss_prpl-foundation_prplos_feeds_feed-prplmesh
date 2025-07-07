@@ -1,13 +1,16 @@
+# WARNING: Automatically generated file using BAF (Build system Agnostic File) tooling
+# WARNING: You should contribute changes to https://gitlab.com/prpl-foundation/prplmesh/pwhm/libraries/libswla/-/blob/main/baf.yml instead
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=libswla
-PKG_VERSION:=v3.13.3
+PKG_VERSION:=dev_PPW-672
 SHORT_DESCRIPTION:=Shared Wifi Library using amx
 
-PKG_SOURCE:=libswla-v3.13.3.tar.gz
-PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/pwhm/libraries/libswla/-/archive/v3.13.3
-PKG_HASH:=3b284f6c9eef3cd24881e6700c6f1ac0866e6abcf83cca35e8c1ab2814389a30
-PKG_BUILD_DIR:=$(BUILD_DIR)/libswla-v3.13.3
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_VERSION:=dev_PPW-672
+PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/pwhm/libraries/libswla.git
+PKG_MIRROR_HASH:=skip
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 PKG_MAINTAINER:=Soft At Home <support.opensource@softathome.com>
 PKG_LICENSE:=BSD-2-Clause-Patent
 PKG_LICENSE_FILES:=LICENSE
@@ -19,7 +22,7 @@ include $(INCLUDE_DIR)/package.mk
 
 define Package/$(PKG_NAME)
   CATEGORY:=prpl Foundation
-  SUBMENU:=Libraries
+  SUBMENU:=prplMesh
   TITLE:=$(SHORT_DESCRIPTION)
   URL:=https://gitlab.com/prpl-foundation/prplmesh/pwhm/libraries/libswla
   DEPENDS += +libsahtrace
