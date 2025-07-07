@@ -1,0 +1,273 @@
+From 51dcf14d681a95fe71d2cce7ae8d44c50899666e Mon Sep 17 00:00:00 2001
+From: Nicolas HENRIQUES <prplmesh.opensources@sagemcom.com>
+Date: Mon, 10 Mar 2025 09:23:41 +0100
+Subject: [PATCH 1/7] slave: mld configuration refacto
+
+Signed-off-by: Nicolas HENRIQUES <prplmesh.opensources@sagemcom.com>
+---
+ agent/src/beerocks/slave/agent_db.h           | 37 +++++++---
+ agent/src/beerocks/slave/son_slave_thread.cpp |  8 +--
+ .../slave/tasks/ap_autoconfiguration_task.cpp | 72 ++++++++++++++-----
+ .../beerocks/slave/tasks/topology_task.cpp    | 43 ++++++-----
+ 4 files changed, 110 insertions(+), 50 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 59b2e32dd..61f80a696 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -605,17 +605,20 @@ public:
+ 
+     /**
+      * Internal structure to keep MLO configuration configured
+-     * Vector index corresponds to the MLDUnit they are linked to
+      */
+-    typedef struct {
+-        std::string ssid;
+-        sMacAddr mac;
+ 
+-        bool str;
+-        bool nstr;
+-        bool emlsr;
+-        bool emlmr;
++    // Worst possible case is one MLD by BSSID (max_mlds <= max_bssids)
++    const uint8_t max_mlds = eBeeRocksIfaceIds::IFACE_TOTAL_VAPS;
+ 
++    typedef struct {
++        std::string mld_ssid = "";
++        sMacAddr mld_mac     = net::network_utils::ZERO_MAC;
++        int8_t mld_unit      = -1;
++        enum mode { NONE = 0, STR = 1 << 0, NSTR = 1 << 1, EMLSR = 1 << 2, EMLMR = 1 << 3 };
++        mode mld_mode;
++    } sMLDConfiguration;
++
++    typedef struct {
+         typedef struct {
+             std::string alias;
+             sMacAddr ruid;
+@@ -623,9 +626,23 @@ public:
+             int8_t link_id;
+         } sAffiliatedAP;
+ 
++        sMLDConfiguration mld_config;
+         std::vector<sAffiliatedAP> affiliated_aps;
+-    } sMLDConfiguration;
+-    std::vector<sMLDConfiguration> mld_configurations;
++    } sAPMLDConfiguration;
++
++    typedef struct {
++        typedef struct {
++            sMacAddr ruid;
++            sMacAddr bssid;
++        } sAffiliatedBSta;
++        sMLDConfiguration mld_config;
++        std::vector<sAffiliatedBSta> affiliated_bstas;
++        sMacAddr ap_mld_mac;
++    } sBStaMLDConfiguration;
++
++    std::vector<sAPMLDConfiguration> ap_mld_configurations;
++    std::unique_ptr<sBStaMLDConfiguration> bsta_mld_configuration;
++
+     std::string em_handle_third_party;
+     bool em_ap_controller_found = false;
+ 
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 5319ba3e6..a75b5ace9 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -5483,10 +5483,10 @@ bool slave_thread::update_vaps_info(const std::string &iface,
+                    << ", p1_dis: " << bss.backhaul_bss_disallow_profile1_agent_association
+                    << ", p2_dis: " << bss.backhaul_bss_disallow_profile2_agent_association;
+ 
+-        for (auto &mld_conf : db->mld_configurations) {
+-            if (mld_conf.ssid == bss.ssid) {
+-                mld_conf.mac = vaps[vap_idx].ap_mld_mac;
+-                for (auto &affiliated_ap : mld_conf.affiliated_aps) {
++        for (auto &ap_mld_conf : db->ap_mld_configurations) {
++            if (ap_mld_conf.mld_config.mld_ssid == bss.ssid) {
++                ap_mld_conf.mld_config.mld_mac = vaps[vap_idx].ap_mld_mac;
++                for (auto &affiliated_ap : ap_mld_conf.affiliated_aps) {
+                     if (affiliated_ap.ruid == radio->front.iface_mac) {
+                         affiliated_ap.bssid = bss.mac;
+                         break;
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 14ffa3e4a..5f3f07185 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -1827,6 +1827,7 @@ bool ApAutoConfigurationTask::handle_agent_ap_mld_configuration_tlv(
+     ieee1905_1::CmduMessageRx &cmdu_rx, std::vector<WSC::configData::config> &configs)
+ {
+     auto db(AgentDB::get());
++    db->ap_mld_configurations.clear();
+ 
+     auto agent_ap_mld_configuration(cmdu_rx.getClass<wfa_map::tlvAgentApMldConfiguration>());
+     if (!agent_ap_mld_configuration) {
+@@ -1850,27 +1851,62 @@ bool ApAutoConfigurationTask::handle_agent_ap_mld_configuration_tlv(
+             return false;
+         }
+ 
+-        int mld_id(-1);
+-        for (size_t mld_confs_it = 0; mld_confs_it != db->mld_configurations.size();
+-             ++mld_confs_it) {
+-            if (ssid == db->mld_configurations[mld_confs_it].ssid) {
+-                mld_id = mld_confs_it;
++        // Find existing MLD Config
++        AgentDB::sAPMLDConfiguration *current_ap_mld_conf = nullptr;
++        for (auto &ap_mld_conf : db->ap_mld_configurations) {
++            if (ssid == ap_mld_conf.mld_config.mld_ssid) {
++                LOG(DEBUG) << "AP MLD configuration already exists for SSID " << ssid;
++                current_ap_mld_conf = &ap_mld_conf;
+                 break;
+             }
+         }
+-        if (mld_id == -1) {
+-            mld_id = db->mld_configurations.size();
+-            db->mld_configurations.push_back(AgentDB::sMLDConfiguration());
+-            db->mld_configurations[mld_id].ssid = ssid;
++        // Insert new MLD Config
++        if (!current_ap_mld_conf) {
++            db->ap_mld_configurations.push_back(AgentDB::sAPMLDConfiguration());
++            current_ap_mld_conf                      = &(db->ap_mld_configurations.back());
++            current_ap_mld_conf->mld_config.mld_ssid = ssid;
++        }
++        // Find new MLD Unit
++        if (current_ap_mld_conf->mld_config.mld_unit == -1) {
++            std::unordered_set<int8_t> used_mld_units;
++            if (db->bsta_mld_configuration) {
++                used_mld_units.insert(db->bsta_mld_configuration->mld_config.mld_unit);
++            }
++            for (auto ap_mld_conf : db->ap_mld_configurations) {
++                used_mld_units.insert(ap_mld_conf.mld_config.mld_unit);
++            }
++            for (int8_t mld_unit = 0; mld_unit < db->max_mlds; ++mld_unit) {
++                if (used_mld_units.find(mld_unit) == used_mld_units.end()) {
++                    current_ap_mld_conf->mld_config.mld_unit = mld_unit;
++                    LOG(DEBUG) << "MLD Unit " << mld_unit << " has been assigned to AP MLD "
++                               << ssid;
++                    break;
++                }
++            }
++        }
++
++        if (ap_mld.modes().str) {
++            current_ap_mld_conf->mld_config.mld_mode = AgentDB::sMLDConfiguration::mode(
++                current_ap_mld_conf->mld_config.mld_mode | AgentDB::sMLDConfiguration::mode::STR);
++        }
++        if (ap_mld.modes().nstr) {
++            current_ap_mld_conf->mld_config.mld_mode = AgentDB::sMLDConfiguration::mode(
++                current_ap_mld_conf->mld_config.mld_mode | AgentDB::sMLDConfiguration::mode::NSTR);
++        }
++        if (ap_mld.modes().emlsr) {
++            current_ap_mld_conf->mld_config.mld_mode = AgentDB::sMLDConfiguration::mode(
++                current_ap_mld_conf->mld_config.mld_mode | AgentDB::sMLDConfiguration::mode::EMLSR);
++        }
++        if (ap_mld.modes().emlmr) {
++            current_ap_mld_conf->mld_config.mld_mode = AgentDB::sMLDConfiguration::mode(
++                current_ap_mld_conf->mld_config.mld_mode | AgentDB::sMLDConfiguration::mode::EMLMR);
+         }
+ 
+-        AgentDB::sMLDConfiguration &mld_conf(db->mld_configurations[mld_id]);
+-        mld_conf.str   = ap_mld.modes().str;
+-        mld_conf.nstr  = ap_mld.modes().nstr;
+-        mld_conf.emlsr = ap_mld.modes().emlsr;
+-        mld_conf.emlmr = ap_mld.modes().emlmr;
+-        mld_conf.affiliated_aps.clear();
++        LOG(DEBUG) << "Storing MLD configuration for BSta MLD " << ssid
++                   << ": [MLD_Unit=" << current_ap_mld_conf->mld_config.mld_unit
++                   << ", MLD_Mode=" << std::hex << current_ap_mld_conf->mld_config.mld_mode << "]";
+ 
++        current_ap_mld_conf->affiliated_aps.clear();
+         for (uint8_t affiliated_ap_it = 0; affiliated_ap_it < ap_mld.num_affiliated_ap();
+              ++affiliated_ap_it) {
+             std::tuple<bool, wfa_map::cAffiliatedAp &> affiliated_ap_tuple(
+@@ -1880,14 +1916,14 @@ bool ApAutoConfigurationTask::handle_agent_ap_mld_configuration_tlv(
+                 return false;
+             }
+ 
+-            AgentDB::sMLDConfiguration::sAffiliatedAP affiliated_conf = {};
++            AgentDB::sAPMLDConfiguration::sAffiliatedAP affiliated_conf = {};
+             affiliated_conf.ruid = std::get<1>(affiliated_ap_tuple).ruid();
+-            mld_conf.affiliated_aps.push_back(affiliated_conf);
++            current_ap_mld_conf->affiliated_aps.push_back(affiliated_conf);
+         }
+ 
+         for (auto &config : configs) {
+             if (config.ssid == ssid) {
+-                config.mld_id = mld_id;
++                config.mld_id = current_ap_mld_conf->mld_config.mld_unit;
+             }
+         }
+     }
+diff --git a/agent/src/beerocks/slave/tasks/topology_task.cpp b/agent/src/beerocks/slave/tasks/topology_task.cpp
+index 5c9e8901d..a257ee53f 100644
+--- a/agent/src/beerocks/slave/tasks/topology_task.cpp
++++ b/agent/src/beerocks/slave/tasks/topology_task.cpp
+@@ -291,9 +291,9 @@ void TopologyTask::handle_topology_query(ieee1905_1::CmduMessageRx &cmdu_rx,
+     }
+ 
+     auto db = AgentDB::get();
+-    for (size_t i = 0; i < db->mld_configurations.size(); ++i) {
++    for (auto ap_mld_config : db->ap_mld_configurations) {
+         // Next step, registering callback to avoid "get" method
+-        for (auto affiliated_ap : db->mld_configurations[i].affiliated_aps) {
++        for (auto affiliated_ap : ap_mld_config.affiliated_aps) {
+             if (affiliated_ap.ruid != net::network_utils::ZERO_MAC &&
+                 affiliated_ap.bssid != net::network_utils::ZERO_MAC) {
+                 auto radio = db->get_radio_by_mac(affiliated_ap.ruid);
+@@ -1072,31 +1072,38 @@ bool TopologyTask::add_agent_ap_mld_configuration_tlv()
+ {
+     auto db(AgentDB::get());
+ 
+-    if (!db->mld_configurations.empty()) {
++    if (!db->ap_mld_configurations.empty()) {
+         auto tlvAgentApMldConfiguration = m_cmdu_tx.addClass<wfa_map::tlvAgentApMldConfiguration>();
+         if (!tlvAgentApMldConfiguration) {
+             LOG(ERROR) << "addClass wfa_map::tlvAgentAPMLDConfiguration failed";
+             return false;
+         }
+ 
+-        for (const auto &mld_conf : db->mld_configurations) {
++        for (const auto &ap_mld_conf : db->ap_mld_configurations) {
+ 
+             auto ap_mld(tlvAgentApMldConfiguration->create_ap_mld());
+             ap_mld->ap_mld_mac_addr_valid().is_valid =
+-                (mld_conf.mac != net::network_utils::ZERO_MAC);
+-            ap_mld->set_ssid(mld_conf.ssid);
+-            ap_mld->ap_mld_mac_addr() = mld_conf.mac;
+-            ap_mld->modes().str       = mld_conf.str;
+-            ap_mld->modes().nstr      = mld_conf.nstr;
+-            ap_mld->modes().emlsr     = mld_conf.emlsr;
+-            ap_mld->modes().emlmr     = mld_conf.emlmr;
+-
+-            LOG(DEBUG) << "Sending MLD configuration for " << mld_conf.ssid
+-                       << "\n[ MAC  : " << mld_conf.mac << "]\n[ STR  : " << mld_conf.str
+-                       << "]\n[ NSTR : " << mld_conf.nstr << "]\n[ EMLSR: " << mld_conf.emlsr
+-                       << "]\n[ EMLMR: " << mld_conf.emlmr << "]";
+-
+-            for (const auto &affiliated_ap_conf : mld_conf.affiliated_aps) {
++                (ap_mld_conf.mld_config.mld_mac != net::network_utils::ZERO_MAC);
++            ap_mld->set_ssid(ap_mld_conf.mld_config.mld_ssid);
++            ap_mld->ap_mld_mac_addr() = ap_mld_conf.mld_config.mld_mac;
++            if (ap_mld_conf.mld_config.mld_mode & AgentDB::sMLDConfiguration::mode::STR) {
++                ap_mld->modes().str = 1;
++            }
++            if (ap_mld_conf.mld_config.mld_mode & AgentDB::sMLDConfiguration::mode::NSTR) {
++                ap_mld->modes().nstr = 1;
++            }
++            if (ap_mld_conf.mld_config.mld_mode & AgentDB::sMLDConfiguration::mode::EMLSR) {
++                ap_mld->modes().emlsr = 1;
++            }
++            if (ap_mld_conf.mld_config.mld_mode & AgentDB::sMLDConfiguration::mode::EMLMR) {
++                ap_mld->modes().emlmr = 1;
++            }
++
++            LOG(DEBUG) << "Sending AP MLD configuration for " << ap_mld_conf.mld_config.mld_ssid
++                       << " [mac=" << ap_mld_conf.mld_config.mld_mac << ", mode=" << std::hex
++                       << ap_mld_conf.mld_config.mld_mode << "]";
++
++            for (const auto &affiliated_ap_conf : ap_mld_conf.affiliated_aps) {
+ 
+                 auto affiliated_ap(ap_mld->create_affiliated_ap());
+                 affiliated_ap->affiliated_ap_fields_valid().affiliated_ap_mac_addr_valid =
+-- 
+2.34.1
+
