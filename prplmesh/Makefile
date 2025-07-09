@@ -73,11 +73,8 @@ define Package/prplmesh
 		+!(TARGET_intel_x86||TARGET_intel_mips):kmod-sched-prio 
 #	non-intel_x86 neither non-intel_mips neither broadcom dependencies:
 	DEPENDS+= \
-		+!(TARGET_intel_x86||TARGET_intel_mips||TARGET_brcmbca||TARGET_ipq95xx):hostapd-openssl \
-		+!(TARGET_intel_x86||TARGET_intel_mips||TARGET_brcmbca||TARGET_ipq95xx):wpa-supplicant-openssl
-	DEPENDS+= \
-		+TARGET_ipq95xx:hostapd-qca-openssl \
-		+TARGET_ipq95xx:wpa-supplicant-qca-openssl
+		+!(TARGET_intel_x86||TARGET_intel_mips||TARGET_brcmbca||TARGET_ipq95xx||TARGET_ipq53xx||TARGET_ipq54xx):hostapd-openssl \
+		+!(TARGET_intel_x86||TARGET_intel_mips||TARGET_brcmbca||TARGET_ipq95xx||TARGET_ipq53xx||TARGET_ipq54xx):wpa-supplicant-openssl
 	DEPENDS+= \
 		+PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND:libamxb \
 		+PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND:libamxrt \
@@ -86,6 +83,8 @@ define Package/prplmesh
 		+PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND:mod-amxb-ubus
 #	pwhm dependency:
 	DEPENDS+= +USE_PRPLMESH_WHM:pwhm
+#	hostapd-header dependecy (only if USE_PRPLMESH_NLHAL is enabled)
+	DEPENDS+= +USE_PRPLMESH_NLHAL:hostapd-headers
 endef
 
 define Package/prplmesh-unit-tests
@@ -126,6 +125,12 @@ ifeq ($(CONFIG_USE_PRPLMESH_WHM),y)
 	CMAKE_OPTIONS += -DUSE_PRPLMESH_WHM=ON
 	CMAKE_OPTIONS += -DWBAPI_SOCK="-DAMBIORIX_WBAPI_BACKEND_PATH=\\\"/usr/bin/mods/amxb/mod-amxb-ubus.so\\\" -DAMBIORIX_WBAPI_BUS_URI=\\\"ubus:/var/run/ubus/ubus.sock\\\""
 endif
+# Else if NLHAL is enabled and both Ambiorix and WHM are not enabled
+else ifeq ($(CONFIG_USE_PRPLMESH_NLHAL),y)
+	CMAKE_OPTIONS += -DUSE_PRPLMESH_NLHAL=ON
+	# disabling NBAPI and WHM
+	CMAKE_OPTIONS += -DENABLE_NBAPI=OFF
+	CMAKE_OPTIONS += -DUSE_PRPLMESH_WHM=OFF
 endif
 
 ifeq ($(CONFIG_TARGET_intel_mips),y)
