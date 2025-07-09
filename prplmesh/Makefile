@@ -113,11 +113,11 @@ $(eval $(call TestHostCommand,python3-yaml, \
 	Please install the Python3 YAML module, \
 	$(STAGING_DIR_HOST)/bin/python3 -c 'import yaml'))
 
-DATAELEMENTS_ROOT_DM:=$(CONFIG_PRPL_CONTROLLER_ROOT_PATH)
+CONTROLLER_ROOT_DM:=$(CONFIG_PRPL_CONTROLLER_ROOT_PATH)
 
 ifeq ($(CONFIG_PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND),y)
 	CMAKE_OPTIONS += -DENABLE_NBAPI=ON
-	CMAKE_OPTIONS += -DDATAELEMENTS_ROOT_DM="$(DATAELEMENTS_ROOT_DM)"
+	CMAKE_OPTIONS += -DCONTROLLER_ROOT_DM="$(CONTROLLER_ROOT_DM)"
 	CMAKE_OPTIONS += -DUBUS_SOCK="-DAMBIORIX_BACKEND_PATH=\\\"/usr/bin/mods/amxb/mod-amxb-ubus.so\\\" -DAMBIORIX_BUS_URI=\\\"ubus:/var/run/ubus/ubus.sock\\\""
 ifeq ($(CONFIG_USE_PRPLMESH_WHM),y)
 	CMAKE_OPTIONS += -DUSE_PRPLMESH_WHM=ON
@@ -175,6 +175,7 @@ define Package/prplmesh/install
 	$(INSTALL_DIR) $(1)/usr/lib
 	$(INSTALL_BIN) ./files/etc/init.d/* $(1)/etc/init.d/
 	$(INSTALL_BIN) ./files/etc/uci-defaults/* $(1)/etc/uci-defaults/
+	$(SED) '/CONFIG_CONTROLLER_ROOT_DM=/ c\CONFIG_CONTROLLER_ROOT_DM=$(CONTROLLER_ROOT_DM)' $(1)/etc/init.d/prplmesh
 	$(CP) $(PKG_INSTALL_DIR)/opt/prplmesh/bin $(1)/opt/prplmesh/
 	$(CP) $(PKG_INSTALL_DIR)/opt/prplmesh/scripts $(1)/opt/prplmesh/
 	$(CP) $(PKG_INSTALL_DIR)/opt/prplmesh/lib/*.so* $(1)/usr/lib/
