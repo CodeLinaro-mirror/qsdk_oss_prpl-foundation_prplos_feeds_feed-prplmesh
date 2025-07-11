@@ -1,0 +1,326 @@
+From 048d0540cec08be2862168bc657ddacadf5b2433 Mon Sep 17 00:00:00 2001
+From: Vinu Bharath R <vinubhar@qti.qualcomm.com>
+Date: Fri, 11 Jul 2025 02:08:14 +0530
+Subject: [PATCH 2/3] Controller: AP MLD Reconfiguration Implementation
+
+Signed-off-by: Vinu Bharath R <vinubhar@qti.qualcomm.com>
+---
+ controller/nbapi/odl/controller.odl.in        |   7 +
+ controller/nbapi/on_action.cpp                |  31 +++
+ controller/src/beerocks/master/controller.cpp | 182 ++++++++++++++++++
+ controller/src/beerocks/master/controller.h   |  13 ++
+ 4 files changed, 233 insertions(+)
+
+diff --git a/controller/nbapi/odl/controller.odl.in b/controller/nbapi/odl/controller.odl.in
+index ed399f74c..20ce88e52 100644
+--- a/controller/nbapi/odl/controller.odl.in
++++ b/controller/nbapi/odl/controller.odl.in
+@@ -425,6 +425,13 @@
+                     }
+                     /* Update all unassociated stations stats, from all agents and all radios */
+                     bool UpdateUnassociatedStationsStats();
++
++                    void ReconfigApmld(
++                        %in %mandatory string al_mac,
++                        %in %mandatory string mld_mac,
++                        %in %mandatory string ruid,
++                        %in %mandatory bool add_link
++                    );
+                 }
+                 %persistent %read-only object SteerEvent[] {
+                     counted with SteerEventNumberOfEntries;
+diff --git a/controller/nbapi/on_action.cpp b/controller/nbapi/on_action.cpp
+index 39db98e6e..bce2ab050 100644
+--- a/controller/nbapi/on_action.cpp
++++ b/controller/nbapi/on_action.cpp
+@@ -404,6 +404,36 @@ amxd_status_t client_steering(amxd_object_t *object, amxd_function_t *func, amxc
+     return amxd_status_ok;
+ }
+ 
++amxd_status_t reconfig_apmld(amxd_object_t *object, amxd_function_t *func, amxc_var_t *args,
++                              amxc_var_t *ret)
++{
++    auto controller_ctx = g_database->get_controller_ctx();
++
++    auto al_mac = GET_CHAR(args, "al_mac");
++    auto mld_mac = GET_CHAR(args, "mld_mac");
++    auto ruid = GET_CHAR(args, "ruid");
++    bool add_link = GET_BOOL(args, "add_link");
++
++    if (!al_mac || !mld_mac || !ruid) {
++        LOG(ERROR) << "Failed to get proper arguments.";
++        return amxd_status_parameter_not_found;
++    }
++
++    if (!controller_ctx) {
++        LOG(ERROR) << "Failed to get controller context.";
++        return amxd_status_unknown_error;
++    }
++
++    if (!controller_ctx->reconfig_apmld(tlvf::mac_from_string(al_mac), tlvf::mac_from_string(mld_mac),
++			                tlvf::mac_from_string(ruid), add_link)) {
++        LOG(ERROR) << "Failed to reconfig apmld from NBAPI for Agent: " << al_mac
++                   << " on MLD MAC: " << mld_mac << " with ruid: " << ruid
++                   << " with operation " << (add_link ? "add_link" : "remove_link");
++        return amxd_status_unknown_error;
++    }
++    return amxd_status_ok;
++}
++
+ /**
+  * @brief Initiate channel scan from NBAPI for given radio and channels.
+  *
+@@ -1271,6 +1301,7 @@ std::vector<beerocks::nbapi::sFunctions> get_func_list(void)
+         {"access_point_commit", DATAELEMENTS_ROOT_DM ".Network.AccessPointCommit",
+          access_point_commit},
+         {"client_steering", DATAELEMENTS_ROOT_DM ".Network.ClientSteering", client_steering},
++        {"reconfig_apmld", DATAELEMENTS_ROOT_DM ".Network.ReconfigApmld", reconfig_apmld},
+         {"trigger_scan", DATAELEMENTS_ROOT_DM ".Network.Device.Radio.ScanTrigger", trigger_scan},
+         {"BTMRequest", DATAELEMENTS_ROOT_DM ".Network.Device.Radio.BSS.STA.MultiAPSTA.BTMRequest",
+          btm_request},
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 6d48ec494..be2bf0715 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -292,6 +292,7 @@ bool Controller::start()
+             ieee1905_1::eMessageType::AP_AUTOCONFIGURATION_WSC_MESSAGE,
+             ieee1905_1::eMessageType::AP_CAPABILITY_REPORT_MESSAGE,
+             ieee1905_1::eMessageType::AP_METRICS_RESPONSE_MESSAGE,
++            ieee1905_1::eMessageType::AP_MLD_CONFIGURATION_RESPONSE_MESSAGE,
+             ieee1905_1::eMessageType::BEACON_METRICS_RESPONSE_MESSAGE,
+             ieee1905_1::eMessageType::CHANNEL_PREFERENCE_REPORT_MESSAGE,
+             ieee1905_1::eMessageType::CHANNEL_SELECTION_RESPONSE_MESSAGE,
+@@ -589,6 +590,8 @@ bool Controller::handle_cmdu_1905_1_message(const sMacAddr &src_mac,
+         return handle_cmdu_1905_ap_capability_report(src_mac, cmdu_rx);
+     case ieee1905_1::eMessageType::AP_METRICS_RESPONSE_MESSAGE:
+         return handle_cmdu_1905_ap_metric_response(src_mac, cmdu_rx);
++    case ieee1905_1::eMessageType::AP_MLD_CONFIGURATION_RESPONSE_MESSAGE:
++        return handle_cmdu_1905_ap_mld_configuration_response_message(src_mac, cmdu_rx);
+     case ieee1905_1::eMessageType::BEACON_METRICS_RESPONSE_MESSAGE:
+         return handle_cmdu_1905_beacon_response(src_mac, cmdu_rx);
+     case ieee1905_1::eMessageType::CHANNEL_SCAN_REPORT_MESSAGE:
+@@ -4149,6 +4152,164 @@ bool Controller::start_client_steering(const std::string &sta_mac, const std::st
+     return true;
+ }
+ 
++bool Controller::reconfig_apmld(const sMacAddr &al_mac, const sMacAddr &mld_mac,
++		                const sMacAddr &ruid, const bool &add_link)
++{
++    // Get Agent
++    auto agent = database.get_agent(al_mac);
++    if (!agent) {
++        LOG(ERROR) << "Agent with MAC:" << tlvf::mac_to_string(al_mac) << " not found in database";
++        return false;
++    }
++
++    // Modify the Agent DB based on reconfig_apmld params
++    auto ap_mlds = agent->ap_mlds;
++
++    // Check MLD MAC match
++    auto apmld = ap_mlds.find(mld_mac);
++
++    if (apmld != ap_mlds.end()) {
++        auto &ap_mld = apmld->second;
++	// Check RUID match
++	if (add_link) {
++            auto affl_ap = ap_mld.affiliated_aps.find(ruid);
++            if (affl_ap != ap_mld.affiliated_aps.end()) {
++                LOG(ERROR) << "Duplicate Affiliated AP addition with RUID: " << tlvf::mac_to_string(ruid);
++	        return false;
++	    }
++            // Add Affiliated AP
++            ap_mld.affiliated_aps[ruid] = Agent::sAPMLD::sAffiliatedAP();
++            ap_mld.affiliated_aps[ruid].ruid = ruid;
++        } else {
++            // Remove Affiliated AP
++            auto affl_ap = ap_mld.affiliated_aps.find(ruid);
++            if (affl_ap != ap_mld.affiliated_aps.end()) {
++                if (ap_mld.affiliated_aps.size() > 1) {
++                    ap_mld.affiliated_aps.erase(ruid);
++                } else {
++                    LOG(ERROR) << "Affiliated AP with RUID: " << tlvf::mac_to_string(ruid)
++                               << " is the last link of APMLD. Hence can't be removed using ReconfigApmld NBAPI trigger";
++                    return false;
++		}
++            } else {
++                LOG(ERROR) << "Affiliated AP with RUID: " << tlvf::mac_to_string(ruid) << " not found";
++                return false;
++            }
++        }
++    } else {
++        LOG(ERROR) << "MLD with MAC: " << tlvf::mac_to_string(mld_mac) << " not found";
++	return false;
++    }
++
++    if (!cmdu_tx.create(0, ieee1905_1::eMessageType::AP_MLD_CONFIGURATION_REQUEST_MESSAGE)) {
++        LOG(ERROR) << "CMDU creation of type AP_MLD_CONFIGURATION_REQUEST_MESSAGE, has failed";
++        return false;
++    }
++
++    // Add TLVs to Message
++    // Add AgentApMldConfiguration TLV
++    auto tlvAgentApMldConfiguration = cmdu_tx.addClass<wfa_map::tlvAgentApMldConfiguration>();
++    if (!tlvAgentApMldConfiguration) {
++        LOG(ERROR) << "addClass wfa_map::tlvAgentAPMLDConfiguration failed";
++        return false;
++    }
++
++    for (const auto &apmld : ap_mlds) {
++
++	auto db_ap_mld = apmld.second;
++        auto ap_mld(tlvAgentApMldConfiguration->create_ap_mld());
++
++	// MLD MAC valid bit
++        ap_mld->ap_mld_mac_addr_valid().is_valid =
++            (db_ap_mld.mld_info.mld_mac != beerocks::net::network_utils::ZERO_MAC);
++
++        // SSID
++        ap_mld->set_ssid(db_ap_mld.mld_info.mld_ssid);
++
++        // MLD MAC
++        ap_mld->ap_mld_mac_addr() = db_ap_mld.mld_info.mld_mac;
++
++        // MLD MODES
++        if (db_ap_mld.mld_info.mld_mode & Agent::sMLDInfo::mode::STR) {
++            ap_mld->modes().str = 1;
++        }
++        if (db_ap_mld.mld_info.mld_mode & Agent::sMLDInfo::mode::NSTR) {
++            ap_mld->modes().nstr = 1;
++        }
++        if (db_ap_mld.mld_info.mld_mode & Agent::sMLDInfo::mode::EMLSR) {
++            ap_mld->modes().emlsr = 1;
++        }
++        if (db_ap_mld.mld_info.mld_mode & Agent::sMLDInfo::mode::EMLMR) {
++            ap_mld->modes().emlmr = 1;
++        }
++
++        LOG(DEBUG) << "Sending AP MLD configuration for " << db_ap_mld.mld_info.mld_ssid
++                   << " [mac=" << db_ap_mld.mld_info.mld_mac << ", mode=" << std::hex
++                   << db_ap_mld.mld_info.mld_mode << "]";
++
++        for (const auto &affl_ap : db_ap_mld.affiliated_aps) {
++            auto db_affiliated_ap = affl_ap.second;
++            auto affiliated_ap(ap_mld->create_affiliated_ap());
++
++            // MAC addr valid
++            affiliated_ap->affiliated_ap_fields_valid().affiliated_ap_mac_addr_valid =
++                (db_affiliated_ap.bssid != beerocks::net::network_utils::ZERO_MAC);
++            // LinkId valid
++            affiliated_ap->affiliated_ap_fields_valid().linkid_valid =
++                (db_affiliated_ap.bssid != beerocks::net::network_utils::ZERO_MAC);
++            // RUID
++            affiliated_ap->ruid()                   = db_affiliated_ap.ruid;
++            // MAC addr (BSSID)
++            affiliated_ap->affiliated_ap_mac_addr() = db_affiliated_ap.bssid;
++            // LinkId
++            affiliated_ap->linkid()                 = db_affiliated_ap.link_id;
++
++            if (!ap_mld->add_affiliated_ap(affiliated_ap)) {
++                LOG(ERROR) << "add_affiliated_ap() failed in tlvAgentApMldConfiguration.affiliated_ap";
++                return false;
++            }
++        }
++
++        if (!tlvAgentApMldConfiguration->add_ap_mld(ap_mld)) {
++            LOG(ERROR) << "add_ap_mld() failed in tlvAgentApMldConfiguration";
++            return false;
++        }
++    }
++
++    //===========================================================================================
++    // Print Agent AP MLD structure
++    LOG(DEBUG) << "Agent AP MLD: Size: " << agent->ap_mlds.size();
++    uint8_t l = 0;
++    for (auto apmld : agent->ap_mlds) {
++       auto ap_mld = apmld.second;
++        LOG(DEBUG) << "\tMLD: " << l << "\n" << "\tssid: " << ap_mld.mld_info.mld_ssid << "\n"
++           << "\tmac: " << tlvf::mac_to_string(ap_mld.mld_info.mld_mac) << "\n"
++           << "\tmode: " << ap_mld.mld_info.mld_mode << "\n"
++           << "\tdm_path: " << ap_mld.dm_path << "\n"
++           << "\tNumber of Affiliated APs: " << ap_mld.affiliated_aps.size();
++        uint8_t m = 0;
++        for (auto affiliatedap : ap_mld.affiliated_aps) {
++          auto affiliated_ap = affiliatedap.second;
++           LOG(DEBUG) << "\tAffiliated AP: " << m << "\n"
++               << "\t\truid: " << tlvf::mac_to_string(affiliated_ap.ruid) << "\n"
++               << "\t\tbssid: " << tlvf::mac_to_string(affiliated_ap.bssid) << "\n"
++               << "\t\tlink_id: " << affiliated_ap.link_id << "\n"
++               << "\t\tdm_path: " << affiliated_ap.dm_path;
++          m++;
++        }
++       l++;
++    }
++    //===========================================================================================
++
++    LOG(DEBUG) << "NBAPI APMLD Reconfig request to " << (add_link ? "add" : "remove")
++               << " Affiliated AP with RUID: " << tlvf::mac_to_string(ruid)
++               << " for APMLD with MLD MAC: "  << tlvf::mac_to_string(mld_mac)
++               << " on Agent: " << tlvf::mac_to_string(al_mac)
++               << " Actual al_mac" << tlvf::mac_to_string(agent->al_mac);
++
++    return son_actions::send_cmdu_to_agent(agent->al_mac, cmdu_tx, database);
++}
++
+ #define BEACON_INTERVAL_MS_IN_BI 100
+ bool Controller::send_btm_request(const bool &disassoc_imminent,
+                                   const uint32_t &disassoc_timer,    // beacon interval count
+@@ -5054,4 +5215,25 @@ bool Controller::send_unassociated_sta_link_metrics_query_message(
+     return true;
+ }
+ 
++bool Controller::handle_cmdu_1905_ap_mld_configuration_response_message(const sMacAddr &src_mac,
++                                                              ieee1905_1::CmduMessageRx &cmdu_rx)
++{
++    auto mid = cmdu_rx.getMessageId();
++    LOG(INFO) << "Received AP_MLD_CONFIGURATION_RESPONSE_MESSAGE, mid=" << std::dec << int(mid);
++
++    auto agent = database.m_agents.get(src_mac);
++    if (!agent) {
++        LOG(WARNING) << "Agent with mac is not found in database mac=" << src_mac;
++        return false;
++    }
++
++    // Handle Agent APMLD Configuration TLV
++    if (!son_actions::handle_agent_ap_mld_configuration_tlv(database, src_mac, cmdu_rx)) {
++        LOG(ERROR) << "handle_ap_mld_configuration_tlv has failed!";
++        return false;
++    }
++
++    return true;
++}
++
+ } // namespace son
+diff --git a/controller/src/beerocks/master/controller.h b/controller/src/beerocks/master/controller.h
+index 730e9997d..d9985c9e4 100644
+--- a/controller/src/beerocks/master/controller.h
++++ b/controller/src/beerocks/master/controller.h
+@@ -100,6 +100,17 @@ public:
+      */
+     bool start_client_steering(const std::string &sta_mac, const std::string &target_bssid);
+ 
++    /*
++     * @brief Reconfig Apmld initiated by NBAPI.
++     * @param al_mac Mac address of Agent.
++     * @param mld_mac Mac address of AP MLD.
++     * @param ruid RUID of Affiliated AP.
++     * @param add flag to add(1)/remove(0) Affiliated AP.
++     * @return True if Apmld Reconfig started successfully, false otherwise.
++     * */
++    bool reconfig_apmld(const sMacAddr &al_mac, const sMacAddr &mld_mac,
++                        const sMacAddr &ruid, const bool &add_link);
++
+     /**
+      * @brief Send BTM Request on NBAPI RPC.
+      *
+@@ -379,6 +390,8 @@ private:
+     bool handle_cmdu_1905_early_ap_capability_report_message(const sMacAddr &src_mac,
+                                                              ieee1905_1::CmduMessageRx &cmdu_rx);
+ 
++    bool handle_cmdu_1905_ap_mld_configuration_response_message(const sMacAddr &src_mac,
++                                                                ieee1905_1::CmduMessageRx &cmdu_rx);
+     bool autoconfig_wsc_parse_radio_caps(
+         const sMacAddr &radio_mac,
+         std::shared_ptr<wfa_map::tlvApRadioBasicCapabilities> radio_caps);
+-- 
+2.34.1
+
