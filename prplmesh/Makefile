@@ -83,8 +83,6 @@ define Package/prplmesh
 		+PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND:mod-amxb-ubus
 #	pwhm dependency:
 	DEPENDS+= +USE_PRPLMESH_WHM:pwhm
-#	hostapd-header dependecy (only if USE_PRPLMESH_NLHAL is enabled)
-	DEPENDS+= +USE_PRPLMESH_NLHAL:hostapd-headers
 endef
 
 define Package/prplmesh-unit-tests
@@ -155,6 +153,11 @@ endif
 ifeq ($(CONFIG_PRPLMESH_ENABLE_UNIT_TESTS),y)
 	CMAKE_OPTIONS += -DBUILD_TESTS=ON
 endif
+
+define Build/Prepare
+	$(call Build/Prepare/Default)
+	$(CP) $(CURDIR)/files/hostapd_dep/include $(PKG_BUILD_DIR)/
+endef
 
 define Build/InstallDev
 	$(INSTALL_DIR) $(1)/usr/lib
