@@ -122,6 +122,7 @@ ifeq ($(CONFIG_PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND),y)
 ifeq ($(CONFIG_USE_PRPLMESH_WHM),y)
 	CMAKE_OPTIONS += -DUSE_PRPLMESH_WHM=ON
 	CMAKE_OPTIONS += -DWBAPI_SOCK="-DAMBIORIX_WBAPI_BACKEND_PATH=\\\"/usr/bin/mods/amxb/mod-amxb-ubus.so\\\" -DAMBIORIX_WBAPI_BUS_URI=\\\"ubus:/var/run/ubus/ubus.sock\\\""
+	CMAKE_OPTIONS += -DUSE_PRPLMESH_NLHAL=OFF
 endif
 # Else if NLHAL is enabled and both Ambiorix and WHM are not enabled
 else ifeq ($(CONFIG_USE_PRPLMESH_NLHAL),y)
