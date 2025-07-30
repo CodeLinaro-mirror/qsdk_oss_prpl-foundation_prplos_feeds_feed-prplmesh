@@ -1,0 +1,220 @@
+From 86df4159f7768e1fd0b5ce9b9c9083e02650de77 Mon Sep 17 00:00:00 2001
+From: Vinu Bharath R <vinubhar@qti.qualcomm.com>
+Date: Mon, 5 May 2025 15:57:33 +0530
+Subject: [PATCH] Controller: Handle Affiliated STA Metrics TLV in AP Metrics
+ Response
+
+Signed-off-by: Vinu Bharath R <vinubhar@qti.qualcomm.com>
+---
+ controller/src/beerocks/master/controller.cpp | 37 ++++++++++++++++++
+ controller/src/beerocks/master/controller.h   |  9 +++++
+ controller/src/beerocks/master/db/db.cpp      | 39 +++++++++++++++++++
+ controller/src/beerocks/master/db/db.h        | 20 ++++++++++
+ controller/src/beerocks/master/db/station.h   | 21 ++++++++++
+ 5 files changed, 126 insertions(+)
+
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 3ec00d79a5..67032e6041 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -53,6 +53,7 @@
+ #include <tlvf/ieee_1905_1/tlvSupportedFreqBand.h>
+ #include <tlvf/ieee_1905_1/tlvSupportedRole.h>
+ #include <tlvf/wfa_map/tlv1905LayerSecurityCapability.h>
++#include <tlvf/wfa_map/tlvAffiliatedStaMetrics.h>
+ #include <tlvf/wfa_map/tlvAgentApMldConfiguration.h>
+ #include <tlvf/wfa_map/tlvAkmSuiteCapabilities.h>
+ #include <tlvf/wfa_map/tlvApCapability.h>
+@@ -1711,6 +1712,7 @@ bool Controller::handle_cmdu_1905_ap_metric_response(const sMacAddr &src_mac,
+     ret_val &= handle_tlv_associated_sta_extended_link_metrics(src_mac, cmdu_rx);
+     ret_val &= handle_tlv_associated_sta_traffic_stats(src_mac, cmdu_rx);
+     ret_val &= handle_tlv_associated_wifi6_sta_status_report(src_mac, cmdu_rx);
++    ret_val &= handle_tlv_affiliated_sta_metrics(src_mac, cmdu_rx);
+ 
+     // For now, this is only used for certification so update the certification cmdu.
+     if (database.setting_certification_mode() &&
+@@ -2020,6 +2022,41 @@ bool Controller::handle_tlv_associated_wifi6_sta_status_report(const sMacAddr &s
+     return ret_val;
+ }
+ 
++bool Controller::handle_tlv_affiliated_sta_metrics(const sMacAddr &src_mac,
++                                                   ieee1905_1::CmduMessageRx &cmdu_rx)
++{
++    auto agent = database.m_agents.get(src_mac);
++
++    if (!agent) {
++        LOG(ERROR) << "Agent with mac is not found in database mac=" << src_mac;
++        return false;
++    }
++
++    for (auto &affiliated_sta_metrics : cmdu_rx.getClassList<wfa_map::tlvAffiliatedStaMetrics>()) {
++
++        db::sAffiliatedStaMetrics affl_sta_metrics;
++
++        // Recalculate counters according to Agent Byte Units.
++        affl_sta_metrics.bytes_sent = database.recalculate_attr_to_byte_units(
++            agent->byte_counter_units, affiliated_sta_metrics->bytes_sent());
++
++        affl_sta_metrics.bytes_received = database.recalculate_attr_to_byte_units(
++            agent->byte_counter_units, affiliated_sta_metrics->bytes_received());
++
++        affl_sta_metrics.packets_received    = affiliated_sta_metrics->packets_received();
++        affl_sta_metrics.packets_sent        = affiliated_sta_metrics->packets_sent();
++        affl_sta_metrics.packets_sent_errors = affiliated_sta_metrics->packets_sent_errors();
++
++        if (!database.dm_set_affiliated_sta_metrics(affiliated_sta_metrics->sta_mac_addr(),
++                                                    affl_sta_metrics)) {
++            LOG(ERROR) << "Failed to set metrics for Affiliated STA:"
++                       << affiliated_sta_metrics->sta_mac_addr();
++            return false;
++        }
++    }
++    return true;
++}
++
+ bool Controller::handle_tlv_ap_vht_capabilities(ieee1905_1::CmduMessageRx &cmdu_rx)
+ {
+     bool ret_val = true;
+diff --git a/controller/src/beerocks/master/controller.h b/controller/src/beerocks/master/controller.h
+index 91763fd033..7e8969f1d0 100644
+--- a/controller/src/beerocks/master/controller.h
++++ b/controller/src/beerocks/master/controller.h
+@@ -551,6 +551,15 @@ private:
+     bool handle_tlv_associated_wifi6_sta_status_report(const sMacAddr &src_mac,
+                                                        ieee1905_1::CmduMessageRx &cmdu_rx);
+ 
++    /**
++     * @brief Handles Tlv of Affiliated STA Metrics (tlvAffiliatedStaMetrics).
++     *
++     * @param src_mac Source MAC address.
++     * @param cmdu_rx  AP Metrics Response message.
++     * @return True on success, false otherwise.
++    */
++    bool handle_tlv_affiliated_sta_metrics(const sMacAddr &src_mac,
++                                           ieee1905_1::CmduMessageRx &cmdu_rx);
+     /**
+      * @brief Handles Tlv of Profile-2 AP Capability (tlvProfile2ApCapability).
+      *
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 3c314d4841..816332b79c 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -7520,6 +7520,45 @@ bool db::dm_set_sta_traffic_stats(const sMacAddr &sta_mac, sAssociatedStaTraffic
+     return ret_val;
+ }
+ 
++bool db::dm_set_affiliated_sta_metrics(const sMacAddr &sta_mac,
++                                       sAffiliatedStaMetrics &affl_sta_metrics)
++{
++    bool ret_val = true;
++    auto station = get_station(sta_mac);
++    if (!station) {
++        LOG(ERROR) << "Failed to get station on db with mac: " << sta_mac;
++        return false;
++    }
++
++    std::string affiliated_sta_dm_path = "";
++
++    // Get Affiliated STA DM path from Station DB
++    for (auto &affiliated_sta : station->sta_mld_configuration.affiliated_stas) {
++        if (affiliated_sta.affiliated_sta_mac == sta_mac) {
++            affiliated_sta_dm_path = affiliated_sta.dm_path;
++            break;
++        }
++    }
++
++    if (affiliated_sta_dm_path.empty()) {
++        LOG(ERROR) << "Failed to get Data Model path for Affiliated STA: " << sta_mac;
++        return false;
++    }
++
++    ret_val &=
++        m_ambiorix_datamodel->set(affiliated_sta_dm_path, "BytesSent", affl_sta_metrics.bytes_sent);
++    ret_val &= m_ambiorix_datamodel->set(affiliated_sta_dm_path, "BytesReceived",
++                                         affl_sta_metrics.bytes_received);
++    ret_val &= m_ambiorix_datamodel->set(affiliated_sta_dm_path, "PacketsSent",
++                                         affl_sta_metrics.packets_sent);
++    ret_val &= m_ambiorix_datamodel->set(affiliated_sta_dm_path, "PacketsReceived",
++                                         affl_sta_metrics.packets_received);
++    ret_val &= m_ambiorix_datamodel->set(affiliated_sta_dm_path, "ErrorsSent",
++                                         affl_sta_metrics.packets_sent_errors);
++
++    return ret_val;
++}
++
+ bool db::dm_add_tid_queue_sizes(
+     const Station &station,
+     const std::vector<wfa_map::tlvAssociatedWiFi6StaStatusReport::sTidQueueSize> &tid_queue_vector)
+diff --git a/controller/src/beerocks/master/db/db.h b/controller/src/beerocks/master/db/db.h
+index 19296d4a3a..7d79e9de5c 100644
+--- a/controller/src/beerocks/master/db/db.h
++++ b/controller/src/beerocks/master/db/db.h
+@@ -260,6 +260,14 @@ public:
+         uint32_t m_retransmission_count = 0;
+     } sAssociatedStaTrafficStats;
+ 
++    typedef struct {
++        uint64_t bytes_sent          = 0;
++        uint64_t bytes_received      = 0;
++        uint32_t packets_sent        = 0;
++        uint32_t packets_received    = 0;
++        uint32_t packets_sent_errors = 0;
++    } sAffiliatedStaMetrics;
++
+     typedef struct {
+         std::string dm_path; /**< data model path */
+         sMacAddr original_bssid;
+@@ -1014,6 +1022,18 @@ public:
+      */
+     bool dm_set_sta_traffic_stats(const sMacAddr &sta_mac, db::sAssociatedStaTrafficStats &stats);
+ 
++    /**
++     * @brief Sets Metrics for corresponding Affiliated STA.
++     *
++     * Path: Device.WiFi.DataElements.Network.Device.{i}.Radio.{i}.BSS.{i}.STA.{i}.AffiliatedSta.{i}
++     *
++     * @param sta_mac sta MAC address for node matching
++     * @param affl_sta_metrics metrics of affiliated sta
++     * @return true on success, false otherwise.
++     */
++    bool dm_set_affiliated_sta_metrics(const sMacAddr &sta_mac,
++                                       db::sAffiliatedStaMetrics &affl_sta_metrics);
++
+     /**
+      * @brief Clears all stats for corresponding STA.
+      *
+diff --git a/controller/src/beerocks/master/db/station.h b/controller/src/beerocks/master/db/station.h
+index ac9878fd49..ba30c1aee9 100644
+--- a/controller/src/beerocks/master/db/station.h
++++ b/controller/src/beerocks/master/db/station.h
+@@ -186,6 +186,27 @@ public:
+     beerocks::eBeaconMeasurementSupportLevel supports_beacon_measurement =
+         beerocks::BEACON_MEAS_UNSUPPORTED;
+ 
++    typedef struct {
++        sMacAddr sta_mld_mac = beerocks::net::network_utils::ZERO_MAC;
++        sMacAddr ap_mld_mac  = beerocks::net::network_utils::ZERO_MAC;
++        enum mode { NONE = 0, STR = 1 << 0, NSTR = 1 << 1, EMLSR = 1 << 2, EMLMR = 1 << 3 };
++        mode mld_mode;
++    } sMLDConfiguration;
++
++    typedef struct {
++        typedef struct {
++            std::string dm_path; // AffiliatedSta data model path
++            sMacAddr bssid;
++            sMacAddr affiliated_sta_mac;
++        } sAffiliatedSta;
++
++        std::string dm_path; // StaMld data model path
++        sMLDConfiguration mld_config;
++        std::vector<sAffiliatedSta> affiliated_stas;
++    } sAssociatedStaMldConfiguration;
++
++    sAssociatedStaMldConfiguration sta_mld_configuration;
++
+ private:
+     int m_client_locating_task_id_new_connection   = -1;
+     int m_client_locating_task_id_exist_connection = -1;
+-- 
+GitLab
+
