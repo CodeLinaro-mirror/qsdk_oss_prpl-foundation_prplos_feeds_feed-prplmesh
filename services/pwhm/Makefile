@@ -3,13 +3,14 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=pwhm
-PKG_VERSION:=v7.6.24
+PKG_VERSION:=PPW-720-rxtime-in-getradioairstats-output-holds-total-rx-time-instead-of-localbss-rx-time_4.0
 SHORT_DESCRIPTION:=prplMesh WHM
 
-PKG_SOURCE:=pwhm-v7.6.24.tar.gz
-PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/pwhm/plugins/pwhm/-/archive/v7.6.24
-PKG_HASH:=28c1e2a8f5bc3c6292dc47b3034649aaabc0fc7017103a5d36c447f9943b082f
-PKG_BUILD_DIR:=$(BUILD_DIR)/pwhm-v7.6.24
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_VERSION:=PPW-720-rxtime-in-getradioairstats-output-holds-total-rx-time-instead-of-localbss-rx-time_4.0
+PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/pwhm/plugins/pwhm.git
+PKG_MIRROR_HASH:=skip
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 PKG_MAINTAINER:=Soft At Home <support.opensource@softathome.com>
 PKG_LICENSE:=BSD-2-Clause-Patent
 PKG_LICENSE_FILES:=LICENSE
