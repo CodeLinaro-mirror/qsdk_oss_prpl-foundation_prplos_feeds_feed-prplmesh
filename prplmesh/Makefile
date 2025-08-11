@@ -101,7 +101,12 @@ CMAKE_OPTIONS+= \
 	-DPLATFORM_BUILD_DIR=$(BUILD_DIR) \
 	-DPLATFORM_STAGING_DIR=$(STAGING_DIR) \
 	-DPLATFORM_INCLUDE_DIR=$(STAGING_DIR)/usr/include \
-	-DCMAKE_CXX_FLAGS="-Wno-error=deprecated-declarations"
+
+#debug symbols enabled
+CMAKE_OPTIONS+= \
+	-DCMAKE_BUILD_TYPE=Debug \
+	-DCMAKE_C_FLAGS="-g3" \
+	-DCMAKE_CXX_FLAGS="-Wno-error=deprecated-declarations -g3"
 
 ifeq ($(wildcard $(PKG_BUILD_DIR)/.source_dir),)
 	CMAKE_OPTIONS += -DPRPLMESH_REVISION=$(PRPLMESH_REVISION)
