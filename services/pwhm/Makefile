@@ -3,13 +3,14 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=pwhm
-PKG_VERSION:=v7.8.20
+PKG_VERSION:=bugfix_PPW-335_station_interface_goes_down
 SHORT_DESCRIPTION:=prplMesh WHM
 
-PKG_SOURCE:=pwhm-v7.8.20.tar.gz
-PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/pwhm/plugins/pwhm/-/archive/v7.8.20
-PKG_HASH:=1bb7a4f2b41174b3333e003638f5a5c6c4083a4a1801a35edce4589f614c74cc
-PKG_BUILD_DIR:=$(BUILD_DIR)/pwhm-v7.8.20
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_VERSION:=bugfix_PPW-335_station_interface_goes_down
+PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/pwhm/plugins/pwhm.git
+PKG_MIRROR_HASH:=skip
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 PKG_MAINTAINER:=Soft At Home <support.opensource@softathome.com>
 PKG_LICENSE:=BSD-2-Clause-Patent
 PKG_LICENSE_FILES:=LICENSE
