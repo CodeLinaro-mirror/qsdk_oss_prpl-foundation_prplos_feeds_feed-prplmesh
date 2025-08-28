@@ -186,6 +186,10 @@ define Package/prplmesh/install
 	$(CP) $(PKG_INSTALL_DIR)/opt/prplmesh/lib/*.so* $(1)/usr/lib/
 	$(CP) $(PKG_INSTALL_DIR)/opt/prplmesh/share $(1)/opt/prplmesh/
 	$(CP) $(PKG_INSTALL_DIR)/opt/prplmesh/config $(1)/opt/prplmesh/
+
+	echo "#!/bin/sh" > $(1)/etc/uci-defaults/99-enable-prplmesh-agent
+	echo "/etc/init.d/prplmesh-agent enable" >> $(1)/etc/uci-defaults/99-enable-prplmesh-agent
+	chmod +x $(1)/etc/uci-defaults/99-enable-prplmesh-agent
 endef
 
 define Package/prplmesh-unit-tests/install
