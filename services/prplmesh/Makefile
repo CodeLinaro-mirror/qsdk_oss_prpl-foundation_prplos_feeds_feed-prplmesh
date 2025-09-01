@@ -2,12 +2,14 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=prplmesh
 PKG_RELEASE:=1
+PKG_VERSION:=dev_PPM-3493
 
 PKG_SOURCE_PROTO:=git
-PKG_SOURCE_VERSION:=6903054fccc7a558d5c7b9a3e1caf23199a7c5bc
+PKG_SOURCE_VERSION:=feature/PPM-3493-amx-processmonitor-enhancements
 PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/prplMesh.git
-PKG_MIRROR_HASH:=0c3304cd9c47ff670787c8915774fcae65df51aab5bbaadb5010ebdfa9dedcb1
-PKG_SOURCE_DATE:=2025-07-25
+PKG_MIRROR_HASH:=skip
+PKG_SOURCE_DATE:=2025-09-02
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 PKG_MAINTAINER:=Frederik Van Bogaert <frederik.vanbogaert@prplfoundation.org>
 PKG_LICENSE:=BSD-2-Clause-Patent
 PKG_LICENSE_FILES:=LICENSE
