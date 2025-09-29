@@ -1,21 +1,28 @@
 # WARNING: Automatically generated file using BAF (Build system Agnostic File) tooling
-# WARNING: You should contribute changes to https://gitlab.com/prpl-foundation/prplmesh/pwhm/libraries/libswla/-/blob/main/baf.yml instead
+# WARNING: You should contribute changes to https://gitlab.com/prpl-foundation/prplmesh/wifi-scheduler/-/blob/main/baf.yml instead
 include $(TOPDIR)/rules.mk
 
-PKG_NAME:=libswla
-PKG_VERSION:=v3.13.4
-SHORT_DESCRIPTION:=Shared Wifi Library using amx
+PKG_NAME:=wifi-scheduler
+PKG_VERSION:=v0.7.0
+SHORT_DESCRIPTION:=WiFi Scheduler
 
-PKG_SOURCE:=libswla-v3.13.4.tar.gz
-PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/pwhm/libraries/libswla/-/archive/v3.13.4
-PKG_HASH:=219eacf30e754331c52c983cb9b3cea1bc2c4fc9a95e522425b24a1314aac642
-PKG_BUILD_DIR:=$(BUILD_DIR)/libswla-v3.13.4
+PKG_SOURCE:=wifi-scheduler-v0.7.0.tar.gz
+PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/wifi-scheduler/-/archive/v0.7.0
+PKG_HASH:=d683b8ebcaa2baf4203d1bf7d30d47eb0d6f0358b407d3d926b18fb36d2b8796
+PKG_BUILD_DIR:=$(BUILD_DIR)/wifi-scheduler-v0.7.0
 PKG_MAINTAINER:=Soft At Home <support.opensource@softathome.com>
 PKG_LICENSE:=BSD-2-Clause-Patent
 PKG_LICENSE_FILES:=LICENSE
 
+COMPONENT:=wifi-scheduler
 
 PKG_RELEASE:=1
+
+define SAHInit/Install
+	install -d ${PKG_INSTALL_DIR}/etc/rc.d/
+	ln -sfr ${PKG_INSTALL_DIR}/etc/init.d/$(COMPONENT) ${PKG_INSTALL_DIR}/etc/rc.d/S99$(COMPONENT)
+	ln -sfr ${PKG_INSTALL_DIR}/etc/init.d/$(COMPONENT) ${PKG_INSTALL_DIR}/etc/rc.d/K1$(COMPONENT)
+endef
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -23,19 +30,21 @@ define Package/$(PKG_NAME)
   CATEGORY:=prpl Foundation
   SUBMENU:=prplMesh
   TITLE:=$(SHORT_DESCRIPTION)
-  URL:=https://gitlab.com/prpl-foundation/prplmesh/pwhm/libraries/libswla
+  URL:=https://gitlab.com/prpl-foundation/prplmesh/wifi-scheduler
   DEPENDS += +libsahtrace
-  DEPENDS += +libswlc
   DEPENDS += +libamxc
   DEPENDS += +libamxp
   DEPENDS += +libamxd
+  DEPENDS += +libamxo
   DEPENDS += +libamxb
   DEPENDS += +amxrt
+  DEPENDS += +libswlc
+  DEPENDS += +libamxs
   MENU:=1
 endef
 
 define Package/$(PKG_NAME)/description
-	Shared Wifi Library using amx
+	WiFi Scheduler
 endef
 
 define Build/Compile
@@ -44,6 +53,8 @@ endef
 
 define Build/Install
 	$(call Build/Install/Default, install INSTALL=install D=$(PKG_INSTALL_DIR) DEST=$(PKG_INSTALL_DIR) STAGINGDIR=$(STAGING_DIR) CONFIGDIR=$(STAGING_DIR) PV=$(PKG_VERSION) PKG_CONFIG_LIBDIR=$(STAGING_DIR)/usr/lib/pkgconfig LIBDIR=/usr/lib INSTALL_LIB_DIR=/lib INSTALL_BIN_DIR=/bin RAW_VERSION=$(PKG_VERSION) HARDCO_HAL_DIR=$(STAGING_DIR)/usr/include)
+
+	$(call SAHInit/Install)
 endef
 
 define Build/InstallDev
