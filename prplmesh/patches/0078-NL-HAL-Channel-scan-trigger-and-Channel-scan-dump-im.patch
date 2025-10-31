@@ -1,0 +1,676 @@
+From 01837e1199d50af68dae8b8400bbfd5833fcfb94 Mon Sep 17 00:00:00 2001
+From: Girija P <gpandiya@qti.qualcomm.com>
+Date: Fri, 31 Oct 2025 11:51:37 +0530
+Subject: [PATCH 1/2] [NL HAL] Channel scan trigger and Channel scan dump
+ implementations
+
+Signed-off-by: Girija P <gpandiya@qti.qualcomm.com>
+---
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |   6 +
+ .../bwl/nl80211/ap_wlan_hal_nl80211.h         |   2 +
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     | 183 +++++++++-
+ .../bwl/nl80211/base_wlan_hal_nl80211.h       |   2 +
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 318 +++++++++++++++++-
+ .../bwl/nl80211/mon_wlan_hal_nl80211.h        |   2 +
+ .../bwl/nl80211/sta_wlan_hal_nl80211.cpp      |   6 +
+ .../bwl/nl80211/sta_wlan_hal_nl80211.h        |   2 +-
+ 8 files changed, 512 insertions(+), 9 deletions(-)
+
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index bf5ef9078..fd768269d 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -2586,6 +2586,12 @@ bool ap_wlan_hal_nl80211::update_beacon(const std::string &ifname)
+     return true;
+ }
+ 
++bool ap_wlan_hal_nl80211::test_nl_event(struct nl_msg *msg, void *arg)
++{
++    LOG(ERROR) << __func__ << "isn't implemented by this derived and shouldn't be called";
++    return false;
++}
++
+ bool ap_wlan_hal_nl80211::set_no_deauth_unknown_sta(const std::string &ifname, bool value)
+ {
+     LOG(TRACE) << __func__ << " ifname: " << ifname << " value: " << value;
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+index e41b7bfc3..3c37deaa3 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+@@ -136,6 +136,8 @@ public:
+ 
+     virtual void set_sta_enable(bool enable) override;
+ 
++    virtual bool test_nl_event(struct nl_msg *msg, void *arg = nullptr) override;
++
+     int getRadioIdxFromLinkId(const std::string &radio_iface_name, int link_id);
+     prplmesh::hostapd::Configuration load_hostapd_config(const std::string &radio_iface_name, const std::string &bssid);
+     virtual bool reload_all_ap_vaps() override;
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index 92a275c27..23f7017e8 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -28,6 +28,104 @@
+ #include <netlink/msg.h>
+ #include <netlink/netlink.h>
+ 
++struct family_data {
++    const char *group;
++    int id;
++};
++
++static int family_handler(struct nl_msg *msg, void *arg)
++{
++    struct family_data *res = (struct family_data *)arg;
++    struct nlattr *tb[CTRL_ATTR_MAX + 1];
++    struct genlmsghdr *gnlh = (struct genlmsghdr *)nlmsg_data(nlmsg_hdr(msg));
++    struct nlattr *mcgrp;
++    int i;
++
++    nla_parse(tb, CTRL_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
++              genlmsg_attrlen(gnlh, 0), NULL);
++
++    if (!tb[CTRL_ATTR_MCAST_GROUPS])
++        return NL_SKIP;
++
++    nla_for_each_nested(mcgrp, tb[CTRL_ATTR_MCAST_GROUPS], i) {
++        struct nlattr *tb2[CTRL_ATTR_MCAST_GRP_MAX + 1];
++        nla_parse(tb2, CTRL_ATTR_MCAST_GRP_MAX, (struct nlattr *)nla_data(mcgrp),
++                  nla_len(mcgrp), NULL);
++        if (!tb2[CTRL_ATTR_MCAST_GRP_NAME] ||
++            !tb2[CTRL_ATTR_MCAST_GRP_ID] ||
++            strncmp((const char *)nla_data(tb2[CTRL_ATTR_MCAST_GRP_NAME]),
++                    res->group,
++                    nla_len(tb2[CTRL_ATTR_MCAST_GRP_NAME])) != 0)
++            continue;
++        res->id = nla_get_u32(tb2[CTRL_ATTR_MCAST_GRP_ID]);
++        break;
++    }
++
++    return NL_SKIP;
++}
++
++static int nl_get_multicast_id(struct nl_sock *sock,
++                               const char *family,
++                               const char *group)
++{
++    struct nl_msg *msg;
++    struct nl_cb *cb;
++    int ret, ctrlid;
++    struct family_data res = { group, -ENOENT };
++
++    msg = nlmsg_alloc();
++    if (!msg)
++        return -ENOMEM;
++
++    cb = nl_cb_alloc(NL_CB_DEFAULT);
++    if (!cb) {
++        ret = -ENOMEM;
++        goto out_fail_cb;
++    }
++
++    ctrlid = genl_ctrl_resolve(sock, "nlctrl");
++    if (ctrlid < 0) {
++        ret = ctrlid;
++        goto out_fail_resolve;
++    }
++
++    genlmsg_put(msg, 0, 0, ctrlid, 0, 0, CTRL_CMD_GETFAMILY, 0);
++
++    ret = -ENOBUFS;
++    if (nla_put_string(msg, CTRL_ATTR_FAMILY_NAME, family) < 0)
++        goto out_fail_resolve;
++
++    ret = nl_send_auto_complete(sock, msg);
++    if (ret < 0)
++        goto out_fail_resolve;
++
++    ret = 1;
++
++    nl_cb_err(cb, NL_CB_CUSTOM, [](struct sockaddr_nl *, struct nlmsgerr *err, void *arg) -> int {
++        int *ret = (int *)arg;
++        *ret = err->error;
++        return NL_STOP;
++    }, &ret);
++    nl_cb_set(cb, NL_CB_ACK, NL_CB_CUSTOM, [](struct nl_msg *, void *arg) -> int {
++        int *ret = (int *)arg;
++        *ret = 0;
++        return NL_STOP;
++    }, &ret);
++    nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, family_handler, &res);
++
++    while (ret > 0)
++        nl_recvmsgs(sock, cb);
++
++    if (ret == 0)
++        ret = res.id;
++
++out_fail_resolve:
++    nl_cb_put(cb);
++out_fail_cb:
++    nlmsg_free(msg);
++    return ret;
++}
++
+ namespace bwl {
+ namespace nl80211 {
+ 
+@@ -296,6 +394,27 @@ bool base_wlan_hal_nl80211::fsm_setup()
+                         LOG(ERROR) << "nl80211 not found!";
+                         return false;
+                     }
++                    
++                    int mcid;
++
++                    mcid = nl_get_multicast_id(m_nl80211_sock.get(), "nl80211", "scan");
++                    if (mcid >= 0) {
++                            if (nl_socket_add_membership(m_nl80211_sock.get(), mcid) < 0) {
++                                    LOG(WARNING) << "Failed to join nl80211 scan multicast group";
++                            } else {
++                                 LOG(INFO) << "Subscribed to nl80211 scan multicast group";
++                             }
++                            } else {
++                    LOG(WARNING) << "No scan multicast group found on this kernel";
++                    }
++
++                    // Get the file descriptor
++                    m_fd_nl_events = nl_socket_get_fd(m_nl80211_sock.get());
++                    if (m_fd_nl_events < 0) {
++                            LOG(ERROR) << "Failed to get nl80211 socket fd";
++                            return false;
++                    }
++                    LOG(INFO) << "nl80211 socket ready: family id=" << m_nl80211_id << ", fd=" << m_fd_nl_events;
+ 
+                     // Store the current interface index
+                     std::string iface_name = get_iface_name();
+@@ -466,6 +585,8 @@ bool base_wlan_hal_nl80211::fsm_setup()
+ 
+             // Init ext event FDS queue
+             m_fds_ext_events = {-1};
++            
++            m_fd_nl_events  = -1;
+ 
+             // Re-register the global interface and the primary vap
+             // entry to be ready for new FSM Attach
+@@ -634,8 +755,66 @@ bool base_wlan_hal_nl80211::wpa_ctrl_send_msg(const std::string &cmd, char **rep
+ 
+ bool base_wlan_hal_nl80211::process_nl_events()
+ {
+-    LOG(ERROR) << __func__ << "not implemented";
+-    return false;
++    LOG(INFO) << "process_nl_events called for interface: " << get_iface_name();
++
++    if (!m_nl80211_sock || !m_nl80211_sock.get()) {
++        LOG(ERROR) << "Invalid Netlink socket used for nl events (m_nl80211_sock == nullptr)";
++        return false;
++    }
++
++    int fd = nl_socket_get_fd(m_nl80211_sock.get());
++    if (fd <= 0) {
++        LOG(ERROR) << "Invalid socket fd=" << fd;
++        return false;
++    }
++
++    LOG(DEBUG) << "Processing nl80211 events on fd=" << fd << ", family_id=" << m_nl80211_id; 
++    static thread_local std::function<bool(struct nl_msg *, void *)> nl_handler_cb_wrapper;
++    nl_handler_cb_wrapper = [this](struct nl_msg *msg, void *arg) -> bool {
++        if (!test_nl_event(msg, arg)) {
++            LOG(ERROR) << "test_nl_event failed!";
++            return false;
++        }
++        return true;
++    };
++
++    auto nl_handler_cb = [](struct nl_msg *msg, void *arg) -> int {
++        return nl_handler_cb_wrapper(msg, arg) ? NL_OK : NL_STOP;
++    };
++
++    // No sequence checking callback - CRITICAL for multicast messages
++    auto no_seq_check = [](struct nl_msg *msg, void *arg) -> int {
++        return NL_OK;
++    };
++
++    // Error callback
++    auto nl_error_cb = [](struct sockaddr_nl *nla, struct nlmsgerr *err, void *arg) -> int {
++        LOG(ERROR) << "Netlink error: " << strerror(-err->error);
++        return NL_STOP;
++    };
++
++    // Allocate callback structure
++    struct nl_cb *cb = nl_cb_alloc(NL_CB_DEFAULT);
++    if (!cb) {
++        LOG(ERROR) << "nl_cb_alloc failed";
++        return false;
++    }
++    nl_cb_set(cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, no_seq_check, nullptr);
++    nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, nl_handler_cb, this);
++    nl_cb_err(cb, NL_CB_CUSTOM, nl_error_cb, nullptr);
++
++    // Process events
++    int err = nl_recvmsgs(m_nl80211_sock.get(), cb);
++    if (err < 0) {
++        LOG(ERROR) << "nl_recvmsgs failed: " << nl_geterror(err) << " (" << err << ")";
++        nl_cb_put(cb);
++        return false;
++    }
++
++    LOG(DEBUG) << "nl_recvmsgs completed successfully, processed messages";
++    nl_cb_put(cb);
++    return true;
++
+ }
+ 
+ bool base_wlan_hal_nl80211::refresh_radio_info()
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
+index 2ecea97ec..dc8f4a4da 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
+@@ -78,6 +78,8 @@ public:
+ 
+     virtual const std::string get_iface_from_fd(int fd) override;
+ 
++    virtual bool test_nl_event(struct nl_msg *msg,void *arg) = 0;
++
+     // Protected methods
+ protected:
+     base_wlan_hal_nl80211(HALType type, const std::string &iface_name, hal_event_cb_t callback,
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 6086dd80e..303675de5 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -57,6 +57,17 @@ static mon_wlan_hal::Event wav_to_bwl_event(const std::string &opcode)
+     return mon_wlan_hal::Event::Invalid;
+ }
+ 
++static mon_wlan_hal::Event nl80211_to_bwl_event(int cmd)
++{
++    switch (cmd) {
++    case NL80211_CMD_NEW_SCAN_RESULTS:
++        return mon_wlan_hal::Event::Channel_Scan_Dump_Result;
++    default:
++        LOG(ERROR) << "Unknown event received: " << int(cmd);
++        return mon_wlan_hal::Event::Invalid;
++    }
++}
++
+ #if 0
+ 
+ static void calc_curr_traffic(std::string buff, uint64_t &total, uint32_t &curr)
+@@ -88,6 +99,137 @@ mon_wlan_hal_nl80211::mon_wlan_hal_nl80211(const std::string &iface_name, hal_ev
+ 
+ mon_wlan_hal_nl80211::~mon_wlan_hal_nl80211() {}
+ 
++static bool translate_nl_data_to_bwl_results(sChannelScanResults &results,
++                                             const struct nlattr **bss)
++{
++    // ---- BSSID ----
++    if (!bss[NL80211_BSS_BSSID]) {
++        LOG(ERROR) << "Invalid BSSID in netlink message";
++        return false;
++    }
++    std::copy_n(reinterpret_cast<unsigned char *>(nla_data(bss[NL80211_BSS_BSSID])),
++                sizeof(results.bssid.oct), results.bssid.oct);
++
++    // ---- Frequency → channel + band ----
++    if (bss[NL80211_BSS_FREQUENCY]) {
++        int freq = nla_get_u32(bss[NL80211_BSS_FREQUENCY]);
++        results.channel = son::wireless_utils::freq_to_channel(freq);
++        switch (son::wireless_utils::which_freq_type(freq)) {
++        case beerocks::FREQ_24G:
++            results.operating_frequency_band =
++                eChannelScanResultOperatingFrequencyBand::eOperating_Freq_Band_2_4GHz;
++            break;
++        case beerocks::FREQ_5G:
++            results.operating_frequency_band =
++                eChannelScanResultOperatingFrequencyBand::eOperating_Freq_Band_5GHz;
++            break;
++        case beerocks::FREQ_6G:
++            results.operating_frequency_band =
++                eChannelScanResultOperatingFrequencyBand::eOperating_Freq_Band_6GHz;
++            break;
++        default:
++            LOG(WARNING) << "Unknown frequency type for freq=" << freq;
++            break;
++        }
++    }
++
++    // ---- Beacon Interval ----
++    if (bss[NL80211_BSS_BEACON_INTERVAL]) {
++        results.beacon_period_ms = nla_get_u16(bss[NL80211_BSS_BEACON_INTERVAL]);
++    }
++
++    // ---- Signal Strength ----
++    if (bss[NL80211_BSS_SIGNAL_MBM]) {
++        results.signal_strength_dBm = int32_t(nla_get_u32(bss[NL80211_BSS_SIGNAL_MBM])) / 100;
++    } else if (bss[NL80211_BSS_SIGNAL_UNSPEC]) {
++        results.signal_strength_dBm = int32_t(nla_get_u8(bss[NL80211_BSS_SIGNAL_UNSPEC]));
++    }
++
++    // ---- Parse Information Elements for SSID and Bandwidth ----
++    if (bss[NL80211_BSS_INFORMATION_ELEMENTS]) {
++        const uint8_t *ie = static_cast<const uint8_t *>(nla_data(bss[NL80211_BSS_INFORMATION_ELEMENTS]));
++        int ie_len = nla_len(bss[NL80211_BSS_INFORMATION_ELEMENTS]);
++        int pos = 0;
++
++        // Default bandwidth to 20MHz
++        results.operating_channel_bandwidth =
++            eChannelScanResultChannelBandwidth::eChannel_Bandwidth_20MHz;
++
++        while (pos + 1 < ie_len) {
++            int id = ie[pos];
++            int len = ie[pos + 1];
++
++            if (pos + 2 + len > ie_len)
++                break;
++
++            const uint8_t *data = &ie[pos + 2];
++
++            switch (id) {
++            case 0: { // SSID element
++                int copy_len = std::min(len, (int)sizeof(results.ssid) - 1);
++                std::copy_n(data, copy_len, results.ssid);
++                results.ssid[copy_len] = '\0';
++                break;
++            }
++
++            case 61: { // HT Operation IE
++                if (len == 22) {
++                    // Parse HT Operation for 20/40MHz bandwidth
++                    if (!(data[1] & 0x3)) {
++                        results.operating_channel_bandwidth =
++                            eChannelScanResultChannelBandwidth::eChannel_Bandwidth_20MHz;
++                    } else if ((data[1] & 0x3) != 2) {
++                        results.operating_channel_bandwidth =
++                            eChannelScanResultChannelBandwidth::eChannel_Bandwidth_40MHz;
++                    }
++                    results.supported_standards.push_back(
++                        eChannelScanResultStandards::eStandard_802_11n);
++                    results.operating_standards = eChannelScanResultStandards::eStandard_802_11n;
++                }
++                break;
++            }
++
++            case 192: { // VHT Operation IE
++                if (len >= 5) {
++                    // Parse VHT Operation for 80/160MHz bandwidth
++                    if (data[0] == 0x01) {
++                        if (data[2]) {
++                            results.operating_channel_bandwidth =
++                                eChannelScanResultChannelBandwidth::eChannel_Bandwidth_160MHz;
++                        } else {
++                            results.operating_channel_bandwidth =
++                                eChannelScanResultChannelBandwidth::eChannel_Bandwidth_80MHz;
++                        }
++                    } else if (data[0] == 0x02) {
++                        results.operating_channel_bandwidth =
++                            eChannelScanResultChannelBandwidth::eChannel_Bandwidth_80MHz;
++                    } else if (data[0] == 0x03) {
++                        results.operating_channel_bandwidth =
++                            eChannelScanResultChannelBandwidth::eChannel_Bandwidth_80_80;
++                    }
++
++                    if (results.operating_frequency_band ==
++                        eChannelScanResultOperatingFrequencyBand::eOperating_Freq_Band_5GHz) {
++                        results.supported_standards.push_back(
++                            eChannelScanResultStandards::eStandard_802_11ac);
++                        results.operating_standards = eChannelScanResultStandards::eStandard_802_11ac;
++                    }
++                }
++                break;
++            }
++
++            default:
++                // Ignore other IEs
++                break;
++            }
++
++            pos += 2 + len;
++        }
++    }
++
++    return true;
++}
++
+ void extractBase1Interface(const std::string& interface_name, std::string& base_interface) {
+     size_t pos = interface_name.find("_link");
+     if (pos != std::string::npos) {
+@@ -482,20 +624,184 @@ bool mon_wlan_hal_nl80211::channel_scan_trigger(int dwell_time_msec,
+                                                 const std::vector<unsigned int> &channel_pool,
+                                                 bool cert_mode)
+ {
+-    LOG(TRACE) << __func__ << " - NOT IMPLEMENTED!";
+-    return false;
++    LOG(TRACE) << __func__ << " dwell_time=" << dwell_time_msec
++               << " channels=" << channel_pool.size()
++               << " cert_mode=" << cert_mode;
++
++    bool ret = send_nl80211_msg(
++        NL80211_CMD_TRIGGER_SCAN, 0,
++        [&](struct nl_msg *msg) -> bool {
++            // Request scan for all SSIDs
++            if (nla_put(msg, NL80211_ATTR_SCAN_SSIDS, 0, "") < 0) {
++                LOG(ERROR) << "Failed to add SCAN_SSIDS attribute";
++                return false;
++            }
++            // Add scan frequencies from channel_pool
++            if (!channel_pool.empty()) {
++                struct nlattr *freqs = nla_nest_start(msg, NL80211_ATTR_SCAN_FREQUENCIES);
++                if (!freqs) {
++                    LOG(ERROR) << "Failed to start SCAN_FREQUENCIES nest";
++                    return false;
++                }
++
++                for (auto channel : channel_pool) {
++                    int freq = son::wireless_utils::channel_to_freq(channel);
++                    if (freq > 0) {
++                        if (nla_put_u32(msg, 0, freq) < 0) {
++                            LOG(ERROR) << "Failed to add frequency " << freq;
++                            return false;
++                        }
++                        LOG(DEBUG) << "Added scan frequency: " << freq << " MHz (channel " << channel << ")";
++                    }
++                }
++                nla_nest_end(msg, freqs);
++            }
++
++            // Optional dwell time
++            if (dwell_time_msec > 0) {
++                if (nla_put_u16(msg, NL80211_ATTR_MEASUREMENT_DURATION,
++                                (uint16_t)dwell_time_msec) < 0) {
++                    LOG(ERROR) << "Failed to add MEASUREMENT_DURATION attribute";
++                    return false;
++                }
++            }
++            return true;
++        },
++        [&](struct nl_msg *) -> bool {
++            LOG(INFO) << "NL80211_CMD_TRIGGER_SCAN accepted for " << get_iface_name();
++            return true;
++        });
++
++    if (!ret) {
++        LOG(ERROR) << "Failed to trigger scan on " << get_iface_name();
++        return false;
++    }
++    event_queue_push(Event::Channel_Scan_Triggered);
++    LOG(INFO) << "Scan request sent to kernel for " << get_iface_name();
++    return true;
+ }
+ 
+ bool mon_wlan_hal_nl80211::channel_scan_dump_cached_results()
+ {
+-    LOG(TRACE) << __func__ << " - NOT IMPLEMENTED";
+-    return false;
++    LOG(TRACE) << __func__;
++    return channel_scan_dump_results();
+ }
+ 
+ bool mon_wlan_hal_nl80211::channel_scan_dump_results()
+ {
+-    LOG(TRACE) << __func__ << " - NOT IMPLEMENTED";
+-    return false;
++     LOG(TRACE) << __func__;
++
++    bool got_results = false;
++    int result_count = 0;
++
++    bool ret = send_nl80211_msg(
++        NL80211_CMD_GET_SCAN, NLM_F_DUMP,
++        [&](struct nl_msg *) -> bool {
++            LOG(DEBUG) << "Sent NL80211_CMD_GET_SCAN request for "
++                       << get_iface_name();
++            return true;
++        },
++        [&](struct nl_msg *msg) -> bool {
++            struct genlmsghdr *gnlh =
++                (struct genlmsghdr *)nlmsg_data(nlmsg_hdr(msg));
++            struct nlattr *tb[NL80211_ATTR_MAX + 1];
++            nla_parse(tb, NL80211_ATTR_MAX,
++                      genlmsg_attrdata(gnlh, 0),
++                      genlmsg_attrlen(gnlh, 0),
++                      nullptr);
++
++            if (!tb[NL80211_ATTR_BSS])
++                return NL_OK;
++
++            struct nlattr *bss[NL80211_BSS_MAX + 1];
++            if (nla_parse_nested(bss, NL80211_BSS_MAX,
++                                 tb[NL80211_ATTR_BSS], nullptr)) {
++                LOG(ERROR) << "Failed to parse BSS entry";
++                return NL_OK;
++            }
++
++            auto results = std::make_shared<sCHANNEL_SCAN_RESULTS_NOTIFICATION>();
++            if (!translate_nl_data_to_bwl_results(results->channel_scan_results,
++                                                  (const nlattr **)bss)) {
++                LOG(ERROR) << "Failed to translate scan result entry";
++                return NL_OK;
++            }
++
++            got_results = true;
++            result_count++;
++
++            LOG(DEBUG) << "Parsed scan result: SSID="
++                       << results->channel_scan_results.ssid
++                       << " Channel="
++                       << results->channel_scan_results.channel
++                       << " RSSI="
++                       << results->channel_scan_results.signal_strength_dBm;
++
++            event_queue_push(Event::Channel_Scan_Dump_Result, results);
++            return NL_OK;
++        });
++
++    if (!ret) {
++        LOG(ERROR) << "send_nl80211_msg(NL80211_CMD_GET_SCAN) failed";
++        return false;
++    }
++
++    if (!got_results) {
++        LOG(WARNING) << "No scan results returned for " << get_iface_name();
++    } else {
++        LOG(INFO) << "Retrieved " << result_count << " scan results for " << get_iface_name();
++    }
++    event_queue_push(Event::Channel_Scan_Finished);
++    return true;
++}
++
++bool mon_wlan_hal_nl80211::test_nl_event(struct nl_msg *msg,void *arg)
++{
++    LOG(INFO) << "test_nl_event called";
++
++    struct nlmsghdr *nlh = nlmsg_hdr(msg);
++    if (!nlh) {
++        LOG(ERROR) << "Invalid nlmsghdr in test_nl_event";
++        return false;
++    }
++
++    struct genlmsghdr *gnlh = (struct genlmsghdr *)nlmsg_data(nlh);
++    if (!gnlh) {
++        LOG(ERROR) << "Invalid genlmsghdr in test_nl_event";
++        return false;
++    }
++
++    std::string iface_name;
++
++    struct nlattr *tb[NL80211_ATTR_MAX + 1] = {};
++    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
++              genlmsg_attrlen(gnlh, 0), nullptr);
++
++    if (tb[NL80211_ATTR_IFINDEX]) {
++        auto index = nla_get_u32(tb[NL80211_ATTR_IFINDEX]);
++        iface_name = beerocks::net::network_utils::linux_get_iface_name(index);
++    }
++
++    int cmd = gnlh->cmd;
++    auto event = nl80211_to_bwl_event(cmd);
++
++    switch (event) {
++
++    case Event::Channel_Scan_Dump_Result:
++        LOG(INFO) << "NL80211_CMD_NEW_SCAN_RESULTS event received on " << get_iface_name();
++        event_queue_push(Event::Channel_Scan_New_Results_Ready);
++        if (!channel_scan_dump_results()) {
++            LOG(ERROR) << "channel_scan_dump_results failed for " << get_iface_name();
++            return false;
++    }
++    break;
++
++    default:
++        LOG(DEBUG) << "Mapped but unhandled nl80211 event: " << static_cast<int>(event)
++                   << " (cmd=" << cmd << ")";
++    break;
++    }
++    return true;
+ }
+ 
+ bool mon_wlan_hal_nl80211::generate_connected_clients_events(
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
+index b945bc3ef..2b833765c 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
+@@ -78,6 +78,8 @@ public:
+ 
+     virtual int create_wpa_ctrl_skt(std::string &sock_name) override;
+     virtual bool remove_ctrl_skt(std::string &ifname) override;
++    
++    virtual bool test_nl_event(struct nl_msg *msg,void *arg) override;
+ 
+     virtual bool get_mld_interface_mac(std::string &iface_name, std::string &mac_out) override;
+ 
+diff --git a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
+index 65df9de0f..ed4a3e240 100644
+--- a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
+@@ -527,6 +527,12 @@ void sta_wlan_hal_nl80211::update_status(const ConnectionStatus &connection_stat
+                << ", active_ssid= " << m_active_ssid;
+ }
+ 
++bool sta_wlan_hal_nl80211::test_nl_event(struct nl_msg *msg, void *arg)
++{
++    LOG(ERROR) << __func__ << "isn't implemented by this derived and shouldn't be called";
++    return false;
++}
++
+ bool sta_wlan_hal_nl80211::clear_non_associated_devices() { return true; }
+ 
+ bool sta_wlan_hal_nl80211::disconnect_backhaul_sta() { return wpa_ctrl_send_msg("DISCONNECT"); }
+diff --git a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h
+index 8987bddd0..429fec881 100644
+--- a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h
+@@ -73,10 +73,10 @@ public:
+     virtual bool disconnect_backhaul_sta() override;
+     virtual bool reconnect_backhaul_sta() override;
+     virtual bool is_disconnected() override;
++    virtual bool test_nl_event(struct nl_msg *msg, void *arg = nullptr) override;
+ 
+ protected:
+     virtual bool process_nl80211_event(parsed_obj_map_t &parsed_obj) override;
+-
+     // Overload for Monitor events
+     bool event_queue_push(sta_wlan_hal::Event event, std::shared_ptr<void> data = {})
+     {
+-- 
+2.34.1
+
