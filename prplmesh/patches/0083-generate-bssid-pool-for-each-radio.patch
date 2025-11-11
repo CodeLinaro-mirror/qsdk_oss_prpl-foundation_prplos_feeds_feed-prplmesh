@@ -1,0 +1,574 @@
+From 8f7f388fc808de95a96f07415d6dfb2ee78808bd Mon Sep 17 00:00:00 2001
+From: Nirmal Raj S <nirm@qti.qualcomm.com>
+Date: Tue, 11 Nov 2025 16:47:32 +0530
+Subject: [PATCH] generating bssid pool for each radio
+
+Signed-off-by: Nirmal Raj S <nirm@qti.qualcomm.com>
+---
+ .../bwl/include/bwl/base_wlan_hal_types.h     |   1 +
+ .../beerocks/bwl/include/bwl/nl80211_client.h |   2 +
+ .../bwl/include/bwl/nl80211_client_impl.h     |   3 +
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 286 +++++++++++-------
+ .../bwl/nl80211/ap_wlan_hal_nl80211.h         |   4 +-
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     |   3 +
+ .../bwl/shared/nl80211_client_impl.cpp        |  43 +++
+ controller/src/beerocks/master/db/agent.h     |   4 +-
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     |  15 +
+ framework/platform/bpl/include/bpl/bpl_cfg.h  |   2 +
+ 10 files changed, 259 insertions(+), 104 deletions(-)
+
+diff --git a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+index a4106a392..0ecd88de3 100644
+--- a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
++++ b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+@@ -220,6 +220,7 @@ struct RadioInfo {
+     std::vector<std::pair<int8_t, MLD_Authinfo>> mld_entries;
+     std::vector<std::string> active_BSSs;
+     std::string phy_name;
++    std::map<std::string,bool> bssid_pool;
+     bool wps_pushbutton_configured = false;
+ };
+ 
+diff --git a/common/beerocks/bwl/include/bwl/nl80211_client.h b/common/beerocks/bwl/include/bwl/nl80211_client.h
+index 3a3bb8e4b..992db032d 100644
+--- a/common/beerocks/bwl/include/bwl/nl80211_client.h
++++ b/common/beerocks/bwl/include/bwl/nl80211_client.h
+@@ -628,6 +628,8 @@ public:
+     virtual bool remove_vap_interface(std::string &iface) =0;
+     
+     virtual bool get_mlo_active_link_count(std::string &bss,int8_t &active_link) =0;
++    virtual bool get_sta_iface_mac(const std::string &sta_iface,
++                                             std::string &sta_mac) = 0 ;
+ };
+ 
+ } // namespace bwl
+diff --git a/common/beerocks/bwl/include/bwl/nl80211_client_impl.h b/common/beerocks/bwl/include/bwl/nl80211_client_impl.h
+index ff31487bc..d08b5fcf1 100644
+--- a/common/beerocks/bwl/include/bwl/nl80211_client_impl.h
++++ b/common/beerocks/bwl/include/bwl/nl80211_client_impl.h
+@@ -201,6 +201,9 @@ public:
+     virtual bool remove_vap_interface(std::string &iface) override;
+ 
+     virtual bool get_mlo_active_link_count(std::string &bss,int8_t &active_link) override;
++
++    virtual bool get_sta_iface_mac(const std::string &sta_iface,
++                                             std::string &sta_mac) override ;
+ private:
+     /**
+      * NL80211 socket to send messages and receive responses to/from the WiFi driver.
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 5985c7310..988c5e625 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -1234,6 +1234,11 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+ 
+     m_radio_info.hostapd_radio_config = base_conf.get_hostapd_radio_config();
+ 
++    // generate BSSID pool
++    if (m_radio_info.bssid_pool.empty()) {
++        ap_wlan_hal_nl80211::generate_bssid_pool();
++    }
++
+     // check 11be support
+     auto ieee80211be_sprt = base_conf.get_head_value("ieee80211be");
+ 
+@@ -1300,8 +1305,10 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+ 
+             sMacAddr new_bssid;
+ 
+-            ap_wlan_hal_nl80211::generate_new_bssid(new_vap_index,new_bssid);
+-
++            if (!ap_wlan_hal_nl80211::generate_new_bssid(new_bssid)) {
++                LOG(ERROR) << " Failed to assign new bssid " ;
++                continue;
++            }
+             LOG(INFO) << "NEW VAP Ifname: "<< new_vap_name << " Index: " << new_vap_index <<  " BSSID: " << new_bssid;
+             if (bss_it.mld_id >= 0) {
+                 std::string mld_grp_bss_name = get_ifname_wrt_mld_grp(bss_it.mld_id, new_vap_name,bss_it.ssid);
+@@ -1326,17 +1333,22 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+ 
+             bss_it.bssid = new_bssid;
+             std::string bridge = "br-lan"; 
++            std::string bss_mac_string = tlvf::mac_to_string(bss_it.bssid);
+ 
+             if ((bss_it.mld_id >=0) && bss_name_changed) {
+                 std::string prev_iface = "";
+                 if (!add_mld_link(new_vap_name,prev_iface,bss_it,bridge)) {
+                     LOG(ERROR) << " add_mld_link failed for " << new_vap_name ;
++                    // mark bssid usage as false
++                    m_radio_info.bssid_pool[bss_mac_string] = false;    
+                     continue;
+                 }
+                 LOG(INFO) << "add_mld_link success:  " << " bss: " << new_vap_name << " bssid: " <<new_bssid;
+             } else {
+                 if (!add_bss(new_vap_name,bss_it,bridge,false)) {
+                     LOG(ERROR) << " Add bss failed for " << new_vap_name ;
++                    // mark bssid usage as false
++                    m_radio_info.bssid_pool[bss_mac_string] = false;    
+                     continue;
+                 } 
+                 LOG(INFO) << "BSS Addtion success:  " << " bss: " << new_vap_name << " bssid: " <<new_bssid;
+@@ -1370,6 +1382,9 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+             }
+         } else {
+             LOG(DEBUG) << "Existing vap with bssid " << conf_bssid;
++            // set bssid is already in use
++            std::string used_bssid = tlvf::mac_to_string(bss_it.bssid);
++            m_radio_info.bssid_pool[used_bssid] = true;
+             prplmesh::hostapd::Configuration conf = load_hostapd_config("",tlvf::mac_to_string(bss_it.bssid));
+ 
+             if (!conf) {
+@@ -1624,7 +1639,12 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                                 std::string base_iface;
+                                 extractLinkBaseInterface(vap_info.bss, base_iface);
+                                 LOG(ERROR) << "Hit remove bss. BSSID: " << bss_it.bssid << " BSS name: " << base_iface;
+-                                remove_bss(base_iface);
++                                if (remove_bss(base_iface)) {
++                                    LOG(DEBUG) << "BSS: " << base_iface << " is removed";
++                                    // mark bssid usage as false
++                                    std::string bss_mac_string = tlvf::mac_to_string(bss_it.bssid);
++                                    m_radio_info.bssid_pool[bss_mac_string] = false;    
++                                }
+                             }
+                         } else {
+                             if(links_present > 1)
+@@ -2441,8 +2461,11 @@ bool ap_wlan_hal_nl80211::remove_mld_link(std::string &link_iface_name, sMacAddr
+     }
+     // remove the fd for this link iface
+     base_wlan_hal_nl80211::remove_interface(link_iface_name);
+-    return true;
+ 
++    // mark bssid usage as false
++    m_radio_info.bssid_pool[link_mac_string] = false;    
++
++    return true;
+ }
+ 
+ bool ap_wlan_hal_nl80211::add_mld_link(std::string &new_iface,std::string &prev_iface,son::wireless_utils::sBssInfoConf &bss_conf,
+@@ -2532,6 +2555,7 @@ bool ap_wlan_hal_nl80211::remove_bss(std::string &ifname)
+     }
+ 
+     LOG(DEBUG) << "Removing the interface from the list";
++    
+     return base_wlan_hal_nl80211::remove_interface(ifname);
+ }
+ 
+@@ -2690,108 +2714,24 @@ bool ap_wlan_hal_nl80211::get_spatial_reuse_config(
+     return false;
+ }
+ 
+-void ap_wlan_hal_nl80211::generate_new_bssid(uint16_t new_vap_index,sMacAddr &new_bssid)
++bool ap_wlan_hal_nl80211::generate_new_bssid(sMacAddr &new_bssid)
+ {
+-    LOG(INFO) << "vap index: " << new_vap_index;
+-    VAPElement vap_element;
+-
+-    parsed_obj_map_t reply;
+-
+-    int mbssid = 0;
+-
+-    int mbssid_group_size = 0;
+-
+-    //int num_global = 0;
+-    int use_global = 0;
+-
+-    int maxbssid_ind = 0;
+-
+-    int num_bss_nontx = 0;
+-
+-    int maxbssid = 0;
+-
+-    sMacAddr mask;
+-
+-    std::string type;
+-
+-    std::string base_mask = "ff:ff:ff:ff:ff:ff";
+-
+-    mask = tlvf::mac_from_string(base_mask);
+-
+-    if (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_6G) {
+-        mbssid = 3;
+-        mbssid_group_size = 4;
+-    }
+-
+-//    if (m_radio_info.sta_enabled) {
+-        new_vap_index += 1;
+-	LOG(INFO) << "Workaround: Incrementing bssid index +2 irrespective of sta status";
+-//        LOG(INFO) << "STA intreface is present in " << m_radio_info.iface_name << " new_vap index: " << new_vap_index;
+-//    }
+-
+-    if (wpa_ctrl_send_msg("STATUS", reply)) {
+-        LOG(INFO) << __func__ << " STATUS Success";
+-
+-        // Try reading values of base bss mac
+-        vap_element.mac  = reply["bssid[" + std::to_string(0) + "]"];
+-
+-        new_bssid = tlvf::mac_from_string(vap_element.mac);
+-
+-        LOG(INFO) << "Base BSS Mac: " << vap_element.mac;
+-
+-        if (mbssid) {
+-            num_bss_nontx = mbssid_group_size - 1;
+-            while (num_bss_nontx > 0) {
+-                    maxbssid_ind++;
+-                    num_bss_nontx >>= 1;
+-            }
+-        }
+-        maxbssid = std::pow(2,maxbssid_ind);
+-        if (mbssid && new_vap_index >= maxbssid) {
+-            new_bssid.oct[5] = ((new_bssid.oct[5] >> maxbssid_ind) << maxbssid_ind);
+-            new_bssid.oct[5] = new_bssid.oct[5] + (new_vap_index / maxbssid) * maxbssid;
+-            new_vap_index = new_vap_index % maxbssid;
+-        }
+-
+-        if (mbssid){
+-            type = "b5";
+-        } else if (use_global) {
+-            type = "add";
+-        } else if (mask.oct[0] > 0) {
+-            type = "b1";
+-        } else if (mask.oct[5] < 0xff){
+-            type = "b5";
+-        } else {
+-            type = "add";
+-        }
+-        LOG(INFO) << "type: " << type;
+-
+-        if (type == "b1") {
+-            if (!(new_bssid.oct[0] & 2)){
+-                new_vap_index--;
+-            }
+-            new_bssid.oct[0] |= 2;
+-            new_bssid.oct[0] ^= new_vap_index << 2;
+-        } else if (type == "b5") {
+-            if (mbssid) {
+-                new_bssid.oct[0] |= 2;
+-                int size = maxbssid;
+-                int B = new_bssid.oct[5] % size;
+-                int loct = new_bssid.oct[5];
+-                new_bssid.oct[5] = loct - B + ((B+new_vap_index) % size);
+-            } else {
+-                new_bssid.oct[5] ^= new_vap_index;
+-            }
+-        } else {
+-            for (int i = 5; i > 0; i--) {
+-                new_bssid.oct[i] += new_vap_index;
+-                new_bssid.oct[i] %= 256;
++    bool found = false;
++    if (!m_radio_info.bssid_pool.empty()) {
++        for (auto &bssid_pool : m_radio_info.bssid_pool) {
++            if (!bssid_pool.second) {
++                LOG(INFO) << "assign new_bssid: " << bssid_pool.first;
++                new_bssid = tlvf::mac_from_string(bssid_pool.first);
++                bssid_pool.second = true;
++                found = true;
++                break;
+             }
+         }
+     } else {
+-        LOG(ERROR) << __func__ << " STATUS Failed";
++        LOG(ERROR) << "BSSID map is empty. Cannot assign ";         
+     }
+-    LOG(INFO) << "new_bssid: " << new_bssid;
++
++    return found;  
+ }
+ 
+ void ap_wlan_hal_nl80211::set_sta_enable(bool enable)
+@@ -3058,7 +2998,151 @@ bool ap_wlan_hal_nl80211::process_reconfig_complete_event(const bool &result)
+ 
+     return push_success;
+ }
++void ap_wlan_hal_nl80211::generate_bssid_pool()
++{
++    VAPElement vap_element;
+ 
++    parsed_obj_map_t reply;
++
++    int mbssid = 0;
++
++    int mbssid_group_size = 0;
++
++    sMacAddr mask;
++
++    std::string type;
++
++    std::string base_mask = "ff:ff:ff:ff:ff:ff";
++
++    mask = tlvf::mac_from_string(base_mask);
++
++    sMacAddr base_mac;
++            
++    sMacAddr new_bssid;
++
++    if (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_6G) {
++        mbssid = 3;
++        mbssid_group_size = 4;
++    }
++
++
++    if (wpa_ctrl_send_msg("STATUS", reply)) {
++        LOG(INFO) << __func__ << " STATUS Success";
++
++        // Try reading values of base bss mac
++        vap_element.mac  = reply["bssid[" + std::to_string(0) + "]"];
++
++        base_mac = tlvf::mac_from_string(vap_element.mac);
++
++        LOG(INFO) << "Base BSS Mac: " << vap_element.mac;
++        m_radio_info.bssid_pool[vap_element.mac] = true;
++    } else {
++        LOG(ERROR) << __func__ << " STATUS Failed";
++        return;
++    }
++
++    
++    // Generate BSSID based on maximum BSS support (1 For STA Vap + 15 AP Vap) on the radio
++    for (int idx = 1; idx < m_radio_info.radio_max_bss_supported; idx++) {
++
++        int bss_idx = idx;
++     
++        // first assign base mac as new_bssid
++        new_bssid = base_mac;
++
++        //int num_global = 0;
++        int use_global = 0;
++
++        int maxbssid_ind = 0;
++
++        int num_bss_nontx = 0;
++
++        int maxbssid = 0;
++
++        if (mbssid) {
++            num_bss_nontx = mbssid_group_size - 1;
++            while (num_bss_nontx > 0) {
++                    maxbssid_ind++;
++                    num_bss_nontx >>= 1;
++            }
++        }
++        maxbssid = std::pow(2,maxbssid_ind);
++        if (mbssid && bss_idx >= maxbssid) {
++            new_bssid.oct[5] = ((new_bssid.oct[5] >> maxbssid_ind) << maxbssid_ind);
++            new_bssid.oct[5] = new_bssid.oct[5] + (bss_idx / maxbssid) * maxbssid;
++            bss_idx = bss_idx % maxbssid;
++        }
++
++        if (mbssid){
++            type = "b5";
++        } else if (use_global) {
++            type = "add";
++        } else if (mask.oct[0] > 0) {
++            type = "b1";
++        } else if (mask.oct[5] < 0xff){
++            type = "b5";
++        } else {
++            type = "add";
++        }
++        LOG(INFO) << "type: " << type;
++
++        if (type == "b1") {
++            if (!(new_bssid.oct[0] & 2)){
++                bss_idx--;
++            }
++            new_bssid.oct[0] |= 2;
++            new_bssid.oct[0] ^= bss_idx << 2;
++        } else if (type == "b5") {
++            if (mbssid) {
++                new_bssid.oct[0] |= 2;
++                int size = maxbssid;
++                int B = new_bssid.oct[5] % size;
++                int loct = new_bssid.oct[5];
++                new_bssid.oct[5] = loct - B + ((B+bss_idx) % size);
++            } else {
++                new_bssid.oct[5] ^= bss_idx;
++            }
++        } else {
++            for (int i = 5; i > 0; i--) {
++                new_bssid.oct[i] += bss_idx;
++                new_bssid.oct[i] %= 256;
++            }
++        }
++        LOG(INFO) << "generated new_bssid: " << new_bssid << " idx: " << idx; 
++        std::string bssid = tlvf::mac_to_string(new_bssid);  
++        m_radio_info.bssid_pool[bssid] = false;
++    }
++
++    // check for STA vap bssid in radio
++    int radio_id = 0;
++    switch (m_radio_info.frequency_band) {
++        case beerocks::FREQ_24G: radio_id = 0; break;
++        case beerocks::FREQ_5G: radio_id = 1;  break;
++        case beerocks::FREQ_6G: radio_id = 2;  break;
++        default: break;
++    }
++
++    char sta_iface[BPL_IFNAME_LEN] = "";
++    if (beerocks::bpl::cfg_get_sta_iface_with_radio_id(radio_id,sta_iface) < 0) {
++        LOG(ERROR) << " Failed to get latest sta iface" ;
++        return;
++    }
++    std::string updated_iface(sta_iface);
++    std::string sta_mac;
++    if (!beerocks::net::network_utils::linux_iface_exists(updated_iface)) {
++        LOG(DEBUG) << "sta_iface " << updated_iface << " is not present";
++        return;
++    } else {
++        LOG(DEBUG) << "sta_iface " << updated_iface << " is present - get bssid";
++        //TODO: [NLHAL] - Needs to handle MLD BSTA case
++        if (m_nl80211_client->get_sta_iface_mac(updated_iface,sta_mac)) {
++            LOG(DEBUG) << " STA_IFACE: " << updated_iface << " STA_MAC: " << sta_mac;
++            m_radio_info.bssid_pool[sta_mac] = true;
++        }
++
++    }
++
++}
+ 
+ 
+ } // namespace nl80211
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+index 3c37deaa3..f7c1a1f48 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+@@ -132,7 +132,7 @@ public:
+     virtual bool remove_affiliated_ap(const sMacAddr &bssid) override;
+     virtual bool get_mld_neighbor_bss_config(son::wireless_utils::sBssInfoConf &bss_config, int8_t mld_id) override;
+ 
+-    void generate_new_bssid(uint16_t new_vap_index,sMacAddr &new_bssid);
++    bool generate_new_bssid(sMacAddr &new_bssid);
+ 
+     virtual void set_sta_enable(bool enable) override;
+ 
+@@ -154,6 +154,8 @@ public:
+     void add_mld_entries(son::wireless_utils::sBssInfoConf, std::string mlo_iface);
+ 
+     bool process_reconfig_complete_event(const bool &result);
++    
++    void generate_bssid_pool(void);
+ 
+     // Protected methods:
+ protected:
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index d15435ed0..c3fdd9bef 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -1028,6 +1028,9 @@ bool base_wlan_hal_nl80211::refresh_vaps_info(int id)
+     }
+     LOG(DEBUG) << " active bss count present in STATUS for iface " << m_radio_info.iface_name << " : " << bss_count;
+ 
++    // clear the available vaps
++    m_radio_info.available_vaps.clear();
++
+     // Try reading values of the requested VAP
+     for (int bss_idx = 0; bss_idx < bss_count; bss_idx++) {
+ 	auto &vap_element = m_radio_info.available_vaps[vap_id];
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.cpp b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+index 797208928..201022fc2 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -1955,4 +1955,47 @@ bool nl80211_client_impl::get_mlo_active_link_count(std::string &interface_name,
+         return true;
+ }
+ 
++bool nl80211_client_impl::get_sta_iface_mac(const std::string &sta_iface,
++                                             std::string &sta_mac)
++{
++                                             
++    interface_info interface_info;
++
++    if (!m_socket) {
++        LOG(ERROR) << "Socket is NULL!";
++        return false;
++    }
++
++    // Get the interface index for given interface name
++    int iface_index = if_nametoindex(sta_iface.c_str());
++    if (0 == iface_index) {
++        LOG(ERROR) << "Failed to read the index of interface " << sta_iface << ": " <<  strerror(errno);
++        return false;
++    }
++    return m_socket.get()->send_receive_msg(
++        NL80211_CMD_GET_INTERFACE, 0,
++        [&](struct nl_msg *msg) -> bool {
++            nla_put_u32(msg, NL80211_ATTR_IFINDEX, iface_index);
++            return true;
++        },
++        [&](struct nl_msg *msg) {
++            struct nlattr *tb[NL80211_ATTR_MAX + 1];
++            struct genlmsghdr *gnlh = (struct genlmsghdr *)nlmsg_data(nlmsg_hdr(msg));
++
++            // Parse the netlink message
++            if (nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0),
++                          NULL)) {
++                LOG(ERROR) << "Failed to parse netlink message!";
++                return;
++            }
++            //TODO: [NLHAL] - Needs to handle MLD BSTA case
++            if (tb[NL80211_ATTR_MAC]) {
++                const uint8_t *data = static_cast<const uint8_t *>(nla_data(tb[NL80211_ATTR_MAC]));
++
++                tlvf::mac_from_array(data, interface_info.addr);
++                sta_mac = tlvf::mac_to_string(interface_info.addr);
++            }
++        });
++}
++
+ } // namespace bwl
+diff --git a/controller/src/beerocks/master/db/agent.h b/controller/src/beerocks/master/db/agent.h
+index cc7f532f1..70d5da2fe 100644
+--- a/controller/src/beerocks/master/db/agent.h
++++ b/controller/src/beerocks/master/db/agent.h
+@@ -473,8 +473,8 @@ public:
+              */
+             int update_vap_id(int vap_id_) const
+             {
+-                if ((vap_id == beerocks::eBeeRocksIfaceIds::IFACE_ID_INVALID) &&
+-                    (vap_id_ >= beerocks::eBeeRocksIfaceIds::IFACE_VAP_ID_MIN)) {
++                if (((vap_id == beerocks::eBeeRocksIfaceIds::IFACE_ID_INVALID) &&
++                    (vap_id_ >= beerocks::eBeeRocksIfaceIds::IFACE_VAP_ID_MIN)) || (vap_id != vap_id_)){
+                     vap_id = vap_id_;
+                 }
+                 return vap_id;
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index ec3e7970a..646b90d7d 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -845,6 +845,21 @@ int cfg_get_hostap_iface(int32_t radio_num, char hostap_iface[BPL_IFNAME_LEN])
+     return cfg_get_prplmesh_radio_param(radio_num, "hostap_iface", hostap_iface, BPL_IFNAME_LEN);
+ }
+ 
++int cfg_get_sta_iface_with_radio_id(int32_t radio_num, char sta_iface[BPL_IFNAME_LEN])
++{
++    if (!sta_iface) {
++        MAPF_ERR("cfg_get_sta_iface_with_radio_id: invalid input: sta_iface is NULL");
++        return RETURN_ERR;
++    }
++
++    if (radio_num < 0) {
++        MAPF_ERR("cfg_get_sta_iface_with_radio_id: invalid input: radio_num < 0");
++        return RETURN_ERR;
++    }
++
++    return cfg_get_prplmesh_radio_param(radio_num, "sta_iface", sta_iface, BPL_IFNAME_LEN);
++}
++
+ bool bpl_cfg_get_monitored_BSSs_by_radio_iface(const std::string &iface,
+                                                std::set<std::string> &monitored_BSSs)
+ {
+diff --git a/framework/platform/bpl/include/bpl/bpl_cfg.h b/framework/platform/bpl/include/bpl/bpl_cfg.h
+index 213cf8912..9c0e150c5 100644
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -745,6 +745,8 @@ int cfg_get_administrator_credentials(char pass[BPL_USER_PASS_LEN]);
+  */
+ int cfg_get_sta_iface(const char iface[BPL_IFNAME_LEN], char sta_iface[BPL_IFNAME_LEN]);
+ 
++int cfg_get_sta_iface_with_radio_id(int32_t radio_num, char sta_iface[BPL_IFNAME_LEN]);
++
+ /**
+  * Clear credentials received during wps session
+ */
+-- 
+2.34.1
+
