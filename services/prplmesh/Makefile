@@ -162,6 +162,11 @@ ifeq ($(CONFIG_PRPLMESH_ENABLE_UNIT_TESTS),y)
 	CMAKE_OPTIONS += -DBUILD_TESTS=ON
 endif
 
+define Build/Prepare
+	$(call Build/Prepare/Default)
+	$(CP) $(CURDIR)/files/hostapd_dep/include $(PKG_BUILD_DIR)/
+endef
+
 define Build/InstallDev
 	$(INSTALL_DIR) $(1)/usr/lib
 	$(INSTALL_DIR) $(1)/usr/include
