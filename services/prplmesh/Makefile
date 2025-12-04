@@ -11,6 +11,7 @@ PKG_SOURCE_DATE:=2025-10-07
 PKG_MAINTAINER:=Frederik Van Bogaert <frederik.vanbogaert@prplfoundation.org>
 PKG_LICENSE:=BSD-2-Clause-Patent
 PKG_LICENSE_FILES:=LICENSE
+PKG_SOURCE_SUBMODULES:=skip
 
 PRPLMESH_VERSION:=$(subst -,.,$(PKG_SOURCE_DATE))
 PRPLMESH_REVISION:=$(PKG_SOURCE_VERSION)
@@ -72,10 +73,8 @@ define Package/prplmesh
 		+!(TARGET_intel_x86||TARGET_intel_mips):kmod-sched-prio 
 #	non-intel_x86 neither non-intel_mips neither broadcom dependencies:
 	DEPENDS+= \
-		+!(TARGET_intel_x86||TARGET_intel_mips||TARGET_brcmbca||TARGET_ipq95xx):hostapd-openssl \
-		+!(TARGET_intel_x86||TARGET_intel_mips||TARGET_brcmbca||TARGET_ipq95xx):wpa-supplicant-openssl
-	DEPENDS+= \
-		+TARGET_ipq95xx:wpad-qca-mesh-openssl
+		+!(TARGET_intel_x86||TARGET_intel_mips||TARGET_brcmbca||TARGET_ipq95xx||TARGET_ipq53xx||TARGET_ipq54xx):hostapd-openssl \
+		+!(TARGET_intel_x86||TARGET_intel_mips||TARGET_brcmbca||TARGET_ipq95xx||TARGET_ipq53xx||TARGET_ipq54xx):wpa-supplicant-openssl
 	DEPENDS+= \
 		+PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND:libamxb \
 		+PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND:libamxrt \
@@ -101,8 +100,15 @@ CMAKE_OPTIONS+= \
 	-DCMAKE_INSTALL_PREFIX=/opt/prplmesh \
 	-DPLATFORM_BUILD_DIR=$(BUILD_DIR) \
 	-DPLATFORM_STAGING_DIR=$(STAGING_DIR) \
-	-DPLATFORM_INCLUDE_DIR=$(STAGING_DIR)/usr/include \
-	-DCMAKE_CXX_FLAGS="-Wno-error=deprecated-declarations"
+	-DPLATFORM_INCLUDE_DIR=$(STAGING_DIR)/usr/include
+
+CMAKE_OPTIONS += --log-level=STATUS
+
+#debug symbols enabled
+CMAKE_OPTIONS+= \
+	-DCMAKE_BUILD_TYPE=Debug \
+	-DCMAKE_C_FLAGS="-g3" \
+	-DCMAKE_CXX_FLAGS="-Wno-error=deprecated-declarations -g3"
 
 ifeq ($(wildcard $(PKG_BUILD_DIR)/.source_dir),)
 	CMAKE_OPTIONS += -DPRPLMESH_REVISION=$(PRPLMESH_REVISION)
@@ -123,7 +129,14 @@ ifeq ($(CONFIG_PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND),y)
 ifeq ($(CONFIG_USE_PRPLMESH_WHM),y)
 	CMAKE_OPTIONS += -DUSE_PRPLMESH_WHM=ON
 	CMAKE_OPTIONS += -DWBAPI_SOCK="-DAMBIORIX_WBAPI_BACKEND_PATH=\\\"/usr/bin/mods/amxb/mod-amxb-ubus.so\\\" -DAMBIORIX_WBAPI_BUS_URI=\\\"ubus:/var/run/ubus/ubus.sock\\\""
+	CMAKE_OPTIONS += -DUSE_PRPLMESH_NLHAL=OFF
 endif
+# Else if NLHAL is enabled and both Ambiorix and WHM are not enabled
+else ifeq ($(CONFIG_USE_PRPLMESH_NLHAL),y)
+	CMAKE_OPTIONS += -DUSE_PRPLMESH_NLHAL=ON
+	# disabling NBAPI and WHM
+	CMAKE_OPTIONS += -DENABLE_NBAPI=OFF
+	CMAKE_OPTIONS += -DUSE_PRPLMESH_WHM=OFF
 endif
 
 ifeq ($(CONFIG_TARGET_intel_mips),y)
@@ -171,8 +184,12 @@ define Package/prplmesh/install
 	$(CP) $(PKG_INSTALL_DIR)/opt/prplmesh/lib/*.so* $(1)/usr/lib/
 	$(CP) $(PKG_INSTALL_DIR)/opt/prplmesh/share $(1)/opt/prplmesh/
 	$(CP) $(PKG_INSTALL_DIR)/opt/prplmesh/config $(1)/opt/prplmesh/
-	$(CP) $(PKG_INSTALL_DIR)/etc/acl/admin/prplmesh.json $(1)/etc/acl/admin/
-	$(CP) $(PKG_INSTALL_DIR)/opt/prplmesh/config/controller/odl/01_device-wifi_prplmesh_mapping.odl $(1)/etc/amx/tr181-device/extensions/
+	if [ -f $(PKG_INSTALL_DIR)/etc/acl/admin/prplmesh.json ]; then \
+		$(CP) $(PKG_INSTALL_DIR)/etc/acl/admin/prplmesh.json $(1)/etc/acl/admin/; \
+	fi
+	if [ -f $(PKG_INSTALL_DIR)/opt/prplmesh/config/controller/odl/01_device-wifi_prplmesh_mapping.odl ]; then \
+		$(CP) $(PKG_INSTALL_DIR)/opt/prplmesh/config/controller/odl/01_device-wifi_prplmesh_mapping.odl $(1)/etc/amx/tr181-device/extensions/; \
+	fi
 endef
 
 define Package/prplmesh-unit-tests/install
