@@ -1,0 +1,1067 @@
+From 78734a8e2ae894ab573b5c603f590b5978f01776 Mon Sep 17 00:00:00 2001
+From: Girija P <gpandiya@qti.qualcomm.com>
+Date: Thu, 8 Jan 2026 00:05:34 +0530
+Subject: [PATCH 09/31] Enabling MLO support in NLHAL
+
+Signed-off-by: Girija P <gpandiya@qti.qualcomm.com>
+---
+ CMakeLists.txt                                |   2 +-
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  17 +-
+ .../beerocks/bwl/include/bwl/nl80211_client.h |   4 +-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 254 ++++++++++++----
+ .../bwl/nl80211/ap_wlan_hal_nl80211.h         |   6 +
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     | 279 +++---------------
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      |  29 +-
+ .../bwl/shared/nl80211_client_impl.cpp        |  72 +++++
+ .../beerocks/bwl/shared/nl80211_client_impl.h |   2 +
+ .../beerocks/hostapd/source/configuration.cpp |   1 +
+ 10 files changed, 374 insertions(+), 292 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 761b8cb1c..54629d867 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -223,7 +223,7 @@ set(BEEROCKS_LOG_FILES_PATH      "${TMP_PATH}/logs" CACHE PATH "prplMesh logs di
+ set(BEEROCKS_LOG_FILES_SUFFIX    ".log" CACHE STRING "prplMesh logs filenames suffix")
+ set(BEEROCKS_LOG_FILES_AUTO_ROLL "true" CACHE STRING "Auto rollback prplMesh logs")
+ set(BEEROCKS_LOG_STDOUT_ENABLED  "false" CACHE STRING "Print logs to stdout")
+-set(BEEROCKS_LOG_SYSLOG_ENABLED  "false" CACHE STRING "Send logs to syslog")
++set(BEEROCKS_LOG_SYSLOG_ENABLED  "true" CACHE STRING "Send logs to syslog")
+ if (TARGET_PLATFORM STREQUAL "linux")
+     set(BEEROCKS_CONTROLLER_LOG_SIZE "30000000" CACHE STRING "Max controller log size")
+     set(BEEROCKS_AGENT_LOG_SIZE "2000000" CACHE STRING "Max agent log size")
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index e6376612b..346f1fdfe 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -560,15 +560,28 @@ void ApAutoConfigurationTask::configuration_complete_wait_action(const std::stri
+         if (bssid.iface_name.empty()) {
+             continue;
+         }
+-
++        
+         if (!bssid.active) {
+             LOG(INFO) << "skip bssid " << bssid.iface_name << " since it is disabled";
+             continue;
+         }
+-        auto found = std::find(ifaces_in_bridge.begin(), ifaces_in_bridge.end(), bssid.iface_name);
++
++        //TODO: [NLHAL] Currently removed _link from bss name and used base interface name to check iface is in bridge or not
++        std::string base_iface_name = "";
++        size_t pos = bssid.iface_name.find("_link");
++        if (pos != std::string::npos) {
++            base_iface_name = bssid.iface_name.substr(0, pos);
++        } else {
++            base_iface_name = bssid.iface_name; //if _link not found
++        }
++
++        LOG(DEBUG) << " bss iface: " << bssid.iface_name << " base iface: " << base_iface_name;
++ 
++        auto found = std::find(ifaces_in_bridge.begin(), ifaces_in_bridge.end(), base_iface_name);
+ 
+         // Return if not all bssids are in the bridge, and print error.
+         if (found == ifaces_in_bridge.end()) {
++            LOG(DEBUG) << " bss iface: " << bssid.iface_name << " is not found in " << db->bridge.iface_name;
+             auto host_bridge = network_utils::linux_iface_get_host_bridge(bssid.iface_name);
+             if (!host_bridge.empty()) {
+                 // skip secondary bss, already belonging to different bridge
+diff --git a/common/beerocks/bwl/include/bwl/nl80211_client.h b/common/beerocks/bwl/include/bwl/nl80211_client.h
+index b1a0d29f2..ae210f809 100644
+--- a/common/beerocks/bwl/include/bwl/nl80211_client.h
++++ b/common/beerocks/bwl/include/bwl/nl80211_client.h
+@@ -510,7 +510,7 @@ public:
+      * @return True on success and false otherwise.
+      */
+     virtual bool get_radio_info(const std::string &interface_name, radio_info &radio_info) = 0;
+-
++ 
+     /**
+      * @brief Gets station information.
+      *
+@@ -616,6 +616,8 @@ public:
+                             const sMacAddr &src, const sMacAddr &bssid) = 0;
+ 
+     virtual bool create_new_interface(std::string &vap_name ) =0;
++
++    virtual bool get_bss_link_id(std::string &interface_name,std::string &link_mac,int8_t &link_id) = 0;
+ };
+ 
+ } // namespace bwl
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index fc574924c..47a3262f9 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -15,7 +15,6 @@
+ #include <bwl/key_value_parser.h>
+ #include <cmath>
+ #include <easylogging++.h>
+-#include <hostapd/configuration.h>
+ #include <linux/nl80211.h>
+ #include <netlink/genl/ctrl.h>
+ #include <netlink/genl/family.h>
+@@ -24,7 +23,7 @@
+ #include <netlink/netlink.h>
+ #include <type_traits>
+ #include <dirent.h>
+-
++#include <fstream>
+ //////////////////////////////////////////////////////////////////////////////
+ ////////////////////////// Local Module Definitions //////////////////////////
+ //////////////////////////////////////////////////////////////////////////////
+@@ -35,6 +34,8 @@ namespace nl80211 {
+ #define BUFFER_SIZE 4096
+ #define CSA_EVENT_FILTERING_TIMEOUT_MS 1000
+ 
++#define MLD_PAIR_ENTRANT_FILE "/tmp/beerocks/mld_pair_entrant.txt"
++
+ // Temporary storage for station capabilities
+ struct SRadioCapabilitiesStrings {
+     std::string supported_rates;
+@@ -107,6 +108,82 @@ static ap_wlan_hal::Event nl80211_to_bwl_event(const std::string &opcode)
+     return ap_wlan_hal::Event::Invalid;
+ }
+ 
++int fetch_mld_id_pair(int mld_id, std::string &mld_grp_primary_ifname) {
++
++       std::string filename = MLD_PAIR_ENTRANT_FILE;
++
++       int fd = open(filename.c_str(), O_RDONLY);
++       if (fd == -1) {
++               perror("open");
++               return -1;
++       }
++
++       struct flock lock = { F_RDLCK, SEEK_SET, 0, 0, 0 };
++       fcntl(fd, F_SETLKW, &lock); // acquire read lock
++
++       std::ifstream file(filename);
++       std::string line;
++       std::string name;
++       while (getline(file, line)) {
++               std::istringstream iss(line);
++               std::string id_str, name_str;
++               if (getline(iss, id_str, ',') && getline(iss, name_str)) {
++                       if (std::stoi(id_str) == mld_id) {
++                               name = name_str;
++                               break;
++                       }
++
++
++
++               }
++       }
++
++       lock.l_type = F_UNLCK;
++       fcntl(fd, F_SETLK, &lock); // release lock
++       close(fd);
++       mld_grp_primary_ifname = name;
++       return 0;
++
++}
++
++int update_mld_grp_primary_ifname(int mld_id, std::string cur_ifname) {
++       std::string filename = MLD_PAIR_ENTRANT_FILE;
++
++       int fd = open(filename.c_str(), O_WRONLY | O_APPEND | O_CREAT, 0666);
++       if (fd == -1) {
++               perror("open");
++               return -1;
++       }
++
++       struct flock lock = { F_WRLCK, SEEK_SET, 0, 0, 0 };
++       lock.l_type = F_WRLCK; // write lock
++
++       fcntl(fd, F_SETLKW, &lock); // wait until lock is acquired
++       std::ofstream file(filename, std::ios::app);
++       if (file.is_open()) {
++               file << mld_id << "," << cur_ifname << "\n";
++               file.close();
++       }
++
++       lock.l_type = F_UNLCK;
++       fcntl(fd, F_SETLK, &lock); // release lock
++       close(fd);
++       return 0;
++
++}
++
++
++std::string get_ifname_wrt_mld_grp(int mld_id, std::string cur_ifname) {
++       std::string mld_grp_primary_ifname;
++       fetch_mld_id_pair(mld_id, mld_grp_primary_ifname);
++       if (mld_grp_primary_ifname.empty()) {
++               update_mld_grp_primary_ifname(mld_id, cur_ifname);
++               return cur_ifname;
++       } else {
++               return mld_grp_primary_ifname;
++       }
++
++}
+ static uint8_t wpa_bw_to_beerocks_bw(const std::string &chan_width)
+ {
+     // 20 MHz (no HT)
+@@ -121,7 +198,7 @@ static uint8_t wpa_bw_to_beerocks_bw(const std::string &chan_width)
+ 
+ /// @brief figures out hostapd config file name by the
+ //  interface name and loads its content
+-static prplmesh::hostapd::Configuration load_hostapd_config(const std::string &radio_iface_name,const std::string &bssid)
++prplmesh::hostapd::Configuration ap_wlan_hal_nl80211::load_hostapd_config(const std::string &radio_iface_name,const std::string &bssid)
+ {
+     // TODO: PRPLMESH_NLHAL To be replaced hostapd.conf selection logic
+ 
+@@ -176,14 +253,51 @@ static prplmesh::hostapd::Configuration load_hostapd_config(const std::string &r
+                 hostapd_conf.get_vap_value(radio_iface_name, "bss") != radio_iface_name) {
+                 LOG(DEBUG) << radio_iface_name << " does not exists in " << try_fname;
+                 continue;
+-            }  
+-        }else {
+-            LOG(DEBUG) << " check bssid exists in conf file " ;
+-            if (hostapd_conf.get_vap_by_bssid(bssid).empty()) {
++            } 
++
++            if (!bssid.empty() && (hostapd_conf.get_vap_by_bssid(bssid).empty())) {
+                 LOG(DEBUG) << bssid << " does not exists in " << try_fname;
+                 continue;
+             }
+-            
++            std::string chanlist_str = hostapd_conf.get_head_value("chanlist");
++
++            if (chanlist_str.empty()) {
++                LOG(DEBUG) << "###No chanlist found in " << try_fname;
++                continue;
++            }
++
++            // Parse chanlist range
++            int chan_start = -1, chan_end = -1;
++            size_t dash_pos = chanlist_str.find('-');
++            if (dash_pos != std::string::npos) {
++                chan_start = std::stoi(chanlist_str.substr(0, dash_pos));
++                chan_end = std::stoi(chanlist_str.substr(dash_pos + 1));
++            } else {
++                LOG(ERROR) << "Unexpected chanlist format in " << try_fname << ": " << chanlist_str;
++                continue;
++            }
++            LOG(DEBUG) << "Chanlist range " << chanlist_str << " start: " << chan_start << " end: " << chan_end;
++
++            // Match based on radio_idx
++            bool band_match = false;
++            switch (m_radio_info.frequency_band) {
++                case beerocks::FREQ_24G: band_match = (chan_start >= 1 && chan_end <= 14); break;
++                case beerocks::FREQ_5G: band_match = (chan_start >= 36 && chan_end <= 177); break;
++                case beerocks::FREQ_6G: band_match = (chan_start >= 2 && chan_end <= 233); break;
++                default: break;
++            }
++
++            if (!band_match) {
++                LOG(DEBUG) << "Chanlist range " << chanlist_str << " does not match radio band in " << try_fname;
++                continue;
++            }
++
++        } else {
++                LOG(DEBUG) << " check bssid exists in conf file " ;
++                if (hostapd_conf.get_vap_by_bssid(bssid).empty()) {
++                    LOG(DEBUG) << bssid << " does not exists in " << try_fname;
++                    continue;
++                }
+         }
+         // all is good, return the conf
+         return hostapd_conf;
+@@ -407,7 +521,9 @@ bool ap_wlan_hal_nl80211::refresh_radio_info()
+     // state. So, to read the latest value, we need to refresh data on every call.
+ 
+     nl80211_client::radio_info radio_info;
++    nl80211_client::eht_info eht_info;
+     if (!m_nl80211_client->get_radio_info(get_iface_name(), radio_info)) {
++
+         LOG(ERROR) << "Unable to read radio info for interface " << m_radio_info.iface_name;
+         return false;
+     }
+@@ -994,6 +1110,7 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+     const std::string &bridge_ifname)
+ {
+     LOG(INFO) << "Update vap credentials: " << m_radio_info.iface_name<<" freq of radio is: " << m_radio_info.frequency_band;
++    
+     // Load hostapd config for the radio
+     prplmesh::hostapd::Configuration base_conf = load_hostapd_config(m_radio_info.iface_name,"");
+     if (!base_conf) {
+@@ -1028,7 +1145,26 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+ 
+     LOG(INFO) << "Available vap count: " << new_vap_index;
+ 
++    int bss_iterator = 0;
++
+     for (auto &bss_it : bss_info_conf_list) {
++
++        bss_iterator++;
++        LOG(DEBUG) << "BSS iterator :   " << bss_iterator;
++        LOG(DEBUG) << "ssid:            " << bss_it.ssid;
++        LOG(DEBUG) << "authentication_type: " << bss_it.authentication_type;
++        LOG(DEBUG) << "encryption_type: " << bss_it.encryption_type;
++        LOG(DEBUG) << "bssid:           " << tlvf::mac_to_string(bss_it.bssid);
++        LOG(DEBUG) << "mld_id:          " << bss_it.mld_id;
++        int op_class_it = 0;
++        for (uint8_t op_class : bss_it.operating_class) {
++                op_class_it++;
++                LOG(DEBUG) << "op_class_list[" << op_class_it << "]: " << static_cast<int>(op_class);
++        }
++        LOG(DEBUG) << "fronthaul:       " << bss_it.fronthaul;
++        LOG(DEBUG) << "backhaul:        " << bss_it.backhaul;
++        LOG(DEBUG) << "teardown:        " << bss_it.teardown;
++        LOG(DEBUG) << "bSTA:            " << bss_it.bSTA;
+         auto conf_bssid = tlvf::mac_to_string(bss_it.bssid);
+         bss_it.freq_band = m_radio_info.frequency_band;
+ 
+@@ -1049,12 +1185,24 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+ 
+             LOG(INFO) << "NEW VAP Ifname: "<< new_vap_name << " Index: " << new_vap_index <<  " BSSID: " << new_bssid;
+ 
++            if (bss_it.mld_id >= 0) {
++                std::string mld_grp_bss_name = get_ifname_wrt_mld_grp(bss_it.mld_id, new_vap_name);
++                if (mld_grp_bss_name == new_vap_name) {
++                    LOG(ERROR) << new_vap_name << ": no need to change bss name for this mld grouping";
++                } else {
++                    LOG(ERROR) << new_vap_name  << ": Need to change the bss name to" << mld_grp_bss_name << "for this mld grouping";
++                    new_vap_name = mld_grp_bss_name;
++                }
++            }
++
++
+             if (!m_nl80211_client->create_new_interface(new_vap_name)) {
+                 LOG(ERROR) << "Unable to create new interface ";
+-                abort = true;
+-                break;
++                continue;
+             }
++
+             new_vap_index++;
++
+             bss_it.bssid = new_bssid;
+             std::string bridge = "br-lan";
+ 
+@@ -1078,14 +1226,6 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                 continue;
+             }
+ 
+-            if (bss_it.teardown) {
+-                // BSS is flagged for teardown
+-                LOG(DEBUG) << "Disabling VAP " << vap_id;
+-                conf.remove_bss_config(vap_id);
+-                // Continue to the next BSS
+-                continue;
+-            }
+-
+             // escape I
+             auto auth_type = son::wireless_utils::wsc_to_bwl_authentication(bss_it.authentication_type);
+             if (auth_type == "INVALID") {
+@@ -1105,11 +1245,16 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+             }
+ 
+             // escape III
++            std::string bss_key_name;
+             std::string bss   = conf.get_vap_value(vap_id, "bss"),
+                         bssid = conf.get_vap_value(vap_id, "bssid");
+             if (bss.empty()) {
+                 bss = conf.get_vap_value(vap_id,"interface");
++                bss_key_name = "interface";
++            } else {
++                bss_key_name = "bss";
+             }
++
+             // check explicit bssid value only in case of Multiple BSSID support
+             if ((!bss.empty()) && bssid.empty()) {
+                 LOG(ERROR) << "Failed to get BSSID for vap: " << vap_id;
+@@ -1128,15 +1273,25 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                 conf.set_create_vap_value(vap_id, "bridge", bridge_ifname);
+             }
+ 
+-            if (!ieee80211be_sprt.empty()) {
+-                    conf.set_create_vap_value(vap_id, "mld_ap","1");
+-             }
+-
+ 
+             LOG(DEBUG) << "Autoconfiguration for ssid: " << bss_it.ssid << " auth_type: " << auth_type
+                        << " encr_type: " << enc_type << " network_key: " << bss_it.network_key
+                        << " fronthaul: " << beerocks::string_utils::bool_str(bss_it.fronthaul)
+                        << " backhaul: " << beerocks::string_utils::bool_str(bss_it.backhaul);
++            
++            if (bss_it.mld_id >= 0) {
++                std::string new_bss_name = get_ifname_wrt_mld_grp(bss_it.mld_id, bss);
++                if (new_bss_name == bss) {
++                        LOG(ERROR) << bss << ": no need to change bss name for this mld grouping";
++                } else {
++                        LOG(ERROR) << bss << ": Need to change the bss name to" << new_bss_name << "for this mld grouping";
++                        conf.set_create_vap_value(vap_id, bss_key_name, new_bss_name);
++                }
++            }
++
++            if (!ieee80211be_sprt.empty()) {
++                    conf.set_create_vap_value(vap_id, "mld_ap","1");
++             }
+ 
+             conf.set_create_vap_value(vap_id, "ssid", bss_it.ssid);
+             conf.set_create_vap_value(vap_id, "wps_state", bss_it.fronthaul ? "2" : "");
+@@ -1191,8 +1346,8 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                 LOG(DEBUG) << "Vap is found in existing vaps";
+ 
+                 auto &vap_info     = m_radio_info.available_vaps[vap_iter->first];
+-                vap_info.bss       = bss;
+-                vap_info.mac       = bssid;
++                //vap_info.bss       = bss;
++                //vap_info.mac       = bssid;
+                 vap_info.fronthaul = bss_it.fronthaul;
+                 vap_info.backhaul  = bss_it.backhaul;
+                 if (vap_info.backhaul) {
+@@ -1206,27 +1361,31 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                     vap_info.profile1_backhaul_sta_association_disallowed = false;
+                     vap_info.profile2_backhaul_sta_association_disallowed = false;
+                 }
+-            }
+-            if (conf.update_required()) {
+-
+-                if (!conf.store()) {
+-                    LOG(ERROR) << "Autoconfiguration: cannot save hostapd config!";
+-                    continue;
++                if (bss_it.teardown) {
++                    // BSS is flagged for teardown
++                    LOG(DEBUG) << "Disabling VAP " << vap_id;
++                    conf.remove_bss_config(vap_id);
+                 }
+-                const std::string cmd("STOP_AP");
+-                if (!wpa_ctrl_send_msg(cmd,bss)) {
+-                    LOG(ERROR) << "Autoconfiguration: \"" << cmd << "\" command to hostapd has failed";
+-                    continue;
+-                }
+-                const std::string cmd_2("RELOAD_CONFIG");
+-                if (!wpa_ctrl_send_msg(cmd_2,bss)) {
+-                    LOG(ERROR) << "Autoconfiguration: \"" << cmd << "\" command to hostapd has failed";
+-                    continue;
++                if (conf.update_required()) {
++                    if (!conf.store()) {
++                        LOG(ERROR) << "Autoconfiguration: cannot save hostapd config!";
++                        continue;
++                    }
++                    const std::string cmd("STOP_AP");
++                    if (!wpa_ctrl_send_msg(cmd,vap_info.bss)) {
++                        LOG(ERROR) << "Autoconfiguration: \"" << cmd << "\" command to hostapd has failed";
++                        continue;
++                    }
++                    const std::string cmd_2("RELOAD_CONFIG");
++                    if (!wpa_ctrl_send_msg(cmd_2,vap_info.bss)) {
++                        LOG(ERROR) << "Autoconfiguration: \"" << cmd << "\" command to hostapd has failed";
++                        continue;
++                    }
+                 }
++                LOG(DEBUG) << "Autoconfiguration: done:\n" << conf;
++                //set uci persist for the particular vapid 
++                set_wifi_credentials_from_vap(vap_id, bss_it, conf);
+             }
+-            LOG(DEBUG) << "Autoconfiguration: done:\n" << conf;
+-            //set uci persist for the particular vapid 
+-            set_wifi_credentials_from_vap(vap_id, bss_it, conf);
+         }
+ 
+     }
+@@ -1520,17 +1679,6 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+         LOG(DEBUG) << "Could not find interface name.";
+     }
+ 
+-    size_t pos;
+-    pos = interface.find("_link");
+-
+-    // retrive actual interface name from link specific interface 
+-    if(pos != std::string::npos) {
+-        interface = interface.substr(0, pos);
+-    }
+-
+-    LOG(INFO) << "updated interface: " << interface;
+-
+-
+     auto vap_id    = get_vap_id_with_bss(interface);
+     auto iface_ids = beerocks::utils::get_ids_from_iface_string(interface);
+     if ((vap_id < 0) && (iface_ids.vap_id != beerocks::IFACE_RADIO_ID)) {
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+index 2f1561e17..842eb088f 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+@@ -12,6 +12,7 @@
+ #include "base_wlan_hal_nl80211.h"
+ #include <bwl/ap_wlan_hal.h>
+ #include <bpl/bpl_cfg.h>
++#include <hostapd/configuration.h>
+ 
+ namespace bwl {
+ namespace nl80211 {
+@@ -131,6 +132,11 @@ public:
+ 
+     virtual void set_sta_enable(bool enable) override;
+ 
++    void extractBaseInterface_link(const std::string &interface_name, std::string &base_interface);
++    void extractRadioIndex_link(const std::string &interface_name, int &link_id);
++    int get_radio_idx_from_iface(const std::string &radio_iface_name, std::string base_interface, int link_id);
++    prplmesh::hostapd::Configuration load_hostapd_config(const std::string &radio_iface_name, const std::string &bssid);
++
+     virtual bool
+     start_platform_acs(const std::shared_ptr<airties::cACSChannelList> &acs_list) override;
+ 
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index 77e885a6e..fea8d50a8 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -299,6 +299,7 @@ bool base_wlan_hal_nl80211::fsm_setup()
+ 
+                     // Store the current interface index
+                     int iface_index = if_nametoindex(get_iface_name().c_str());
++
+                     if (iface_index <= 0) {
+                         LOG(ERROR) << "Failed reading the index of interface " << get_iface_name()
+                                    << ": " << strerror(errno);
+@@ -831,141 +832,29 @@ bool base_wlan_hal_nl80211::refresh_vaps_info(int id)
+ 
+     std::unordered_set<std::string> parsed_BSSs;
+     parsed_obj_map_t reply;
+-    VAPElement vap_element;
+     int vap_id = 0;
+-
+-    for (const auto& iface : m_radio_info.active_BSSs) {
+-        LOG(DEBUG) << " refresh vaps for iface " << iface;
+-        if (parsed_BSSs.count(iface)) continue;
+-
+-        // Read the radio status
+-        if (!wpa_ctrl_send_msg("STATUS", reply,iface)) {
+-            LOG(ERROR) << __func__ << " failed";
+-            continue;
+-        }
+-
+-        int bss_count = 0;
+-        for (const auto& pair : reply) {
+-            if (pair.first.find("bss[") == 0) { // key starts with "bss["
+-                ++bss_count;
+-            }
+-        }
+-        LOG(DEBUG) << " active bss count present in iface " << iface << " : " << bss_count;
+-        // Try reading values of the requested VAP
+-        for (int bss_idx = 0; bss_idx < bss_count; bss_idx++) {
+-            vap_element.bss  = reply["bss[" + std::to_string(bss_idx) + "]"];
+-
+-            vap_element.mac  = reply["bssid[" + std::to_string(bss_idx) + "]"];
+-            vap_element.ssid = reply["ssid[" + std::to_string(bss_idx) + "]"];
+-
+-            // Read number of link value
+-            auto iter = reply.find("num_links");
+-            if (iter != reply.end()) {
+-                vap_element.num_links = beerocks::string_utils::stoi(iter->second);
+-                LOG(DEBUG) << "Num_links present: " << vap_element.num_links;
+-            } else {
+-                LOG(DEBUG) << "num_link not present: ";
+-            }
+-
+-            // Store the VAP element
+-            LOG(DEBUG) << "Detected VAP ID (" << vap_id << ") - MAC: " << vap_element.mac
+-                       << ", SSID: " << vap_element.ssid << ", BSS: " << vap_element.bss;
+-
+-            // Since some of the required information is not exist on the "STATUS" command reply, it
+-            // was pre-inserted when configured the BSSs. Therefore, not overriding the whole struct at
+-            // the mapped value of "available_vaps[vap_id]", instead copy the struct members one by one,
+-            // if possible.
+-
+-            // Secondary BSSs are detected in STATUS reply.
+-            // At that time, the relative wpa_ctrl socket files are created.
+-            // Only refresh primary BSS or those BSSs to be monitored.
+-
+-            if (add_interface(vap_element.bss) < 0) {
+-                LOG(INFO) << "Failed to add interface for " << vap_element.bss
+-                          << ". Is it not monitored?";
+-                // unfortunately register_wpa_ctrl_interface() both returns
+-                // false for failures and for the allowed case where a
+-                // monitor interface is not in the list of interfaces, so we
+-                // still have to return true;
+-            }
+-
+-            // Read network configuration
+-            NetworkConfiguration network_configuration;
+-            if (!get_config(network_configuration, vap_element.bss)) {
+-                LOG(ERROR) << "Failed to get network configuration for iface: " << vap_element.bss;
+-                return false;
+-            }
+-
+-            switch (network_configuration.multi_ap) {
+-            case beerocks::eBssType::BSS_TYPE_BACKHAUL:
+-                vap_element.fronthaul = false;
+-                vap_element.backhaul  = true;
+-                break;
+-            case beerocks::eBssType::BSS_TYPE_FRONTHAUL:
+-                vap_element.fronthaul = true;
+-                vap_element.backhaul  = false;
+-                break;
+-            case beerocks::eBssType::BSS_TYPE_BACK_FRONTHAUL:
+-                vap_element.fronthaul = true;
+-                vap_element.backhaul  = true;
+-                break;
+-            default:
+-                LOG(ERROR) << "Multi AP configuration value is unrecognized "
+-                           << network_configuration.multi_ap << ", assign as only fronthaul support";
+-                vap_element.fronthaul = true;
+-                vap_element.backhaul  = false;
+-                break;
+-            }
+-
+-            auto &mapped_vap_element = m_radio_info.available_vaps[vap_id];
+-            
+-            mapped_vap_element = vap_element;
+-
+-            vap_id++;
+- 
+-            parsed_BSSs.insert(vap_element.bss);
+-        }
+-    }    
+-    // TODO: To be removed already stored bss if it is not available now  
+-#if 0
+     // Read the radio status
+     if (!wpa_ctrl_send_msg("STATUS", reply)) {
+         LOG(ERROR) << __func__ << " failed";
+         return false;
+     }
+ 
+-    auto fill_bss_info = [&](uint16_t vap_id) {
+-        VAPElement vap_element;
++    int bss_count = 0;
++    for (const auto& pair : reply) {
++        if (pair.first.find("bss[") == 0) { // key starts with "bss["
++            ++bss_count;
++        }
++    }
++    LOG(DEBUG) << " active bss count present in STATUS for iface " << m_radio_info.iface_name << " : " << bss_count;
++    // Try reading values of the requested VAP
++    for (int bss_idx = 0; bss_idx < bss_count; bss_idx++) {
++	auto &vap_element = m_radio_info.available_vaps[vap_id];
+ 
+         // Try reading values of the requested VAP
+         vap_element.bss  = reply["bss[" + std::to_string(vap_id) + "]"];
+         vap_element.mac  = reply["bssid[" + std::to_string(vap_id) + "]"];
+         vap_element.ssid = reply["ssid[" + std::to_string(vap_id) + "]"];
+ 
+-        // Read number of link value
+-        auto iter = reply.find("num_links");
+-        if (iter != reply.end()) {
+-            vap_element.num_links = beerocks::string_utils::stoi(iter->second);
+-            LOG(DEBUG) << "Num_links present: " << vap_element.num_links;
+-        } else {
+-            LOG(DEBUG) << "num_link not present: ";
+-        }
+-
+-        // VAP does not exists
+-        if (vap_element.mac.empty()) {
+-            if (m_radio_info.available_vaps.find(vap_id) != m_radio_info.available_vaps.end()) {
+-
+-                LOG(DEBUG) << "Removing non-existent vap with id " << vap_id;
+-                // clean wpa_ctrl_sockets which relative BSS is more valid (null mac)
+-                auto &ifname = m_radio_info.available_vaps.at(vap_id).bss;
+-                m_wpa_ctrl_client.del_interface(ifname);
+-                m_iface_index.erase(ifname);
+-                m_radio_info.available_vaps.erase(vap_id);
+-            }
+-
+-            return false;
+-        }
+-
+         // Store the VAP element
+         LOG(DEBUG) << "Detected VAP ID (" << vap_id << ") - MAC: " << vap_element.mac
+                    << ", SSID: " << vap_element.ssid << ", BSS: " << vap_element.bss;
+@@ -979,6 +868,15 @@ bool base_wlan_hal_nl80211::refresh_vaps_info(int id)
+         // At that time, the relative wpa_ctrl socket files are created.
+         // Only refresh primary BSS or those BSSs to be monitored.
+ 
++
++        // Send NL CALL to fetch bss name incase mlo capability iface
++        if (!m_nl80211_client->get_bss_link_id(vap_element.bss,vap_element.mac,vap_element.link_id)) {
++            LOG(ERROR) << " get_bss_link_id failed " ;
++        }
++
++        LOG(INFO) << "vap_element.link_id updated to: " << vap_element.link_id;
++        LOG(INFO) << "vap_element.bss updated to: " << vap_element.bss;
++
+         if (add_interface(vap_element.bss) < 0) {
+             LOG(INFO) << "Failed to add interface for " << vap_element.bss
+                       << ". Is it not monitored?";
+@@ -986,77 +884,39 @@ bool base_wlan_hal_nl80211::refresh_vaps_info(int id)
+             // false for failures and for the allowed case where a
+             // monitor interface is not in the list of interfaces, so we
+             // still have to return true;
+-            return true;
+         }
+ 
+         // Read network configuration
+         NetworkConfiguration network_configuration;
+         if (!get_config(network_configuration, vap_element.bss)) {
+             LOG(ERROR) << "Failed to get network configuration for iface: " << vap_element.bss;
+-            return false;
+-        }
+-
+-        switch (network_configuration.multi_ap) {
+-        case beerocks::eBssType::BSS_TYPE_BACKHAUL:
+-            vap_element.fronthaul = false;
+-            vap_element.backhaul  = true;
+-            break;
+-        case beerocks::eBssType::BSS_TYPE_FRONTHAUL:
+-            vap_element.fronthaul = true;
+-            vap_element.backhaul  = false;
+-            break;
+-        case beerocks::eBssType::BSS_TYPE_BACK_FRONTHAUL:
+-            vap_element.fronthaul = true;
+-            vap_element.backhaul  = true;
+-            break;
+-        default:
+-            LOG(ERROR) << "Multi AP configuration value is unrecognized "
+-                       << network_configuration.multi_ap << ", assign as only fronthaul support";
+-            vap_element.fronthaul = true;
+-            vap_element.backhaul  = false;
+-            break;
+-        }
+-
+-        auto &mapped_vap_element = m_radio_info.available_vaps[vap_id];
+-        if (mapped_vap_element.bss.empty()) {
+-            LOG(WARNING) << "BSS " << vap_element.bss << " is not preconfigured!"
+-                         << " Overriding VAP element.";
+-
+-            mapped_vap_element = vap_element;
+-            return true;
+-
+-        } else if (mapped_vap_element.bss != vap_element.bss) {
+-            LOG(ERROR) << "bss mismatch! vap_element.bss=" << vap_element.bss
+-                       << ", mapped_vap_element.bss=" << mapped_vap_element.bss;
+-            return false;
+-        } else if (mapped_vap_element.ssid != vap_element.ssid) {
+-            LOG(DEBUG) << "SSID changed from " << mapped_vap_element.ssid << ", to "
+-                       << vap_element.ssid << ". Overriding VAP element.";
+-            mapped_vap_element = vap_element;
+-            return true;
++        } else {
++            switch (network_configuration.multi_ap) {
++            case beerocks::eBssType::BSS_TYPE_BACKHAUL:
++                vap_element.fronthaul = false;
++                vap_element.backhaul  = true;
++                break;
++            case beerocks::eBssType::BSS_TYPE_FRONTHAUL:
++                vap_element.fronthaul = true;
++                vap_element.backhaul  = false;
++                break;
++            case beerocks::eBssType::BSS_TYPE_BACK_FRONTHAUL:
++                vap_element.fronthaul = true;
++                vap_element.backhaul  = true;
++                break;
++            default:
++                LOG(ERROR) << "Multi AP configuration value is unrecognized "
++                           << network_configuration.multi_ap << ", assign as only fronthaul support";
++                vap_element.fronthaul = true;
++                vap_element.backhaul  = false;
++                break;
++            }
+         }
+-
+         // If reached here, assume that the BSS information is already exist on the container,
+         // therefore there is no need to update the information except the BSS mac that is not
+         // preset.
+-        mapped_vap_element.mac = vap_element.mac;
+-
+-        return true;
+-    };
+-
+-    // If the ID is the radio ID, read all VAPS.
+-    if (id == beerocks::IFACE_RADIO_ID) {
+-        for (uint16_t vap_id = beerocks::IFACE_VAP_ID_MIN; vap_id <= beerocks::IFACE_VAP_ID_MAX;
+-             vap_id++) {
+-            if (!fill_bss_info(vap_id)) {
+-                break;
+-            }
+-        }
+-    } else {
+-        fill_bss_info(id);
++        vap_id++;
+     }
+-#endif
+-
+     LOG(INFO) << "Active vap count in " << m_radio_info.iface_name << " : "<< m_radio_info.available_vaps.size();
+ 
+     return true;
+@@ -1109,9 +969,11 @@ bool base_wlan_hal_nl80211::process_ext_events(int fd)
+ std::string base_wlan_hal_nl80211::get_radio_mac()
+ {
+     std::string mac;
++
+     if (!beerocks::net::network_utils::linux_iface_get_mac(m_radio_info.iface_name, mac)) {
+         LOG(ERROR) << "Failed to get radio mac from ifname " << m_radio_info.iface_name;
+     }
++    LOG(DEBUG) << "radio_mac of iface " <<  m_radio_info.iface_name << "  " << mac; 
+     return mac;
+ }
+ 
+@@ -1298,6 +1160,8 @@ bool base_wlan_hal_nl80211::register_wpa_ctrl_interface(const std::string &inter
+ 
+     auto wpa_ctrl_path = m_hal_conf.wpa_ctrl_path;
+ 
++    size_t link_pos = 0;
++
+     // Build wpa_ctrl path for secondary BSSs.
+     if (interface.compare(get_iface_name()) != 0) {
+ 
+@@ -1313,12 +1177,11 @@ bool base_wlan_hal_nl80211::register_wpa_ctrl_interface(const std::string &inter
+         if (beerocks::os_utils::wpa_ctrl_skt_exists(wpa_ctrl_path)) {
+             LOG(DEBUG) << " wpa_ctrl_path for interface " << interface << " exists in " << wpa_ctrl_path;
+         } else {
+-            auto link_pos = interface.find("_link");
++            link_pos = interface.find("_link");
+             if (link_pos == std::string::npos) {
+                 wpa_ctrl_path = wpa_ctrl_path.substr(0, pos) + interface + "/" + interface;
+             } else {
+-                auto base_iface = interface.substr(0,link_pos);
+-                wpa_ctrl_path = wpa_ctrl_path.substr(0, pos) + base_iface + "/" + interface;
++                wpa_ctrl_path = wpa_ctrl_path.substr(0, pos) +  interface.substr(0, link_pos)  + "/" + interface;
+             }
+             if (beerocks::os_utils::wpa_ctrl_skt_exists(wpa_ctrl_path)) {
+                 LOG(DEBUG) << " wpa_ctrl_path for interface " << interface << " exists in " << wpa_ctrl_path;
+@@ -1327,34 +1190,12 @@ bool base_wlan_hal_nl80211::register_wpa_ctrl_interface(const std::string &inter
+                 return false;
+             }
+         }
+- 
+-        LOG(DEBUG) << "Built wpa_ctrl_path " << wpa_ctrl_path << " for interface " << interface;
+     }
++    LOG(DEBUG) << "Built wpa_ctrl_path " << wpa_ctrl_path << " for interface " << interface;
+     if (!m_wpa_ctrl_client.add_interface(interface, wpa_ctrl_path, m_fds_ext_events)) {
+         return false;
+     }
+ 
+-    bool exists = false;
+-    if ((interface != global_iface) && ((interface.find("_link") == std::string::npos))) { 
+-        if (m_radio_info.active_BSSs.empty()) {
+-            m_radio_info.active_BSSs.push_back(interface);
+-            LOG(DEBUG) << "Active BSSs is empty : added  " << interface;
+-        } else {
+-            for (const auto& existing_bss : m_radio_info.active_BSSs) {
+-                if (existing_bss == interface) {
+-                    LOG(DEBUG) << "Interface " << interface << " is already there in Active_BSSs ";
+-                    exists = true;
+-                    break;
+-                }
+-            }
+-            if (!exists) {
+-                m_radio_info.active_BSSs.push_back(interface);
+-                LOG(DEBUG) << "Interface " << interface << " is newly added in Active_BSSs ";
+-            }
+-        }
+-    } else {
+-        LOG(DEBUG) << "Skipping Interface " << interface << " in Active_BSSs ";
+-    }
+     return true;
+ }
+ 
+@@ -1428,28 +1269,6 @@ int base_wlan_hal_nl80211::add_interface(const std::string &interface)
+         m_iface_index.emplace(interface, iface_index);
+     }
+ 
+-    bool exists = false;
+-    if ((interface != global_iface) && ((interface.find("_link") == std::string::npos))) { 
+-        if (m_radio_info.active_BSSs.empty()) {
+-            m_radio_info.active_BSSs.push_back(interface);
+-            LOG(DEBUG) << "Active BSSs is empty : added  " << interface;
+-        } else {
+-            for (const auto& existing_bss : m_radio_info.active_BSSs) {
+-                if (existing_bss == interface) {
+-                    LOG(DEBUG) << "Interface " << interface << " is already there in Active_BSSs ";
+-                    exists = true;
+-                    break;
+-                }
+-            }
+-            if (!exists) {
+-                m_radio_info.active_BSSs.push_back(interface);
+-                LOG(DEBUG) << "Interface " << interface << " is newly added in Active_BSSs ";
+-            }
+-        }
+-    } else {
+-        LOG(DEBUG) << "Skipping Interface " << interface << " in Active_BSSs ";
+-    }
+-
+     return event_socket->fd();
+ }
+ 
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 0a9663ad4..115044422 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -88,10 +88,25 @@ mon_wlan_hal_nl80211::mon_wlan_hal_nl80211(const std::string &iface_name, hal_ev
+ 
+ mon_wlan_hal_nl80211::~mon_wlan_hal_nl80211() {}
+ 
++void extractBase1Interface(const std::string& interface_name, std::string& base_interface) {
++    size_t pos = interface_name.find("_link");
++    if (pos != std::string::npos) {
++        base_interface = interface_name.substr(0, pos);
++    } else {
++        base_interface = interface_name; // fallback if "_link" not found
++    }
++}
++
+ bool mon_wlan_hal_nl80211::update_radio_stats(SRadioStats &radio_stats)
+ {
+     beerocks::net::sInterfaceStats iface_stats;
+-    if (!beerocks::net::network_utils::get_iface_stats(get_iface_name(), iface_stats)) {
++    
++    //TODO: [NLHAL] Currently removed _link from get_iface_name and used base interface name for getting iface stats
++    std::string interface_name = get_iface_name();
++    std::string base_interface;
++    extractBase1Interface(interface_name, base_interface);
++
++    if (!beerocks::net::network_utils::get_iface_stats(base_interface, iface_stats)) {
+         LOG(ERROR) << "Failed to get interface statistics for interface " << get_iface_name();
+         return false;
+     }
+@@ -110,8 +125,12 @@ bool mon_wlan_hal_nl80211::update_radio_stats(SRadioStats &radio_stats)
+ 
+ bool mon_wlan_hal_nl80211::update_vap_stats(const std::string &vap_iface_name, SVapStats &vap_stats)
+ {
++    //TODO: [NLHAL] Currently removed _link from vap_iface_name and used base interface name for getting iface stats
+     beerocks::net::sInterfaceStats iface_stats;
+-    if (!beerocks::net::network_utils::get_iface_stats(vap_iface_name, iface_stats)) {
++    std::string base_interface;
++    extractBase1Interface(vap_iface_name, base_interface);
++    LOG(DEBUG) << "update vap stats for interface " << vap_iface_name << " base iface: " << base_interface;
++    if (!beerocks::net::network_utils::get_iface_stats(base_interface, iface_stats)) {
+         LOG(ERROR) << "Failed to get interface statistics for interface " << vap_iface_name;
+         return false;
+     }
+@@ -490,7 +509,6 @@ bool mon_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+     auto event = wav_to_bwl_event(opcode);
+ 
+     std::string interface;
+-    size_t pos;
+ 
+     if (parsed_obj.find(bwl::EVENT_KEYLESS_PARAM_IFACE) != parsed_obj.end()) {
+         interface = parsed_obj.at(bwl::EVENT_KEYLESS_PARAM_IFACE);
+@@ -498,7 +516,8 @@ bool mon_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+     if (interface.empty()) {
+         LOG(DEBUG) << "Could not find interface name.";
+     }
+-
++#if 0
++    size_t pos;
+     pos = interface.find("_link");
+ 
+     if(pos != std::string::npos) {
+@@ -506,7 +525,7 @@ bool mon_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+     }
+ 
+     LOG(DEBUG) << "updated interface: " << interface;
+-
++#endif
+ 
+     auto vap_id = get_vap_id_with_bss(interface);
+     if (vap_id < 0) {
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.cpp b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+index 05bab2b9d..5f0975f17 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -1548,4 +1548,76 @@ bool nl80211_client_impl::create_new_interface(std::string &vap_name)
+         });
+ }
+ 
++bool nl80211_client_impl::get_bss_link_id(std::string &interface_name,std::string &link_mac,int8_t &link_id)
++{
++    sMacAddr link_mac_addr;
++
++    if (!m_socket) {
++        LOG(ERROR) << "Socket is NULL!";
++        return false;
++    }
++
++    // Get the interface index for given interface name
++    int iface_index = if_nametoindex(interface_name.c_str());
++    if (0 == iface_index) {
++        LOG(ERROR) << "Failed to read the index of interface " << interface_name << " : "
++                   << strerror(errno);
++
++        return false;
++    }
++
++    return m_socket.get()->send_receive_msg(
++        NL80211_CMD_GET_INTERFACE, 0,
++        [&](struct nl_msg *msg) -> bool {
++            nla_put_u32(msg, NL80211_ATTR_IFINDEX, iface_index);
++
++            return true;
++        },
++        [&](struct nl_msg *msg) {
++            struct nlattr *tb[NL80211_ATTR_MAX + 1];
++            struct genlmsghdr *gnlh = (struct genlmsghdr *)nlmsg_data(nlmsg_hdr(msg));
++
++            // Parse the netlink message
++            if (nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0),
++                          NULL)) {
++                LOG(ERROR) << "Failed to parse netlink message!";
++                return false;
++            }
++            if (tb[NL80211_ATTR_MLO_LINKS]) {
++                LOG(ERROR) << " MLO LINK PRESENT ";
++                int ret = 0;
++                struct nlattr *attrs, *link[NL80211_ATTR_MAX + 1];
++                nla_for_each_nested(attrs, tb[NL80211_ATTR_MLO_LINKS], ret) {
++                   nla_parse_nested(link, NL80211_ATTR_MAX, attrs, NULL);
++
++                   if (link[NL80211_ATTR_MLO_LINK_ID]) {
++                      if (link[NL80211_ATTR_MAC]) {
++                           const uint8_t *link_addr = static_cast<const uint8_t *>(nla_data(link[NL80211_ATTR_MAC]));
++
++                           tlvf::mac_from_array(link_addr, link_mac_addr);
++                           LOG(ERROR) << " link_mac_address: " << link_mac_addr;
++                           std::string mac_string;
++                           mac_string = tlvf::mac_to_string(link_mac_addr); 
++                            if (link_mac == mac_string) {
++                                LOG(ERROR) << " link_mac_address matched ";
++                                link_id = nla_get_u8(link[NL80211_ATTR_MLO_LINK_ID]);
++                                LOG(ERROR) << " link_id: " << link_id;
++                                interface_name = interface_name + "_link" +  std::to_string(link_id);
++                                LOG(ERROR) << " interface: " << interface_name << " link_id: " << link_id;
++                            } else {
++                                LOG(ERROR) << " link_mac_address: not matched ";
++                            }
++                       }
++                   }
++                }
++            } else {
++                LOG(ERROR) << " MLO LINK NOT PRESENT ";
++            }
++            return true;
++        });
++        return true;
++}
++
++
++
+ } // namespace bwl
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.h b/common/beerocks/bwl/shared/nl80211_client_impl.h
+index 768425379..26162fc9a 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.h
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.h
+@@ -182,6 +182,8 @@ public:
+ 
+     virtual bool create_new_interface(std::string &vap_name) override;
+ 
++    virtual bool get_bss_link_id(std::string &interface_name,std::string &link_mac,int8_t &link_id) override;
++
+     struct ehtEmlCapInfo_t {
+ 	    uint16_t emlsr_support:1;
+ 	    uint16_t b_1_6:6;
+diff --git a/common/beerocks/hostapd/source/configuration.cpp b/common/beerocks/hostapd/source/configuration.cpp
+index 64949482b..fe98bd77a 100644
+--- a/common/beerocks/hostapd/source/configuration.cpp
++++ b/common/beerocks/hostapd/source/configuration.cpp
+@@ -438,6 +438,7 @@ void Configuration::remove_bss_config(const std::string &vap_name)
+         ),
+         m_hostapd_config_vaps.end()
+     );
++    m_update_required = true;
+ }
+ 
+ void Configuration::set_hostapd_radio_config(std::vector<std::string> &config)
+-- 
+2.34.1
+
