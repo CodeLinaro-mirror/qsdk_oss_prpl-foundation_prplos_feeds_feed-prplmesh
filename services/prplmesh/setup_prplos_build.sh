@@ -34,14 +34,20 @@ echo "QSDK Directory: $QSDK_DIR"
 
 # Check if PRPLOS_TOOLCHAIN is already set in environment
 if [ -z "$PRPLOS_TOOLCHAIN" ]; then
+    
     # Try to auto-detect toolchain path
     PRPLOS_TOOLCHAIN="$QSDK_DIR/../toolchain/aarch64-prpl-linux/prplos-toolchain-${TARGET}-${SUBTARGET}_gcc-13.3.0_musl.Linux-x86_64/toolchain-aarch64_cortex-a55+neon-vfpv4_gcc-13.3.0_musl"
+    # Fallback to ipq54xx if specific target toolchain doesn't exist
+    if [ ! -d "$PRPLOS_TOOLCHAIN" ]; then
+        PRPLOS_TOOLCHAIN="$QSDK_DIR/../toolchain/aarch64-prpl-linux/prplos-toolchain-ipq54xx-generic_gcc-13.3.0_musl.Linux-x86_64/toolchain-aarch64_cortex-a55+neon-vfpv4_gcc-13.3.0_musl"
+    fi
+fi
 
 if [ ! -d "$PRPLOS_TOOLCHAIN" ]; then
     echo "ERROR: prplOS toolchain not found at: $PRPLOS_TOOLCHAIN"
     echo ""
     echo "Please set PRPLOS_TOOLCHAIN environment variable:"
-    echo "  export PRPLOS_TOOLCHAIN=/path/to/prplos/toolchain"
+    echo "export PRPLOS_TOOLCHAIN=/path/to/prplos/toolchain"
     echo ""
     return 1
 fi
