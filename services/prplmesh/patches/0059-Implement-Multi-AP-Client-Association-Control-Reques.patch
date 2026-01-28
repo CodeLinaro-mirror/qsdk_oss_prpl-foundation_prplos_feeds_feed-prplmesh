@@ -1,0 +1,1003 @@
+From c46d8a91b007348a6a5cd8f98f26bd520c9d8a70 Mon Sep 17 00:00:00 2001
+From: Sureshkumar <suresure@qti.qualcomm.com>
+Date: Fri, 23 Jan 2026 20:44:46 +0530
+Subject: [PATCH]  Implement Multi-AP Client Association Control Request
+ (0x8016) handling  to allow blocking/unblocking client STAs from associating
+ with specific BSSIDs.
+
+ Changes:
+    - Add BML API for client association control
+    - Implement agent-side handling for allow/disallow requests
+    - Add CLI command for testing
+    - Support timed and indefinite blocking modes
+
+Signed-off-by: Sureshkumar <suresure@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 |  60 +++++---
+ agent/src/beerocks/slave/son_slave_thread.cpp |  93 +++++++-----
+ .../tlvf/beerocks_message_action.yaml         |   7 +-
+ .../beerocks/tlvf/beerocks_message_bml.yaml   |  19 +++
+ controller/src/beerocks/bml/bml.cpp           |  46 ++++++
+ controller/src/beerocks/bml/bml.h             |  18 +++
+ controller/src/beerocks/bml/bml_defs.h        |  18 +++
+ .../beerocks/bml/internal/bml_internal.cpp    |  71 +++++++++
+ .../src/beerocks/bml/internal/bml_internal.h  |  13 ++
+ .../src/beerocks/cli/beerocks_cli_bml.cpp     | 137 ++++++++++++++++--
+ .../src/beerocks/cli/beerocks_cli_bml.h       |   4 +
+ .../src/beerocks/master/son_management.cpp    | 126 ++++++++++++++++
+ 12 files changed, 542 insertions(+), 70 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 47bc399e5..e30b1e1dd 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -1573,20 +1573,25 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+         break;
+     }
+     case beerocks_message::ACTION_APMANAGER_CLIENT_DISALLOW_REQUEST: {
++        LOG(DEBUG) << "Received CLIENT_DISALLOW_REQUEST";
++        
+         auto request =
+             beerocks_header
+                 ->addClass<beerocks_message::cACTION_APMANAGER_CLIENT_DISALLOW_REQUEST>();
+         if (request == nullptr) {
+-            LOG(ERROR) << "addClass cACTION_APMANAGER_CLIENT_DISALLOW_REQUEST failed";
++            LOG(ERROR) << "Failed to parse CLIENT_DISALLOW_REQUEST";
+             return;
+         }
+ 
+         uint8_t sta_mac_list_length = request->sta_list_size();
++        LOG(DEBUG) << "BSSID: " << tlvf::mac_to_string(request->bssid())
++                   << ", STA count: " << int(sta_mac_list_length)
++                   << ", validity period: " << request->validity_period_sec() << "s";
+ 
+         for (auto i = 0; i < sta_mac_list_length; i++) {
+             auto sta_info_tuple = request->sta(i);
+             if (!std::get<0>(sta_info_tuple)) {
+-                LOG(ERROR) << "getting sta info entry has failed!";
++                LOG(ERROR) << "Failed to get STA info at index " << i;
+                 return;
+             }
+             auto sta_info = std::get<1>(sta_info_tuple);
+@@ -1599,19 +1604,24 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+                              });
+ 
+             if (it == vap_unordered_map.end()) {
+-                //AP does not have the requested vap, probably will be handled on the other AP
++                LOG(DEBUG) << "VAP not found for BSSID " << tlvf::mac_to_string(request->bssid());
+                 return;
+             }
+ 
+-            LOG(DEBUG) << "CLIENT_DISALLOW: mac = " << tlvf::mac_to_string(sta_info.mac)
+-                       << ", bssid = " << tlvf::mac_to_string(request->bssid());
++            LOG(DEBUG) << "Disallowing STA " << tlvf::mac_to_string(sta_info.mac)
++                       << " on BSSID " << tlvf::mac_to_string(request->bssid())
++                       << ", disassoc=" << (sta_info.disassoc ? "yes" : "no");
+ 
+             if (sta_info.disassoc) {
+-                ap_wlan_hal->sta_disassoc(it->first, tlvf::mac_to_string(sta_info.mac),
+-                                          wfa_map::tlvProfile2ReasonCode::AP_INITIATED);
++                if (!ap_wlan_hal->sta_disassoc(it->first, tlvf::mac_to_string(sta_info.mac),
++                                               wfa_map::tlvProfile2ReasonCode::AP_INITIATED)) {
++                    LOG(WARNING) << "Failed to disassociate STA " << tlvf::mac_to_string(sta_info.mac);
++                }
+             }
+ 
+-            ap_wlan_hal->sta_deny(sta_info.mac, request->bssid());
++            if (!ap_wlan_hal->sta_deny(sta_info.mac, request->bssid())) {
++                LOG(WARNING) << "Failed to deny STA " << tlvf::mac_to_string(sta_info.mac);
++            }
+ 
+             // Check if validity period is set then add it to the "disallowed client timeouts" list
+             // This list will be polled in ap_manager_fsm() while in operational state through method
+@@ -1632,36 +1642,41 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+                 // insert new disallow timeout to the list
+                 m_disallowed_clients.push_back(disallowed_client);
+ 
+-                LOG(DEBUG) << "client " << disallowed_client.mac
+-                           << " will be allowed to associate with bssid " << disallowed_client.bssid
+-                           << " in "
++                LOG(DEBUG) << "STA " << disallowed_client.mac
++                           << " will be allowed on BSSID " << disallowed_client.bssid
++                           << " after "
+                            << std::chrono::duration_cast<std::chrono::seconds>(
+                                   disallowed_client.timeout - std::chrono::steady_clock::now())
+                                   .count()
+-                           << "sec";
++                           << "s";
+             } else {
+-                LOG(WARNING) << "CLIENT_DISALLOW validity period set to 0, STA mac " << sta_info.mac
+-                             << " will remain blocked from bssid " << request->bssid();
++                LOG(WARNING) << "Indefinite block: STA " << tlvf::mac_to_string(sta_info.mac)
++                             << " will remain blocked on BSSID " << tlvf::mac_to_string(request->bssid());
+             }
+         }
+         break;
+     }
+     case beerocks_message::ACTION_APMANAGER_CLIENT_ALLOW_REQUEST: {
++        LOG(DEBUG) << "Received CLIENT_ALLOW_REQUEST";
++        
+         auto request =
+             beerocks_header->addClass<beerocks_message::cACTION_APMANAGER_CLIENT_ALLOW_REQUEST>();
+         if (request == nullptr) {
+-            LOG(ERROR) << "addClass cACTION_APMANAGER_CLIENT_ALLOW_REQUEST failed";
++            LOG(ERROR) << "Failed to parse CLIENT_ALLOW_REQUEST";
+             return;
+         }
+ 
+         auto sta_mac_list_length = request->mac_list_size();
++        LOG(DEBUG) << "BSSID: " << tlvf::mac_to_string(request->bssid())
++                   << ", STA count: " << int(sta_mac_list_length);
+ 
+         for (auto i = 0; i < sta_mac_list_length; i++) {
+             auto sta_tuple = request->mac(i);
+             if (!std::get<0>(sta_tuple)) {
+-                LOG(ERROR) << "getting sta mac entry has failed!";
++                LOG(ERROR) << "Failed to get STA MAC at index " << i;
+                 return;
+             }
++            auto sta_mac = std::get<1>(sta_tuple);
+ 
+             const auto &vap_unordered_map = ap_wlan_hal->get_radio_info().available_vaps;
+             auto it =
+@@ -1671,15 +1686,18 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+                              });
+ 
+             if (it == vap_unordered_map.end()) {
+-                //AP does not have the requested vap, probably will be handled on the other AP
++                LOG(DEBUG) << "VAP not found for BSSID " << tlvf::mac_to_string(request->bssid());
+                 return;
+             }
+ 
+-            remove_client_from_disallowed_list(std::get<1>(sta_tuple), request->bssid());
++            remove_client_from_disallowed_list(sta_mac, request->bssid());
+ 
+-            LOG(DEBUG) << "CLIENT_ALLOW: mac = " << tlvf::mac_to_string(std::get<1>(sta_tuple))
+-                       << ", bssid = " << tlvf::mac_to_string(request->bssid());
+-            ap_wlan_hal->sta_allow(std::get<1>(sta_tuple), request->bssid());
++            LOG(DEBUG) << "Allowing STA " << tlvf::mac_to_string(sta_mac)
++                       << " on BSSID " << tlvf::mac_to_string(request->bssid());
++            
++            if (!ap_wlan_hal->sta_allow(sta_mac, request->bssid())) {
++                LOG(WARNING) << "Failed to allow STA " << tlvf::mac_to_string(sta_mac);
++            }
+         }
+         break;
+     }
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 02abc64f0..fd715b51a 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -5089,99 +5089,116 @@ bool slave_thread::forward_cmdu_to_controller(ieee1905_1::CmduMessageRx &cmdu_rx
+ bool slave_thread::handle_client_association_request(ieee1905_1::CmduMessageRx &cmdu_rx)
+ {
+     const auto mid = cmdu_rx.getMessageId();
+-    LOG(DEBUG) << "Received CLIENT_ASSOCIATION_CONTROL_REQUEST_MESSAGE, mid=" << std::dec
+-               << int(mid);
++    LOG(DEBUG) << "Received CLIENT_ASSOCIATION_CONTROL_REQUEST (0x8016), mid=0x" 
++               << std::hex << int(mid) << std::dec;
+ 
+     auto association_control_request_tlv =
+         cmdu_rx.getClass<wfa_map::tlvClientAssociationControlRequest>();
+     if (!association_control_request_tlv) {
+-        LOG(ERROR) << "addClass wfa_map::tlvClientAssociationControlRequest failed";
++        LOG(ERROR) << "Failed to get tlvClientAssociationControlRequest, mid=0x" 
++                   << std::hex << int(mid) << std::dec;
+         return false;
+     }
+ 
+     const auto &bssid = association_control_request_tlv->bssid_to_block_client();
++    auto control_type = association_control_request_tlv->association_control();
++    LOG(DEBUG) << "BSSID: " << bssid << ", control=" << int(control_type)
++               << ", validity=" << association_control_request_tlv->validity_period_sec() << "s"
++               << ", STA count=" << association_control_request_tlv->sta_list_length();
+ 
+     auto db    = AgentDB::get();
+     auto radio = db->get_radio_by_mac(bssid, AgentDB::eMacType::BSSID);
+     if (!radio) {
+-        LOG(ERROR) << "BSSID " << bssid << " was not found in any of the Agent radios";
++        LOG(ERROR) << "BSSID " << bssid << " not found in agent radios";
+         return false;
+     }
+-    /**
+-     * 'sta_connected' list contains all STAs reported in ClientAssociationControlRequest tlv with
+-     * information on whether it is connected to the involved AP.
+-     * Client Association Control request specify 4 differents control parameter :
+-     *  - BLOCK : All STA connected to the AP specified in the tlv must be reported in an error code
+-     *            tlv in the ACK returned. And no disallow request are performed for them.
+-     *  - INDEFINITE_BLOCK/TIMED_BLOCK : All STA connected to the AP specified in the tlv must be disconnected
+-     *                                   and then blacklisted
+-     */
++
++    // Map of STA MAC to connection status (true if connected)
+     std::multimap<bool, sMacAddr> sta_connected = {};
+-    auto block = association_control_request_tlv->association_control();
+-    if (block == wfa_map::tlvClientAssociationControlRequest::UNBLOCK) {
++    
++    if (control_type == wfa_map::tlvClientAssociationControlRequest::UNBLOCK) {
++        LOG(DEBUG) << "Processing UNBLOCK request";
++        
+         auto request_out = message_com::create_vs_message<
+             beerocks_message::cACTION_APMANAGER_CLIENT_ALLOW_REQUEST>(cmdu_tx, mid);
+         if (!request_out) {
+-            LOG(ERROR) << "Failed building ACTION_APMANAGER_CLIENT_ALLOW_REQUEST message!";
++            LOG(ERROR) << "Failed to create CLIENT_ALLOW_REQUEST";
+             return false;
+         }
++        
+         if (!request_out->alloc_mac(association_control_request_tlv->sta_list_length())) {
+-            LOG(ERROR) << "alloc_mac failed";
++            LOG(ERROR) << "Failed to allocate STA list";
+             return false;
+         }
++        
+         for (size_t sta_idx = 0; sta_idx < association_control_request_tlv->sta_list_length();
+              sta_idx++) {
+             auto sta_tuple = association_control_request_tlv->sta_list(sta_idx);
+             if (!std::get<0>(sta_tuple)) {
+-                LOG(ERROR) << "Failed to get STA from tlvClientAssociationControlRequest";
++                LOG(ERROR) << "Failed to get STA at index " << sta_idx;
++                return false;
+             }
+-            auto &sta_mac = std::get<1>(request_out->mac(sta_idx));
+-
+-            sta_mac = std::get<1>(sta_tuple);
++            std::get<1>(request_out->mac(sta_idx)) = std::get<1>(sta_tuple);
+         }
+         request_out->bssid() = bssid;
++        
+     } else {
++        LOG(DEBUG) << "Processing BLOCK/DISALLOW request";
++        
++        // Build list of STAs with connection status
+         for (size_t sta_idx = 0; sta_idx < association_control_request_tlv->sta_list_length();
+              sta_idx++) {
+             auto sta_tuple = association_control_request_tlv->sta_list(sta_idx);
+             if (!std::get<0>(sta_tuple)) {
+-                LOG(ERROR) << "Failed to get STA from tlvClientAssociationControlRequest";
++                LOG(ERROR) << "Failed to get STA at index " << sta_idx;
++                return false;
+             }
+ 
++            auto sta_mac = std::get<1>(sta_tuple);
+             auto associated_sta = find_if(
+                 radio->associated_clients.begin(), radio->associated_clients.end(),
+                 [&](const std::pair<sMacAddr, AgentDB::sRadio::sClient> &sta) {
+-                    return ((sta.first == std::get<1>(sta_tuple)) && (sta.second.bssid == bssid));
++                    return (sta.first == sta_mac) && (sta.second.bssid == bssid);
+                 });
+-            sta_connected.insert(std::pair<bool, sMacAddr>(
+-                (associated_sta != radio->associated_clients.end()), std::get<1>(sta_tuple)));
++            
++            bool is_connected = (associated_sta != radio->associated_clients.end());
++            sta_connected.insert({is_connected, sta_mac});
+         }
+ 
+         auto request_out = message_com::create_vs_message<
+             beerocks_message::cACTION_APMANAGER_CLIENT_DISALLOW_REQUEST>(cmdu_tx, mid);
+         if (!request_out) {
+-            LOG(ERROR) << "Failed building ACTION_APMANAGER_CLIENT_DISALLOW_REQUEST message!";
++            LOG(ERROR) << "Failed to create CLIENT_DISALLOW_REQUEST";
+             return false;
+         }
+-        size_t disallow_sta_length = ((block == wfa_map::tlvClientAssociationControlRequest::BLOCK)
+-                                          ? sta_connected.count(false)
+-                                          : sta_connected.size());
++        
++        // For BLOCK mode, only include unconnected STAs; for others, include all
++        size_t disallow_sta_length = 
++            (control_type == wfa_map::tlvClientAssociationControlRequest::BLOCK)
++                ? sta_connected.count(false)
++                : sta_connected.size();
++        
+         if (!request_out->alloc_sta(disallow_sta_length)) {
+-            LOG(ERROR) << "alloc_sta failed";
++            LOG(ERROR) << "Failed to allocate STA list for " << disallow_sta_length << " STAs";
+             return false;
+         }
++        
+         size_t sta_idx = 0;
+         for (auto &sta : sta_connected) {
+-            if ((block == wfa_map::tlvClientAssociationControlRequest::BLOCK) && sta.first) {
++            // Skip connected STAs in BLOCK mode (they'll get error codes in ACK)
++            if ((control_type == wfa_map::tlvClientAssociationControlRequest::BLOCK) && sta.first) {
+                 continue;
+             }
+-            auto &sta_info    = std::get<1>(request_out->sta(sta_idx++));
++            
++            auto &sta_info    = std::get<1>(request_out->sta(sta_idx));
+             sta_info.disassoc = sta.first;
+             sta_info.mac      = sta.second;
++            sta_idx++;
+         }
++        
+         request_out->bssid() = bssid;
+         request_out->validity_period_sec() =
+-            (block != wfa_map::tlvClientAssociationControlRequest::INDEFINITE_BLOCK)
++            (control_type != wfa_map::tlvClientAssociationControlRequest::INDEFINITE_BLOCK)
+                 ? association_control_request_tlv->validity_period_sec()
+                 : 0;
+     }
+@@ -5190,17 +5207,19 @@ bool slave_thread::handle_client_association_request(ieee1905_1::CmduMessageRx &
+ 
+     send_cmdu(radio_manager.ap_manager_fd, cmdu_tx);
+ 
++    // Send ACK back to controller
+     if (!cmdu_tx.create(mid, ieee1905_1::eMessageType::ACK_MESSAGE)) {
+-        LOG(ERROR) << "cmdu creation of type ACK_MESSAGE, has failed";
++        LOG(ERROR) << "Failed to create ACK message";
+         return false;
+     }
+ 
+-    if (block == wfa_map::tlvClientAssociationControlRequest::BLOCK) {
++    // Add error codes for connected STAs in BLOCK mode
++    if (control_type == wfa_map::tlvClientAssociationControlRequest::BLOCK) {
+         for (const auto &sta : sta_connected) {
+             if (sta.first) {
+                 auto error_code_tlv = cmdu_tx.addClass<wfa_map::tlvErrorCode>();
+                 if (!error_code_tlv) {
+-                    LOG(ERROR) << "addClass wfa_map::tlvErrorCode has failed";
++                    LOG(ERROR) << "Failed to add error code TLV for STA " << sta.second;
+                     continue;
+                 }
+ 
+@@ -5212,7 +5231,7 @@ bool slave_thread::handle_client_association_request(ieee1905_1::CmduMessageRx &
+         }
+     }
+ 
+-    LOG(DEBUG) << "sending ACK message back to controller with mid: " << std::hex << mid;
++    LOG(DEBUG) << "Sending ACK (0x8000) to controller, mid=0x" << std::hex << mid << std::dec;
+     return send_cmdu_to_controller(radio->front.iface_name, cmdu_tx);
+ }
+ 
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
+index 990e10c63..29956d9d5 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
+@@ -509,9 +509,12 @@ eActionOp_BML:
+   ACTION_BML_UNASSOC_STA_RCPI_QUERY_REQUEST: 237
+   ACTION_BML_UNASSOC_STA_RCPI_QUERY_RESPONSE: 238
+   ACTION_BML_GET_UNASSOC_STA_QUERY_RESULT_REQUEST: 239
+-  ACTION_BML_GET_UNASSOC_STA_QUERY_RESULT_RESPONSE: 240 
++  ACTION_BML_GET_UNASSOC_STA_QUERY_RESULT_RESPONSE: 240
+ 
+-  ACTION_BML_ENUM_END: 241
++  ACTION_BML_CLIENT_ASSOC_CONTROL_REQUEST: 247
++  ACTION_BML_CLIENT_ASSOC_CONTROL_RESPONSE: 248
++
++  ACTION_BML_ENUM_END: 249
+ 
+ ####################################################
+ ####################################################
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_bml.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_bml.yaml
+index fa0cdc14a..ed48d5958 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_bml.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_bml.yaml
+@@ -631,3 +631,22 @@ cACTION_BML_GET_UNASSOC_STA_QUERY_RESULT_RESPONSE:
+   op_error_code:
+     _type: uint8_t
+     _comment: 0 - Success, Otherwise error
++
++cACTION_BML_CLIENT_ASSOC_CONTROL_REQUEST:
++  _type: class
++  bssid:
++    _type: sMacAddr
++  association_control:
++    _type: uint8_t
++  time_period_sec:
++    _type: uint16_t
++  sta_count:
++    _type: uint8_t
++  sta_list:
++    _type: sMacAddr
++    _length: [16]
++
++cACTION_BML_CLIENT_ASSOC_CONTROL_RESPONSE:
++  _type: class
++  op_error_code:
++    _type: uint8_t
+diff --git a/controller/src/beerocks/bml/bml.cpp b/controller/src/beerocks/bml/bml.cpp
+index 7d0059b07..ea5bb4ae0 100644
+--- a/controller/src/beerocks/bml/bml.cpp
++++ b/controller/src/beerocks/bml/bml.cpp
+@@ -728,6 +728,52 @@ int bml_get_unassoc_sta_rcpi_query_result(BML_CTX ctx, const char *sta_mac,
+                                                    sta_info);
+ }
+ 
++int bml_trigger_client_assoc_control(BML_CTX ctx, const char *bssid,
++                                     uint8_t association_control,
++                                     uint16_t time_period_sec,
++                                     uint8_t sta_count,
++                                     const char **sta_macs)
++{
++    if (!ctx || !bssid || !sta_macs || sta_count == 0) {
++        return -BML_RET_INVALID_ARGS;
++    }
++
++    // Validate association_control mode (must be 0x00-0x03)
++    if (association_control > BML_CLIENT_ASSOC_CONTROL_INDEFINITE_BLOCK) {
++        LOG(ERROR) << "Invalid association control mode: " << int(association_control)
++                   << " (valid range: 0x00-0x03)";
++        return -BML_RET_INVALID_ARGS;
++    }
++
++    // Validate time_period_sec based on mode
++    if (association_control == BML_CLIENT_ASSOC_CONTROL_TIMED_BLOCK && time_period_sec == 0) {
++        LOG(ERROR) << "TIMED_BLOCK mode (0x02) requires time_period_sec > 0";
++        return -BML_RET_INVALID_ARGS;
++    }
++
++    if (association_control == BML_CLIENT_ASSOC_CONTROL_INDEFINITE_BLOCK && time_period_sec != 0) {
++        LOG(WARNING) << "INDEFINITE_BLOCK mode (0x03) ignores time_period_sec parameter (provided: "
++                     << time_period_sec << "s)";
++    }
++
++    if (association_control == BML_CLIENT_ASSOC_CONTROL_UNBLOCK && time_period_sec != 0) {
++        LOG(WARNING) << "UNBLOCK mode (0x01) ignores time_period_sec parameter (provided: "
++                     << time_period_sec << "s)";
++    }
++
++    // Validate STA count
++    if (sta_count > BML_CLIENT_ASSOC_MAX_STA_COUNT) {
++        LOG(ERROR) << "STA count " << int(sta_count) << " exceeds maximum "
++                   << BML_CLIENT_ASSOC_MAX_STA_COUNT;
++        return -BML_RET_INVALID_ARGS;
++    }
++
++    auto pBML = static_cast<bml_internal *>(ctx);
++    return pBML->send_client_assoc_control(tlvf::mac_from_string(std::string(bssid)),
++                                           association_control, time_period_sec,
++                                           sta_count, sta_macs);
++}
++
+ int bml_get_dcs_continuous_scan_enable(BML_CTX ctx, const char *radio_mac, int *enable)
+ {
+     // Validate input parameters
+diff --git a/controller/src/beerocks/bml/bml.h b/controller/src/beerocks/bml/bml.h
+index 26b61706d..208a44e6d 100644
+--- a/controller/src/beerocks/bml/bml.h
++++ b/controller/src/beerocks/bml/bml.h
+@@ -645,6 +645,24 @@ int bml_send_unassoc_sta_rcpi_query(BML_CTX ctx, const char *sta_mac, int16_t op
+ int bml_get_unassoc_sta_rcpi_query_result(BML_CTX ctx, const char *sta_mac,
+                                           struct BML_UNASSOC_STA_LINK_METRIC *sta_info);
+ 
++/**
++ * Trigger Client Association Control for specific STAs on a BSSID
++ *
++ * @param [in] ctx BML Context
++ * @param [in] bssid Target BSSID MAC address
++ * @param [in] association_control 0x00 to block, 0x01 to unblock
++ * @param [in] time_period_sec Time period in seconds
++ * @param [in] sta_count Number of STAs in the list
++ * @param [in] sta_macs Array of STA MAC address strings
++ *
++ * @return BML_RET_OK on success
++ */
++int bml_trigger_client_assoc_control(BML_CTX ctx, const char *bssid,
++                                     uint8_t association_control,
++                                     uint16_t time_period_sec,
++                                     uint8_t sta_count,
++                                     const char **sta_macs);
++
+ /**
+  * get DCS continuous scans param.
+  *
+diff --git a/controller/src/beerocks/bml/bml_defs.h b/controller/src/beerocks/bml/bml_defs.h
+index 2fcb9a0eb..81d18515b 100644
+--- a/controller/src/beerocks/bml/bml_defs.h
++++ b/controller/src/beerocks/bml/bml_defs.h
+@@ -644,6 +644,24 @@ struct BML_UNASSOC_STA_LINK_METRIC {
+     uint32_t measurement_delta;
+ };
+ 
++/**
++ * Client Association Control parameters (IEEE 1905.1 Table 53)
++ * These values correspond directly to the Association Control field
++ * in the Client Association Control Request TLV.
++ */
++#define BML_CLIENT_ASSOC_CONTROL_BLOCK             0x00  /* Block (no disassociation) */
++#define BML_CLIENT_ASSOC_CONTROL_UNBLOCK           0x01  /* Unblock */
++#define BML_CLIENT_ASSOC_CONTROL_TIMED_BLOCK       0x02  /* Timed block with auto-expiration */
++#define BML_CLIENT_ASSOC_CONTROL_INDEFINITE_BLOCK  0x03  /* Indefinite block with disassociation */
++#define BML_CLIENT_ASSOC_MAX_STA_COUNT             16    /* Maximum STAs per request */
++
++typedef enum {
++    BML_CLIENT_ASSOC_ERR_SUCCESS = 0,
++    BML_CLIENT_ASSOC_ERR_INVALID_PARAMS = 1,
++    BML_CLIENT_ASSOC_ERR_AGENT_NOT_FOUND = 2,
++    BML_CLIENT_ASSOC_ERR_INVALID_MODE = 3,
++} BML_CLIENT_ASSOC_ERR_CODE;
++
+ /****************************************************************************/
+ /****************************** Callback Types ******************************/
+ /****************************************************************************/
+diff --git a/controller/src/beerocks/bml/internal/bml_internal.cpp b/controller/src/beerocks/bml/internal/bml_internal.cpp
+index a57b6d696..e81172e11 100644
+--- a/controller/src/beerocks/bml/internal/bml_internal.cpp
++++ b/controller/src/beerocks/bml/internal/bml_internal.cpp
+@@ -1553,6 +1553,18 @@ int bml_internal::process_cmdu_header(std::shared_ptr<beerocks_header> beerocks_
+                 }
+             }
+         } break;
++        case beerocks_message::ACTION_BML_CLIENT_ASSOC_CONTROL_RESPONSE: {
++            auto response = beerocks_header->addClass<
++                beerocks_message::cACTION_BML_CLIENT_ASSOC_CONTROL_RESPONSE>();
++            if (!response) {
++                LOG(ERROR) << "Failed to parse CLIENT_ASSOC_CONTROL_RESPONSE";
++                return BML_RET_OP_FAILED;
++            }
++            if (!wake_up(beerocks_message::ACTION_BML_CLIENT_ASSOC_CONTROL_REQUEST,
++                         response->op_error_code())) {
++                LOG(WARNING) << "Received CLIENT_ASSOC_CONTROL_RESPONSE but no one is waiting";
++            }
++        } break;
+         default: {
+             LOG(WARNING) << "unhandled header BML action type 0x" << std::hex
+                          << int(beerocks_header->action_op());
+@@ -1969,6 +1981,65 @@ int bml_internal::get_unassoc_sta_rcpi_query_result(const sMacAddr &mac,
+     return BML_RET_OK;
+ }
+ 
++int bml_internal::send_client_assoc_control(const sMacAddr &bssid,
++                                            uint8_t association_control,
++                                            uint16_t time_period_sec,
++                                            uint8_t sta_count,
++                                            const char **sta_macs)
++{
++    LOG(DEBUG) << "Client association control: BSSID=" << bssid
++               << ", control=" << int(association_control)
++               << ", period=" << time_period_sec << "s"
++               << ", STA count=" << int(sta_count);
++
++    if (!is_local_master()) {
++        LOG(ERROR) << "Command supported only on local master";
++        return -BML_RET_OP_NOT_SUPPORTED;
++    }
++
++    if (!m_sockMaster) {
++        int ret = connect_to_master();
++        if (ret != BML_RET_OK) {
++            LOG(ERROR) << "Failed to connect to master";
++            return ret;
++        }
++    }
++
++    auto request = message_com::create_vs_message<
++        beerocks_message::cACTION_BML_CLIENT_ASSOC_CONTROL_REQUEST>(cmdu_tx);
++    if (!request) {
++        LOG(ERROR) << "Failed to create CLIENT_ASSOC_CONTROL_REQUEST";
++        return -BML_RET_OP_FAILED;
++    }
++
++    request->bssid()               = bssid;
++    request->association_control() = association_control;
++    request->time_period_sec()     = time_period_sec;
++    request->sta_count()           = sta_count;
++
++    for (uint8_t i = 0; i < sta_count; i++) {
++        auto sta_tuple = request->sta_list(i);
++        if (!std::get<0>(sta_tuple)) {
++            LOG(ERROR) << "Failed to access sta_list element " << int(i);
++            return -BML_RET_OP_FAILED;
++        }
++        std::get<1>(sta_tuple) = tlvf::mac_from_string(std::string(sta_macs[i]));
++    }
++
++    int result = 0;
++    int ret = send_bml_cmdu(result, request->get_action_op());
++    if (ret != BML_RET_OK) {
++        LOG(ERROR) << "send_bml_cmdu failed: " << ret;
++        return ret;
++    }
++    if (result != 0) {
++        LOG(ERROR) << "Client association control failed with error: " << result;
++        return result;
++    }
++
++    return BML_RET_OK;
++}
++
+ int bml_internal::get_dcs_continuous_scan_enable(const sMacAddr &mac, int &enable)
+ {
+     // If the socket is not valid, attempt to re-establish the connection
+diff --git a/controller/src/beerocks/bml/internal/bml_internal.h b/controller/src/beerocks/bml/internal/bml_internal.h
+index 161fb05f3..279083e67 100644
+--- a/controller/src/beerocks/bml/internal/bml_internal.h
++++ b/controller/src/beerocks/bml/internal/bml_internal.h
+@@ -235,6 +235,19 @@ public:
+     int get_unassoc_sta_rcpi_query_result(const sMacAddr &mac,
+                                           struct BML_UNASSOC_STA_LINK_METRIC *sta_info);
+ 
++    /**
++    * @brief Send Client Association Control (block/unblock clients) for a given BSSID.
++    *
++    * @param [in] bssid Target BSSID MAC address.
++    * @param [in] association_control 0x00=block, 0x01=unblock.
++    * @param [in] time_period_sec Time period in seconds.
++    * @param [in] sta_count Number of STA MAC addresses.
++    * @param [in] sta_macs Array of STA MAC address strings.
++    * @return BML_RET_OK on success.
++    */
++    int send_client_assoc_control(const sMacAddr &bssid, uint8_t association_control,
++                                 uint16_t time_period_sec, uint8_t sta_count, const char **sta_macs);
++
+     /**
+     * @brief Get DCS continuous scans param.
+     *
+diff --git a/controller/src/beerocks/cli/beerocks_cli_bml.cpp b/controller/src/beerocks/cli/beerocks_cli_bml.cpp
+index 65d9a6a66..d849d3f7c 100644
+--- a/controller/src/beerocks/cli/beerocks_cli_bml.cpp
++++ b/controller/src/beerocks/cli/beerocks_cli_bml.cpp
+@@ -495,8 +495,7 @@ void cli_bml::setFunctionsMapAndArray()
+                        "trigger channel selection procedure",
+                        static_cast<pFunction>(&cli_bml::bml_channel_selection_caller), 3, 4,
+                        STRING_ARG, INT_ARG, INT_ARG, INT_ARG);
+-    insertCommandToMap("bml_trigger_reconfig_apmld",
+-                       "<al mac> <mld mac> <ruid> <add link>",
++    insertCommandToMap("bml_trigger_reconfig_apmld", "<al mac> <mld mac> <ruid> <add link>",
+                        "trigger reconfig apmld",
+                        static_cast<pFunction>(&cli_bml::bml_reconfig_apmld_caller), 4, 4,
+                        STRING_ARG, STRING_ARG, STRING_ARG, INT_ARG);
+@@ -640,6 +639,16 @@ void cli_bml::setFunctionsMapAndArray()
+                        "Prints unassoc STA link metric query result for given sta",
+                        static_cast<pFunction>(&cli_bml::get_unassoc_sta_rcpi_result_caller), 1, 1,
+                        STRING_ARG);
++    insertCommandToMap("bml_trigger_client_assoc_control",
++                       "<bssid> <association_control> <time_period_sec> <sta_count> <sta_mac_1> [<sta_mac_2> ...]",
++                       "Trigger Client Association Control Request\n"
++                       "  bssid: Target BSSID\n"
++                       "  association_control: 0=BLOCK, 1=UNBLOCK, 2=TIMED_BLOCK, 3=INDEFINITE_BLOCK\n"
++                       "  time_period_sec: Time period in seconds (required for mode 2, ignored for modes 1 and 3)\n"
++                       "  sta_count: Number of STAs\n"
++                       "  sta_mac_N: MAC addresses of STAs (up to 6 supported via CLI)",
++                       static_cast<pFunction>(&cli_bml::bml_trigger_client_assoc_control_caller), 5, 10,
++                       STRING_ARG, INT_ARG, INT_ARG, INT_ARG, STRING_ARG, STRING_ARG, STRING_ARG, STRING_ARG, STRING_ARG, STRING_ARG);
+ 
+     //bool insertCommandToMap(std::string command, std::string help_args, std::string help,  pFunction funcPtr, uint8_t minNumOfArgs, uint8_t maxNumOfArgs,
+ }
+@@ -1261,7 +1270,7 @@ int cli_bml::bml_reconfig_apmld_caller(int numOfArgs)
+ {
+     if (numOfArgs == 4) {
+         return reconfig_apmld(args.stringArgs[0], args.stringArgs[1], args.stringArgs[2],
+-                                 args.intArgs[3]);
++                              args.intArgs[3]);
+     }
+     return -1;
+ }
+@@ -1787,7 +1796,7 @@ int cli_bml::enable_client_roaming(int8_t isEnable)
+ {
+     int result = -1;
+     int ret    = (isEnable < 0) ? bml_get_client_roaming(ctx, &result)
+-                             : bml_set_client_roaming(ctx, isEnable);
++                                : bml_set_client_roaming(ctx, isEnable);
+     printBmlReturnVals("bml_enable_client_roaming", ret);
+     if (isEnable < 0 && ret == BML_RET_OK)
+         std::cout << "client_roaming mode = " << result << std::endl;
+@@ -1798,7 +1807,7 @@ int cli_bml::enable_client_roaming_11k_support(int8_t isEnable)
+ {
+     int result = -1;
+     int ret    = (isEnable < 0) ? bml_get_client_roaming_11k_support(ctx, &result)
+-                             : bml_set_client_roaming_11k_support(ctx, isEnable);
++                                : bml_set_client_roaming_11k_support(ctx, isEnable);
+     printBmlReturnVals("bml_enable_client_roaming_11k_support", ret);
+     if (isEnable < 0 && ret == BML_RET_OK)
+         std::cout << "client_roaming_11k_support mode = " << result << std::endl;
+@@ -1809,7 +1818,7 @@ int cli_bml::enable_legacy_client_roaming(int8_t isEnable)
+ {
+     int result = -1;
+     int ret    = (isEnable < 0) ? bml_get_legacy_client_roaming(ctx, &result)
+-                             : bml_set_legacy_client_roaming(ctx, isEnable);
++                                : bml_set_legacy_client_roaming(ctx, isEnable);
+     printBmlReturnVals("bml_enable_legacy_client_roaming", ret);
+     if (isEnable < 0 && ret == BML_RET_OK)
+         std::cout << "legacy_client_roaming mode = " << result << std::endl;
+@@ -1820,7 +1829,7 @@ int cli_bml::enable_client_roaming_prefer_signal_strength(int8_t isEnable)
+ {
+     int result = -1;
+     int ret    = (isEnable < 0) ? bml_get_client_roaming_prefer_signal_strength(ctx, &result)
+-                             : bml_set_client_roaming_prefer_signal_strength(ctx, isEnable);
++                                : bml_set_client_roaming_prefer_signal_strength(ctx, isEnable);
+     printBmlReturnVals("bml_enable_client_roaming_prefer_signal_strength", ret);
+     if (isEnable < 0 && ret == BML_RET_OK)
+         std::cout << "client roaming prefer signal strength mode = " << result << std::endl;
+@@ -1831,7 +1840,7 @@ int cli_bml::enable_client_band_steering(int8_t isEnable)
+ {
+     int result = -1;
+     int ret    = (isEnable < 0) ? bml_get_client_band_steering(ctx, &result)
+-                             : bml_set_client_band_steering(ctx, isEnable);
++                                : bml_set_client_band_steering(ctx, isEnable);
+     printBmlReturnVals("bml_enable_client_band_steering", ret);
+     if (isEnable < 0 && ret == BML_RET_OK)
+         std::cout << "client_band_steering mode = " << result << std::endl;
+@@ -1864,7 +1873,7 @@ int cli_bml::enable_service_fairness(int8_t isEnable)
+ {
+     int result = -1;
+     int ret    = (isEnable < 0) ? bml_get_service_fairness(ctx, &result)
+-                             : bml_set_service_fairness(ctx, isEnable);
++                                : bml_set_service_fairness(ctx, isEnable);
+     printBmlReturnVals("bml_enable_service_fairness", ret);
+     if (isEnable < 0 && ret == BML_RET_OK)
+         std::cout << "service_fairness mode = " << result << std::endl;
+@@ -1886,7 +1895,7 @@ int cli_bml::enable_certification_mode(int8_t isEnable)
+ {
+     int result = -1;
+     int ret    = (isEnable < 0) ? bml_get_certification_mode(ctx, &result)
+-                             : bml_set_certification_mode(ctx, isEnable);
++                                : bml_set_certification_mode(ctx, isEnable);
+     printBmlReturnVals("bml_enable_certification_mode", ret);
+     if (isEnable < 0 && ret == BML_RET_OK)
+         std::cout << "enable_certification_mode = " << result << std::endl;
+@@ -2776,3 +2785,111 @@ int cli_bml::remove_unassociated_station_stats(std::string &mac_address,
+     return bml_remove_unassociated_station_stats(
+         ctx, mac_address.c_str(), agent_mac_addr.empty() ? nullptr : agent_mac_addr.c_str());
+ }
++
++int cli_bml::bml_trigger_client_assoc_control_caller(int numOfArgs)
++{
++    if (numOfArgs < 5) {
++        LOG(ERROR) << "Insufficient arguments. Usage: <bssid> <association_control> "
++                   << "<time_period_sec> <sta_count> <sta_mac_1> [<sta_mac_2> ...]";
++        return -1;
++    }
++
++    std::string bssid = args.stringArgs[0];
++    int association_control = args.intArgs[1];
++    int time_period_sec = args.intArgs[2];
++    int sta_count = args.intArgs[3];
++
++    // Validate association_control is in valid range [0-3]
++    if (association_control < BML_CLIENT_ASSOC_CONTROL_BLOCK ||
++        association_control > BML_CLIENT_ASSOC_CONTROL_INDEFINITE_BLOCK) {
++        LOG(ERROR) << "Invalid association_control: " << association_control
++                   << " (must be 0=BLOCK, 1=UNBLOCK, 2=TIMED_BLOCK, or 3=INDEFINITE_BLOCK)";
++        return -1;
++    }
++
++    // Validate time_period_sec requirements based on mode
++    if (association_control == BML_CLIENT_ASSOC_CONTROL_TIMED_BLOCK) {
++        if (time_period_sec <= 0) {
++            LOG(ERROR) << "TIMED_BLOCK mode requires time_period_sec > 0, got: " << time_period_sec;
++            return -1;
++        }
++    } else if ((association_control == BML_CLIENT_ASSOC_CONTROL_UNBLOCK ||
++                association_control == BML_CLIENT_ASSOC_CONTROL_INDEFINITE_BLOCK) &&
++               time_period_sec != 0) {
++        LOG(WARNING) << "Mode " << int(association_control)
++                     << " does not use time_period_sec, but non-zero value provided: "
++                     << time_period_sec << " (will be ignored)";
++    }
++
++    if (sta_count <= 0 || sta_count > BML_CLIENT_ASSOC_MAX_STA_COUNT) {
++        LOG(ERROR) << "Invalid sta_count: " << sta_count
++                   << " (must be 1-" << BML_CLIENT_ASSOC_MAX_STA_COUNT << ")";
++        return -1;
++    }
++
++    if (numOfArgs < 4 + sta_count) {
++        LOG(ERROR) << "Insufficient STA MAC addresses. Expected " << sta_count
++                   << " but got " << (numOfArgs - 4);
++        return -1;
++    }
++
++    if (!beerocks::net::network_utils::is_valid_mac(bssid)) {
++        LOG(ERROR) << "Invalid BSSID: " << bssid;
++        return -1;
++    }
++
++    // Collect and validate STA MAC addresses
++    std::vector<std::string> sta_mac_strings;
++    for (int i = 0; i < sta_count; i++) {
++        std::string sta_mac = args.stringArgs[4 + i];
++        if (!beerocks::net::network_utils::is_valid_mac(sta_mac)) {
++            LOG(ERROR) << "Invalid STA MAC at position " << (i + 1) << ": " << sta_mac;
++            return -1;
++        }
++        sta_mac_strings.push_back(sta_mac);
++    }
++
++    return trigger_client_assoc_control(bssid, uint8_t(association_control),
++                                       uint16_t(time_period_sec), uint8_t(sta_count),
++                                       sta_mac_strings);
++}
++
++int cli_bml::trigger_client_assoc_control(const std::string &bssid,
++                                         uint8_t association_control,
++                                         uint16_t time_period_sec,
++                                         uint8_t sta_count,
++                                         const std::vector<std::string> &sta_macs)
++{
++    std::cout << "Client Association Control Request:" << std::endl;
++    std::cout << "  BSSID: " << bssid << std::endl;
++    std::cout << "  Control: " << int(association_control)
++              << " (" << (association_control == BML_CLIENT_ASSOC_CONTROL_BLOCK ? "BLOCK" : "UNBLOCK")
++              << ")" << std::endl;
++    std::cout << "  Period: " << time_period_sec << " seconds" << std::endl;
++    std::cout << "  STA count: " << int(sta_count) << std::endl;
++    std::cout << "  STA MACs:" << std::endl;
++    
++    for (size_t i = 0; i < sta_macs.size(); i++) {
++        std::cout << "    [" << (i + 1) << "] " << sta_macs[i] << std::endl;
++    }
++
++    // Convert to C string array
++    std::vector<const char *> sta_mac_ptrs;
++    for (const auto &mac : sta_macs) {
++        sta_mac_ptrs.push_back(mac.c_str());
++    }
++
++    int ret = bml_trigger_client_assoc_control(ctx, bssid.c_str(), association_control,
++                                               time_period_sec, sta_count,
++                                               sta_mac_ptrs.data());
++
++    if (ret == BML_RET_OK) {
++        std::cout << "SUCCESS: Request sent" << std::endl;
++    } else {
++        std::cout << "FAILED: Error code " << ret << std::endl;
++    }
++
++    printBmlReturnVals("bml_trigger_client_assoc_control", ret);
++
++    return 0;
++}
+diff --git a/controller/src/beerocks/cli/beerocks_cli_bml.h b/controller/src/beerocks/cli/beerocks_cli_bml.h
+index d8ab127e4..251198382 100644
+--- a/controller/src/beerocks/cli/beerocks_cli_bml.h
++++ b/controller/src/beerocks/cli/beerocks_cli_bml.h
+@@ -164,6 +164,10 @@ private:
+     int client_clear_client_caller(int numOfArgs);
+     int send_unassoc_sta_rcpi_query_caller(int numOfArgs);
+     int get_unassoc_sta_rcpi_result_caller(int numOfArgs);
++    int bml_trigger_client_assoc_control_caller(int numOfArgs);
++    int trigger_client_assoc_control(const std::string &bssid, uint8_t association_control,
++                                    uint16_t time_period_sec, uint8_t sta_count,
++                                    const std::vector<std::string> &sta_macs);
+     // Functions
+     int onboard_status();
+     int ping();
+diff --git a/controller/src/beerocks/master/son_management.cpp b/controller/src/beerocks/master/son_management.cpp
+index fabeb324d..996e5ba21 100644
+--- a/controller/src/beerocks/master/son_management.cpp
++++ b/controller/src/beerocks/master/son_management.cpp
+@@ -24,6 +24,7 @@
+ #include <beerocks/tlvf/beerocks_message_1905_vs.h>
+ #include <beerocks/tlvf/beerocks_message_bml.h>
+ #include <beerocks/tlvf/beerocks_message_cli.h>
++#include <bml_defs.h>
+ 
+ #include <tlvf/tlvftypes.h>
+ #include <tlvf/wfa_map/tlvClientAssociationControlRequest.h>
+@@ -2687,6 +2688,131 @@ void son_management::handle_bml_message(int sd, std::shared_ptr<beerocks_header>
+         break;
+     }
+ 
++    case beerocks_message::ACTION_BML_CLIENT_ASSOC_CONTROL_REQUEST: {
++        LOG(DEBUG) << "Received CLIENT_ASSOC_CONTROL_REQUEST";
++        
++        auto request = beerocks_header->addClass<
++            beerocks_message::cACTION_BML_CLIENT_ASSOC_CONTROL_REQUEST>();
++        if (!request) {
++            LOG(ERROR) << "Failed to parse CLIENT_ASSOC_CONTROL_REQUEST";
++            auto response = message_com::create_vs_message<
++                beerocks_message::cACTION_BML_CLIENT_ASSOC_CONTROL_RESPONSE>(
++                    cmdu_tx, beerocks_header->id());
++            if (response) {
++                response->op_error_code() = BML_CLIENT_ASSOC_ERR_INVALID_PARAMS;
++                controller_ctx->send_cmdu(sd, cmdu_tx);
++            }
++            break;
++        }
++
++        auto bssid = request->bssid();
++        auto association_control = request->association_control();
++        auto time_period_sec = request->time_period_sec();
++        auto sta_count = request->sta_count();
++
++        LOG(DEBUG) << "BSSID: " << bssid
++                   << ", control=" << int(association_control)
++                   << ", period=" << int(time_period_sec) << "s"
++                   << ", STA count=" << int(sta_count);
++
++        // Get agent MAC for the BSSID
++        auto agent_mac = database.get_bss_parent_agent(bssid);
++        if (agent_mac == network_utils::ZERO_MAC) {
++            LOG(ERROR) << "Agent not found for BSSID: " << bssid;
++            auto response = message_com::create_vs_message<
++                beerocks_message::cACTION_BML_CLIENT_ASSOC_CONTROL_RESPONSE>(
++                    cmdu_tx, beerocks_header->id());
++            if (response) {
++                response->op_error_code() = BML_CLIENT_ASSOC_ERR_AGENT_NOT_FOUND;
++                controller_ctx->send_cmdu(sd, cmdu_tx);
++            }
++            break;
++        }
++
++        // Build STA list
++        std::unordered_set<sMacAddr> station_list;
++        for (uint8_t i = 0; i < sta_count; i++) {
++            auto sta_tuple = request->sta_list(i);
++            if (!std::get<0>(sta_tuple)) {
++                LOG(ERROR) << "Failed to get STA at index " << int(i);
++                auto response = message_com::create_vs_message<
++                    beerocks_message::cACTION_BML_CLIENT_ASSOC_CONTROL_RESPONSE>(
++                        cmdu_tx, beerocks_header->id());
++                if (response) {
++                    response->op_error_code() = BML_CLIENT_ASSOC_ERR_INVALID_PARAMS;
++                    controller_ctx->send_cmdu(sd, cmdu_tx);
++                }
++                break;
++            }
++            station_list.insert(std::get<1>(sta_tuple));
++        }
++
++        // Map BML control to Multi-AP flag with explicit handling of all 4 modes
++        wfa_map::tlvClientAssociationControlRequest::eAssociationControl assoc_flag;
++        bool valid_mode = true;
++        
++        switch (association_control) {
++            case BML_CLIENT_ASSOC_CONTROL_BLOCK:
++                // 0x00: Block (no disassociation)
++                assoc_flag = wfa_map::tlvClientAssociationControlRequest::BLOCK;
++                LOG(DEBUG) << "Mode: BLOCK (0x00)";
++                break;
++                
++            case BML_CLIENT_ASSOC_CONTROL_UNBLOCK:
++                // 0x01: Unblock
++                assoc_flag = wfa_map::tlvClientAssociationControlRequest::UNBLOCK;
++                LOG(DEBUG) << "Mode: UNBLOCK (0x01)";
++                break;
++                
++            case BML_CLIENT_ASSOC_CONTROL_TIMED_BLOCK:
++                // 0x02: Timed block with auto-expiration
++                assoc_flag = wfa_map::tlvClientAssociationControlRequest::TIMED_BLOCK;
++                LOG(DEBUG) << "Mode: TIMED_BLOCK (0x02), period=" << time_period_sec << "s";
++                break;
++                
++            case BML_CLIENT_ASSOC_CONTROL_INDEFINITE_BLOCK:
++                // 0x03: Indefinite block with disassociation
++                assoc_flag = wfa_map::tlvClientAssociationControlRequest::INDEFINITE_BLOCK;
++                LOG(DEBUG) << "Mode: INDEFINITE_BLOCK (0x03)";
++                break;
++                
++            default:
++                LOG(ERROR) << "Invalid association control mode: " << int(association_control);
++                valid_mode = false;
++                auto response = message_com::create_vs_message<
++                    beerocks_message::cACTION_BML_CLIENT_ASSOC_CONTROL_RESPONSE>(
++                        cmdu_tx, beerocks_header->id());
++                if (response) {
++                    response->op_error_code() = BML_CLIENT_ASSOC_ERR_INVALID_MODE;
++                    controller_ctx->send_cmdu(sd, cmdu_tx);
++                }
++                break;
++        }
++
++        // Only proceed if we have a valid mode
++        if (!valid_mode) {
++            break;
++        }
++
++        // Send client association control request to agent
++        bool success = son_actions::send_client_association_control(
++            database, cmdu_tx, agent_mac, bssid, station_list, time_period_sec, assoc_flag);
++
++        LOG(DEBUG) << "Client association control " << (success ? "sent" : "failed")
++                   << " to agent " << agent_mac;
++
++        // Send response to BML client
++        auto response = message_com::create_vs_message<
++            beerocks_message::cACTION_BML_CLIENT_ASSOC_CONTROL_RESPONSE>(
++                cmdu_tx, beerocks_header->id());
++        if (response) {
++            response->op_error_code() = success ? BML_CLIENT_ASSOC_ERR_SUCCESS
++                                                : BML_CLIENT_ASSOC_ERR_AGENT_NOT_FOUND;
++            controller_ctx->send_cmdu(sd, cmdu_tx);
++        }
++        break;
++    }
++
+     default: {
+         LOG(ERROR) << "Unsupported BML action_op:" << int(beerocks_header->action_op());
+         break;
+-- 
+2.34.1
+
