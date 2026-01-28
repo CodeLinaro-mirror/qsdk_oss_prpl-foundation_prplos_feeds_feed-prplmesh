@@ -1,0 +1,496 @@
+From 02e014281d3a62d88460cde1ab5a873a98720854 Mon Sep 17 00:00:00 2001
+From: Nirmal Raj S <nirm@qti.qualcomm.com>
+Date: Wed, 28 Jan 2026 10:20:04 +0530
+Subject: [PATCH] AP_MLD_RECONFIGURATION SUPPORT IN NLHAL
+
+Signed-off-by: Nirmal Raj S <nirm@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 |   5 +
+ common/beerocks/bwl/include/bwl/ap_wlan_hal.h |   2 +
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 348 +++++++++++++++++-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.h         |   3 +
+ .../bwl/shared/nl80211_client_impl.cpp        |   2 +-
+ .../hostapd/include/hostapd/configuration.h   |   2 +-
+ .../beerocks/hostapd/source/configuration.cpp |  16 +-
+ 7 files changed, 373 insertions(+), 5 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index e30b1e1dd..d7e2d3ecb 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -2335,6 +2335,11 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+         // same SSIDs on other radio (ex: single links).
+         ap_wlan_hal->update_mld_mode(request->ssid(), request->mld_mode());
+         ap_wlan_hal->update_mld_unit(request->ssid(), request->mld_unit());
++
++#ifdef USE_PRPLMESH_NLHAL
++        ap_wlan_hal->handle_mld_reconfig(request->ssid(),request->mld_unit());
++#endif        
++
+         break;
+     }
+     default: {
+diff --git a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+index 5e3b3a90e..c42973125 100644
+--- a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+@@ -643,6 +643,8 @@ public:
+      */
+     virtual bool update_mld_unit(std::string ssid, int8_t mld_unit) = 0;
+ 
++    virtual bool handle_mld_reconfig(std::string target_ssid, int8_t mld_unit) = 0;
++
+ private:
+     static const int frame_body_idx = (sizeof(s80211MgmtFrame::sHeader) * 2);
+ 
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 5ab7d9800..82c54bfca 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -255,6 +255,65 @@ std::string get_ifname_wrt_mld_grp(int mld_id, std::string cur_ifname,std::strin
+        }
+ 
+ }
++
++
++bool fetch_mld_iface_by_ssid(const std::string &target_ssid, std::string &mld_iface)
++{
++    const std::string filename = MLD_PAIR_ENTRANT_FILE;
++
++    int fd = open(filename.c_str(), O_RDONLY | O_CLOEXEC);
++    if (fd == -1) {
++        perror("open");
++        return false;
++    }
++
++    struct flock lock{};
++    lock.l_type   = F_RDLCK;
++    lock.l_whence = SEEK_SET;
++    lock.l_start  = 0;
++    lock.l_len    = 0;
++
++    if (fcntl(fd, F_SETLKW, &lock) == -1) {
++        perror("fcntl(F_SETLKW)");
++        close(fd);
++        return false;
++    }
++
++    int ret = 1; // default: not found
++    std::ifstream file(filename);
++    if (!file.is_open()) {
++        LOG(ERROR) << "Failed to open" << filename;
++        return false;
++    } else {
++        std::string line;
++        while (std::getline(file, line)) {
++            if (line.empty()) continue;
++
++            std::istringstream iss(line);
++            std::string id_str, name_str, ssid_str;
++
++            if (std::getline(iss, id_str, ',') &&
++                std::getline(iss, name_str, ',') &&
++                std::getline(iss, ssid_str))
++            {
++                if (ssid_str == target_ssid) {
++                    mld_iface = name_str;
++                    ret = 0; // found
++                    break;
++                }
++            }
++        }
++    }
++
++    lock.l_type = F_UNLCK;
++    if (fcntl(fd, F_SETLK, &lock) == -1) {
++        perror("fcntl(F_SETLK)");
++    }
++    close(fd);
++    return (ret==0);
++}
++
++
+ static uint8_t wpa_bw_to_beerocks_bw(const std::string &chan_width)
+ {
+     // 20 MHz (no HT)
+@@ -404,6 +463,67 @@ prplmesh::hostapd::Configuration ap_wlan_hal_nl80211::load_hostapd_config(const
+     return prplmesh::hostapd::Configuration("file not found");
+ }
+ 
++prplmesh::hostapd::Configuration ap_wlan_hal_nl80211::load_hostapd_config(const std::string &bssid)
++{
++    std::vector<std::string> hostapd_cfg_names;
++    std::string path = "/var/run/";
++    
++    auto hasExtension = [] (const std::string& filename, const std::string& extension) {
++        if (filename.length() >= extension.length()) {
++            return filename.compare(filename.length() - extension.length(), extension.length(), extension) == 0;
++        }
++        return false;
++    };
++
++    DIR* dir = opendir(path.c_str());
++    if (!dir) {
++        LOG(ERROR) << "can't open the directory" ;
++        return prplmesh::hostapd::Configuration("file not found");
++    }
++
++    struct dirent* entry;
++    std::string hostapd_phy = "hostapd-phy";
++    LOG(DEBUG) << " Load hostapd files startes with " << hostapd_phy;
++    while ((entry = readdir(dir)) != nullptr) {
++        if (entry->d_type == DT_REG && (strncmp(entry->d_name,hostapd_phy.c_str(),11) == 0) && hasExtension(entry->d_name,".conf")) {
++            std::string hostapd_conf_file = path + entry->d_name;
++            hostapd_cfg_names.push_back(hostapd_conf_file);
++        }
++    }
++
++    closedir(dir);
++
++    // sorting the filenames
++    std::sort(hostapd_cfg_names.begin(), hostapd_cfg_names.end());
++
++    for (const auto &try_fname : hostapd_cfg_names) {
++        LOG(DEBUG) << "Trying to load " << try_fname << "...";
++
++        if (!beerocks::os_utils::file_exists(try_fname)) {
++            continue;
++        }
++
++        prplmesh::hostapd::Configuration hostapd_conf(try_fname);
++
++        // try loading
++        if (!hostapd_conf.load("interface=", "bss=")) {
++            LOG(ERROR) << "Failed to load hostapd config file: " << hostapd_conf;
++            continue;
++        }
++
++        LOG(DEBUG) << " check bssid exists in conf file " ;
++        if (hostapd_conf.get_vap_by_bssid(bssid).empty()) {
++            LOG(DEBUG) << bssid << " does not exists in " << try_fname;
++            continue;
++        }
++        // all is good, return the conf
++        return hostapd_conf;
++    }
++
++    // return an empty one since we couldn't find the
++    return prplmesh::hostapd::Configuration("file not found");
++}
++
+ /**
+ * @brief Assign hostapd parameters based on authentication and
+ * encryption configuration.
+@@ -1391,7 +1511,7 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+             mld_id_val = beerocks::string_utils::stoi(bss_it.mld_id); // Convert string to int
+         }
+ 
+-        if (conf_bssid == beerocks::net::network_utils::WILD_MAC_STRING) {          
++        if (conf_bssid == beerocks::net::network_utils::WILD_MAC_STRING) {
+             LOG(INFO) << "create new vap for wildcard bssid ";
+ 
+             std::string new_vap_name = base_interface + "_" + std::to_string(new_vap_index);
+@@ -3088,6 +3208,232 @@ void ap_wlan_hal_nl80211::set_sta_enable(bool enable)
+     m_radio_info.sta_enabled = enable;
+ }
+ 
++bool ap_wlan_hal_nl80211::handle_mld_reconfig(std::string target_ssid, int8_t mld_unit)
++{
++    std::string mld_iface;
++
++    //fetch mld iface name using ssid
++    if (!fetch_mld_iface_by_ssid(target_ssid,mld_iface)) {
++        LOG(ERROR) << " Failed to get mld iface for SSID:" << target_ssid;
++        return false;
++    }
++
++    LOG(INFO) << "MLD_IFACE: " << mld_iface << " SSID:" << target_ssid << " MLD_UNIT:" << mld_unit;
++
++    std::string base_interface="";
++    extractLinkBaseInterface(m_radio_info.iface_name, base_interface);
++
++    // Load hostapd default config for the radio
++    prplmesh::hostapd::Configuration base_conf = load_hostapd_config(m_radio_info.iface_name,"");
++    if (!base_conf) {
++        LOG(ERROR) << "Autoconfiguration: no hostapd config to apply configuration!";
++        return false;
++    }
++
++    if (mld_unit == beerocks::DISABLED_MLDUNIT) {
++        LOG(DEBUG) << " REMOVE MLD LINK";
++
++        const auto vap_iter = 
++            std::find_if(m_radio_info.available_vaps.begin(),m_radio_info.available_vaps.end(),
++                        [&target_ssid](const std::pair<int, bwl::VAPElement> &elem) {
++                            return (elem.second.ssid == target_ssid);
++                        });
++       
++        // check ssid exists in available
++        if (vap_iter != m_radio_info.available_vaps.end()) {
++            auto &vap_info     = vap_iter->second;
++            LOG(INFO) << "REMOVE " << vap_info.bss << "MAC ADDR: "<< vap_info.mac << "AP_MLD_MAC: " << vap_info.ap_mld_mac;
++            
++            if (m_radio_info.iface_name == vap_info.bss) {
++                LOG(ERROR) << "Can't remove management vap which is bss[0]";
++                return false;
++            }
++
++            std::stringstream remove_cmd;
++            remove_cmd << "LINK_REMOVE " << HOST_MIN_ML_RECONF_COUNT;
++
++            LOG(DEBUG) << "CMD framed : " << remove_cmd.str();
++            if (!wpa_ctrl_send_msg(remove_cmd.str(), vap_info.bss)) {
++                LOG(ERROR) << "Failed to remove link of " << vap_info.bss;
++                return false;
++            }
++
++            // remove the fd for this link iface
++            base_wlan_hal_nl80211::remove_interface(vap_info.bss);
++
++            auto &vap_id = base_conf.get_vap_by_bssid(vap_info.mac);
++                LOG(INFO) << "vap_id: " << vap_id;
++            if (vap_id.empty()) {
++                LOG(ERROR) << "Failed to remove bss info from default config";
++                return false;
++            }
++ 
++            // store the removed bss config for creating SLO iface
++            m_radio_info.hostapd_new_bss_config.clear();
++
++            base_conf.remove_bss_config(vap_id);
++
++            if (!base_conf.store(vap_id)) {
++                LOG(ERROR) << "Failed to update default config file";
++                return false;
++            }
++
++            // mark bssid usage as false for non ap-mld-mac
++            if (vap_info.ap_mld_mac == vap_info.mac) {
++                LOG(INFO) << "LINK MAC and AP_MLD_MAC both are same";
++            } else {
++                LOG(INFO) << "LINK MAC is not AP_MLD_MAC ";
++                m_radio_info.bssid_pool[vap_info.mac] = false;
++            }
++            return true;
++        } else {
++            LOG(ERROR) << "MLD with SSID " << target_ssid << "does not exist skip REMOVE_LINK";
++            return false;
++        }
++    } else {
++        LOG(DEBUG) << " ADD MLD LINK";
++
++        const auto vap_iter =
++          std::find_if(m_radio_info.available_vaps.begin(),m_radio_info.available_vaps.end(),
++                      [&target_ssid](const std::pair<int, bwl::VAPElement> &elem) {
++                          return (elem.second.ssid == target_ssid);
++                      });
++
++        // check ssid exists in available
++        if (vap_iter != m_radio_info.available_vaps.end()) {
++            LOG(ERROR) << "SSID " << target_ssid << "is already present skip ADD_MLD_LINK";
++            return false;
++        }
++
++        std::string link_mac;
++        if (!m_nl80211_client->getMLDLinkIfaceMacAddr(mld_iface, link_mac)) {
++            LOG(ERROR) << "Unable to read interface info of " << mld_iface;
++            return false;
++        }
++            
++        // get bss config for link_mac
++        prplmesh::hostapd::Configuration mld_conf = load_hostapd_config(link_mac);
++ 
++        if (!mld_conf) {
++            LOG(ERROR) << "Unable to load hostapd config for interface " << mld_iface;
++            return false;
++        }
++            
++        std::vector<std::pair<std::string, std::vector<std::string>>> mld_info = mld_conf.get_hostapd_bss_config(mld_iface);
++        if (!mld_info.empty()) { 
++            m_radio_info.hostapd_new_bss_config = std::move(mld_info);
++
++            std::string conf_path =
++            std::string(bwl::nl80211::base_ctrl_path) + "hostapd-" + m_radio_info.phy_name + "." + mld_iface + ".conf";
++            // create new hostapd conf file
++            prplmesh::hostapd::Configuration new_conf(conf_path);
++
++            new_conf.set_hostapd_radio_config(m_radio_info.hostapd_radio_config);
++            
++            sMacAddr new_bssid;
++
++            if (!ap_wlan_hal_nl80211::generate_new_bssid(new_bssid)) {
++                LOG(ERROR) << " Failed to assign new bssid " ;
++                return false;
++            }
++
++            LOG(INFO) << "New BSSID: " << new_bssid;
++
++            // Add new bss configuration to default hostapd_config file
++            if (!m_radio_info.hostapd_new_bss_config.empty()) {
++                auto& new_vap = m_radio_info.hostapd_new_bss_config.front();
++                std::vector<std::string>& config_lines = new_vap.second;
++                
++                // remove multi_ap_backhaul_ssid
++                config_lines.erase(
++                    std::remove_if(config_lines.begin(), config_lines.end(),
++                        [](const std::string& line) {
++                            return line.rfind("multi_ap_backhaul_ssid=", 0) == 0; // starts with
++                        }),
++                    config_lines.end()
++                );
++                config_lines.erase(
++                    std::remove_if(config_lines.begin(), config_lines.end(),
++                        [](const std::string& line) {
++                            return line.rfind("multi_ap_backhaul_wpa_passphrase=", 0) == 0; // starts with
++                        }),
++                    config_lines.end()
++                );
++
++                for (auto& line : config_lines) {
++                    if (line.rfind("bss=", 0) == 0) { // starts with "bss="
++                        line = "interface=" + mld_iface;      // replace with "interface=<vap_name>"
++                    }
++                    if (line.rfind("bssid=", 0) == 0) { // starts with "bssid="
++                        line = "bssid=" + tlvf::mac_to_string(new_bssid);      // replace with new_bssid"
++                    }
++                }
++                new_conf.add_new_vap_to_default_config(new_vap);
++
++                if (!new_conf.store(mld_iface)) {
++                    LOG(ERROR) << "Failed to store the hostapd configuration!";
++                    return false;
++                }
++            }
++            // Create a WPA control socket for the existing interface where a new link is being added
++            int fd = base_wlan_hal_nl80211::add_interface(mld_iface);
++            if (fd < 0) {
++                LOG(ERROR) << "Failed to register and connect the new BSS interface!";
++                return false;
++            }
++            std::stringstream cmd;
++            cmd << "MLD_ADD_LINK bss_config=" <<m_radio_info.phy_name<< ":" <<conf_path;
++            if (!wpa_ctrl_send_msg(cmd.str(),mld_iface)) {
++                LOG(ERROR) << "Failed to add link to the BSS: " << mld_iface;
++                return false;
++            }
++
++            std::string new_bss_link = mld_iface;
++            std::string bssid = tlvf::mac_to_string(new_bssid);
++            int8_t link_id = 0;
++
++            if (!m_nl80211_client->get_bss_link_id(new_bss_link,bssid,link_id)) {
++                    LOG(ERROR) << " get_bss_link_id failed " ;
++            }
++
++            LOG(INFO) << "link_id updated to: " << link_id;
++            LOG(INFO) << "bss updated to: " << new_bss_link;
++            fd = base_wlan_hal_nl80211::add_interface(new_bss_link);
++            if (fd < 0) {
++                LOG(ERROR) << "Failed to register and connect the Link of new BSS interface!";
++                return false;
++            }
++            // Add new bss configuration to default hostapd_config file
++            if (!m_radio_info.hostapd_new_bss_config.empty()) {
++                auto& new_vap = m_radio_info.hostapd_new_bss_config.front();
++                std::vector<std::string>& config_lines = new_vap.second;
++
++                for (auto& line : config_lines) {
++                    if (line.rfind("interface=", 0) == 0) { // starts with "interface="
++                        line = "bss=" + new_vap.first;      // replace with "bss=<vap_name>"
++                        break;
++                    }
++                }
++                if (base_conf) {
++                    base_conf.add_new_vap_to_default_config(new_vap);
++                    m_radio_info.hostapd_new_bss_config.clear();
++                    // store the default config
++                    if (!base_conf.append_new_bss_to_default_hostapd_conf()) {
++                        LOG(ERROR) << "Autoconfiguration: failed to add new bss in default config file!";
++                    }
++                } else {
++                    LOG(ERROR) << "Default config file is not updated!";
++                }
++            }
++        } else {
++            LOG(ERROR) << "Failed to get mld info";
++            return false;
++        }
++    }
++    return true;
++}
++
++
+ } // namespace nl80211
+ 
+ std::shared_ptr<ap_wlan_hal> ap_wlan_hal_create(std::string iface_name, hal_conf_t hal_conf,
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+index 16270d671..e84480d1b 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+@@ -151,6 +151,9 @@ public:
+     start_platform_acs(const std::shared_ptr<airties::cACSChannelList> &acs_list) override;
+ 
+     virtual bool nl_event_handle(struct nl_msg *msg, void *arg = nullptr) override;
++    
++    virtual bool handle_mld_reconfig(std::string target_ssid, int8_t mld_unit) override;
++    prplmesh::hostapd::Configuration load_hostapd_config(const std::string &bssid);
+ 
+     // Protected methods:
+ protected:
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.cpp b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+index 18e4b5335..4fbdb4674 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -241,7 +241,7 @@ bool nl80211_client_impl::getMLDLinkIfaceMacAddr(std::string &interface_name, st
+                 struct nlattr *attrs, *link[NL80211_ATTR_MAX + 1];
+                 nla_for_each_nested(attrs, tb[NL80211_ATTR_MLO_LINKS], ret) {
+                     nla_parse_nested(link, NL80211_ATTR_MAX, attrs, NULL);
+-                    if (link[NL80211_ATTR_MLO_LINK_ID] && (nla_get_u8(link[NL80211_ATTR_MLO_LINK_ID]) == link_idx)) {
++                    if ((link_idx == -1) || (link[NL80211_ATTR_MLO_LINK_ID] && (nla_get_u8(link[NL80211_ATTR_MLO_LINK_ID]) == link_idx))) {
+                         if (link[NL80211_ATTR_MAC]) {
+                             const uint8_t *link_addr = static_cast<const uint8_t *>(nla_data(link[NL80211_ATTR_MAC]));
+                             mac_out = tlvf::mac_to_string(link_addr);
+diff --git a/common/beerocks/hostapd/include/hostapd/configuration.h b/common/beerocks/hostapd/include/hostapd/configuration.h
+index cb225a11a..a001a776d 100644
+--- a/common/beerocks/hostapd/include/hostapd/configuration.h
++++ b/common/beerocks/hostapd/include/hostapd/configuration.h
+@@ -221,7 +221,7 @@ public:
+     std::vector<std::string> get_hostapd_radio_config();
+     void set_hostapd_radio_config(std::vector<std::string> &config);
+    
+-    std::vector<std::pair<std::string, std::vector<std::string>>> get_hostapd_bss_config();    
++    std::vector<std::pair<std::string, std::vector<std::string>>> get_hostapd_bss_config(const std::string &vap = {});    
+  
+     void add_new_vap_to_default_config (const std::pair<std::string, std::vector<std::string>>& new_vap);
+ 
+diff --git a/common/beerocks/hostapd/source/configuration.cpp b/common/beerocks/hostapd/source/configuration.cpp
+index c2f956bef..96c11c9e8 100644
+--- a/common/beerocks/hostapd/source/configuration.cpp
++++ b/common/beerocks/hostapd/source/configuration.cpp
+@@ -518,9 +518,21 @@ std::vector<std::string> Configuration::get_hostapd_radio_config()
+     return m_hostapd_config_head; 
+ }
+ 
+-std::vector<std::pair<std::string, std::vector<std::string>>> Configuration::get_hostapd_bss_config()
++std::vector<std::pair<std::string, std::vector<std::string>>> Configuration::get_hostapd_bss_config(const std::string &vap)
+ {
+-    return m_hostapd_config_vaps; 
++    if (vap.empty()) {
++        return m_hostapd_config_vaps; 
++    } else {
++        const auto it = std::find_if(
++            m_hostapd_config_vaps.begin(), m_hostapd_config_vaps.end(),
++            [&](const auto &entry) { return entry.first == vap; });
++
++        if (it != m_hostapd_config_vaps.end()) {
++            return { *it }; // returns a **copy** of (vap_name, params)
++        }
++    }
++
++    return {};
+ }
+ 
+ void Configuration::add_new_vap_to_default_config(const std::pair<std::string, std::vector<std::string>>& new_vap)
+-- 
+2.34.1
+
