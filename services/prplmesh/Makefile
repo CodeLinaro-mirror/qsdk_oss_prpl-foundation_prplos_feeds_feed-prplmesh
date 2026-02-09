@@ -52,7 +52,8 @@ define Package/prplmesh
 		+uci \
 		+ubus \
 		+ubox \
-		+ebtables
+		+ebtables \
+        +libpcap
 #	intel_mips and intel_x86 specific dependencies:
 	DEPENDS+= \
 		+TARGET_intel_mips:dwpal_6x-uci \
