@@ -1,0 +1,383 @@
+From 259370379484cf04e24b997ba3b58caa02a696c7 Mon Sep 17 00:00:00 2001
+From: Girija P <gpandiya@qti.qualcomm.com>
+Date: Tue, 10 Feb 2026 05:58:52 +0530
+Subject: [PATCH] Link based sta mac derival and invalidation in bssid_pool in
+ MLD BSTA case Send messages to ap manager not based on sta iface name but sta
+ mac address Extract sta network params from M8 irrespective of any conditions
+ to use it in case of BH link down event
+
+Signed-off-by: Girija P <gpandiya@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/agent_db.h           |  1 +
+ .../backhaul_manager/backhaul_manager.cpp     | 63 ++++++++++++++++---
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  5 +-
+ .../tasks/controller_connectivity_task.cpp    |  4 ++
+ .../beerocks/bwl/include/bwl/nl80211_client.h |  2 +-
+ .../bwl/include/bwl/nl80211_client_impl.h     |  2 +-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 12 ++--
+ .../bwl/shared/nl80211_client_impl.cpp        | 43 +++++++++++--
+ .../beerocks/bwl/whm/nl80211_client_whm.cpp   |  2 +-
+ common/beerocks/bwl/whm/nl80211_client_whm.h  |  2 +-
+ 10 files changed, 113 insertions(+), 23 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 80ad3a82c..588dfe347 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -210,6 +210,7 @@ public:
+     struct sBackhaul {
+         enum class eConnectionType { Invalid = 0, Wired, Wireless } connection_type;
+         std::string selected_iface_name;
++        sMacAddr selected_iface_radio_mac = net::network_utils::ZERO_MAC;
+         sMacAddr preferred_bssid;
+ 
+         // Multi-AP Profile advertised by the upstream AP in its association response.
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index b8b88a8f7..b03083715 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -569,7 +569,10 @@ bool BackhaulManager::handle_backhaul_connect()
+ 
+     for (auto &radio_info : m_radios_info) { // Detach from unused stations first
+         if (db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wireless &&
+-            radio_info->sta_iface == db->backhaul.selected_iface_name) {
++            ((radio_info->sta_iface == db->backhaul.selected_iface_name) &&
++             (radio_info->radio_mac != net::network_utils::ZERO_MAC &&
++            db->backhaul.selected_iface_radio_mac != net::network_utils::ZERO_MAC &&
++            radio_info->radio_mac == db->backhaul.selected_iface_radio_mac))) {
+             continue;
+         } else {
+             clear_radio_handlers(radio_info);
+@@ -581,7 +584,10 @@ bool BackhaulManager::handle_backhaul_connect()
+ 
+     for (auto &radio_info : m_radios_info) {
+         if (db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wireless &&
+-            radio_info->sta_iface == db->backhaul.selected_iface_name) {
++            radio_info->sta_iface == db->backhaul.selected_iface_name &&
++            radio_info->radio_mac != net::network_utils::ZERO_MAC &&
++            db->backhaul.selected_iface_radio_mac != net::network_utils::ZERO_MAC &&
++            radio_info->radio_mac == db->backhaul.selected_iface_radio_mac) {
+             LOG_IF(!radio_info->sta_wlan_hal, FATAL) << "selected sta_hal is nullptr";
+             db->backhaul.backhaul_bssid =
+                 tlvf::mac_from_string(radio_info->sta_wlan_hal->get_bssid());
+@@ -804,6 +810,7 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+             // Mark the connection as WIRED
+             db->backhaul.connection_type     = AgentDB::sBackhaul::eConnectionType::Wired;
+             db->backhaul.selected_iface_name = db->ethernet.wan.iface_name;
++            db->backhaul.selected_iface_radio_mac = net::network_utils::ZERO_MAC;
+ 
+         } else {
+             // If no wired backhaul is configured, or it is down, we get into this else branch.
+@@ -896,8 +903,9 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+                     send_slaves_enable();
+ 
+                     // Mark the connection as WIRED
+-                    db->backhaul.connection_type     = AgentDB::sBackhaul::eConnectionType::Wired;
+-                    db->backhaul.selected_iface_name = db->ethernet.wan.iface_name;
++                    db->backhaul.connection_type          = AgentDB::sBackhaul::eConnectionType::Wired;
++                    db->backhaul.selected_iface_name      = db->ethernet.wan.iface_name;
++                    db->backhaul.selected_iface_radio_mac = net::network_utils::ZERO_MAC;
+                     LOG(DEBUG) << " Moved to WIRED BACKHAUL";
+ 
+                 }
+@@ -1508,6 +1516,10 @@ bool BackhaulManager::backhaul_fsm_wireless(bool &skip_select)
+             }
+ 
+             db->backhaul.selected_iface_name = iface;
++            auto radio = db->radio(iface);
++            if (radio) {
++                db->backhaul.selected_iface_radio_mac = radio->front.iface_mac;
++            }
+             active_hal                       = get_wireless_hal();
+         }
+         // PRPLMESH [NLHAL] TODO: Since db is not updated with correct values, commented down set network
+@@ -1933,9 +1945,9 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+         LOG(TRACE) << "received ACTION_BACKHAUL_WIFI_CREDENTIALS_UPDATE_REQUEST";
+         auto db = AgentDB::get();
+ 
+-        bool wired_backhaul =
++/*        bool wired_backhaul =
+             db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wired;
+-
++*/
+         auto request =
+             beerocks_header
+                 ->addClass<beerocks_message::cACTION_BACKHAUL_WIFI_CREDENTIALS_UPDATE_REQUEST>();
+@@ -1947,7 +1959,7 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+         const sMacAddr &radio_mac = request->radio_mac();
+ 
+         LOG(DEBUG) << "handle ACTION_BACKHAUL_WIFI_CREDENTIALS_UPDATE_REQUEST for bsta " << radio_mac;
+-        if ((!db->device_conf.local_gw) && wired_backhaul && (m_prev_bh_connection != backhaul_connection::Wireless)) {
++        if (!db->device_conf.local_gw) {
+ 
+             for (auto &radio_info : m_radios_info) {
+                 std::string iface = radio_info->sta_iface;
+@@ -2121,7 +2133,10 @@ bool BackhaulManager::send_slaves_enable()
+         notification->set_iface(radio_info->hostap_iface);
+ 
+         // enable wireless backhaul interface on the selected channel
+-        if (radio_info->sta_iface == db->backhaul.selected_iface_name) {
++        if ( (radio_info->sta_iface == db->backhaul.selected_iface_name) && 
++            (radio_info->radio_mac != net::network_utils::ZERO_MAC &&
++            db->backhaul.selected_iface_radio_mac != net::network_utils::ZERO_MAC &&
++            radio_info->radio_mac == db->backhaul.selected_iface_radio_mac)) {
+             notification->channel() = iface_hal->get_channel();
+             // Set default bw 0 (20Mhz) to cover most cases.
+             // Since channel operates in 20Mhz center_channel is the same as the main channel.
+@@ -2252,6 +2267,10 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+ 
+         if (FSM_IS_IN_STATE(WAIT_WPS) || FSM_IS_IN_STATE(WIRELESS_CONFIG_4ADDR_MODE)) {
+             db->backhaul.selected_iface_name = iface;
++            auto radio = db->radio(iface);
++            if (radio) {
++                db->backhaul.selected_iface_radio_mac = radio->front.iface_mac;
++            }
+             db->backhaul.connection_type     = AgentDB::sBackhaul::eConnectionType::Wireless;
+             LOG(DEBUG) << "WPS scan completed successfully on iface = " << iface
+                        << ", enabling all APs";
+@@ -2600,6 +2619,10 @@ bool BackhaulManager::select_bssid()
+                                << int(roam_selected_bssid_channel.first)
+                                << " freq type = " << roam_selected_bssid_channel.second;
+                     db->backhaul.selected_iface_name = iface;
++                    auto radio = db->radio(iface);
++                    if (radio) {
++                        db->backhaul.selected_iface_radio_mac = radio->front.iface_mac;
++                    }
+                     return true;
+                 }
+             } else if ((db->backhaul.preferred_bssid != beerocks::net::network_utils::ZERO_MAC) &&
+@@ -2608,6 +2631,10 @@ bool BackhaulManager::select_bssid()
+                 selected_bssid_channel           = {scan_result.channel, scan_result.freq_type};
+                 selected_bssid                   = bssid;
+                 db->backhaul.selected_iface_name = iface;
++                auto radio = db->radio(iface);
++                if (radio) {
++                    db->backhaul.selected_iface_radio_mac = radio->front.iface_mac;
++                }
+                 return true;
+             } else if (scan_result.freq_type == eFreqType::FREQ_5G) {
+                 auto radio = db->radio(radio_info->sta_iface);
+@@ -2729,22 +2756,42 @@ bool BackhaulManager::select_bssid()
+         selected_bssid                   = best_bssid_5;
+         selected_bssid_channel           = {best_bssid_channel_5, eFreqType::FREQ_5G};
+         db->backhaul.selected_iface_name = best_5_sta_iface;
++        auto radio = db->radio(best_5_sta_iface);
++        if (radio) {
++            db->backhaul.selected_iface_radio_mac = radio->front.iface_mac;
++        }
+     } else if (max_rssi_5_best == beerocks::RSSI_INVALID) {
+         selected_bssid                   = best_bssid_24;
+         selected_bssid_channel           = {best_bssid_channel_24, eFreqType::FREQ_24G};
+         db->backhaul.selected_iface_name = best_24_sta_iface;
++        auto radio = db->radio(best_24_sta_iface);
++        if (radio) {
++            db->backhaul.selected_iface_radio_mac = radio->front.iface_mac;
++        }
+     } else if ((max_rssi_5_best > RSSI_THRESHOLD_5GHZ)) {
+         selected_bssid                   = best_bssid_5;
+         selected_bssid_channel           = {best_bssid_channel_5, eFreqType::FREQ_5G};
+         db->backhaul.selected_iface_name = best_5_sta_iface;
++        auto radio = db->radio(best_5_sta_iface);
++        if (radio) {
++            db->backhaul.selected_iface_radio_mac = radio->front.iface_mac;
++        }
+     } else if (max_rssi_24 < max_rssi_5_best + RSSI_BAND_DELTA_THRESHOLD) {
+         selected_bssid                   = best_bssid_5;
+         selected_bssid_channel           = {best_bssid_channel_5, eFreqType::FREQ_5G};
+         db->backhaul.selected_iface_name = best_5_sta_iface;
++        auto radio = db->radio(best_5_sta_iface);
++        if (radio) {
++            db->backhaul.selected_iface_radio_mac = radio->front.iface_mac;
++        }
+     } else {
+         selected_bssid                   = best_bssid_24;
+         selected_bssid_channel           = {best_bssid_channel_24, eFreqType::FREQ_24G};
+         db->backhaul.selected_iface_name = best_24_sta_iface;
++        auto radio = db->radio(best_24_sta_iface);
++        if (radio) {
++            db->backhaul.selected_iface_radio_mac = radio->front.iface_mac;
++        }
+     }
+ 
+     if (!get_wireless_hal()) {
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 7a75ca01a..1bd340949 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -941,7 +941,10 @@ bool ApAutoConfigurationTask::send_ap_autoconfiguration_wsc_m1_message(
+     // Backhaul Params
+     bool wireless_bh_manager =
+         db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wireless &&
+-        radio->back.iface_name == db->backhaul.selected_iface_name;
++        ((radio->back.iface_name == db->backhaul.selected_iface_name) &&
++         (radio->front.iface_mac != net::network_utils::ZERO_MAC &&
++            db->backhaul.selected_iface_radio_mac != net::network_utils::ZERO_MAC &&
++            radio->front.iface_mac == db->backhaul.selected_iface_radio_mac));
+ 
+     std::string first_radio_iface;
+     auto first_radio_it = db->get_radios_list().begin();
+diff --git a/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp b/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp
+index 869b376f8..458702a4b 100644
+--- a/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp
++++ b/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp
+@@ -149,6 +149,10 @@ void ControllerConnectivityTask::work()
+ 
+             db->backhaul.connection_type     = AgentDB::sBackhaul::eConnectionType::Wireless;
+             db->backhaul.selected_iface_name = it->iface_name;
++            auto radio = db->radio(it->iface_name);
++            if (radio) {
++                db->backhaul.selected_iface_radio_mac = radio->front.iface_mac;
++            }
+ 
+             // Filling in credentials for a future backhaul connection
+             db->device_conf.back_radio.ssid = it->credentials.front().ssid;
+diff --git a/common/beerocks/bwl/include/bwl/nl80211_client.h b/common/beerocks/bwl/include/bwl/nl80211_client.h
+index ff0d7f923..7592029f5 100644
+--- a/common/beerocks/bwl/include/bwl/nl80211_client.h
++++ b/common/beerocks/bwl/include/bwl/nl80211_client.h
+@@ -636,7 +636,7 @@ public:
+     
+     virtual bool get_mlo_active_link_count(std::string &bss,int8_t &active_link) =0;
+     virtual bool get_sta_iface_mac(const std::string &sta_iface,
+-                                             std::string &sta_mac) = 0 ;
++                                             std::vector<std::string> &sta_mac_list) = 0 ;
+     virtual bool get_radio_band_info(int8_t &num_of_bands) = 0;
+ };
+ 
+diff --git a/common/beerocks/bwl/include/bwl/nl80211_client_impl.h b/common/beerocks/bwl/include/bwl/nl80211_client_impl.h
+index b464dadb2..e3c4d5add 100644
+--- a/common/beerocks/bwl/include/bwl/nl80211_client_impl.h
++++ b/common/beerocks/bwl/include/bwl/nl80211_client_impl.h
+@@ -203,7 +203,7 @@ public:
+     virtual bool get_mlo_active_link_count(std::string &bss,int8_t &active_link) override;
+ 
+     virtual bool get_sta_iface_mac(const std::string &sta_iface,
+-                                             std::string &sta_mac) override ;
++                                             std::vector<std::string> &sta_mac_list) override ;
+    
+     virtual bool get_radio_band_info(int8_t &num_of_bands) override;
+ private:
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 6895c98bb..8cdbf677a 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -3034,16 +3034,18 @@ void ap_wlan_hal_nl80211::generate_bssid_pool()
+         return;
+     }
+     std::string updated_iface(sta_iface);
+-    std::string sta_mac;
++    std::vector<std::string> sta_mac_list;
+     if (!beerocks::net::network_utils::linux_iface_exists(updated_iface)) {
+         LOG(DEBUG) << "sta_iface " << updated_iface << " is not present";
+         return;
+     } else {
+         LOG(DEBUG) << "sta_iface " << updated_iface << " is present - get bssid";
+-        //TODO: [NLHAL] - Needs to handle MLD BSTA case
+-        if (m_nl80211_client->get_sta_iface_mac(updated_iface,sta_mac)) {
+-            LOG(DEBUG) << " STA_IFACE: " << updated_iface << " STA_MAC: " << sta_mac;
+-            m_radio_info.bssid_pool[sta_mac] = true;
++        if (m_nl80211_client->get_sta_iface_mac(updated_iface, sta_mac_list)) {
++            LOG(DEBUG) << " STA_IFACE: " << updated_iface << " STA_MAC_COUNT: " << sta_mac_list.size();
++            for (const auto& sta_mac : sta_mac_list) {
++                LOG(DEBUG) << " STA_MAC: " << sta_mac;
++                m_radio_info.bssid_pool[sta_mac] = true;
++            }
+         }
+ 
+     }
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.cpp b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+index f7fab946c..a0d9314c1 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -1999,10 +1999,10 @@ bool nl80211_client_impl::get_mlo_active_link_count(std::string &interface_name,
+ }
+ 
+ bool nl80211_client_impl::get_sta_iface_mac(const std::string &sta_iface,
+-                                             std::string &sta_mac)
++                                             std::vector<std::string> &sta_mac_list)
+ {
+-                                             
+     interface_info interface_info;
++    sta_mac_list.clear();
+ 
+     if (!m_socket) {
+         LOG(ERROR) << "Socket is NULL!";
+@@ -2031,13 +2031,46 @@ bool nl80211_client_impl::get_sta_iface_mac(const std::string &sta_iface,
+                 LOG(ERROR) << "Failed to parse netlink message!";
+                 return;
+             }
+-            //TODO: [NLHAL] - Needs to handle MLD BSTA case
++
++            // Read primary MAC address (non-MLO case or MLD MAC)
+             if (tb[NL80211_ATTR_MAC]) {
+                 const uint8_t *data = static_cast<const uint8_t *>(nla_data(tb[NL80211_ATTR_MAC]));
+-
+                 tlvf::mac_from_array(data, interface_info.addr);
+-                sta_mac = tlvf::mac_to_string(interface_info.addr);
++                std::string mac_str = tlvf::mac_to_string(interface_info.addr);
++                sta_mac_list.push_back(mac_str);
++                LOG(DEBUG) << "Primary MAC address: " << mac_str;
++            }
++
++            // Check for MLO links and read all link MAC addresses
++            if (tb[NL80211_ATTR_MLO_LINKS]) {
++                LOG(DEBUG) << "MLO links present, reading link MAC addresses";
++                int ret = 0;
++                struct nlattr *attrs, *link[NL80211_ATTR_MAX + 1];
++                nla_for_each_nested(attrs, tb[NL80211_ATTR_MLO_LINKS], ret) {
++                    nla_parse_nested(link, NL80211_ATTR_MAX, attrs, NULL);
++                    
++                    if (link[NL80211_ATTR_MAC]) {
++                        const uint8_t *link_addr = static_cast<const uint8_t *>(nla_data(link[NL80211_ATTR_MAC]));
++                        sMacAddr link_mac_addr;
++                        tlvf::mac_from_array(link_addr, link_mac_addr);
++                        std::string link_mac_str = tlvf::mac_to_string(link_mac_addr);
++                        
++                        // Add link MAC if it's not already in the list (avoid duplicates)
++                        if (std::find(sta_mac_list.begin(), sta_mac_list.end(), link_mac_str) == sta_mac_list.end()) {
++                            sta_mac_list.push_back(link_mac_str);
++                            
++                            if (link[NL80211_ATTR_MLO_LINK_ID]) {
++                                int link_id = nla_get_u8(link[NL80211_ATTR_MLO_LINK_ID]);
++                                LOG(DEBUG) << "Link ID " << link_id << " MAC address: " << link_mac_str;
++                            } else {
++                                LOG(DEBUG) << "Link MAC address: " << link_mac_str;
++                            }
++                        }
++                    }
++                }
+             }
++            
++            LOG(INFO) << "Total MAC addresses found for interface " << sta_iface << ": " << sta_mac_list.size();
+         });
+ }
+ 
+diff --git a/common/beerocks/bwl/whm/nl80211_client_whm.cpp b/common/beerocks/bwl/whm/nl80211_client_whm.cpp
+index 5b91d7b56..8da9f7e74 100644
+--- a/common/beerocks/bwl/whm/nl80211_client_whm.cpp
++++ b/common/beerocks/bwl/whm/nl80211_client_whm.cpp
+@@ -143,7 +143,7 @@ bool nl80211_client_whm::get_mlo_active_link_count(std::string &bss, int8_t &act
+     return false;
+ }
+ 
+-bool nl80211_client_whm::get_sta_iface_mac(const std::string &sta_iface, std::string &mac_out)
++bool nl80211_client_whm::get_sta_iface_mac(const std::string &sta_iface, std::vector<std::string> &sta_mac_list)
+ {
+     LOG(TRACE) << __func__ << " - NOT IMPLEMENTED";
+     return false;
+diff --git a/common/beerocks/bwl/whm/nl80211_client_whm.h b/common/beerocks/bwl/whm/nl80211_client_whm.h
+index 7c14c5b38..bed67d3be 100644
+--- a/common/beerocks/bwl/whm/nl80211_client_whm.h
++++ b/common/beerocks/bwl/whm/nl80211_client_whm.h
+@@ -87,7 +87,7 @@ public:
+     virtual bool get_radio_idx_from_link_id(const std::string &interface_name, int link_id, int &radio_idx) override;
+     virtual bool remove_vap_interface(std::string &iface) override;
+     virtual bool get_mlo_active_link_count(std::string &bss, int8_t &active_link) override;
+-    virtual bool get_sta_iface_mac(const std::string &sta_iface, std::string &mac_out) override;
++    virtual bool get_sta_iface_mac(const std::string &sta_iface, std::vector<std::string> &sta_mac_list) override;
+     virtual bool get_radio_band_info(int8_t &num_of_bands) override;
+ 
+     /**
+-- 
+2.34.1
+
