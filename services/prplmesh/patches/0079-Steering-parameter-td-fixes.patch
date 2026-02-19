@@ -1,0 +1,541 @@
+From a60a49428cc9522c0b70ebd8508bd96fc8958920 Mon Sep 17 00:00:00 2001
+From: Sureshkumar <suresure@qti.qualcomm.com>
+Date: Thu, 19 Feb 2026 15:27:52 +0530
+Subject: [PATCH]     [PATCH] Steering parameter & td fixes
+
+            1. Operating Class Calculation Fix:
+                            - Properly calculates operating class values for unassociated STA metrics and beacon reports
+
+            2. Configurable Beacon Measurement Modes:
+                            - Adds support for configurable 11k beacon measurement modes (Passive, Active, Table)
+
+            3. TD RSSI Instantaneous Update:
+                            - Updates network_map to use current RSSI values from stats_info
+
+            4. TD Bandwidth Update:
+                            - Updates network_map to use dynamic bandwidth from stats_info when available
+
+            5. 1905 ACK Transmission:
+                            - Implements proper ACK message transmission after controller receives beacon metric report
+
+            6. Populate SSID & SSID Length details on 11k beacon metric query
+                            - Accomodate respective SSID & length fields on 1905 beacon metric tlv to adhere spec
+
+Signed-off-by: Sureshkumar <suresure@qti.qualcomm.com>
+---
+ agent/config/beerocks_agent.conf.in           |  5 ++
+ .../fronthaul_manager/monitor/monitor.cpp     |  5 ++
+ agent/src/beerocks/slave/agent_db.h           |  1 +
+ .../beerocks/slave/beerocks_agent_main.cpp    | 16 +++++
+ .../bcl/include/bcl/beerocks_config_file.h    |  1 +
+ .../bcl/include/bcl/beerocks_defines.h        | 10 +++
+ .../bcl/source/beerocks_config_file.cpp       |  1 +
+ .../beerocks/bwl/include/bwl/mon_wlan_hal.h   |  5 ++
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 63 ++++++++++++-------
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   | 13 ++++
+ controller/src/beerocks/bml/bml_defs.h        |  6 +-
+ .../src/beerocks/cli/beerocks_cli_bml.cpp     |  3 +-
+ .../src/beerocks/cli/beerocks_cli_bml.h       |  1 +
+ controller/src/beerocks/master/controller.cpp | 16 +++--
+ controller/src/beerocks/master/db/db.cpp      |  1 +
+ .../src/beerocks/master/db/network_map.cpp    | 20 +++++-
+ controller/src/beerocks/master/db/station.h   |  1 +
+ .../src/beerocks/master/son_management.cpp    | 39 +++++++++++-
+ 18 files changed, 173 insertions(+), 34 deletions(-)
+
+diff --git a/agent/config/beerocks_agent.conf.in b/agent/config/beerocks_agent.conf.in
+index bd5f13904..22e508851 100644
+--- a/agent/config/beerocks_agent.conf.in
++++ b/agent/config/beerocks_agent.conf.in
+@@ -64,6 +64,11 @@ clients_unicast_measurements=0
+ # send_btm_to_non_11v_sta = 1 -> Allow sending BTM requests to STAs even if they do not support 802.11v
+ send_btm_to_non_11v_sta=0
+ 
++# beacon_11k_default_measurement_mode = BEACON_MEASUREMENT_MODE_PASSIVE (0) -> Passive measurement mode
++# beacon_11k_default_measurement_mode = BEACON_MEASUREMENT_MODE_ACTIVE (1) -> Active measurement mode
++# beacon_11k_default_measurement_mode = BEACON_MEASUREMENT_MODE_TABLE (2) -> Beacon Table measurement mode (default)
++beacon_11k_default_measurement_mode=2
++
+ [backhaul]
+ backhaul_preferred_bssid=
+ 
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+index c10319e26..eb0160b71 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+@@ -221,6 +221,11 @@ bool Monitor::thread_init()
+               << (clients_unicast_measurements ? "enabled" : "disabled");
+     mon_db.set_clients_unicast_measurements(clients_unicast_measurements);
+ 
++    // Initialize beacon 11k measurement mode from configuration
++    uint8_t beacon_mode = string_utils::stoi(beerocks_slave_conf.beacon_11k_default_measurement_mode);
++    LOG(DEBUG) << "Setting beacon_11k_measurement_mode to: " << int(beacon_mode);
++    bwl::nl80211::set_beacon_11k_measurement_mode(beacon_mode);
++
+ #ifdef USE_PRPLMESH_NLHAL
+     bwl::HALState state = mon_wlan_hal->get_state();
+     std::string interface_mld_mac;
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 588dfe347..14ea0bf4c 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -180,6 +180,7 @@ public:
+         uint8_t bsta_maximum_links   = 0;
+         bool enable_auto_chansel_handling;
+         int8_t num_of_bands = 0;
++        uint8_t beacon_11k_default_measurement_mode = 2;
+     } device_conf;
+ 
+     struct sControllerInfo {
+diff --git a/agent/src/beerocks/slave/beerocks_agent_main.cpp b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+index a2ff9842f..77364444f 100644
+--- a/agent/src/beerocks/slave/beerocks_agent_main.cpp
++++ b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+@@ -29,6 +29,7 @@ static std::shared_ptr<beerocks::nbapi::Amxrt> guarantee = nullptr;
+ 
+ #include <bcl/beerocks_cmdu_server_factory.h>
+ #include <bcl/beerocks_config_file.h>
++#include <bcl/beerocks_defines.h>
+ #include <bcl/beerocks_event_loop_impl.h>
+ #include <bcl/beerocks_logging.h>
+ #include <bcl/beerocks_timer_factory_impl.h>
+@@ -36,6 +37,7 @@ static std::shared_ptr<beerocks::nbapi::Amxrt> guarantee = nullptr;
+ #include <bcl/beerocks_utils.h>
+ #include <bcl/beerocks_version.h>
+ #include <bcl/network/network_utils.h>
++#include <bwl/mon_wlan_hal.h>
+ #include <mapf/common/utils.h>
+ 
+ #include <bpl/bpl_amx.h>
+@@ -505,6 +507,20 @@ static int run_beerocks_slave(beerocks::config_file::sConfigSlave &beerocks_slav
+             beerocks::string_utils::stoi(beerocks_slave_conf.send_btm_to_non_11v_sta);
+         db->device_conf.send_btm_to_non_11v_sta = send_btm_to_non_11v_sta;
+ 
++        // Read and validate beacon_11k_default_measurement_mode configuration
++        auto beacon_11k_mode = beerocks::string_utils::stoi(beerocks_slave_conf.beacon_11k_default_measurement_mode);
++        
++        if (beacon_11k_mode < BEACON_MEASUREMENT_MODE_PASSIVE || beacon_11k_mode > BEACON_MEASUREMENT_MODE_TABLE) {
++            LOG(WARNING) << "Invalid beacon_11k_default_measurement_mode value: " << beacon_11k_mode
++                         << ", using BEACON_TABLE mode (2) as default";
++            db->device_conf.beacon_11k_default_measurement_mode = BEACON_MEASUREMENT_MODE_TABLE;
++        } else {
++            db->device_conf.beacon_11k_default_measurement_mode = static_cast<uint8_t>(beacon_11k_mode);
++        }
++        
++        // Set the global beacon 11k measurement mode in the bwl layer
++        bwl::nl80211::set_beacon_11k_measurement_mode(db->device_conf.beacon_11k_default_measurement_mode);
++
+         auto dwell_time = beerocks::string_utils::stoi(beerocks_slave_conf.dwell_time);
+         if (dwell_time > 0) {
+             db->device_conf.dwell_time = dwell_time;
+diff --git a/common/beerocks/bcl/include/bcl/beerocks_config_file.h b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+index 1fa794a1f..e3fcf5a5f 100644
+--- a/common/beerocks/bcl/include/bcl/beerocks_config_file.h
++++ b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+@@ -98,6 +98,7 @@ public:
+         std::string enable_auto_chansel_handling;
+         std::string clients_unicast_measurements;
+         std::string send_btm_to_non_11v_sta;
++        std::string beacon_11k_default_measurement_mode;
+         //[slaveX]
+         std::string enable_repeater_mode[MAX_RADIOS_PER_AGENT];
+         std::string hostap_iface_type[MAX_RADIOS_PER_AGENT];
+diff --git a/common/beerocks/bcl/include/bcl/beerocks_defines.h b/common/beerocks/bcl/include/bcl/beerocks_defines.h
+index 6b6b2c92a..0d9fec357 100644
+--- a/common/beerocks/bcl/include/bcl/beerocks_defines.h
++++ b/common/beerocks/bcl/include/bcl/beerocks_defines.h
+@@ -525,6 +525,16 @@ enum class eZWDFS_flags : uint8_t {
+ constexpr int8_t DISABLED_MLDUNIT = -1;
+ constexpr int8_t INVALID_LINKID   = -1;
+ 
++/**
++ * @brief 802.11k Beacon Measurement Mode configuration
++ * 
++ * Defines the measurement mode to be used for 802.11k beacon requests.
++ * These values correspond to the Measurement Mode field in the Beacon Request.
++ */
++#define BEACON_MEASUREMENT_MODE_PASSIVE 0  /**< Passive measurement mode */
++#define BEACON_MEASUREMENT_MODE_ACTIVE  1  /**< Active measurement mode */
++#define BEACON_MEASUREMENT_MODE_TABLE   2  /**< Beacon Table measurement mode */
++
+ } // namespace beerocks
+ 
+ #endif //_BEEROCKS_DEFINES_H_
+diff --git a/common/beerocks/bcl/source/beerocks_config_file.cpp b/common/beerocks/bcl/source/beerocks_config_file.cpp
+index 93d3ebb4a..f6808e8bc 100644
+--- a/common/beerocks/bcl/source/beerocks_config_file.cpp
++++ b/common/beerocks/bcl/source/beerocks_config_file.cpp
+@@ -150,6 +150,7 @@ bool config_file::read_slave_config_file(const std::string &config_file_path, sC
+             std::make_tuple("enable_auto_chansel_handling=", &conf.enable_auto_chansel_handling, 0),
+             std::make_tuple("clients_unicast_measurements=", &conf.clients_unicast_measurements, 0),
+             std::make_tuple("send_btm_to_non_11v_sta=", &conf.send_btm_to_non_11v_sta, 0),
++            std::make_tuple("beacon_11k_default_measurement_mode=", &conf.beacon_11k_default_measurement_mode, 0),
+         };
+         std::string config_type = "global";
+         if (!read_config_file(config_file_path, slave_global_conf_args, config_type)) {
+diff --git a/common/beerocks/bwl/include/bwl/mon_wlan_hal.h b/common/beerocks/bwl/include/bwl/mon_wlan_hal.h
+index 39b1dcbb0..94a555083 100644
+--- a/common/beerocks/bwl/include/bwl/mon_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/mon_wlan_hal.h
+@@ -153,6 +153,11 @@ std::shared_ptr<mon_wlan_hal> mon_wlan_hal_create(const std::string &iface_name,
+                                                   base_wlan_hal::hal_event_cb_t cb,
+                                                   const bwl::hal_conf_t &hal_conf);
+ 
++// Global configuration setter for beacon 11k measurement mode
++namespace nl80211 {
++void set_beacon_11k_measurement_mode(uint8_t mode);
++}
++
+ } // namespace bwl
+ 
+ #endif // _BWL_MON_WLAN_HAL_H_
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 1fe3c188b..b96d2752a 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -9,8 +9,10 @@
+ #include "mon_wlan_hal_nl80211.h"
+ 
+ #include <bwl/nl80211_client.h>
++#include <bcl/beerocks_defines.h>
+ #include <bcl/beerocks_utils.h>
+ #include <bcl/network/network_utils.h>
++#include <bcl/son/son_wireless_utils.h>
+ #include <bwl/key_value_parser.h>
+ 
+ #include <easylogging++.h>
+@@ -34,6 +36,16 @@ extern "C" {
+ namespace bwl {
+ namespace nl80211 {
+ 
++// Global configuration for beacon 11k measurement mode
++static uint8_t g_beacon_11k_measurement_mode = BEACON_MEASUREMENT_MODE_PASSIVE;
++
++// Function to set the global beacon 11k measurement mode
++void set_beacon_11k_measurement_mode(uint8_t mode)
++{
++    g_beacon_11k_measurement_mode = mode;
++    LOG(DEBUG) << "Global beacon_11k_measurement_mode set to: " << int(g_beacon_11k_measurement_mode);
++}
++
+ // Minimal required implementation to resolve link error.
+ bool mon_wlan_hal_nl80211::nl_event_handle(struct nl_msg *msg, void *arg)
+ {
+@@ -388,30 +400,18 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+     uint8_t req_mode = (req.parallel | (req.enable ? 0x02 : 0) | (request ? 0x04 : 0) |
+                         (report ? 0x08 : 0) | (req.mandatory_duration ? 0x10 : 0));
+ 
+-    auto op_class = req.op_class < 0 ? GET_OP_CLASS(get_radio_info().channel) : req.op_class;
++    // Calculate operating class properly using radio info
++    auto &radio_info = get_radio_info();
++    auto op_class = req.op_class < 0 
++        ? son::wireless_utils::get_operating_class_by_channel(
++            beerocks::WifiChannel(radio_info.channel, radio_info.frequency_band, radio_info.bandwidth))
++        : req.op_class;
+ 
+     if (req.op_class <= 0) {
+-        LOG(WARNING) << __func__ << " op_class not set!";
++        LOG(WARNING) << __func__ << " op_class not set, calculated from radio: " << int(op_class);
+     }
+ 
+-    uint8_t measurement_mode;
+-    switch ((SBeaconRequest11k::MeasurementMode)(req.measurement_mode)) {
+-    case SBeaconRequest11k::MeasurementMode::Passive:
+-        measurement_mode = 0;
+-        break;
+-    case SBeaconRequest11k::MeasurementMode::Active:
+-        measurement_mode = 1;
+-        break;
+-    case SBeaconRequest11k::MeasurementMode::Table:
+-        measurement_mode = 2;
+-        break;
+-    default: {
+-        LOG(WARNING) << "Invalid measuremetn mode: " << int(req.measurement_mode)
+-                     << ", using PASSIVE...";
+-
+-        measurement_mode = 0;
+-    }
+-    }
++    uint8_t measurement_mode = g_beacon_11k_measurement_mode;
+ 
+     // REQ_BEACON 02:14:5f:b8:ae:9f req_mode=01 510B000011110004f021318193
+     // op_class (2), channel (2), randomization_interval (4), measurement duration (4), measurement mode (2), bssid (12)
+@@ -1044,6 +1044,15 @@ bool mon_wlan_hal_nl80211::process_roc_expired_event()
+ 
+     sUnassociatedStationsStats stats_out;
+ 
++    // Get radio info for operating class calculation
++    auto &radio_info = get_radio_info();
++    
++    LOG(DEBUG) << "Processing ROC expired event for radio: " 
++               << radio_info.iface_name 
++               << ", band=" << int(radio_info.frequency_band)
++               << ", current_channel=" << int(radio_info.channel)
++               << ", bandwidth=" << int(radio_info.bandwidth);
++
+     // Iterate through all STAs that were pending measurement
+     for (auto &measurement : m_pending_unassoc_measurements) {
+         int8_t rssi = 0;
+@@ -1058,9 +1067,17 @@ bool mon_wlan_hal_nl80211::process_roc_expired_event()
+             new_stat.signal_strength = (rssi_dbm + 110) * 2;
+             new_stat.channel         = measurement.channel;
+ 
+-            // Derive operating_class from channel
+-            new_stat.operating_class = GET_OP_CLASS(measurement.channel);
+-            // Note: operating_class was not stored in UnassocMeasurementContext
++            // Calculate operating_class based on channel and bandwidth using the proper utility function
++            uint8_t calculated_opclass = son::wireless_utils::get_operating_class_by_channel(
++                beerocks::WifiChannel(measurement.channel, radio_info.frequency_band, 
++                                     radio_info.bandwidth));
++            
++            new_stat.operating_class = calculated_opclass;
++            
++            LOG(DEBUG) << "STA=" << measurement.mac_address 
++                       << " channel=" << int(measurement.channel)
++                       << " calculated_opclass=" << int(calculated_opclass)
++                       << " RSSI[dBm]=" << rssi_dbm;
+             // It should be derived from the channel if needed by the caller
+ 
+             // Calculate time elapsed since measurement was initiated
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index bcd64aef2..1da363b59 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -2433,6 +2433,19 @@ bool ap_wlan_hal_whm::change_radio_mode_config(
+ 
+ } // namespace whm
+ 
++// Stub implementation for bwl::nl80211::set_beacon_11k_measurement_mode
++// This function is called by the agent but only implemented in the nl80211 HAL.
++// On Purple OS, whm HAL is used, so we need this stub to resolve linker errors.
++namespace nl80211 {
++void set_beacon_11k_measurement_mode(uint8_t mode)
++{
++    LOG(DEBUG) << "set_beacon_11k_measurement_mode called with mode=" << int(mode)
++               << " - NOT IMPLEMENTED for whm HAL (Purple OS platform)";
++    // This is a stub implementation to resolve linker errors on Purple OS platform
++    // The actual implementation is only available in the nl80211 HAL
++}
++} // namespace nl80211
++
+ std::shared_ptr<ap_wlan_hal> ap_wlan_hal_create(std::string iface_name, bwl::hal_conf_t hal_conf,
+                                                 base_wlan_hal::hal_event_cb_t callback)
+ {
+diff --git a/controller/src/beerocks/bml/bml_defs.h b/controller/src/beerocks/bml/bml_defs.h
+index 81d18515b..e44b29db9 100644
+--- a/controller/src/beerocks/bml/bml_defs.h
++++ b/controller/src/beerocks/bml/bml_defs.h
+@@ -214,12 +214,12 @@ struct BML_NODE {
+     /* DL_RSSI of the node*/
+     int8_t rx_rssi;
+ 
++    /* Signal quality (SNR) in dB */
++    int8_t signal_quality;
++
+     /* Wired/Wireless backhaul*/
+     bool isWiFiBH;
+ 
+-    /* Reserved bytes for alignment */
+-    uint8_t reserved[2];
+-
+     /* Extra information for the specific node. */
+     union N_DATA {
+ 
+diff --git a/controller/src/beerocks/cli/beerocks_cli_bml.cpp b/controller/src/beerocks/cli/beerocks_cli_bml.cpp
+index 0cd497b85..7aca26118 100644
+--- a/controller/src/beerocks/cli/beerocks_cli_bml.cpp
++++ b/controller/src/beerocks/cli/beerocks_cli_bml.cpp
+@@ -35,6 +35,7 @@ static void fill_conn_map_node(
+     n->freq_type                   = node->freq_type;
+     n->channel_ext_above_secondary = node->channel_ext_above_secondary;
+     n->rx_rssi                     = node->rx_rssi;
++    n->signal_quality              = node->signal_quality;
+     n->isWiFiBH                    = node->isWiFiBH;
+     n->mac                         = tlvf::mac_to_string(node->mac);
+     n->status                      = node->status;
+@@ -148,7 +149,7 @@ static void bml_utils_dump_conn_map(
+                    << utils::convert_bandwidth_to_string((beerocks::eWiFiBandwidth)node->bw)
+                    << utils::convert_channel_ext_above_to_string(node->channel_ext_above_secondary,
+                                                                  (beerocks::eWiFiBandwidth)node->bw)
+-                   << ", rx_rssi: " << std::to_string(node->rx_rssi);
++                   << ", rx_rssi: " << std::to_string(node->signal_quality);
+             }
+             ss << std::endl;
+ 
+diff --git a/controller/src/beerocks/cli/beerocks_cli_bml.h b/controller/src/beerocks/cli/beerocks_cli_bml.h
+index d2db0a7dc..712d6a57a 100644
+--- a/controller/src/beerocks/cli/beerocks_cli_bml.h
++++ b/controller/src/beerocks/cli/beerocks_cli_bml.h
+@@ -30,6 +30,7 @@ public:
+         uint8_t freq_type;
+         uint8_t channel_ext_above_secondary;
+         int8_t rx_rssi;
++        int8_t signal_quality;
+         bool isWiFiBH;
+         std::string mac;
+         bool status;
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 41239714d..eeb028c86 100644
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -2823,11 +2823,19 @@ bool Controller::handle_cmdu_1905_failed_connection_message(const sMacAddr &src_
+ bool Controller::handle_cmdu_1905_beacon_response(const sMacAddr &src_mac,
+                                                   ieee1905_1::CmduMessageRx &cmdu_rx)
+ {
+-    // here we need to extract and keep the data received from the STA
+-    // but currently we'll just print that we are here
+     auto mid = cmdu_rx.getMessageId();
+-    LOG(DEBUG) << "got beacon response from STA. mid: 0x" << std::hex << mid;
+-    return true;
++    LOG(DEBUG) << "Received BEACON_METRICS_RESPONSE_MESSAGE from " << src_mac 
++               << ", mid=0x" << std::hex << mid;
++
++    // Build ACK message CMDU
++    auto cmdu_tx_header = cmdu_tx.create(mid, ieee1905_1::eMessageType::ACK_MESSAGE);
++    if (!cmdu_tx_header) {
++        LOG(ERROR) << "cmdu creation of type ACK_MESSAGE, has failed";
++        return false;
++    }
++
++    LOG(DEBUG) << "Sending ACK message back to agent, mid=0x" << std::hex << mid;
++    return son_actions::send_cmdu_to_agent(src_mac, cmdu_tx, database);
+ }
+ 
+ bool Controller::handle_intel_slave_join(
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 62cceae9a..dd9ef4e4e 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -5248,6 +5248,7 @@ bool db::set_sta_stats_info(const sMacAddr &mac, const beerocks_message::sStaSta
+         pStats->rx_load_percent   = params->rx_load_percent;
+         pStats->stats_delta_ms    = params->stats_delta_ms;
+         pStats->rx_rssi           = params->rx_rssi;
++        pStats->dl_bandwidth      = params->dl_bandwidth;
+         pStats->timestamp         = std::chrono::steady_clock::now();
+     }
+     return true;
+diff --git a/controller/src/beerocks/master/db/network_map.cpp b/controller/src/beerocks/master/db/network_map.cpp
+index 5e54c55bb..752b42090 100644
+--- a/controller/src/beerocks/master/db/network_map.cpp
++++ b/controller/src/beerocks/master/db/network_map.cpp
+@@ -301,7 +301,16 @@ std::ptrdiff_t network_map::fill_bml_station_data(db &database, std::shared_ptr<
+                      << " has empty wifi channel";
+     }
+     node->channel                     = station->wifi_channel.get_channel();
+-    node->bw                          = station->wifi_channel.get_bandwidth();
++    
++    // Use dynamic bandwidth from stats_info if available (for associated clients)
++    if (station->stats_info && station->stats_info->dl_bandwidth != 0) {
++        node->bw = station->stats_info->dl_bandwidth;
++        LOG(DEBUG) << "Using dynamic bandwidth from stats_info for STA " 
++                   << tlvf::mac_to_string(station->mac) << ": bw=" << node->bw;
++    } else {
++        node->bw = station->wifi_channel.get_bandwidth();
++    }
++    
+     node->freq_type                   = station->wifi_channel.get_freq_type();
+     node->channel_ext_above_secondary = station->wifi_channel.get_ext_above_secondary();
+ 
+@@ -317,6 +326,15 @@ std::ptrdiff_t network_map::fill_bml_station_data(db &database, std::shared_ptr<
+     }
+ 
+     node->rx_rssi = database.get_sta_load_rx_rssi(tlvf::mac_to_string(station->mac));
++    
++    // Use the current RSSI from stats_info directly
++    if (station->stats_info) {
++        node->signal_quality = station->stats_info->rx_rssi;
++        LOG(DEBUG) << "Setting signal_quality from stats_info for STA " 
++                   << tlvf::mac_to_string(station->mac) << ": " << int(node->signal_quality) << " dBm";
++    } else {
++        node->signal_quality = 0;
++    }
+ 
+     network_utils::ipv4_from_string(node->ip_v4, station->ipv4);
+     string_utils::copy_string(node->name, station->name.c_str(), sizeof(node->name));
+diff --git a/controller/src/beerocks/master/db/station.h b/controller/src/beerocks/master/db/station.h
+index f8e3f0173..05fe610b5 100644
+--- a/controller/src/beerocks/master/db/station.h
++++ b/controller/src/beerocks/master/db/station.h
+@@ -150,6 +150,7 @@ public:
+         uint16_t rx_phy_rate_100kb                      = 0;
+         uint16_t tx_phy_rate_100kb                      = 0;
+         int8_t rx_rssi                                  = beerocks::RSSI_INVALID;
++        uint16_t dl_bandwidth                           = 0;
+         uint16_t stats_delta_ms                         = 0;
+         std::chrono::steady_clock::time_point timestamp = std::chrono::steady_clock::now();
+     };
+diff --git a/controller/src/beerocks/master/son_management.cpp b/controller/src/beerocks/master/son_management.cpp
+index cb64e8bcf..876ee0afc 100644
+--- a/controller/src/beerocks/master/son_management.cpp
++++ b/controller/src/beerocks/master/son_management.cpp
+@@ -2760,14 +2760,33 @@ void son_management::handle_bml_message(int sd, std::shared_ptr<beerocks_header>
+                 beacon_query_tlv->bssid() = bssid; // Wildcard BSSID
+                 beacon_query_tlv->reporting_detail_value() = request->reporting_detail();
+ 
+-                // Handle optional SSID
++                // Handle SSID - lookup from database if BSSID is provided and not wildcard
++                std::string ssid;
++                if (!is_broadcast) {
++                    // Try to get SSID from database for the specific BSSID
++                    ssid = database.get_bss_ssid(bssid);
++                }
++                
++                // Use SSID from request if provided, otherwise use database lookup
+                 if (request->ssid_length() > 0) {
+                     if (!beacon_query_tlv->alloc_ssid(request->ssid_length())) {
+                         LOG(ERROR) << "Failed to allocate SSID buffer for agent " << agent->al_mac;
+                         continue;
+                     }
+                     std::memcpy(beacon_query_tlv->ssid(), request->ssid(0), request->ssid_length());
++                    beacon_query_tlv->ssid_length() = request->ssid_length();
++                } else if (!ssid.empty()) {
++                    // Use SSID from database lookup
++                    if (!beacon_query_tlv->alloc_ssid(ssid.length())) {
++                        LOG(ERROR) << "Failed to allocate SSID buffer for agent " << agent->al_mac;
++                        continue;
++                    }
++                    std::memcpy(beacon_query_tlv->ssid(), ssid.data(), ssid.length());
++                    beacon_query_tlv->ssid_length() = ssid.length();
++                    LOG(DEBUG) << "Using SSID from database: " << ssid << " (length=" << ssid.length() << ")";
+                 } else {
++                    // No SSID available - use wildcard (empty)
++                    beacon_query_tlv->alloc_ssid(0);
+                     beacon_query_tlv->ssid_length() = 0;
+                 }
+ 
+@@ -2813,15 +2832,31 @@ void son_management::handle_bml_message(int sd, std::shared_ptr<beerocks_header>
+             beacon_query_tlv->bssid() = bssid; // Specific BSSID
+             beacon_query_tlv->reporting_detail_value() = request->reporting_detail();
+ 
+-            // Handle optional SSID
++            // Handle SSID - lookup from database for the specific BSSID
++            std::string ssid = database.get_bss_ssid(bssid);
++            
++            // Use SSID from request if provided, otherwise use database lookup
+             if (request->ssid_length() > 0) {
+                 if (!beacon_query_tlv->alloc_ssid(request->ssid_length())) {
+                     LOG(ERROR) << "Failed to allocate SSID buffer";
+                     break;
+                 }
+                 std::memcpy(beacon_query_tlv->ssid(), request->ssid(0), request->ssid_length());
++                beacon_query_tlv->ssid_length() = request->ssid_length();
++            } else if (!ssid.empty()) {
++                // Use SSID from database lookup
++                if (!beacon_query_tlv->alloc_ssid(ssid.length())) {
++                    LOG(ERROR) << "Failed to allocate SSID buffer";
++                    break;
++                }
++                std::memcpy(beacon_query_tlv->ssid(), ssid.data(), ssid.length());
++                beacon_query_tlv->ssid_length() = ssid.length();
++                LOG(DEBUG) << "Using SSID from database for BSSID " << bssid << ": " << ssid << " (length=" << ssid.length() << ")";
+             } else {
++                // No SSID available - use wildcard (empty)
++                beacon_query_tlv->alloc_ssid(0);
+                 beacon_query_tlv->ssid_length() = 0;
++                LOG(DEBUG) << "No SSID found for BSSID " << bssid << ", using wildcard";
+             }
+ 
+             // AP Channel Reports list length (0 for now - no specific channels requested)
+-- 
+2.34.1
+
