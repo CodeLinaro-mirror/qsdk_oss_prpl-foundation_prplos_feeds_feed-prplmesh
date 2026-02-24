@@ -1,0 +1,390 @@
+From 552c4ea9e36a492646f2fb8a12ed7d1f4056cdb6 Mon Sep 17 00:00:00 2001
+From: Girija P <gpandiya@qti.qualcomm.com>
+Date: Tue, 24 Feb 2026 16:02:44 +0530
+Subject: [PATCH] New network creation upon renew/new configs for BH STA
+ Reconnect bsta with new credentials if received when ethernet goes off RELOAD
+ properly if radio manager's tracking iface is a link
+
+Signed-off-by: Girija P <gpandiya@qti.qualcomm.com>
+---
+ .../backhaul_manager/backhaul_manager.cpp     | 75 +++++++++++++++++--
+ .../slave/backhaul_manager/backhaul_manager.h |  6 +-
+ .../beerocks/bwl/include/bwl/nl80211_client.h | 13 ++++
+ .../bwl/include/bwl/nl80211_client_impl.h     |  3 +
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 37 +++++++++
+ .../bwl/shared/nl80211_client_impl.cpp        | 75 +++++++++++++++++++
+ .../beerocks/bwl/whm/nl80211_client_whm.cpp   |  8 +-
+ common/beerocks/bwl/whm/nl80211_client_whm.h  |  1 +
+ 8 files changed, 209 insertions(+), 9 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index f4364c850..3050ff5e3 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -899,6 +899,10 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+                     // Disconnect Backhaul sta connection
+                     radio_info->sta_wlan_hal->disconnect_backhaul_sta();
+ 
++                    // Set flag indicating disconnection due to ethernet detection
++                    radio_info->sta_hal_disconnected_for_eth = true;
++                    LOG(DEBUG) << "Set sta_hal_disconnected_for_eth flag for " << radio_info->sta_iface;
++
+                     // Enable all AP VAPS in the radio
+                     send_slaves_enable();
+ 
+@@ -971,7 +975,6 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+                     m_prev_bh_connection = backhaul_connection::Wired;
+                 } else {
+                     m_prev_bh_connection = backhaul_connection::Wireless;
+-                    m_wireless_bh = true;
+                 } 
+                 m_eth_link_up = beerocks::net::network_utils::linux_iface_is_up_and_running(db->ethernet.wan.iface_name);
+ 
+@@ -991,10 +994,57 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+                             // Disconnect Backhaul sta connection
+                             radio_info->sta_wlan_hal->disconnect_backhaul_sta();
+ 
++                            // Set flag indicating disconnection due to ethernet detection
++                            radio_info->sta_hal_disconnected_for_eth = true;
++                            LOG(DEBUG) << "Set sta_hal_disconnected_for_eth flag for " << radio_info->sta_iface;
++
+                             // Enable all AP VAPS in the radio
+                             send_slaves_enable();
+                         }
+                     }
++                } else {
++                    // Ethernet backhaul disconnected - check if we should reconnect STA or restart FSM
++                    bool should_reconnect_sta = false;
++                    for (auto &radio_info : m_radios_info) {
++                        if (radio_info->sta_hal_initialized && radio_info->sta_hal_disconnected_for_eth) {
++                            should_reconnect_sta = true;
++                            LOG(DEBUG) << "Both flags set for " << radio_info->sta_iface 
++                                      << " - will reconnect STA instead of restarting FSM";
++                            break;
++                        }
++                    }
++
++                    if (should_reconnect_sta) {
++                        // Reconnect STA interfaces that were disconnected due to ethernet detection
++                        for (auto &radio_info : m_radios_info) {
++                            if (radio_info->sta_hal_initialized && 
++                                radio_info->sta_hal_disconnected_for_eth &&
++                                radio_info->sta_wlan_hal) {
++                                
++                                LOG(INFO) << "Reconnecting STA interface " << radio_info->sta_iface 
++                                         << " after ethernet backhaul disconnection";
++                                
++                                // Clear the flag before reconnecting
++                                radio_info->sta_hal_disconnected_for_eth = false;
++                                
++                                // Reconnect the STA interface
++                                if (radio_info->added_network_status) {
++                                    radio_info->sta_wlan_hal->reconnect_backhaul_sta();
++                                } else {
++                                    // Add network credentials if not already added
++                                    if (radio_info->sta_wlan_hal->add_new_network(radio_info->bSta_conf)) {
++                                        LOG(DEBUG) << "ADD NETWORK completed for " << radio_info->sta_iface;
++                                        radio_info->added_network_status = true;
++                                        radio_info->sta_wlan_hal->reconnect_backhaul_sta();
++                                    } else {
++                                        LOG(ERROR) << "Failed to add network for " << radio_info->sta_iface;
++                                    }
++                                }
++                            }
++                        }
++                        // Don't restart FSM, stay in current state to allow reconnection
++                        break;
++                    }
+                 }
+                 FSM_MOVE_STATE(RESTART);
+             }
+@@ -1025,6 +1075,10 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+             if (radio_info->sta_wlan_hal) {
+                 radio_info->sta_wlan_hal.reset();
+             }
++
++            // Clear the flags when restarting
++            radio_info->sta_hal_initialized = false;
++            radio_info->sta_hal_disconnected_for_eth = false;
+         }
+ 
+         handle_backhaul_disconnect(); //send disconnect to all connected slaves
+@@ -1212,6 +1266,10 @@ bool BackhaulManager::backhaul_fsm_wireless(bool &skip_select)
+                     return false;
+                 }
+ 
++                // Set flag indicating WiFi HAL is initialized and attached
++                radio_info->sta_hal_initialized = true;
++                LOG(DEBUG) << "WiFi HAL initialized for " << radio_info->sta_iface;
++
+                 /**
+                  * This code was disabled as part of the effort to pass certification flow
+                  * (PR #1469), and broke wireless backhaul flow.
+@@ -1293,13 +1351,14 @@ bool BackhaulManager::backhaul_fsm_wireless(bool &skip_select)
+                 // reconnect backhaul sta if backhaul switching is happened already  
+                 if (m_backhaul_switch || radio_info->sta_wlan_hal->is_disconnected()) {
+                     // already wireless connection established
+-                    if (m_wireless_bh) {
++                    if (radio_info->added_network_status) {
+                         radio_info->sta_wlan_hal->reconnect_backhaul_sta();
+                     } else {
+-                        // wired to wireless first time switching - add bh credentials
+-                        if ((!radio_info->add_network_status) && radio_info->sta_wlan_hal->add_new_network(radio_info->bSta_conf)) {
++                        // wired to wireless switching - add bh credentials
++                        // Todo: radio_info->sta_wlan_hal->remove_current_networks();
++                        if ( radio_info->sta_wlan_hal->add_new_network(radio_info->bSta_conf)) {
+                             LOG(DEBUG) << " ADD NETWORK Completed ";
+-                            radio_info->add_network_status = true;
++                            radio_info->added_network_status = true;
+                         }
+                     }
+                     m_backhaul_switch = false;
+@@ -1971,6 +2030,12 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+                     LOG(DEBUG) << " Radio matched ";
+                     auto config_data = request->wifi_credentials();
+                     if (config_data) {
++                      if ((radio_info->bSta_conf.ssid != config_data->ssid_str()) ||
++                        (radio_info->bSta_conf.authentication_type != config_data->authentication_type_attr().data) ||
++                        (radio_info->bSta_conf.encryption_type != config_data->encryption_type_attr().data) || 
++                        (radio_info->bSta_conf.network_key != config_data->network_key_str()) ) {
++                          radio_info->added_network_status = false;
++                      }
+                         radio_info->bSta_conf.ssid                = config_data->ssid_str();
+                         radio_info->bSta_conf.authentication_type = config_data->authentication_type_attr().data;
+                         radio_info->bSta_conf.encryption_type     = config_data->encryption_type_attr().data;
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+index bc92d0ac6..4df4c9719 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+@@ -443,8 +443,6 @@ private:
+ 
+     backhaul_connection m_prev_bh_connection = backhaul_connection::Invalid;
+ 
+-    bool m_wireless_bh = false;
+-
+     std::string bssid_bridge_mac;
+ 
+     std::unique_ptr<beerocks::agent_ucc_listener> m_agent_ucc_listener;
+@@ -498,7 +496,9 @@ public:
+         std::vector<int> sta_hal_ext_events = {beerocks::net::FileDescriptor::invalid_descriptor};
+         int sta_hal_int_events              = beerocks::net::FileDescriptor::invalid_descriptor;
+         son::wireless_utils::sBssInfoConf bSta_conf;
+-        bool add_network_status = false;
++        bool added_network_status = false;
++        bool sta_hal_initialized = false;           /**< Flag: Set when sta_wlan_hal is created and attached */
++        bool sta_hal_disconnected_for_eth = false;  /**< Flag: Set when disconnected due to ethernet detection */
+     };
+ 
+ private:
+diff --git a/common/beerocks/bwl/include/bwl/nl80211_client.h b/common/beerocks/bwl/include/bwl/nl80211_client.h
+index 7592029f5..1535d2ba0 100644
+--- a/common/beerocks/bwl/include/bwl/nl80211_client.h
++++ b/common/beerocks/bwl/include/bwl/nl80211_client.h
+@@ -638,6 +638,19 @@ public:
+     virtual bool get_sta_iface_mac(const std::string &sta_iface,
+                                              std::vector<std::string> &sta_mac_list) = 0 ;
+     virtual bool get_radio_band_info(int8_t &num_of_bands) = 0;
++
++    /**
++     * @brief Check if a link ID is operational.
++     *
++     * This function checks if there is a matching link with NL80211_ATTR_MLO_LINK_ID
++     * for the provided link_id and whether that link has a valid NL80211_ATTR_WIPHY_FREQ.
++     *
++     * @param[in] iface Interface name.
++     * @param[in] link_id Link ID to check.
++     *
++     * @return True if link exists and is operational (has valid frequency), false otherwise.
++     */
++    virtual bool check_link_id_operational(const std::string &iface, int link_id) = 0;
+ };
+ 
+ } // namespace bwl
+diff --git a/common/beerocks/bwl/include/bwl/nl80211_client_impl.h b/common/beerocks/bwl/include/bwl/nl80211_client_impl.h
+index e3c4d5add..57370d400 100644
+--- a/common/beerocks/bwl/include/bwl/nl80211_client_impl.h
++++ b/common/beerocks/bwl/include/bwl/nl80211_client_impl.h
+@@ -206,6 +206,9 @@ public:
+                                              std::vector<std::string> &sta_mac_list) override ;
+    
+     virtual bool get_radio_band_info(int8_t &num_of_bands) override;
++
++    virtual bool check_link_id_operational(const std::string &iface, int link_id) override;
++
+ private:
+     /**
+      * NL80211 socket to send messages and receive responses to/from the WiFi driver.
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 8cdbf677a..36056707d 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -755,6 +755,16 @@ bool ap_wlan_hal_nl80211::refresh_radio_info()
+             if (!wpa_ctrl_send_msg("RELOAD")) {
+                 LOG(ERROR) << "RELOAD command to hostapd failed";
+             }
++        } else if (base_interface != m_radio_info.iface_name) {
++            LOG(DEBUG) << "Base Iface " << m_radio_info.iface_name << " is a link";
++            // Check if hostapd control socket exists for m_radio_info.iface_name
++            std::string hostapd_ctrl_path = "/var/run/hostapd/" + m_radio_info.iface_name;
++            if (beerocks::os_utils::file_exists(hostapd_ctrl_path)) {
++                LOG(INFO) << "Sending RELOAD to " << m_radio_info.iface_name;
++                if (!wpa_ctrl_send_msg("RELOAD", m_radio_info.iface_name)) {
++                    LOG(ERROR) << "RELOAD command to hostapd failed for " << m_radio_info.iface_name;
++                }
++            }
+         } else {
+             LOG(DEBUG) << "iface " << base_interface << " is in up state, skip reload";
+         }
+@@ -3085,6 +3095,33 @@ bool ap_wlan_hal_nl80211::reload_all_ap_vaps()
+             LOG(ERROR) << "RELOAD command to hostapd failed";
+             return false;
+         }
++    } else if (base_interface != m_radio_info.iface_name) {
++        // Check if hostapd control socket exists for m_radio_info.iface_name
++        LOG(DEBUG) << "Base Iface " << m_radio_info.iface_name << " is a link";
++        
++        // Extract link_id from the interface name
++        int link_id = -1;
++        extractLinkId(m_radio_info.iface_name, link_id);
++        
++        // Check if the link is operational before sending RELOAD
++        if (link_id >= 0) {
++            bool link_operational = m_nl80211_client->check_link_id_operational(m_radio_info.iface_name, link_id);
++            LOG(DEBUG) << "Link " << link_id << " operational status: " << (link_operational ? "true" : "false");
++            
++            if (!link_operational) {
++                LOG(WARNING) << "Link " << link_id << " is not operational, skipping RELOAD";
++                std::string hostapd_ctrl_path = "/var/run/hostapd/" + m_radio_info.iface_name;
++                if (beerocks::os_utils::file_exists(hostapd_ctrl_path)) {
++                    LOG(INFO) << "Sending RELOAD to " << m_radio_info.iface_name;
++                    if (!wpa_ctrl_send_msg("RELOAD", m_radio_info.iface_name)) {
++                        LOG(ERROR) << "RELOAD command to hostapd failed for " << m_radio_info.iface_name;
++                    }
++                }
++            } else {
++                LOG(DEBUG) << "iface " <<  m_radio_info.iface_name << " is in up state, skip reload";
++            }
++        }
++        
+     } else {
+         LOG(DEBUG) << "iface " << base_interface << " is in up state, skip reload";
+     }
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.cpp b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+index deb9e8b10..a880d86e9 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -2129,5 +2129,80 @@ bool nl80211_client_impl::get_radio_band_info(int8_t &num_of_bands)
+         });
+ }
+ 
++bool nl80211_client_impl::check_link_id_operational(const std::string &iface, int link_id)
++{
++    std::string base_interface;
++    bwl::base_wlan_hal::extractLinkBaseInterface(iface, base_interface);
++
++    LOG(INFO) << "Checking if link_id " << link_id << " is operational for interface: " << base_interface;
++
++    if (!m_socket) {
++        LOG(ERROR) << "Socket is NULL!";
++        return false;
++    }
++
++    int iface_index = if_nametoindex(base_interface.c_str());
++    if (0 == iface_index) {
++        LOG(ERROR) << "Failed to read the index of interface " << iface << " base_interface:" << base_interface << ": "
++                   << strerror(errno);
++        return false;
++    }
++
++    bool link_operational = false;
++
++    m_socket.get()->send_receive_msg(
++        NL80211_CMD_GET_INTERFACE, 0,
++        [&](struct nl_msg *msg) -> bool {
++            nla_put_u32(msg, NL80211_ATTR_IFINDEX, iface_index);
++            return true;
++        },
++        [&](struct nl_msg *msg) {
++            struct nlattr *tb[NL80211_ATTR_MAX + 1];
++            struct genlmsghdr *gnlh = (struct genlmsghdr *)nlmsg_data(nlmsg_hdr(msg));
++
++            // Parse the netlink message
++            if (nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0),
++                          NULL)) {
++                LOG(ERROR) << "Failed to parse netlink message!";
++                return;
++            }
++
++            if (tb[NL80211_ATTR_MLO_LINKS]) {
++                LOG(INFO) << "MLO links attribute present";
++                int ret = 0;
++                struct nlattr *attrs, *link[NL80211_ATTR_MAX + 1];
++                nla_for_each_nested(attrs, tb[NL80211_ATTR_MLO_LINKS], ret) {
++                    nla_parse_nested(link, NL80211_ATTR_MAX, attrs, NULL);
++                    
++                    if (link[NL80211_ATTR_MLO_LINK_ID]) {
++                        int current_link_id = nla_get_u8(link[NL80211_ATTR_MLO_LINK_ID]);
++                        
++                        if (current_link_id == link_id) {
++                            LOG(INFO) << "Found matching link_id: " << link_id;
++                            
++                            // Check if the link has a valid frequency
++                            if (link[NL80211_ATTR_WIPHY_FREQ]) {
++                                int freq = nla_get_u32(link[NL80211_ATTR_WIPHY_FREQ]);
++                                LOG(INFO) << "Link " << link_id << " has valid frequency: " << freq << " MHz";
++                                link_operational = true;
++                            } else {
++                                LOG(WARNING) << "Link " << link_id << " found but has no valid frequency";
++                            }
++                            return;
++                        }
++                    }
++                }
++                
++                if (!link_operational) {
++                    LOG(WARNING) << "Link " << link_id << " not found or not operational";
++                }
++            } else {
++                LOG(INFO) << "No MLO links attribute present for interface " << base_interface;
++            }
++        });
++
++    return link_operational;
++}
++
+ 
+ } // namespace bwl
+diff --git a/common/beerocks/bwl/whm/nl80211_client_whm.cpp b/common/beerocks/bwl/whm/nl80211_client_whm.cpp
+index 8da9f7e74..fdb192ca3 100644
+--- a/common/beerocks/bwl/whm/nl80211_client_whm.cpp
++++ b/common/beerocks/bwl/whm/nl80211_client_whm.cpp
+@@ -153,7 +153,13 @@ bool nl80211_client_whm::get_radio_band_info(int8_t &num_of_bands)
+ {
+     LOG(TRACE) << __func__ << " - NOT IMPLEMENTED";
+     return false;
+-} 
++}
++
++bool nl80211_client_whm::check_link_id_operational(const std::string &iface, int link_id)
++{
++    LOG(TRACE) << __func__ << " - NOT IMPLEMENTED";
++    return false;
++}
+ 
+ bool nl80211_client_whm::get_survey_info(const std::string &interface_name, SurveyInfo &survey_info)
+ {
+diff --git a/common/beerocks/bwl/whm/nl80211_client_whm.h b/common/beerocks/bwl/whm/nl80211_client_whm.h
+index bed67d3be..219649c03 100644
+--- a/common/beerocks/bwl/whm/nl80211_client_whm.h
++++ b/common/beerocks/bwl/whm/nl80211_client_whm.h
+@@ -89,6 +89,7 @@ public:
+     virtual bool get_mlo_active_link_count(std::string &bss, int8_t &active_link) override;
+     virtual bool get_sta_iface_mac(const std::string &sta_iface, std::vector<std::string> &sta_mac_list) override;
+     virtual bool get_radio_band_info(int8_t &num_of_bands) override;
++    virtual bool check_link_id_operational(const std::string &iface, int link_id) override;
+ 
+     /**
+      * @brief Gets whm survey information.
+-- 
+2.34.1
+
