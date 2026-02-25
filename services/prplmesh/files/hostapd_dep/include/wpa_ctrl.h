@@ -118,6 +118,10 @@ extern "C" {
 #define WPA_EVENT_T2LM_UPDATE "CTRL-EVENT-T2LM-UPDATE "
 /** MLO link reconfiguration event */
 #define WPA_EVENT_LINK_RECONFIG "CTRL-EVENT-LINK-RECONFIG "
+/** MLO link sta removed */
+#define WPA_EVENT_LINK_STA_REMOVED "CTRL-EVENT-LINK-STA-REMOVED "
+/** MLO link sta added */
+#define WPA_EVENT_LINK_STA_ADDED "CTRL-EVENT-LINK-STA-ADDED "
 
 /** IP subnet status change notification
  *
@@ -208,6 +212,7 @@ extern "C" {
 #define DPP_EVENT_CONFOBJ_PASS "DPP-CONFOBJ-PASS "
 #define DPP_EVENT_CONFOBJ_IDPASS "DPP-CONFOBJ-IDPASS "
 #define DPP_EVENT_CONFOBJ_PSK "DPP-CONFOBJ-PSK "
+#define DPP_EVENT_SAE_PWE "DPP-EVENT-SAE-PWE "
 #define DPP_EVENT_CONNECTOR "DPP-CONNECTOR "
 #define DPP_EVENT_C_SIGN_KEY "DPP-C-SIGN-KEY "
 #define DPP_EVENT_PP_KEY "DPP-PP-KEY "
@@ -343,7 +348,6 @@ extern "C" {
 /* parameters: <Venue Number> <Venue URL> */
 #define RX_VENUE_URL "RX-VENUE-URL "
 
-#define HS20_SUBSCRIPTION_REMEDIATION "HS20-SUBSCRIPTION-REMEDIATION "
 #define HS20_DEAUTH_IMMINENT_NOTICE "HS20-DEAUTH-IMMINENT-NOTICE "
 #define HS20_T_C_ACCEPTANCE "HS20-T-C-ACCEPTANCE "
 
@@ -456,6 +460,11 @@ extern "C" {
 /* Event triggered for received management frame */
 #define AP_MGMT_FRAME_RECEIVED "AP-MGMT-FRAME-RECEIVED "
 
+/* Event triggerred on AP receiving Wi-Fi Alliance Generational Capabilities
+ * indication.
+ * Parameters: <STA addr> <Generational Capabilities Indication body> */
+#define WFA_GEN_CAPAB_RX "WFA-GEN-CAPAB "
+
 #ifndef BIT
 #define BIT(x) (1U << (x))
 #endif
@@ -515,6 +524,7 @@ enum wpa_vendor_elem_frame {
         VENDOR_ELEM_PROBE_REQ = 14,
         NUM_VENDOR_ELEM_FRAMES
 };
+
 
 /* wpa_supplicant/hostapd control interface access */
 
