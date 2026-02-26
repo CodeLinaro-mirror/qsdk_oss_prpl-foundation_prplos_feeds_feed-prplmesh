@@ -1,0 +1,190 @@
+From 2c9034f1def96d1ff56f54e38d91b44cd052edac Mon Sep 17 00:00:00 2001
+From: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+Date: Thu, 26 Feb 2026 15:18:24 +0530
+Subject: [PATCH] Fix MLO metrics matching and STA capability selection
+
+- Continue processing metric reporting policy entries even if one fails.
+- Handle MLO by matching AP Metrics BSSID against either link BSSID or AP MLD MAC.
+- Prefer nl80211 *_BYTES64 station counters when available to avoid overflow.
+- Fix controller STA capability lookup returning wrong band capabilities.
+
+Signed-off-by: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+---
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  6 +--
+ .../tasks/link_metrics_collection_task.cpp    | 23 ++++++++--
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 46 +++++++++++++------
+ controller/src/beerocks/master/db/db.cpp      |  4 +-
+ 4 files changed, 56 insertions(+), 23 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 1bd340949..c01c980e9 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -1682,7 +1682,7 @@ void ApAutoConfigurationTask::handle_multi_ap_policy_config_request(
+             if (!std::get<0>(tuple)) {
+                 LOG(ERROR) << "Failed to get metrics_reporting_conf[" << i
+                            << "] from TLV_METRIC_REPORTING_POLICY";
+-                return;
++                continue;
+             }
+ 
+             auto metrics_reporting_conf = std::get<1>(tuple);
+@@ -1701,12 +1701,12 @@ void ApAutoConfigurationTask::handle_multi_ap_policy_config_request(
+              */
+             if (monitor_fd == beerocks::net::FileDescriptor::invalid_descriptor) {
+                 LOG(ERROR) << "monitor_socket is null";
+-                return;
++                continue;
+             }
+ 
+             if (!m_btl_ctx.forward_cmdu_to_uds(monitor_fd, cmdu_rx)) {
+                 LOG(ERROR) << "Failed to forward message to monitor";
+-                return;
++                continue;
+             }
+         }
+ 
+diff --git a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+index 7a0a4b5e3..2fa9d0cf0 100644
+--- a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+@@ -1075,6 +1075,17 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+             continue;
+         }
+ 
++        // For MLO, the client's BSSID in associated_clients is the AP MLD MAC,
++        // while metric.bssid is the link-specific BSSID. Find the AP MLD MAC for
++        // this BSS to handle both cases in the BSSID checks below.
++        sMacAddr bss_apmld_mac = net::network_utils::ZERO_MAC;
++        for (const auto &bssid_entry : radio->front.bssids) {
++            if (bssid_entry.mac == metric.bssid) {
++                bss_apmld_mac = bssid_entry.apmld_mac;
++                break;
++            }
++        }
++
+         std::vector<sStaTrafficStats> traffic_stats_response;
+ 
+         for (const auto &sta_traffic :
+@@ -1086,7 +1097,9 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+ 
+             auto assoc_client = radio->associated_clients.find(sta_traffic->sta_mac());
+             if (assoc_client != radio->associated_clients.end() &&
+-                assoc_client->second.bssid == metric.bssid) {
++                (assoc_client->second.bssid == metric.bssid ||
++                 (bss_apmld_mac != net::network_utils::ZERO_MAC &&
++                  assoc_client->second.bssid == bss_apmld_mac))) {
+                 traffic_stats_response.push_back({
+                     sta_traffic->sta_mac(),
+                     sta_traffic->byte_sent(),
+@@ -1127,7 +1140,9 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+             }
+             auto assoc_client = radio->associated_clients.find(sta_qos_ctrl_params->sta_mac());
+             if (assoc_client != radio->associated_clients.end() &&
+-                assoc_client->second.bssid == metric.bssid) {
++                (assoc_client->second.bssid == metric.bssid ||
++                 (bss_apmld_mac != net::network_utils::ZERO_MAC &&
++                  assoc_client->second.bssid == bss_apmld_mac))) {
+                 uint8_t tid_list_length = sta_qos_ctrl_params->tid_queue_size_list_length();
+ 
+                 sStaQosCtrlParams sta_qos_params;
+@@ -1176,7 +1191,9 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+ 
+             auto assoc_client = radio->associated_clients.find(affl_sta_metrics->sta_mac_addr());
+             if (assoc_client != radio->associated_clients.end() &&
+-                assoc_client->second.bssid == metric.bssid) {
++                (assoc_client->second.bssid == metric.bssid ||
++                 (bss_apmld_mac != net::network_utils::ZERO_MAC &&
++                  assoc_client->second.bssid == bss_apmld_mac))) {
+                 affiliated_sta_metrics.push_back({
+                     affl_sta_metrics->sta_mac_addr(),
+                     affl_sta_metrics->bytes_sent(),
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index b96d2752a..cb5c31f99 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -183,17 +183,21 @@ bool mon_wlan_hal_nl80211::update_stations_stats(const std::string &vap_iface_na
+     stats_policy[NL80211_STA_INFO_INACTIVE_TIME] = {NLA_U32, 0, 0};
+     stats_policy[NL80211_STA_INFO_RX_BYTES]      = {NLA_U32, 0, 0};
+     stats_policy[NL80211_STA_INFO_TX_BYTES]      = {NLA_U32, 0, 0};
+-    stats_policy[NL80211_STA_INFO_RX_PACKETS]    = {NLA_U32, 0, 0};
+-    stats_policy[NL80211_STA_INFO_TX_PACKETS]    = {NLA_U32, 0, 0};
+-    stats_policy[NL80211_STA_INFO_SIGNAL]        = {NLA_U8, 0, 0};
+-    stats_policy[NL80211_STA_INFO_T_OFFSET]      = {NLA_U64, 0, 0};
+-    stats_policy[NL80211_STA_INFO_TX_BITRATE]    = {NLA_NESTED, 0, 0};
+-    stats_policy[NL80211_STA_INFO_RX_BITRATE]    = {NLA_NESTED, 0, 0};
+-    stats_policy[NL80211_STA_INFO_LLID]          = {NLA_U16, 0, 0};
+-    stats_policy[NL80211_STA_INFO_PLID]          = {NLA_U16, 0, 0};
+-    stats_policy[NL80211_STA_INFO_PLINK_STATE]   = {NLA_U8, 0, 0};
+-    stats_policy[NL80211_STA_INFO_TX_RETRIES]    = {NLA_U32, 0, 0};
+-    stats_policy[NL80211_STA_INFO_TX_FAILED]     = {NLA_U32, 0, 0};
++#if defined(NL80211_STA_INFO_RX_BYTES64) && defined(NL80211_STA_INFO_TX_BYTES64)
++    stats_policy[NL80211_STA_INFO_RX_BYTES64] = {NLA_U64, 0, 0};
++    stats_policy[NL80211_STA_INFO_TX_BYTES64] = {NLA_U64, 0, 0};
++#endif
++    stats_policy[NL80211_STA_INFO_RX_PACKETS]  = {NLA_U32, 0, 0};
++    stats_policy[NL80211_STA_INFO_TX_PACKETS]  = {NLA_U32, 0, 0};
++    stats_policy[NL80211_STA_INFO_SIGNAL]      = {NLA_U8, 0, 0};
++    stats_policy[NL80211_STA_INFO_T_OFFSET]    = {NLA_U64, 0, 0};
++    stats_policy[NL80211_STA_INFO_TX_BITRATE]  = {NLA_NESTED, 0, 0};
++    stats_policy[NL80211_STA_INFO_RX_BITRATE]  = {NLA_NESTED, 0, 0};
++    stats_policy[NL80211_STA_INFO_LLID]        = {NLA_U16, 0, 0};
++    stats_policy[NL80211_STA_INFO_PLID]        = {NLA_U16, 0, 0};
++    stats_policy[NL80211_STA_INFO_PLINK_STATE] = {NLA_U8, 0, 0};
++    stats_policy[NL80211_STA_INFO_TX_RETRIES]  = {NLA_U32, 0, 0};
++    stats_policy[NL80211_STA_INFO_TX_FAILED]   = {NLA_U32, 0, 0};
+     stats_policy[NL80211_STA_INFO_STA_FLAGS]  = {NLA_UNSPEC, sizeof(struct nl80211_sta_flag_update),
+                                                 0};
+     stats_policy[NL80211_STA_INFO_LOCAL_PM]   = {NLA_U32, 0, 0};
+@@ -309,14 +313,26 @@ bool mon_wlan_hal_nl80211::update_stations_stats(const std::string &vap_iface_na
+                 total = val;
+             };
+ 
+-            // TX Bytes
+-            if (sinfo[NL80211_STA_INFO_TX_BYTES]) {
++        // TX Bytes
++#if defined(NL80211_STA_INFO_TX_BYTES64)
++            if (sinfo[NL80211_STA_INFO_TX_BYTES64]) {
++                calc_curr_traffic(nla_get_u64(sinfo[NL80211_STA_INFO_TX_BYTES64]),
++                                  sta_stats.tx_bytes_cnt, sta_stats.tx_bytes);
++            } else
++#endif
++                if (sinfo[NL80211_STA_INFO_TX_BYTES]) {
+                 calc_curr_traffic(nla_get_u32(sinfo[NL80211_STA_INFO_TX_BYTES]),
+                                   sta_stats.tx_bytes_cnt, sta_stats.tx_bytes);
+             }
+ 
+-            // RX Bytes
+-            if (sinfo[NL80211_STA_INFO_RX_BYTES]) {
++        // RX Bytes
++#if defined(NL80211_STA_INFO_RX_BYTES64)
++            if (sinfo[NL80211_STA_INFO_RX_BYTES64]) {
++                calc_curr_traffic(nla_get_u64(sinfo[NL80211_STA_INFO_RX_BYTES64]),
++                                  sta_stats.rx_bytes_cnt, sta_stats.rx_bytes);
++            } else
++#endif
++                if (sinfo[NL80211_STA_INFO_RX_BYTES]) {
+                 calc_curr_traffic(nla_get_u32(sinfo[NL80211_STA_INFO_RX_BYTES]),
+                                   sta_stats.rx_bytes_cnt, sta_stats.rx_bytes);
+             }
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index ff1e07266..760dd8153 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -2362,11 +2362,11 @@ const beerocks::message::sRadioCapabilities *db::get_sta_capabilities(const std:
+     }
+ 
+     if ((freq_type == eFreqType::FREQ_5G) && (pSta->m_sta_5ghz_capabilities.valid == true)) {
+-        return &pSta->m_sta_24ghz_capabilities;
++        return &pSta->m_sta_5ghz_capabilities;
+     }
+ 
+     if ((freq_type == eFreqType::FREQ_6G) && (pSta->m_sta_6ghz_capabilities.valid == true)) {
+-        return &pSta->m_sta_24ghz_capabilities;
++        return &pSta->m_sta_6ghz_capabilities;
+     }
+ 
+     LOG(ERROR) << "Failed to find valid sta capabilities for freq type "
+-- 
+2.34.1
+
