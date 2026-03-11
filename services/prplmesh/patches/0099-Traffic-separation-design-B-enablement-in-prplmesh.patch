@@ -1,0 +1,1955 @@
+From 1bd6c85376ddb928880495cec15b281d2c8e4dc9 Mon Sep 17 00:00:00 2001
+From: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+Date: Fri, 13 Mar 2026 19:22:47 +0530
+Subject: [PATCH] Traffic separation design B enablement in prplmesh
+
+This commit brings the necessary plumbing and persistence mechanisms to
+fully enable Traffic Separation (TS) in prplMesh, particularly for
+OpenWrt/UCI-based systems.
+
+Key changes:
+
+- Derive VAP Type from UCI: Parse `custom_alias` in the `wireless` UCI
+  package to determine `vap_type` (HOME, GUEST, VIDEO, etc.) during AP
+  HAL initialization (nl80211 / bpl_cfg_wifi). Adds
+  `bpl_cfg_get_wifi_credentials_by_ssid()` for SSID-based credential
+  lookup when interface-name lookup fails (e.g., MLO link-suffixed ifaces).
+
+- Fallback VAP Type resolution: In `update_vaps_type()`, dynamically
+  deduce `vap_type=GUEST` on repeater nodes using the Traffic Separation
+  SSID-to-VID mapping when no explicit UCI entry exists (handles
+  dynamically-created BSS that arrive before TS policy).
+
+- MLO support for TS: Strip `_linkX` suffixes from VAP interface names
+  in `collect_ports_from_db()` to ensure correct access port
+  identification and bridge attachment.
+
+- Bridge Mapping Verification (optional): Add `ts_bridge_mapping_enabled`
+  flag (UCI: `TrafficSeparation_bridge_mapping_enable`) to optionally
+  verify and fix Linux bridge attachments for access and trunk ports at
+  runtime via `verify_and_fix_bridge_assignments()`.
+
+- Bridge Assignment Persistence (optional): Add `ts_persistence_enabled`
+  flag (UCI: `TrafficSeparation_persistence_enable`) to optionally persist
+  guest/private interface bridge assignments into the `network` UCI config
+  (modifying the `ports` list of bridge device sections) via
+  `persist_bridge_assignments()`. Backhaul BSS always go to the private
+  bridge; fronthaul-only BSS are assigned based on `vap_type` with
+  fallback to SSID-VID mapping.
+
+- BPL APIs: Introduce new BPL functions for UCI network config
+  manipulation:
+    - `cfg_get_traffic_separation_bridge_mapping_enabled()`
+    - `cfg_get_traffic_separation_persistence_enabled()`
+    - `cfg_persist_iface_bridge_assignment()`
+    - `cfg_remove_iface_from_bridge_config()`
+    - `cfg_commit_network_config()`
+    - `cfg_get_bridge_for_iface()`
+    - `cfg_get_network_name_for_bridge()`
+    - `cfg_set_wifi_iface_network()`
+    - `cfg_commit_wireless_config()`
+  Implemented for UCI, DM, and Linux platforms.
+
+- Re-read TS feature flags at apply time in `TrafficSeparationTask::reset()`
+  to handle the case where UCI is not yet initialized when the agent starts
+  (timing issue on first boot).
+
+- Optimized UCI Commit Logic: Avoid unnecessary UCI commits in
+  `bpl_cfg_set_wifi_credentials()` if the credentials (ssid, encryption, key)
+  have not changed. This prevents netifd from triggering unnecessary hostapd
+  restarts on every autoconfiguration cycle.
+
+- Robust Interface Section Matching: Improved `wifi-iface` lookup in UCI by
+  falling back to matching the `wifi-device` section if the `ifname` option
+  is not explicitly set (which is the default behavior in fresh OpenWrt setups).
+
+- Robust BPL UCI List Manipulation: Added new BPL utilities
+  `uci_add_list_option` and `uci_del_list_option` to safely manage bridge
+  ports lists without creating duplicate entries.
+
+- Configuration Validation & Cleanup: Added validation for `TrafficSeparation`
+  VLAN IDs to strictly enforce the 1-4094 range. Refactored `vap_type` parsing
+  in `wbapi_utils.cpp` to reuse `string_to_vap_type`.
+  Implemented for UCI, DM, and Linux platforms.
+
+Signed-off-by: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/agent_db.h           |   4 +-
+ .../beerocks/slave/beerocks_agent_main.cpp    |  12 +
+ agent/src/beerocks/slave/son_slave_thread.cpp |   8 +
+ .../slave/tasks/traffic_separation_task.cpp   |   4 +-
+ .../traffic_separation_manager.cpp            | 308 ++++++++++++++
+ .../traffic_separation_manager.h              |  43 ++
+ .../traffic_separation_utils.h                |  45 +++
+ .../bcl/include/bcl/network/network_utils.h   |   1 +
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  39 +-
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     |  25 ++
+ framework/platform/bpl/cfg/dm/bpl_cfg.cpp     |  37 ++
+ .../platform/bpl/cfg/dm/bpl_cfg_wifi.cpp      |  20 +
+ framework/platform/bpl/cfg/uci/bpl_cfg.cpp    | 249 +++++++++++-
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     | 376 ++++++++++++++----
+ framework/platform/bpl/common/uci/bpl_uci.cpp |  90 +++++
+ framework/platform/bpl/common/uci/bpl_uci.h   |  34 ++
+ framework/platform/bpl/include/bpl/bpl_cfg.h  | 126 ++++++
+ framework/platform/wbapi/wbapi_utils.cpp      |  20 +-
+ 18 files changed, 1337 insertions(+), 104 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 3f181f2e2..cb585fae9 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -183,6 +183,8 @@ public:
+         uint8_t beacon_11k_default_measurement_mode = 2;
+         eUnsupportedProfileDisallowPolicy unsupported_profile_disallow_policy =
+             eUnsupportedProfileDisallowPolicy::NO_OVERRIDE;
++        bool ts_bridge_mapping_enabled  = false;
++        bool ts_persistence_enabled     = false;
+     } device_conf;
+ 
+     struct sControllerInfo {
+@@ -441,7 +443,7 @@ public:
+ 
+         beerocks::eFreqType frequency_band = beerocks::eFreqType::FREQ_UNKNOWN;
+     };
+-    struct {
++    struct sTrafficSeparation {
+         uint16_t max_number_of_vlans_ids;
+         // Key: SSID, Value: VID
+         std::unordered_map<std::string, uint16_t> ssid_vid_mapping;
+diff --git a/agent/src/beerocks/slave/beerocks_agent_main.cpp b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+index 684078a4d..1ec59bff6 100644
+--- a/agent/src/beerocks/slave/beerocks_agent_main.cpp
++++ b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+@@ -556,6 +556,18 @@ static int run_beerocks_slave(beerocks::config_file::sConfigSlave &beerocks_slav
+ 
+         db->device_conf.enable_auto_chansel_handling =
+             beerocks_slave_conf.enable_auto_chansel_handling == "1";
++        {
++            bool uci_enabled = false;
++            if (beerocks::bpl::cfg_get_traffic_separation_bridge_mapping_enabled(uci_enabled)) {
++                db->device_conf.ts_bridge_mapping_enabled = uci_enabled;
++            }
++        }
++        {
++            bool uci_enabled = false;
++            if (beerocks::bpl::cfg_get_traffic_separation_persistence_enabled(uci_enabled)) {
++                db->device_conf.ts_persistence_enabled = uci_enabled;
++            }
++        }
+         db->init_data_model(amb_dm_obj);
+ 
+         auto management_mode = beerocks::bpl::cfg_get_management_mode();
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index b2832732b..dd54bd636 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -5913,6 +5913,14 @@ bool slave_thread::update_vaps_type(const std::string &iface,
+         const auto raw = static_cast<uint8_t>(vap_types[vap_idx].vap_type);
+         bss.vap_type = eVapTypeValidate::check(raw) ? vap_types[vap_idx].vap_type : eVapType::OTHER;
+ 
++        // If vap_type is still OTHER, try to determine from TS SSID-to-VID mapping.
++        // This handles dynamically-created BSS on repeaters that have no UCI entry.
++        if (bss.vap_type == eVapType::OTHER && is_guest_bss(bss, db->traffic_separation)) {
++            bss.vap_type = eVapType::GUEST;
++            LOG(DEBUG) << "Determined vap_type=GUEST from TS SSID-VID mapping for "
++                       << bss.iface_name << " (ssid=" << bss.ssid << ")";
++        }
++
+         LOG(DEBUG) << "Updated vap_type: iface=" << bss.iface_name << " idx=" << int(vap_idx)
+                    << " vap_id=" << int(vap_types[vap_idx].vap_id)
+                    << " vap_type=" << eVapType_str(bss.vap_type);
+diff --git a/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp b/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
+index 7944247e5..65e6e7f2e 100644
+--- a/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
++++ b/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
+@@ -486,7 +486,9 @@ bool TrafficSeparationTask::collect_ports_from_db(std::vector<net::sTrunkPort> &
+             if (bss.fronthaul_bss && !bss.backhaul_bss) {
+                 if (!bss.iface_name.empty()) {
+                     net::sAccessPort ap{};
+-                    ap.iface_name = bss.iface_name;
++
++                    ap.iface_name = net::strip_link_suffix(bss.iface_name);
++
+                     access_ports.push_back(ap);
+                 }
+             }
+diff --git a/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.cpp b/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.cpp
+index b62aa091f..80f2a5112 100644
+--- a/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.cpp
++++ b/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.cpp
+@@ -11,7 +11,10 @@
+ #include "access_port_plumbing_8021q.h"
+ #include "trunk_port_plumbing_8021q.h"
+ 
++#include "../agent_db.h"
++
+ #include <bcl/network/network_utils.h>
++#include <bpl/bpl_cfg.h>
+ 
+ #include <memory>
+ 
+@@ -58,6 +61,7 @@ bool TrafficSeparationManager::add_trunk_port(const sTrunkPort &trunk_port)
+     }
+ 
+     m_trunk_port_plumbing_map.emplace(trunk_port.iface_name, std::move(plumbing));
++    m_trunk_ports.emplace(trunk_port.iface_name, trunk_port);
+ 
+     LOG(DEBUG) << "trunk_port added iface=" << trunk_port.iface_name;
+     return true;
+@@ -82,6 +86,7 @@ bool TrafficSeparationManager::remove_trunk_port(const std::string &iface_name)
+     }
+ 
+     m_trunk_port_plumbing_map.erase(it);
++    m_trunk_ports.erase(iface_name);
+ 
+     LOG(DEBUG) << "removed trunk iface=" << iface_name;
+     return success;
+@@ -203,6 +208,21 @@ bool TrafficSeparationManager::apply_policies()
+     LOG(DEBUG) << "all policies applied successfully";
+ 
+     m_state = eTsManagerState::APPLIED;
++
++    {
++        auto db = beerocks::AgentDB::get();
++        if (db->device_conf.ts_bridge_mapping_enabled) {
++            verify_and_fix_bridge_assignments();
++        }
++    }
++
++    {
++        auto db = beerocks::AgentDB::get();
++        if (db->device_conf.ts_persistence_enabled) {
++            persist_bridge_assignments();
++        }
++    }
++
+     return true;
+ }
+ 
+@@ -276,6 +296,13 @@ bool TrafficSeparationManager::reset()
+         success = false;
+     }
+ 
++    {
++        auto db = beerocks::AgentDB::get();
++        if (db->device_conf.ts_persistence_enabled) {
++            reset_persistence();
++        }
++    }
++
+     m_config = sTrafficSeparationConfig{};
+     m_state  = eTsManagerState::NO_CONFIG;
+ 
+@@ -331,4 +358,285 @@ bool TrafficSeparationManager::remove_all_access_ports()
+     return success;
+ }
+ 
++void TrafficSeparationManager::persist_bridge_assignments()
++{
++    if (m_config.private_bridge.empty()) {
++        LOG(WARNING) << "persist_bridge_assignments: private_bridge is empty, skipping";
++        return;
++    }
++
++    auto db          = beerocks::AgentDB::get();
++    bool wireless_written = false;
++    bool network_written  = false;
++
++    for (const auto *radio : db->get_radios_list()) {
++        if (!radio) {
++            continue;
++        }
++
++        for (const auto &bss : radio->front.bssids) {
++            if (!bss.active || bss.iface_name.empty()) {
++                continue;
++            }
++
++            // Skip BSS that are neither fronthaul nor backhaul
++            if (!bss.fronthaul_bss && !bss.backhaul_bss) {
++                continue;
++            }
++
++            // Backhaul BSS (including combined fh+bh) always belong to the private bridge.
++            // Fronthaul-only BSS go to guest or private based on vap_type.
++            // If vap_type is OTHER (repeater BSS created before TS policy arrived),
++            // fall back to ssid_vid_mapping to identify guest interfaces.
++            const bool is_guest = !bss.backhaul_bss && is_guest_bss(bss, db->traffic_separation);
++            const std::string &correct_bridge =
++                is_guest ? m_config.guest_bridge : m_config.private_bridge;
++
++            if (correct_bridge.empty()) {
++                LOG(DEBUG) << "persist_bridge_assignments: no bridge for iface=" << bss.iface_name
++                           << ", skipping";
++                continue;
++            }
++
++            // Strip _link suffix for MLO
++            const std::string iface_name = strip_link_suffix(bss.iface_name);
++
++            // Clean up any legacy bridge ports assignment for this iface.
++            std::string current_bridge_in_config;
++            if (bpl::cfg_get_bridge_for_iface(iface_name, current_bridge_in_config) &&
++                !current_bridge_in_config.empty()) {
++                bpl::cfg_remove_iface_from_bridge_config(current_bridge_in_config, iface_name);
++                network_written = true;
++            }
++
++            // Update wireless config: set option network in the wifi-iface section.
++            std::string network_name;
++            if (!bpl::cfg_get_network_name_for_bridge(correct_bridge, network_name)) {
++                LOG(WARNING) << "persist_bridge_assignments: cannot find network name for bridge="
++                             << correct_bridge << ", iface=" << iface_name;
++                continue;
++            }
++
++            if (bpl::cfg_set_wifi_iface_network(iface_name, network_name, bss.ssid)) {
++                wireless_written = true;
++            }
++        }
++    }
++
++    // Persist VLAN subinterface bridge assignments for tagged trunk ports.
++    // For each tagged trunk port, the VLAN subinterface(s) must also be listed
++    // in the correct bridge's ports in /etc/config/network so they survive reboot.
++    //   - Ethernet trunks: <iface>.<guest_vid> -> guest_bridge
++    //   - WiFi trunks:     <iface>.<guest_vid> -> guest_bridge
++    //                      <iface>.<private_vid> -> private_bridge
++    // Untagged trunk ports are skipped (no VLAN subinterfaces are created for them).
++    for (const auto &entry : m_trunk_ports) {
++        const sTrunkPort &tp = entry.second;
++        if (tp.is_untagged_mode) {
++            continue;
++        }
++
++        // Guest VLAN subinterface -> guest_bridge
++        if (!m_config.guest_bridge.empty() && m_config.guest_vid != 0) {
++            const std::string guest_vlan_iface =
++                tp.iface_name + "." + std::to_string(m_config.guest_vid);
++            if (bpl::cfg_persist_iface_bridge_assignment(m_config.guest_bridge, guest_vlan_iface)) {
++                network_written = true;
++            }
++        }
++
++        // Private VLAN subinterface -> private_bridge (WiFi trunks only;
++        // for Ethernet trunks the private traffic is untagged on the native VLAN).
++        if (!tp.is_ethernet && !m_config.private_bridge.empty() && m_config.private_vid != 0) {
++            const std::string private_vlan_iface =
++                tp.iface_name + "." + std::to_string(m_config.private_vid);
++            if (bpl::cfg_persist_iface_bridge_assignment(m_config.private_bridge,
++                                                         private_vlan_iface)) {
++                network_written = true;
++            }
++        }
++    }
++
++    if (wireless_written) {
++        if (!bpl::cfg_commit_wireless_config()) {
++            LOG(WARNING) << "persist_bridge_assignments: wireless commit FAILED";
++        } else {
++            LOG(DEBUG) << "persist_bridge_assignments: wireless commit SUCCESS";
++        }
++    }
++
++    if (network_written) {
++        if (!bpl::cfg_commit_network_config()) {
++            LOG(WARNING) << "persist_bridge_assignments: network commit FAILED";
++        } else {
++            LOG(DEBUG) << "persist_bridge_assignments: network commit SUCCESS";
++        }
++    }
++}
++
++void TrafficSeparationManager::reset_persistence()
++{
++    if (m_config.private_bridge.empty()) {
++        LOG(WARNING) << "reset_persistence: private_bridge is empty, skipping";
++        return;
++    }
++
++    std::string private_network_name;
++    if (!bpl::cfg_get_network_name_for_bridge(m_config.private_bridge, private_network_name)) {
++        LOG(WARNING) << "reset_persistence: cannot find network name for private_bridge="
++                     << m_config.private_bridge;
++        return;
++    }
++
++    auto db               = beerocks::AgentDB::get();
++    bool wireless_written = false;
++    bool network_written  = false;
++
++    // Reset wifi-iface 'option network' back to the private bridge for all BSS interfaces.
++    for (const auto *radio : db->get_radios_list()) {
++        if (!radio) {
++            continue;
++        }
++
++        for (const auto &bss : radio->front.bssids) {
++            if (!bss.active || bss.iface_name.empty()) {
++                continue;
++            }
++
++            if (!bss.fronthaul_bss && !bss.backhaul_bss) {
++                continue;
++            }
++
++            const std::string iface_name = strip_link_suffix(bss.iface_name);
++
++            if (bpl::cfg_set_wifi_iface_network(iface_name, private_network_name, bss.ssid)) {
++                LOG(DEBUG) << "reset_persistence: reset iface=" << iface_name
++                           << " to network=" << private_network_name;
++                wireless_written = true;
++            }
++        }
++    }
++
++    // Remove VLAN subinterface entries from /etc/config/network that were added by
++    // persist_bridge_assignments() for tagged trunk ports.
++    //   - All tagged trunk ports: remove <iface>.<guest_vid> from guest_bridge
++    //   - WiFi trunks only:       remove <iface>.<private_vid> from private_bridge
++    for (const auto &entry : m_trunk_ports) {
++        const sTrunkPort &tp = entry.second;
++        if (tp.is_untagged_mode) {
++            continue;
++        }
++
++        // Remove guest VLAN subinterface from guest_bridge
++        if (!m_config.guest_bridge.empty() && m_config.guest_vid != 0) {
++            const std::string guest_vlan_iface =
++                tp.iface_name + "." + std::to_string(m_config.guest_vid);
++            if (bpl::cfg_remove_iface_from_bridge_config(m_config.guest_bridge,
++                                                         guest_vlan_iface)) {
++                LOG(DEBUG) << "reset_persistence: removed " << guest_vlan_iface
++                           << " from bridge=" << m_config.guest_bridge;
++                network_written = true;
++            }
++        }
++
++        // Remove private VLAN subinterface from private_bridge (WiFi trunks only)
++        if (!tp.is_ethernet && !m_config.private_bridge.empty() && m_config.private_vid != 0) {
++            const std::string private_vlan_iface =
++                tp.iface_name + "." + std::to_string(m_config.private_vid);
++            if (bpl::cfg_remove_iface_from_bridge_config(m_config.private_bridge,
++                                                         private_vlan_iface)) {
++                LOG(DEBUG) << "reset_persistence: removed " << private_vlan_iface
++                           << " from bridge=" << m_config.private_bridge;
++                network_written = true;
++            }
++        }
++    }
++
++    if (wireless_written) {
++        if (!bpl::cfg_commit_wireless_config()) {
++            LOG(WARNING) << "reset_persistence: wireless commit FAILED";
++        } else {
++            LOG(DEBUG) << "reset_persistence: wireless commit SUCCESS";
++        }
++    }
++
++    if (network_written) {
++        if (!bpl::cfg_commit_network_config()) {
++            LOG(WARNING) << "reset_persistence: network commit FAILED";
++        } else {
++            LOG(DEBUG) << "reset_persistence: network commit SUCCESS";
++        }
++    }
++}
++
++void TrafficSeparationManager::verify_and_fix_bridge_assignments()
++{
++    if (m_config.private_bridge.empty()) {
++        LOG(WARNING) << "verify_and_fix_bridge_assignments: private_bridge is empty, skipping";
++        return;
++    }
++
++    auto db = beerocks::AgentDB::get();
++
++    for (const auto *radio : db->get_radios_list()) {
++        if (!radio) {
++            continue;
++        }
++
++        for (const auto &bss : radio->front.bssids) {
++            if (!bss.active || bss.iface_name.empty()) {
++                continue;
++            }
++
++            // Only process fronthaul-only BSS (access ports)
++            if (!bss.fronthaul_bss || bss.backhaul_bss) {
++                continue;
++            }
++
++            // GUEST vap_type goes to guest bridge; all others go to private bridge.
++            // If vap_type is OTHER (e.g. repeater BSS created before TS policy arrived),
++            // fall back to the SSID-to-VID mapping from the TS policy to identify guest SSIDs.
++            const bool is_guest = is_guest_bss(bss, db->traffic_separation);
++            const std::string &expected_bridge =
++                is_guest ? m_config.guest_bridge : m_config.private_bridge;
++
++            if (expected_bridge.empty()) {
++                LOG(DEBUG) << "verify_and_fix: no expected bridge for iface=" << bss.iface_name
++                           << ", skipping";
++                continue;
++            }
++
++            // Strip _link suffix for MLO (prplMesh uses wlan0_link0 internally, system uses wlan0)
++            const std::string iface_name = strip_link_suffix(bss.iface_name);
++
++            // Get current bridge
++            const std::string current_bridge =
++                network_utils::linux_iface_get_host_bridge(iface_name);
++
++            if (current_bridge == expected_bridge) {
++                LOG(TRACE) << "verify_and_fix: iface=" << iface_name
++                           << " already in correct bridge=" << expected_bridge;
++                continue;
++            }
++
++            LOG(INFO) << "verify_and_fix: iface=" << iface_name << " current_bridge='"
++                      << current_bridge << "' expected_bridge='" << expected_bridge << "' - fixing";
++
++            // Remove from wrong bridge if currently in one
++            if (!current_bridge.empty()) {
++                if (!network_utils::linux_remove_iface_from_bridge(current_bridge, iface_name)) {
++                    LOG(ERROR) << "verify_and_fix: failed to remove iface=" << iface_name
++                               << " from bridge=" << current_bridge;
++                }
++            }
++
++            // Add to expected bridge
++            if (!network_utils::linux_add_iface_to_bridge(expected_bridge, iface_name)) {
++                LOG(ERROR) << "verify_and_fix: failed to add iface=" << iface_name
++                           << " to bridge=" << expected_bridge;
++            }
++        }
++    }
++}
++
+ } // namespace beerocks::net
+diff --git a/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.h b/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.h
+index cfcf9bb6d..ed2110d9f 100644
+--- a/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.h
++++ b/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.h
+@@ -101,6 +101,41 @@ public:
+     bool reset();
+ 
+ private:
++    /**
++     * @brief Persist the current bridge assignments to /etc/config/network via uci.
++     *
++     * For each active fronthaul-only BSS interface, finds the UCI network device
++     * section for the expected bridge and adds the interface to its ports list.
++     * Commits the network package after all additions.
++     *
++     * Called from apply_policies() when ts_persistence_enabled is true.
++     */
++    void persist_bridge_assignments();
++
++    /**
++     * @brief Reset persisted bridge assignments in UCI wireless config.
++     *
++     * For each active BSS interface, resets the wifi-iface 'option network'
++     * back to the private bridge network so that netifd places all interfaces
++     * in the default bridge on the next boot.
++     *
++     * Called from reset() when ts_persistence_enabled is true.
++     */
++    void reset_persistence();
++
++    /**
++     * @brief Verify that each active fronthaul-only BSS interface is in its correct bridge
++     * and fix the assignment if it is wrong or missing.
++     *
++     * Reads BSS info and the ts_bridge_mapping_enabled flag from AgentDB.
++     * Uses bss.vap_type to determine the expected bridge:
++     *   eVapType::GUEST -> m_config.guest_bridge
++     *   all others      -> m_config.private_bridge
++     *
++     * Called from apply_policies() when ts_bridge_mapping_enabled is true.
++     */
++    void verify_and_fix_bridge_assignments();
++
+     bool has_config() const { return m_state != eTsManagerState::NO_CONFIG; }
+     bool is_applied() const { return m_state == eTsManagerState::APPLIED; }
+ 
+@@ -138,6 +173,14 @@ private:
+      */
+     std::unordered_map<std::string, std::unique_ptr<PortPlumbing>> m_trunk_port_plumbing_map;
+ 
++    /**
++     * @brief Map from trunk port interface name to its sTrunkPort descriptor.
++     * Maintained in parallel with m_trunk_port_plumbing_map to allow
++     * persist_bridge_assignments() to access trunk port metadata for VLAN
++     * subinterface persistence.
++     */
++    std::unordered_map<std::string, sTrunkPort> m_trunk_ports;
++
+     /**
+      * @brief Map from access port interface name to its plumbing implementation.
+      */
+diff --git a/agent/src/beerocks/slave/traffic_separation/traffic_separation_utils.h b/agent/src/beerocks/slave/traffic_separation/traffic_separation_utils.h
+index a2a19a506..aa98ef3e3 100644
+--- a/agent/src/beerocks/slave/traffic_separation/traffic_separation_utils.h
++++ b/agent/src/beerocks/slave/traffic_separation/traffic_separation_utils.h
+@@ -14,6 +14,8 @@
+ 
+ #include <bcl/beerocks_defines.h>
+ 
++#include "../agent_db.h"
++
+ namespace beerocks {
+ namespace net {
+ 
+@@ -99,6 +101,23 @@ inline bool resolve_profile_disallow_flags(bool &dis_p1, bool &dis_p2,
+     }
+ }
+ 
++/**
++ * @brief Strip the MLO link suffix from an interface name.
++ *
++ * prplMesh uses link-specific interface names internally (e.g. "wlan0_link0"),
++ * while the system uses the base interface name (e.g. "wlan0"). This function
++ * strips the "_link" suffix and everything after it.
++ *
++ * @param iface_name Interface name, possibly with a "_link" suffix.
++ * @return Base interface name with the "_link" suffix removed, or the original
++ *         name if no such suffix is present.
++ */
++inline std::string strip_link_suffix(const std::string &iface_name)
++{
++    const auto pos = iface_name.rfind("_link");
++    return (pos != std::string::npos) ? iface_name.substr(0, pos) : iface_name;
++}
++
+ /**
+  * @brief Derive trunk mode (tagged/untagged) from profile-disallow flags and policy.
+  *
+@@ -113,6 +132,32 @@ inline bool is_untagged_mode(bool dis_p1, bool dis_p2, eUnsupportedProfileDisall
+ }
+ 
+ } // namespace net
++
++/**
++ * @brief Determine whether a BSS is a guest BSS.
++ *
++ * Returns true if bss.vap_type is GUEST, or if vap_type is OTHER and the
++ * BSS SSID maps to a secondary (guest) VID in the traffic-separation policy.
++ *
++ * @param bss    BSS descriptor from AgentDB.
++ * @param ts_db  Traffic-separation sub-database from AgentDB.
++ * @return true if the BSS is a guest BSS, false otherwise.
++ */
++inline bool is_guest_bss(const AgentDB::sRadio::sFront::sBssid &bss,
++                         const AgentDB::sTrafficSeparation &ts_db)
++{
++    if (bss.vap_type == eVapType::GUEST) {
++        return true;
++    }
++    if (bss.vap_type == eVapType::OTHER && !bss.ssid.empty()) {
++        const auto it = ts_db.ssid_vid_mapping.find(bss.ssid);
++        if (it != ts_db.ssid_vid_mapping.end() && ts_db.secondary_vlans_ids.count(it->second)) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ } // namespace beerocks
+ 
+ #endif // TRAFFIC_SEPARATION_UTILS_H
+diff --git a/common/beerocks/bcl/include/bcl/network/network_utils.h b/common/beerocks/bcl/include/bcl/network/network_utils.h
+index 14ed2ce95..122eb57fc 100644
+--- a/common/beerocks/bcl/include/bcl/network/network_utils.h
++++ b/common/beerocks/bcl/include/bcl/network/network_utils.h
+@@ -172,6 +172,7 @@ public:
+ 
+     static bool linux_add_iface_to_bridge(const std::string &bridge, const std::string &iface);
+     static bool linux_remove_iface_from_bridge(const std::string &bridge, const std::string &iface);
++
+     static bool linux_iface_ctrl(const std::string &iface, bool up, std::string ip = "",
+                                  const std::string &netmask = "");
+     static bool linux_iface_get_mac(const std::string &iface, std::string &mac);
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index f3f138cce..a221b3f1e 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -1525,12 +1525,9 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+     bool new_radio_iface_name_updated = false;
+ 
+     //Exacting radio name to get only the base interface
+-    std::string base_radio_iface_name = m_radio_info.iface_name;
+-    size_t link_pos = base_radio_iface_name.find("_link");
+-    if (link_pos != std::string::npos) {
+-        base_radio_iface_name = base_radio_iface_name.substr(0, link_pos);
+-    }
+-    m_radio_info.wps_pushbutton_configured=false;
++    std::string base_radio_iface_name;
++    extractLinkBaseInterface(m_radio_info.iface_name, base_radio_iface_name);
++    m_radio_info.wps_pushbutton_configured = false;
+     for (auto &bss_it : bss_info_conf_list) {
+         bss_iterator++;
+         LOG(DEBUG) << "BSS iterator :   " << bss_iterator;
+@@ -1607,9 +1604,35 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+             new_vap_index++;
+ 
+             bss_it.bssid = new_bssid;
+-            std::string bridge = "br-lan";
+             std::string bss_mac_string = tlvf::mac_to_string(bss_it.bssid);
+ 
++            // Read vap_type from UCI custom_alias if not already set
++            if (bss_it.vap_type == eVapType::OTHER) {
++                son::wireless_utils::sBssInfoConf uci_config;
++                if (beerocks::bpl::bpl_cfg_get_wifi_credentials(new_vap_name, uci_config)) {
++                    bss_it.vap_type = uci_config.vap_type;
++                    LOG(DEBUG) << "Read vap_type from UCI for " << new_vap_name
++                               << ": " << eVapType_str(bss_it.vap_type);
++                }
++            }
++
++            // Determine bridge based on vap_type using BPL configuration
++            std::string bridge;
++            if (bss_it.vap_type == eVapType::GUEST) {
++                if (!beerocks::bpl::cfg_get_guest_bridge_iface(bridge)) {
++                    LOG(WARNING) << "Failed to get guest bridge from config, using default";
++                    bridge = beerocks::bpl::DEFAULT_GUEST_BRIDGE_IFACE;
++                }
++            } else {
++                if (!beerocks::bpl::cfg_get_private_bridge_iface(bridge)) {
++                    LOG(WARNING) << "Failed to get private bridge from config, using default";
++                    bridge = beerocks::bpl::DEFAULT_PRIVATE_BRIDGE_IFACE;
++                }
++            }
++
++            LOG(DEBUG) << "BSS " << new_vap_name << " vap_type=" << static_cast<int>(bss_it.vap_type)
++                       << " -> bridge=" << bridge;
++
+             if ((mld_id_val >=0) && bss_name_changed) {
+                 std::string prev_iface = "";
+                 if (!add_mld_link(new_vap_name,prev_iface,bss_it,bridge)) {
+@@ -1722,7 +1745,7 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                 }
+ 
+                 if (!bridge_ifname.empty() &&
+-                        beerocks::net::network_utils::linux_iface_is_up(bridge_ifname)) {
++                    beerocks::net::network_utils::linux_iface_is_up(bridge_ifname)) {
+                     conf.set_create_vap_value(vap_id, "bridge", bridge_ifname);
+                 }
+ 
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index 503ac5f40..6a820ca5e 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -17,6 +17,7 @@
+ #include <bcl/son/son_wireless_utils.h>
+ #include <bwl/key_value_parser.h>
+ #include <bwl/nl80211_client_factory.h>
++#include <bpl/bpl_cfg.h>
+ 
+ #include <easylogging++.h>
+ 
+@@ -941,6 +942,30 @@ bool base_wlan_hal_nl80211::refresh_vaps_info(int id)
+                 break;
+             }
+         }
++
++        // Read vap_type from UCI custom_alias
++        // Strip _link suffix from interface name for UCI lookup
++        std::string base_iface;
++        extractLinkBaseInterface(vap_element.bss, base_iface);
++
++        son::wireless_utils::sBssInfoConf uci_config;
++        if (beerocks::bpl::bpl_cfg_get_wifi_credentials(base_iface, uci_config)) {
++            vap_element.vap_type = uci_config.vap_type;
++            LOG(DEBUG) << "Read vap_type from UCI for " << vap_element.bss
++                       << " (base=" << base_iface << "): " << eVapType_str(vap_element.vap_type);
++        } else {
++            // Fallback: try SSID-based lookup when interface name lookup fails
++            if (beerocks::bpl::bpl_cfg_get_wifi_credentials_by_ssid(vap_element.ssid, uci_config)) {
++                vap_element.vap_type = uci_config.vap_type;
++                LOG(DEBUG) << "Read vap_type from UCI by SSID for " << vap_element.bss
++                           << " (ssid=" << vap_element.ssid << "): " << eVapType_str(vap_element.vap_type);
++            } else {
++                vap_element.vap_type = eVapType::OTHER;
++                LOG(DEBUG) << "Failed to read vap_type from UCI for " << vap_element.bss
++                           << " (base=" << base_iface << ", ssid=" << vap_element.ssid
++                           << "), defaulting to OTHER";
++            }
++        }
+         // If reached here, assume that the BSS information is already exist on the container,
+         // therefore there is no need to update the information except the BSS mac that is not
+         // preset.
+diff --git a/framework/platform/bpl/cfg/dm/bpl_cfg.cpp b/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
+index dea88aea5..9b27d4467 100644
+--- a/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
+@@ -713,6 +713,43 @@ bool cfg_get_traffic_separation_guest_vid(int &guest_vid)
+     return false;
+ }
+ 
++bool cfg_get_traffic_separation_bridge_mapping_enabled(bool &enabled)
++{
++    enabled = DEFAULT_TS_BRIDGE_MAPPING_ENABLED;
++    return true;
++}
++
++bool cfg_get_traffic_separation_persistence_enabled(bool &enabled)
++{
++    enabled = DEFAULT_TS_PERSISTENCE_ENABLED;
++    return true;
++}
++
++bool cfg_persist_iface_bridge_assignment(const std::string & /*bridge*/,
++                                         const std::string & /*iface*/)
++{
++    return true;
++}
++
++bool cfg_remove_iface_from_bridge_config(const std::string & /*bridge*/,
++                                          const std::string & /*iface*/)
++{
++    return true;
++}
++
++bool cfg_commit_network_config() { return true; }
++
++bool cfg_get_bridge_for_iface(const std::string & /*iface*/, std::string & /*bridge_name*/)
++{
++    return false;
++}
++
++bool cfg_get_network_name_for_bridge(const std::string & /*bridge_name*/,
++                                     std::string & /*network_name*/)
++{
++    return false;
++}
++
+ /* ============================================================
+  *                        Other Config
+  * ============================================================
+diff --git a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+index 0ef7dd57c..373c1d7d5 100644
+--- a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+@@ -389,6 +389,12 @@ bool bpl_cfg_get_hostapd_ctrl_path(const std::string &iface, std::string &hostap
+     return true;
+ }
+ 
++bool bpl_cfg_get_wifi_credentials_by_ssid(const std::string & /*ssid*/,
++                                          son::wireless_utils::sBssInfoConf & /*configuration*/)
++{
++    return false;
++}
++
+ /* Enable this API only if needed 
+  * Right now adding this abstract to have similar implementation as NL HAL
+  * But this is needed to be called from backhaul manager only if credentials are to be saved earlier
+@@ -454,5 +460,19 @@ bool bpl_cfg_set_sta_vap_bh_credentials(const std::string &iface,
+ }
+ 
+ */
++
++bool cfg_set_wifi_iface_network(const std::string &iface_name, const std::string &network_name,
++                                const std::string &ssid)
++{
++    LOG(DEBUG) << "cfg_set_wifi_iface_network: not implemented for DM platform";
++    return false;
++}
++
++bool cfg_commit_wireless_config()
++{
++    LOG(DEBUG) << "cfg_commit_wireless_config: not implemented for DM platform";
++    return true;
++}
++
+ } // namespace bpl
+ } // namespace beerocks
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
+index eb168d43e..2ccfd72e4 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
+@@ -15,6 +15,10 @@
+ #include "bpl_cfg_helper.h"
+ #include "bpl_cfg_uci.h"
+ 
++extern "C" {
++#include <uci.h>
++}
++
+ #include <bcl/beerocks_string_utils.h>
+ #include <mapf/common/logger.h>
+ #include <mapf/common/utils.h>
+@@ -1085,31 +1089,255 @@ bool cfg_get_clients_unicast_measurements(bool &client_unicast_measurements)
+ 
+ bool cfg_get_private_bridge_iface(std::string &bridge_iface)
+ {
+-    bridge_iface = DEFAULT_PRIVATE_BRIDGE_IFACE;
++    char ifname[IFNAMSIZ + 1] = {0};
++
++    int retVal = cfg_get_prplmesh_param("PrivateBridgeIface", ifname, IFNAMSIZ);
++    if (retVal == RETURN_ERR) {
++        MAPF_DBG(
++            "Failed to read PrivateBridgeIface, using default=" << DEFAULT_PRIVATE_BRIDGE_IFACE);
++        bridge_iface = DEFAULT_PRIVATE_BRIDGE_IFACE;
++        return true;
++    }
++
++    bridge_iface = ifname;
+     return true;
+ }
+ 
+ bool cfg_get_guest_bridge_iface(std::string &bridge_iface)
+ {
+-    bridge_iface = DEFAULT_GUEST_BRIDGE_IFACE;
++    char ifname[IFNAMSIZ + 1] = {0};
++
++    int retVal = cfg_get_prplmesh_param("GuestBridgeIface", ifname, IFNAMSIZ);
++    if (retVal == RETURN_ERR) {
++        MAPF_DBG("Failed to read GuestBridgeIface, using default=" << DEFAULT_GUEST_BRIDGE_IFACE);
++        bridge_iface = DEFAULT_GUEST_BRIDGE_IFACE;
++        return true;
++    }
++
++    bridge_iface = ifname;
+     return true;
+ }
+ 
+ bool cfg_get_is_traffic_separation_enabled(bool &is_traffic_separation_enabled)
+ {
+-    is_traffic_separation_enabled = DEFAULT_IS_TRAFFIC_SEPARATION_ENABLED;
++    int retVal = -1;
++    if (cfg_get_prplmesh_param_int_default("TrafficSeparation_enable", &retVal,
++                                           DEFAULT_IS_TRAFFIC_SEPARATION_ENABLED) == RETURN_ERR) {
++        MAPF_DBG("Failed to read TrafficSeparation_enable, using default="
++                 << DEFAULT_IS_TRAFFIC_SEPARATION_ENABLED);
++        is_traffic_separation_enabled = DEFAULT_IS_TRAFFIC_SEPARATION_ENABLED;
++        return true;
++    }
++
++    is_traffic_separation_enabled = (retVal == 1);
+     return true;
+ }
+ 
+ bool cfg_get_traffic_separation_private_vid(int &private_vid)
+ {
+-    private_vid = DEFAULT_PRIVATE_VLAN_ID;
++    int retVal = -1;
++    if (cfg_get_prplmesh_param_int_default("TrafficSeparation_PrivateVID", &retVal,
++                                           DEFAULT_PRIVATE_VLAN_ID) == RETURN_ERR) {
++        MAPF_DBG("Failed to read TrafficSeparation_PrivateVID, using default="
++                 << DEFAULT_PRIVATE_VLAN_ID);
++        private_vid = DEFAULT_PRIVATE_VLAN_ID;
++        return true;
++    }
++
++    // Validate VLAN ID range (1-4094)
++    if (retVal < 1 || retVal > 4094) {
++        MAPF_ERR("Invalid TrafficSeparation_PrivateVID=" << retVal << ", using default="
++                                                         << DEFAULT_PRIVATE_VLAN_ID);
++        private_vid = DEFAULT_PRIVATE_VLAN_ID;
++        return true;
++    }
++
++    private_vid = retVal;
+     return true;
+ }
+ 
+ bool cfg_get_traffic_separation_guest_vid(int &guest_vid)
+ {
+-    guest_vid = DEFAULT_GUEST_VLAN_ID;
++    int retVal = -1;
++    if (cfg_get_prplmesh_param_int_default("TrafficSeparation_GuestVID", &retVal,
++                                           DEFAULT_GUEST_VLAN_ID) == RETURN_ERR) {
++        MAPF_DBG(
++            "Failed to read TrafficSeparation_GuestVID, using default=" << DEFAULT_GUEST_VLAN_ID);
++        guest_vid = DEFAULT_GUEST_VLAN_ID;
++        return true;
++    }
++
++    // Validate VLAN ID range (1-4094)
++    if (retVal < 1 || retVal > 4094) {
++        MAPF_ERR("Invalid TrafficSeparation_GuestVID=" << retVal << ", using default="
++                                                        << DEFAULT_GUEST_VLAN_ID);
++        guest_vid = DEFAULT_GUEST_VLAN_ID;
++        return true;
++    }
++
++    guest_vid = retVal;
++    return true;
++}
++
++bool cfg_get_traffic_separation_bridge_mapping_enabled(bool &enabled)
++{
++    int retVal = -1;
++
++    if (cfg_get_prplmesh_param_int_default("TrafficSeparation_bridge_mapping_enable", &retVal,
++                                           0) == RETURN_ERR) {
++        MAPF_DBG("Failed to read TrafficSeparation_bridge_mapping_enable, using default=0");
++        enabled = DEFAULT_TS_BRIDGE_MAPPING_ENABLED;
++        return true;
++    }
++    enabled = (retVal != 0);
++    return true;
++}
++
++bool cfg_get_traffic_separation_persistence_enabled(bool &enabled)
++{
++    int retVal = -1;
++
++    if (cfg_get_prplmesh_param_int_default("TrafficSeparation_persistence_enable", &retVal,
++                                           0) == RETURN_ERR) {
++        MAPF_DBG("Failed to read TrafficSeparation_persistence_enable, using default=0");
++        enabled = DEFAULT_TS_PERSISTENCE_ENABLED;
++        return true;
++    }
++    enabled = (retVal != 0);
++    return true;
++}
++
++bool cfg_persist_iface_bridge_assignment(const std::string &bridge, const std::string &iface)
++{
++    // Find the UCI network device section whose 'name' option matches the bridge.
++    std::string section_name;
++    bool find_ok = uci_find_section_by_option("network", "device", "name", bridge, section_name);
++
++    if (!find_ok || section_name.empty()) {
++        LOG(WARNING) << "cfg_persist_iface_bridge_assignment: no UCI section found for bridge="
++                     << bridge << ", skipping iface=" << iface;
++        return false;
++    }
++
++    // uci_add_list_option removes any existing occurrence first (dedup), then adds,
++    // and issues a single uci_save covering both operations.
++    bool add_ok = uci_add_list_option("network", section_name, "ports", iface, false);
++    if (!add_ok) {
++        LOG(ERROR) << "cfg_persist_iface_bridge_assignment: failed to add iface=" << iface
++                   << " to bridge=" << bridge;
++        return false;
++    }
++
++    LOG(DEBUG) << "cfg_persist_iface_bridge_assignment: added iface=" << iface
++               << " to bridge=" << bridge;
++    return true;
++}
++
++bool cfg_remove_iface_from_bridge_config(const std::string &bridge, const std::string &iface)
++{
++    // Find the UCI network device section whose 'name' option matches the bridge.
++    std::string section_name;
++    bool find_ok = uci_find_section_by_option("network", "device", "name", bridge, section_name);
++
++    if (!find_ok || section_name.empty()) {
++        LOG(DEBUG) << "cfg_remove_iface_from_bridge_config: no UCI section for bridge=" << bridge
++                   << ", nothing to remove for iface=" << iface;
++        return true;
++    }
++
++    uci_del_list_option("network", section_name, "ports", iface, false);
++
++    LOG(DEBUG) << "cfg_remove_iface_from_bridge_config: removed iface=" << iface
++               << " from bridge=" << bridge;
++    return true;
++}
++
++bool cfg_get_bridge_for_iface(const std::string &iface, std::string &bridge_name)
++{
++    uci_context *ctx = uci_alloc_context();
++    if (!ctx) {
++        LOG(ERROR) << "cfg_get_bridge_for_iface: failed to alloc UCI context";
++        return false;
++    }
++
++    uci_package *pkg = nullptr;
++    if (uci_load(ctx, "network", &pkg) != UCI_OK || !pkg) {
++        LOG(ERROR) << "cfg_get_bridge_for_iface: failed to load network package";
++        uci_free_context(ctx);
++        return false;
++    }
++
++    bool found       = false;
++    uci_element *elm = nullptr;
++    uci_foreach_element(&pkg->sections, elm)
++    {
++        uci_section *sec = uci_to_section(elm);
++        if (strcmp(sec->type, "device") != 0) {
++            continue;
++        }
++
++        // Look for the interface in the "ports" list of this section
++        uci_element *opt_elm = nullptr;
++        uci_foreach_element(&sec->options, opt_elm)
++        {
++            uci_option *opt = uci_to_option(opt_elm);
++            if (strcmp(opt->e.name, "ports") != 0 || opt->type != UCI_TYPE_LIST) {
++                continue;
++            }
++            uci_element *list_elm = nullptr;
++            uci_foreach_element(&opt->v.list, list_elm)
++            {
++                if (iface == list_elm->name) {
++                    // Found the interface; get the bridge name from the "name" option
++                    uci_element *name_elm = nullptr;
++                    uci_foreach_element(&sec->options, name_elm)
++                    {
++                        uci_option *name_opt = uci_to_option(name_elm);
++                        if (strcmp(name_opt->e.name, "name") == 0 &&
++                            name_opt->type == UCI_TYPE_STRING) {
++                            bridge_name = name_opt->v.string;
++                            found       = true;
++                            break;
++                        }
++                    }
++                    break;
++                }
++            }
++            if (found) {
++                break;
++            }
++        }
++        if (found) {
++            break;
++        }
++    }
++
++    uci_free_context(ctx);
++    if (found) {
++        LOG(DEBUG) << "cfg_get_bridge_for_iface: iface=" << iface << " -> bridge=" << bridge_name;
++    } else {
++        LOG(DEBUG) << "cfg_get_bridge_for_iface: iface=" << iface << " not found in any bridge";
++    }
++    return found;
++}
++
++bool cfg_commit_network_config() { return uci_commit_changes("network"); }
++
++bool cfg_get_network_name_for_bridge(const std::string &bridge_name, std::string &network_name)
++{
++    // Find the UCI network interface section whose 'device' option matches the bridge name.
++    // e.g. bridge_name="br-lan" -> section 'lan' has option device 'br-lan' -> network_name="lan"
++    std::string section_name;
++    bool found = uci_find_section_by_option("network", "interface", "device", bridge_name,
++                                            section_name);
++    if (!found || section_name.empty()) {
++        LOG(DEBUG) << "cfg_get_network_name_for_bridge: no interface section found for bridge="
++                   << bridge_name;
++        return false;
++    }
++    network_name = section_name;
++    LOG(DEBUG) << "cfg_get_network_name_for_bridge: bridge=" << bridge_name
++               << " -> network=" << network_name;
+     return true;
+ }
+ 
+@@ -1117,13 +1345,12 @@ bool cfg_get_traffic_separation_guest_vid(int &guest_vid)
+ 
+ bool cfg_commit_changes() { return uci_commit_changes("prplmesh"); }
+ 
+-bool cfg_update_prplmesh_option(const std::string &package_name,
+-                            const std::string &section_type,
+-                            const std::string &option_name,
+-                            const std::string &old_value,
+-                            const std::string &new_value)
++bool cfg_update_prplmesh_option(const std::string &package_name, const std::string &section_type,
++                                const std::string &option_name, const std::string &old_value,
++                                const std::string &new_value)
+ {
+-    return cfg_update_prplmesh_option_commit(package_name, section_type, option_name, old_value, new_value);
++    return cfg_update_prplmesh_option_commit(package_name, section_type, option_name, old_value,
++                                             new_value);
+ }
+ 
+ } // namespace bpl
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index ebe03df21..65b32814c 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -7,6 +7,9 @@
+  */
+ 
+ #include <bpl/bpl_cfg.h>
++#include <tlvf/common/eVapType.h>
++#include <algorithm>
++#include <bcl/son/son_wireless_utils.h>
+ 
+ #include "../../common/uci/bpl_uci.h"
+ #include "../../common/utils/utils.h"
+@@ -100,6 +103,20 @@ static bool bpl_cfg_get_bss_configuration(const std::string &section_name,
+ 	    configuration.mld_id = std::to_string(get_mld_id(options["mld"]));
+     }
+ 
++    std::string custom_alias = options["custom_alias"];
++    if (!custom_alias.empty()) {
++        std::transform(custom_alias.begin(), custom_alias.end(), custom_alias.begin(),
++                      [](unsigned char c) { return std::tolower(c); });
++
++        configuration.vap_type = son::wireless_utils::string_to_vap_type(custom_alias);
++
++        MAPF_DBG("Section " << section_name << ": custom_alias='" << options["custom_alias"]
++                 << "' -> vap_type=" << eVapType_str(configuration.vap_type));
++    } else {
++        configuration.vap_type = eVapType::OTHER;
++        MAPF_DBG("Section " << section_name << ": no custom_alias, defaulting to vap_type=OTHER");
++    }
++
+     return true;
+ }
+ 
+@@ -415,6 +432,40 @@ bool bpl_cfg_get_wifi_credentials(const std::string &iface,
+     return true;
+ }
+ 
++bool bpl_cfg_get_wifi_credentials_by_ssid(const std::string &ssid,
++                                          son::wireless_utils::sBssInfoConf &configuration)
++{
++    // Get all "wireless.wifi-iface" section names in UCI configuration
++    const std::string package_name = "wireless";
++    const std::string section_type = "wifi-iface";
++    std::vector<std::string> sections;
++    if (!uci_get_all_sections(package_name, section_type, sections)) {
++        LOG(WARNING) << "Failed to get section names";
++        return false;
++    }
++
++    // Search for section with matching SSID
++    for (const auto &section_name : sections) {
++        std::string section_ssid;
++        if (!uci_get_option(package_name, section_type, section_name, "ssid", section_ssid)) {
++            continue;
++        }
++
++        if (section_ssid == ssid) {
++            // Found matching SSID, get full configuration
++            if (!bpl_cfg_get_bss_configuration(section_name, configuration)) {
++                LOG(ERROR) << "Failed to get wireless configuration for SSID " << ssid
++                           << " at section " << section_name;
++                return false;
++            }
++            return true;
++        }
++    }
++
++    LOG(WARNING) << "Configuration for SSID " << ssid << " not found";
++    return false;
++}
++
+ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+                                   const son::wireless_utils::sBssInfoConf &configuration,std::string &radio_id)
+ {
+@@ -433,34 +484,80 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+ 
+ 
+     if(mld_id_val ==-1){
+-	    if (!uci_find_section_by_option(package_name, section_type, option_name, iface, section_name)) {
+-		    LOG(ERROR) << "Failed to find configuration section for interface " << iface;
++	    // Find the device section for this radio first (needed for robust section matching below)
++	    std::string device_section;
++	    if (!radio_id.empty() &&
++			    uci_find_section_by_option("wireless", "wifi-device", "radio", radio_id, device_section)) {
++		    LOG(INFO) << "Found device section for radio " << radio_id << ": " << device_section;
++	    } else {
++		    LOG(ERROR) << "No matching wifi-device section found for radio: " << radio_id;
+ 		    return false;
+ 	    }
+-	    
++
++	    // Robust section search: match by device+ifname (handles sections without ifname set,
++	    // which is the default for original OpenWrt UCI configs where ifname is kernel-assigned)
++	    {
++		    std::vector<std::string> all_iface_sections;
++		    if (!uci_get_all_sections(package_name, section_type, all_iface_sections)) {
++			    LOG(ERROR) << "Failed to get all wifi-iface sections for " << iface;
++			    return false;
++		    }
++		    std::string candidate_section; // match by device only (no ifname set yet)
++		    for (const auto &sec : all_iface_sections) {
++			    std::string device_val, mld_val;
++			    if (!uci_get_option(package_name, section_type, sec, "device", device_val)) {
++				    continue;
++			    }
++			    if (device_val != device_section) {
++				    continue;
++			    }
++			    // Skip MLD sections (they have a "mld" option)
++			    uci_get_option(package_name, section_type, sec, "mld", mld_val);
++			    if (!mld_val.empty()) {
++				    continue;
++			    }
++			    // Check ifname for exact match
++			    std::string ifname_val;
++			    bool has_ifname = uci_get_option(package_name, section_type, sec, "ifname", ifname_val);
++			    if (has_ifname) {
++				    bool ifname_matches = (ifname_val == iface);
++				    if (!configuration.old_iface_name.empty()) {
++					    ifname_matches = ifname_matches || (ifname_val == configuration.old_iface_name);
++				    }
++				    if (ifname_matches) {
++					    section_name = sec;
++					    LOG(INFO) << "Found section " << sec << " for " << iface << " (exact match)";
++					    break;
++				    }
++			    } else if (candidate_section.empty()) {
++				    // No ifname set - candidate match by device alone
++				    candidate_section = sec;
++			    }
++		    }
++		    if (section_name.empty() && !candidate_section.empty()) {
++			    section_name = candidate_section;
++			    LOG(INFO) << "Found section " << section_name << " for " << iface << " (device match, no ifname)";
++		    }
++	    }
++
+ 	    if (section_name.empty()) {
+-		    
+ 		    LOG(INFO) << "Section not found for interface " << iface << ", creating new section";
+ 		    int iface_index = 0;
+-        
+-        	    // Generate a unique section name for the interface configuration
+-        	    // Start with "iface_wlan" followed by an incrementing index (e.g., iface_wlan0, iface_wlan1, ...)
+-         	    // Continue incrementing until a section name is found that does not already exist in the uci wireless file
+ 		    do {
+ 			    section_name = "iface_wlan" + std::to_string(iface_index++);
+-        	    } while (uci_section_exists(package_name, section_type, section_name));
+-		    
++		    } while (uci_section_exists(package_name, section_type, section_name));
++
+ 		    if (!uci_add_section(package_name, section_type, section_name, true)) {
+ 			    LOG(ERROR) << "Failed to add new section for interface " << iface;
+ 			    return false;
+ 		    }
+-		    LOG(INFO)<<"uci_add_section added successfully";
++		    LOG(INFO) << "uci_add_section added successfully";
+ 	    }
+-	    
++
+ 	    // Overwrite UCI configuration with wireless credentials for the given interface
+ 	    OptionsUnorderedMap options;
+ 	    options["ssid"] = configuration.ssid;
+-	    
++
+ 	    auto get_encryption = [](WSC::eWscAuth authentication_type, WSC::eWscEncr encryption_type) {
+ 		    std::string encryption = "none";
+ 		    if (authentication_type == WSC::eWscAuth::WSC_AUTH_WPA2PSK) {
+@@ -494,7 +591,6 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+ 	    
+ 	    if(!configuration.multi_ap.empty()) {
+ 		    options["multi_ap"] = configuration.multi_ap;
+-		    
+ 	    }
+ 	    else {
+ 		    options["wds"] = "1"; //wds enabled only when multi_ap not present
+@@ -510,15 +606,37 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+             options["bss_transition"] = "1";
+             options["ieee80211k"] = "1";
+ 
+-	    std::string device_section;
+-	    
+-	    if (!radio_id.empty() &&
+-			    uci_find_section_by_option("wireless", "wifi-device", "radio", radio_id, device_section)) {
+-                    LOG(INFO) << "Found device section for radio " << radio_id << ": " << device_section;
+-		    options["device"] = device_section;
+-	    } else {
+-                    LOG(ERROR) << "No matching wifi-device section found for radio: " << radio_id;
+-                    return false;
++	    options["device"] = device_section;
++	    // Check if credential-relevant fields have actually changed to avoid unnecessary
++	    // UCI commits that would trigger netifd to restart hostapd on every autoconfiguration
++	    // cycle.  Only ssid/encryption/key/multi_ap and backhaul credentials are compared;
++	    // non-credential fields (bss_transition, ieee80211k, sae_pwe, device, etc.) may
++	    // legitimately differ from the existing UCI config without requiring a restart.
++	    {
++		    static const char * const cred_keys[] = {
++			    "ssid", "encryption", "key", "multi_ap",
++			    "multi_ap_backhaul_ssid", "multi_ap_backhaul_key", nullptr
++		    };
++		    bool changed = false;
++		    for (int i = 0; cred_keys[i] != nullptr; ++i) {
++			    auto new_it = options.find(cred_keys[i]);
++			    if (new_it == options.end()) continue;
++			    std::string current_value;
++			    if (!uci_get_option(package_name, section_type, section_name,
++					    cred_keys[i], current_value)) {
++				    changed = true;
++				    break;
++			    }
++			    if (current_value != new_it->second) {
++				    changed = true;
++				    break;
++			    }
++		    }
++		    if (!changed) {
++			    LOG(DEBUG) << "UCI credentials for " << iface << " unchanged, skipping commit";
++			    return true;
++		    }
++		    LOG(INFO) << "UCI credentials for " << iface << " changed, updating";
+ 	    }
+ 	    // Write UCI options in the "wireless.wifi-iface" section for the given interface.
+ 	    if (!uci_set_section(package_name, section_type, section_name, options, true)) {
+@@ -619,49 +737,9 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+             return options;
+         };
+ 
+-        //Creating a new wifi-mld section if it doesnt exists
+-        const std::string mld_section_type = "wifi-mld";
+-        std::string mld_section_name = "mld" + std::to_string(mld_id_val+1);
+-
+-        bool mld_section_exists = uci_section_exists(package_name, mld_section_type, mld_section_name);
+-
+-        if (!mld_section_exists) {
+-            LOG(INFO) << "Creating new MLD section: " << mld_section_name;
+-
+-            if (!uci_add_section(package_name, mld_section_type, mld_section_name, true)) {
+-                LOG(ERROR) << "Failed to add new section for MLD: " << mld_section_name;
+-                return false;
+-            }
+-        } else {
+-            LOG(INFO) << "MLD section " << mld_section_name << " already exists, updating configuration";
+-        }
+-
+-        OptionsUnorderedMap mldOptions;
+-        mldOptions["ssid"] = configuration.ssid;
+-        mldOptions["key"] = configuration.network_key;
+-        mldOptions["ifname"] = iface;
+-        if (!configuration.multi_ap.empty()) {
+-                mldOptions["multi_ap"] = configuration.multi_ap;
+-        } else {
+-            mldOptions["wds"] = "1"; //wds enabled only when multi_ap not present
+-        }
+-
+-        //wps_pushbutton for FH
+-        if (configuration.wps_pushbutton) {
+-            mldOptions["wps_pushbutton"] = "1";
+-        }
+-	mldOptions["bss_transition"] = "1";
+-	mldOptions["ieee80211k"] = "1";
+-
+-
+-        if (!uci_set_section(package_name, mld_section_type, mld_section_name, mldOptions, true)) {
+-            LOG(ERROR) << "Failed to set wireless configuration for MLD: " << mld_id_val << " at section " << mld_section_name;
+-            return false;
+-        }
+-
+-        LOG(INFO) << "Successfully configured MLD section: " << mld_section_name 
+-                  << " (ssid=" << configuration.ssid << ")";
+-
++        // Find target_section FIRST (before any commit) to enable early-exit
++        // when credentials are unchanged, avoiding unnecessary UCI commits that
++        // would trigger netifd to restart hostapd on both wifi-mld and wifi-iface.
+         std::string target_section;
+         bool section_found = false;
+ 
+@@ -722,6 +800,79 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+             }
+         }
+ 
++        // Check if credential-relevant fields have actually changed before ANY commit.
++        // Both the wifi-mld and wifi-iface commits trigger netifd to reload hostapd;
++        // skip both when credentials are unchanged to prevent interface cycling.
++        const std::string mld_section_type = "wifi-mld";
++        std::string mld_section_name = "mld" + std::to_string(mld_id_val+1);
++        bool mld_section_exists = uci_section_exists(package_name, mld_section_type, mld_section_name);
++
++        OptionsUnorderedMap options = build_map_options(iface, configuration);
++        if (section_found && mld_section_exists) {
++            static const char * const cred_keys[] = {
++                "ssid", "encryption", "key", "multi_ap",
++                "multi_ap_backhaul_ssid", "multi_ap_backhaul_key", nullptr
++            };
++            bool changed = false;
++            for (int i = 0; cred_keys[i] != nullptr; ++i) {
++                auto new_it = options.find(cred_keys[i]);
++                if (new_it == options.end()) continue;
++                std::string current_value;
++                if (!uci_get_option(package_name, section_type, target_section,
++                        cred_keys[i], current_value)) {
++                    changed = true;
++                    break;
++                }
++                if (current_value != new_it->second) {
++                    changed = true;
++                    break;
++                }
++            }
++            if (!changed) {
++                LOG(DEBUG) << "UCI credentials for MLD iface " << iface << " unchanged, skipping commit";
++                return true;
++            }
++            LOG(INFO) << "UCI credentials for MLD iface " << iface << " changed, updating";
++        }
++
++        //Creating a new wifi-mld section if it doesnt exists
++        if (!mld_section_exists) {
++            LOG(INFO) << "Creating new MLD section: " << mld_section_name;
++
++            if (!uci_add_section(package_name, mld_section_type, mld_section_name, true)) {
++                LOG(ERROR) << "Failed to add new section for MLD: " << mld_section_name;
++                return false;
++            }
++        } else {
++            LOG(INFO) << "MLD section " << mld_section_name << " already exists, updating configuration";
++        }
++
++        OptionsUnorderedMap mldOptions;
++        mldOptions["ssid"] = configuration.ssid;
++        mldOptions["key"] = configuration.network_key;
++        mldOptions["ifname"] = iface;
++        if (!configuration.multi_ap.empty()) {
++                mldOptions["multi_ap"] = configuration.multi_ap;
++        } else {
++            mldOptions["wds"] = "1"; //wds enabled only when multi_ap not present
++        }
++
++        //wps_pushbutton for FH
++        if (configuration.wps_pushbutton) {
++            mldOptions["wps_pushbutton"] = "1";
++        }
++	mldOptions["bss_transition"] = "1";
++	mldOptions["ieee80211k"] = "1";
++
++
++        if (!uci_set_section(package_name, mld_section_type, mld_section_name, mldOptions, true)) {
++            LOG(ERROR) << "Failed to set wireless configuration for MLD: " << mld_id_val << " at section " << mld_section_name;
++            return false;
++        }
++
++        LOG(INFO) << "Successfully configured MLD section: " << mld_section_name 
++                  << " (ssid=" << configuration.ssid << ")";
++
+         if (!section_found) {
+             int iface_index = 0;
+             do {
+@@ -735,7 +886,6 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+             LOG(INFO) << "Created new section: " << target_section << " for device: " << device_section;
+         }
+ 
+-        OptionsUnorderedMap options = build_map_options(iface, configuration);
+         if (!uci_set_section(package_name, section_type, target_section, options, true)) {
+             LOG(ERROR) << "Failed to update section: " << target_section;
+             return false;
+@@ -1037,6 +1187,98 @@ bool bpl_cfg_set_sta_vap_bh_credentials(const std::string &iface,
+     
+     return true;
+ }
++
++bool cfg_set_wifi_iface_network(const std::string &iface_name, const std::string &network_name,
++                                const std::string &ssid)
++{
++    const std::string pkg  = "wireless";
++    const std::string type = "wifi-iface";
++
++    // First try to find the section by ifname.
++    std::string section_name;
++    bool found_by_ifname = uci_find_section_by_option(pkg, type, "ifname", iface_name,
++                                                      section_name);
++
++    if (found_by_ifname && !section_name.empty()) {
++        // Skip if already set to the desired value.
++        std::string current_network;
++        if (uci_get_option(pkg, type, section_name, "network", current_network) &&
++            current_network == network_name) {
++            LOG(DEBUG) << "cfg_set_wifi_iface_network: iface=" << iface_name
++                       << " already has network=" << network_name << ", skipping";
++            return true;
++        }
++
++        OptionsUnorderedMap options;
++        options["network"] = network_name;
++        if (!uci_set_section(pkg, type, section_name, options, false)) {
++            LOG(ERROR) << "cfg_set_wifi_iface_network: failed to set network=" << network_name
++                       << " for iface=" << iface_name;
++            return false;
++        }
++
++        LOG(DEBUG) << "cfg_set_wifi_iface_network: iface=" << iface_name
++                   << " -> network=" << network_name;
++        return true;
++    }
++
++    // ifname not found in any section. Fall back to SSID-based search if ssid is provided.
++    if (ssid.empty()) {
++        LOG(DEBUG) << "cfg_set_wifi_iface_network: no wifi-iface section found for iface="
++                   << iface_name << " and no ssid provided for fallback";
++        return false;
++    }
++
++    LOG(DEBUG) << "cfg_set_wifi_iface_network: iface=" << iface_name
++               << " not found by ifname, trying ssid=" << ssid;
++
++    std::vector<std::string> all_sections;
++    if (!uci_get_all_sections(pkg, type, all_sections)) {
++        LOG(ERROR) << "cfg_set_wifi_iface_network: failed to get all wifi-iface sections";
++        return false;
++    }
++
++    bool any_updated = false;
++    for (const auto &sec : all_sections) {
++        std::string sec_ssid;
++        if (!uci_get_option(pkg, type, sec, "ssid", sec_ssid) || sec_ssid != ssid) {
++            continue;
++        }
++
++        // Skip if already set to the desired value.
++        std::string current_network;
++        if (uci_get_option(pkg, type, sec, "network", current_network) &&
++            current_network == network_name) {
++            LOG(DEBUG) << "cfg_set_wifi_iface_network: section=" << sec
++                       << " (ssid=" << ssid << ") already has network=" << network_name
++                       << ", skipping";
++            any_updated = true;
++            continue;
++        }
++
++        OptionsUnorderedMap options;
++        options["network"] = network_name;
++        if (!uci_set_section(pkg, type, sec, options, false)) {
++            LOG(ERROR) << "cfg_set_wifi_iface_network: failed to set network=" << network_name
++                       << " for section=" << sec << " (ssid=" << ssid << ")";
++            continue;
++        }
++
++        LOG(DEBUG) << "cfg_set_wifi_iface_network: section=" << sec
++                   << " (ssid=" << ssid << ") -> network=" << network_name;
++        any_updated = true;
++    }
++
++    if (!any_updated) {
++        LOG(DEBUG) << "cfg_set_wifi_iface_network: no section found for iface=" << iface_name
++                   << " or ssid=" << ssid;
++    }
++
++    return any_updated;
++}
++
++bool cfg_commit_wireless_config() { return uci_commit_changes("wireless"); }
++
+ #endif
+ 
+ } // namespace bpl
+diff --git a/framework/platform/bpl/common/uci/bpl_uci.cpp b/framework/platform/bpl/common/uci/bpl_uci.cpp
+index 9a9a0138b..d6e8cdccf 100644
+--- a/framework/platform/bpl/common/uci/bpl_uci.cpp
++++ b/framework/platform/bpl/common/uci/bpl_uci.cpp
+@@ -528,5 +528,95 @@ bool uci_commit_changes(const std::string &package_name)
+ }
+ 
+ 
++bool uci_add_list_option(const std::string &package_name, const std::string &section_name,
++                         const std::string &option_name, const std::string &value,
++                         bool commit_changes)
++{
++    auto ctx = alloc_context();
++    if (!ctx) {
++        return false;
++    }
++
++    // path format: "package.section.option=value"
++    // NOTE: uci_lookup_ptr() modifies the path buffer in-place (inserts null terminators).
++    // Two separate buffers are required: one for the del operation and one for the add operation.
++    char del_path[256] = {0};
++    char add_path[256] = {0};
++    if (snprintf(del_path, sizeof(del_path), "%s.%s.%s=%s", package_name.c_str(),
++                 section_name.c_str(), option_name.c_str(), value.c_str()) <= 0) {
++        LOG(ERROR) << "uci_add_list_option: failed to compose del_path";
++        return false;
++    }
++    if (snprintf(add_path, sizeof(add_path), "%s.%s.%s=%s", package_name.c_str(),
++                 section_name.c_str(), option_name.c_str(), value.c_str()) <= 0) {
++        LOG(ERROR) << "uci_add_list_option: failed to compose add_path";
++        return false;
++    }
++
++    // Remove any existing occurrence first to prevent duplicates on re-apply.
++    uci_ptr del_ptr = {};
++    if (uci_lookup_ptr(ctx.get(), &del_ptr, del_path, true) == UCI_OK) {
++        uci_del_list(ctx.get(), &del_ptr);
++    }
++
++    // Add the value to the list.
++    uci_ptr add_ptr = {};
++    if (uci_lookup_ptr(ctx.get(), &add_ptr, add_path, true) != UCI_OK) {
++        LOG(ERROR) << "uci_add_list_option: uci_lookup_ptr failed for path="
++                   << package_name << "." << section_name << "." << option_name << "=" << value;
++        return false;
++    }
++    if (uci_add_list(ctx.get(), &add_ptr) != UCI_OK) {
++        LOG(ERROR) << "uci_add_list_option: uci_add_list failed for path="
++                   << package_name << "." << section_name << "." << option_name << "=" << value;
++        return false;
++    }
++
++    // Single uci_save covers both the del and the add.
++    if (uci_save(ctx.get(), add_ptr.p) != UCI_OK) {
++        LOG(ERROR) << "uci_add_list_option: uci_save failed for path="
++                   << package_name << "." << section_name << "." << option_name << "=" << value;
++        return false;
++    }
++
++    if (commit_changes) {
++        return uci_commit_changes(package_name);
++    }
++    return true;
++}
++
++bool uci_del_list_option(const std::string &package_name, const std::string &section_name,
++                         const std::string &option_name, const std::string &value,
++                         bool commit_changes)
++{
++    auto ctx = alloc_context();
++    if (!ctx) {
++        return false;
++    }
++
++    char path[256] = {0};
++    if (snprintf(path, sizeof(path), "%s.%s.%s=%s", package_name.c_str(), section_name.c_str(),
++                 option_name.c_str(), value.c_str()) <= 0) {
++        LOG(ERROR) << "uci_del_list_option: failed to compose path";
++        return false;
++    }
++
++    uci_ptr del_ptr = {};
++    if (uci_lookup_ptr(ctx.get(), &del_ptr, path, true) != UCI_OK) {
++        LOG(ERROR) << "uci_del_list_option: uci_lookup_ptr failed for path=" << path;
++        return false;
++    }
++    uci_del_list(ctx.get(), &del_ptr);
++
++    if (uci_save(ctx.get(), del_ptr.p) != UCI_OK) {
++        LOG(WARNING) << "uci_del_list_option: uci_save failed for path=" << path;
++    }
++
++    if (commit_changes) {
++        return uci_commit_changes(package_name);
++    }
++    return true;
++}
++
+ } // namespace bpl
+ } // namespace beerocks
+diff --git a/framework/platform/bpl/common/uci/bpl_uci.h b/framework/platform/bpl/common/uci/bpl_uci.h
+index f8946f575..0d86f0694 100644
+--- a/framework/platform/bpl/common/uci/bpl_uci.h
++++ b/framework/platform/bpl/common/uci/bpl_uci.h
+@@ -147,6 +147,40 @@ bool uci_delete_section(const std::string &package_name, const std::string &sect
+ bool uci_get_all_sections(const std::string &package_name, const std::string &section_type,
+                           std::vector<std::string> &sections);
+ 
++/**
++ * @brief Add a value to a UCI list option in a named section.
++ *
++ * Any existing occurrence of @a value in the list is removed first to prevent
++ * duplicates on re-apply.  A single uci_save() covers both the removal and the
++ * addition.
++ *
++ * @param[in] package_name  UCI package (e.g. "network").
++ * @param[in] section_name  Name of the section (e.g. "br_lan_dev").
++ * @param[in] option_name   Name of the list option (e.g. "ports").
++ * @param[in] value         Value to add to the list.
++ * @param[in] commit_changes  If true, commit the package immediately.
++ * @return true on success, false otherwise.
++ */
++bool uci_add_list_option(const std::string &package_name, const std::string &section_name,
++                         const std::string &option_name, const std::string &value,
++                         bool commit_changes);
++
++/**
++ * @brief Remove a value from a UCI list option in a named section.
++ *
++ * Succeeds silently if the value is not present in the list.
++ *
++ * @param[in] package_name  UCI package (e.g. "network").
++ * @param[in] section_name  Name of the section (e.g. "br_lan_dev").
++ * @param[in] option_name   Name of the list option (e.g. "ports").
++ * @param[in] value         Value to remove from the list.
++ * @param[in] commit_changes  If true, commit the package immediately.
++ * @return true on success, false otherwise.
++ */
++bool uci_del_list_option(const std::string &package_name, const std::string &section_name,
++                         const std::string &option_name, const std::string &value,
++                         bool commit_changes);
++
+ /**
+  * @brief Commit changes by package name
+  * 
+diff --git a/framework/platform/bpl/include/bpl/bpl_cfg.h b/framework/platform/bpl/include/bpl/bpl_cfg.h
+index ad408eb06..ee1f80e20 100644
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -236,6 +236,10 @@ constexpr bool DEFAULT_IS_TRAFFIC_SEPARATION_ENABLED = false;
+ constexpr int DEFAULT_PRIVATE_VLAN_ID = 10;
+ // Default guest network VLAN id
+ constexpr int DEFAULT_GUEST_VLAN_ID = 20;
++// Default enable flag for traffic separation bridge assignment persistence
++constexpr bool DEFAULT_TS_PERSISTENCE_ENABLED = false;
++// Default enable flag for traffic separation bridge mapping verification
++constexpr bool DEFAULT_TS_BRIDGE_MAPPING_ENABLED = false;
+ 
+ /****************************************************************************/
+ /******************************* Structures *********************************/
+@@ -913,6 +917,19 @@ bool bpl_cfg_get_wireless_settings(std::list<son::wireless_utils::sBssInfoConf>
+ bool bpl_cfg_get_wifi_credentials(const std::string &iface,
+                                   son::wireless_utils::sBssInfoConf &configuration);
+ 
++/**
++ * @brief Reads wireless network configuration by SSID.
++ *
++ * This function searches for a wireless configuration matching the given SSID.
++ * It is useful when the interface name lookup fails (e.g., for link-suffixed interfaces).
++ *
++ * @param [in] ssid SSID to search for.
++ * @param [out] configuration Wireless network configuration.
++ * @return true on success and false otherwise.
++ */
++bool bpl_cfg_get_wifi_credentials_by_ssid(const std::string &ssid,
++                                          son::wireless_utils::sBssInfoConf &configuration);
++
+ /**
+  * @brief Reads link metrics request interval configuration for periodic requests from agents.
+  *
+@@ -1367,6 +1384,115 @@ bool cfg_get_traffic_separation_private_vid(int &private_vid);
+  */
+ bool cfg_get_traffic_separation_guest_vid(int &guest_vid);
+ 
++/**
++ * @brief Get TrafficSeparation bridge mapping enabled flag from UCI.
++ *
++ * Reads `TrafficSeparation_bridge_mapping_enable` from prplmesh UCI config.
++ *
++ * @param[out] enabled true if bridge mapping verification is enabled.
++ * @return true on success, false on failure.
++ */
++bool cfg_get_traffic_separation_bridge_mapping_enabled(bool &enabled);
++
++/**
++ * @brief Get TrafficSeparation persistence enabled flag from UCI.
++ *
++ * Reads `TrafficSeparation_persistence_enable` from prplmesh UCI config.
++ *
++ * @param[out] enabled true if bridge assignment persistence is enabled.
++ * @return true on success, false on failure.
++ */
++bool cfg_get_traffic_separation_persistence_enabled(bool &enabled);
++
++/**
++ * @brief Persist an interface's bridge assignment in the network UCI config.
++ *
++ * Finds the UCI device section for @p bridge (by its `name` option) and adds
++ * @p iface to its `ports` list.  Duplicate entries are removed first.
++ * Call cfg_commit_network_config() once after all calls to flush to disk.
++ *
++ * @param[in] bridge  Bridge name (e.g. "br-lan", "brguest").
++ * @param[in] iface   Interface name to add (e.g. "wlan1.1").
++ * @return true on success, false on failure.
++ */
++bool cfg_persist_iface_bridge_assignment(const std::string &bridge, const std::string &iface);
++
++/**
++ * @brief Remove an interface from a bridge's ports list in the network UCI config.
++ *
++ * Finds the UCI device section for @p bridge and removes @p iface from its
++ * `ports` list.  No-op (returns true) if the section or entry is not found.
++ * Call cfg_commit_network_config() once after all calls to flush to disk.
++ *
++ * @param[in] bridge  Bridge name (e.g. "br-lan", "brguest").
++ * @param[in] iface   Interface name to remove (e.g. "wlan1.1").
++ * @return true on success, false on failure.
++ */
++bool cfg_remove_iface_from_bridge_config(const std::string &bridge, const std::string &iface);
++
++/**
++ * @brief Commit pending changes to the network UCI package.
++ *
++ * Should be called once after a batch of cfg_persist_iface_bridge_assignment()
++ * or cfg_remove_iface_from_bridge_config() calls.
++ *
++ * @return true on success, false on failure.
++ */
++bool cfg_commit_network_config();
++
++/**
++ * @brief Find the bridge that contains a given interface in the network UCI config.
++ *
++ * Iterates over all UCI network device sections and checks if @p iface appears
++ * in their `ports` list.  Returns the `name` option of the matching section.
++ *
++ * @param[in]  iface        Interface name to look up (e.g. "wlan0.1_1").
++ * @param[out] bridge_name  Bridge name if found (e.g. "brguest").
++ * @return true if the interface was found in a bridge, false otherwise.
++ */
++bool cfg_get_bridge_for_iface(const std::string &iface, std::string &bridge_name);
++
++/**
++ * @brief Find the UCI network interface name for a given bridge.
++ *
++ * Iterates over all UCI network interface sections and returns the section
++ * name (e.g. "lan", "guest") whose `device` option matches @p bridge_name.
++ * This is the inverse of the bridge-name lookup: given "br-lan" it returns
++ * "lan", given "brguest" it returns "guest".
++ *
++ * @param[in]  bridge_name   Bridge device name (e.g. "br-lan", "brguest").
++ * @param[out] network_name  UCI interface section name if found (e.g. "lan").
++ * @return true if a matching interface section was found, false otherwise.
++ */
++bool cfg_get_network_name_for_bridge(const std::string &bridge_name, std::string &network_name);
++
++/**
++ * @brief Update the `network` option of a wifi-iface section in the wireless UCI config.
++ *
++ * Finds the wifi-iface section whose `ifname` matches @p iface_name and sets
++ * its `network` option to @p network_name.  This controls which bridge netifd
++ * places the interface into at boot.  No-op (returns true) if the option is
++ * already set to the desired value.
++ * Call cfg_commit_wireless_config() once after all calls to flush to disk.
++ *
++ * @param[in] iface_name    Interface name (e.g. "wlan6").
++ * @param[in] network_name  UCI network interface name (e.g. "lan", "guest").
++ * @param[in] ssid          Optional SSID fallback: if the wifi-iface section has no `ifname`
++ *                          option set, search by matching SSID instead.
++ * @return true on success or if already set, false if the section was not found.
++ */
++bool cfg_set_wifi_iface_network(const std::string &iface_name, const std::string &network_name,
++                                const std::string &ssid = "");
++
++/**
++ * @brief Commit pending changes to the wireless UCI package.
++ *
++ * Should be called once after a batch of cfg_set_wifi_iface_network() calls.
++ *
++ * @return true on success, false on failure.
++ */
++bool cfg_commit_wireless_config();
++
+ /**
+  * @brief Commit changes to prplmesh. uci package
+  *
+diff --git a/framework/platform/wbapi/wbapi_utils.cpp b/framework/platform/wbapi/wbapi_utils.cpp
+index 551c1655b..231e14bab 100644
+--- a/framework/platform/wbapi/wbapi_utils.cpp
++++ b/framework/platform/wbapi/wbapi_utils.cpp
+@@ -203,22 +203,10 @@ WSC::eWscEncr wbapi_utils::encryption_type_from_auth(WSC::eWscAuth auth)
+ 
+ eVapType wbapi_utils::vap_type_from_custom_alias(const std::string &custom_alias)
+ {
+-    if (custom_alias.find("home") != std::string::npos)
+-        return eVapType::HOME;
+-    else if (custom_alias.find("guest") != std::string::npos)
+-        return eVapType::GUEST;
+-    else if (custom_alias.find("video") != std::string::npos)
+-        return eVapType::VIDEO;
+-    else if (custom_alias.find("backhaul") != std::string::npos)
+-        return eVapType::BACKHAUL;
+-    else if (custom_alias.find("hotspot") != std::string::npos)
+-        return eVapType::HOTSPOT;
+-    else if (custom_alias.find("staff") != std::string::npos)
+-        return eVapType::STAFF;
+-    else if (custom_alias.find("isolated") != std::string::npos)
+-        return eVapType::ISOLATED;
+-    else
+-        return eVapType::OTHER;
++    std::string alias_lc = custom_alias;
++    std::transform(alias_lc.begin(), alias_lc.end(), alias_lc.begin(),
++                   [](unsigned char c) { return std::tolower(c); });
++    return son::wireless_utils::string_to_vap_type(alias_lc);
+ }
+ 
+ int wbapi_utils::get_object_id(const std::string &object_path)
+-- 
+2.34.1
+
