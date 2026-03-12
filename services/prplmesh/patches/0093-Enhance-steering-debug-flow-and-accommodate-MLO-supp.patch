@@ -1,0 +1,684 @@
+From b3b69ea2455a478436b87e10084376e04b84a87a Mon Sep 17 00:00:00 2001
+From: Sureshkumar <suresure@qti.qualcomm.com>
+Date: Mon, 9 Mar 2026 20:24:06 +0530
+Subject: [PATCH] Enhance steering debug flow and accommodate MLO support
+
+Signed-off-by: Sureshkumar <suresure@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/son_slave_thread.cpp |  73 ++++++++--
+ .../tasks/link_metrics_collection_task.cpp    |  35 ++++-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 129 +++++++++++++++---
+ common/beerocks/bwl/nl80211/mlo_utils.h       |  74 ++++++++++
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      |  80 ++++++++---
+ 5 files changed, 345 insertions(+), 46 deletions(-)
+ create mode 100644 common/beerocks/bwl/nl80211/mlo_utils.h
+
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index fcd992719..62ce3ae2a 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -3980,6 +3980,12 @@ bool slave_thread::handle_cmdu_monitor_message(const std::string &fronthaul_ifac
+             return false;
+         }
+ 
++        LOG(DEBUG) << "Beacon Metric Query - Prepare 1905 Beacon Metric Response: "
++                   << "mid=" << std::hex << mid
++                   << ", sta_mac=" << response_in->params().sta_mac
++                   << ", dialog_token=" << int(response_in->params().dialog_token)
++                   << ", measurement_rep_mode=" << int(response_in->params().rep_mode);
++
+         send_cmdu_to_controller(fronthaul_iface, cmdu_tx);
+         // end new 1905 response
+ 
+@@ -5096,22 +5102,49 @@ bool slave_thread::forward_cmdu_to_controller(ieee1905_1::CmduMessageRx &cmdu_rx
+ bool slave_thread::handle_client_association_request(ieee1905_1::CmduMessageRx &cmdu_rx)
+ {
+     const auto mid = cmdu_rx.getMessageId();
+-    LOG(DEBUG) << "Received CLIENT_ASSOCIATION_CONTROL_REQUEST (0x8016), mid=0x" 
+-               << std::hex << int(mid) << std::dec;
+ 
+     auto association_control_request_tlv =
+         cmdu_rx.getClass<wfa_map::tlvClientAssociationControlRequest>();
+     if (!association_control_request_tlv) {
+-        LOG(ERROR) << "Failed to get tlvClientAssociationControlRequest, mid=0x" 
++        LOG(ERROR) << "Failed to parse tlvClientAssociationControlRequest, mid=0x" 
+                    << std::hex << int(mid) << std::dec;
+         return false;
+     }
+ 
+     const auto &bssid = association_control_request_tlv->bssid_to_block_client();
+     auto control_type = association_control_request_tlv->association_control();
+-    LOG(DEBUG) << "BSSID: " << bssid << ", control=" << int(control_type)
+-               << ", validity=" << association_control_request_tlv->validity_period_sec() << "s"
+-               << ", STA count=" << association_control_request_tlv->sta_list_length();
++    const char *control_type_str = "UNKNOWN";
++    switch (control_type) {
++        case wfa_map::tlvClientAssociationControlRequest::BLOCK:
++            control_type_str = "BLOCK";
++            break;
++        case wfa_map::tlvClientAssociationControlRequest::UNBLOCK:
++            control_type_str = "UNBLOCK";
++            break;
++        case wfa_map::tlvClientAssociationControlRequest::TIMED_BLOCK:
++            control_type_str = "TIMED_BLOCK";
++            break;
++        case wfa_map::tlvClientAssociationControlRequest::INDEFINITE_BLOCK:
++            control_type_str = "INDEFINITE_BLOCK";
++            break;
++        default:
++            control_type_str = "UNKNOWN";
++    }
++
++    LOG(DEBUG) << "Received CLIENT_ASSOCIATION_CONTROL_REQUEST (0x8016): "
++               << "mid=0x" << std::hex << int(mid) << std::dec
++               << ", bssid=" << bssid
++               << ", control=" << int(control_type) << " (" << control_type_str << ")"
++               << ", validity_period_sec=" << association_control_request_tlv->validity_period_sec()
++               << ", sta_count=" << association_control_request_tlv->sta_list_length();
++
++    for (size_t sta_idx = 0; sta_idx < association_control_request_tlv->sta_list_length(); sta_idx++) {
++        auto sta_tuple = association_control_request_tlv->sta_list(sta_idx);
++        if (std::get<0>(sta_tuple)) {
++            LOG(DEBUG) << "STA[" << sta_idx << "]: " 
++                       << std::get<1>(sta_tuple);
++        }
++    }
+ 
+     auto db    = AgentDB::get();
+     auto radio = db->get_radio_by_mac(bssid, AgentDB::eMacType::BSSID);
+@@ -5120,11 +5153,15 @@ bool slave_thread::handle_client_association_request(ieee1905_1::CmduMessageRx &
+         return false;
+     }
+ 
++    LOG(DEBUG) << "Radio found: iface=" << radio->front.iface_name
++               << ", radio_mac=" << radio->front.iface_mac;
++
+     // Map of STA MAC to connection status (true if connected)
+     std::multimap<bool, sMacAddr> sta_connected = {};
+     
+     if (control_type == wfa_map::tlvClientAssociationControlRequest::UNBLOCK) {
+-        LOG(DEBUG) << "Processing UNBLOCK request";
++        LOG(DEBUG) << "Processing UNBLOCK request for " 
++                   << association_control_request_tlv->sta_list_length() << " STAs";
+         
+         auto request_out = message_com::create_vs_message<
+             beerocks_message::cACTION_APMANAGER_CLIENT_ALLOW_REQUEST>(cmdu_tx, mid);
+@@ -5148,6 +5185,10 @@ bool slave_thread::handle_client_association_request(ieee1905_1::CmduMessageRx &
+             std::get<1>(request_out->mac(sta_idx)) = std::get<1>(sta_tuple);
+         }
+         request_out->bssid() = bssid;
++
++        LOG(DEBUG) << "Sending CLIENT_ALLOW_REQUEST to AP Manager: "
++                   << "bssid=" << bssid
++                   << ", sta_count=" << association_control_request_tlv->sta_list_length();
+         
+     } else {
+         LOG(DEBUG) << "Processing BLOCK/DISALLOW request";
+@@ -5208,10 +5249,19 @@ bool slave_thread::handle_client_association_request(ieee1905_1::CmduMessageRx &
+             (control_type != wfa_map::tlvClientAssociationControlRequest::INDEFINITE_BLOCK)
+                 ? association_control_request_tlv->validity_period_sec()
+                 : 0;
++
++        LOG(DEBUG) << "Sending CLIENT_DISALLOW_REQUEST to AP Manager: "
++                   << "bssid=" << bssid
++                   << ", disallow_sta_count=" << disallow_sta_length
++                   << ", validity_period_sec=" << request_out->validity_period_sec();
+     }
+ 
+     const auto &radio_manager = m_radio_managers[radio->front.iface_name];
+ 
++    LOG(DEBUG) << "AssocCtrl - Forwarding request to AP Manager: "
++               << "iface=" << radio->front.iface_name
++               << ", ap_manager_fd=" << radio_manager.ap_manager_fd;
++
+     send_cmdu(radio_manager.ap_manager_fd, cmdu_tx);
+ 
+     // Send ACK back to controller
+@@ -5222,6 +5272,7 @@ bool slave_thread::handle_client_association_request(ieee1905_1::CmduMessageRx &
+ 
+     // Add error codes for connected STAs in BLOCK mode
+     if (control_type == wfa_map::tlvClientAssociationControlRequest::BLOCK) {
++        size_t error_count = 0;
+         for (const auto &sta : sta_connected) {
+             if (sta.first) {
+                 auto error_code_tlv = cmdu_tx.addClass<wfa_map::tlvErrorCode>();
+@@ -5234,11 +5285,17 @@ bool slave_thread::handle_client_association_request(ieee1905_1::CmduMessageRx &
+                     wfa_map::tlvErrorCode::STA_ASSOCIATED_WITH_A_BSS_OPERATED_BY_THE_AGENT;
+ 
+                 error_code_tlv->sta_mac() = sta.second;
++                error_count++;
+             }
+         }
++        if (error_count > 0) {
++            LOG(DEBUG) << "AssocCtrl - Added " << error_count 
++                       << " error code TLVs for connected STAs in BLOCK mode";
++        }
+     }
+ 
+-    LOG(DEBUG) << "Sending ACK (0x8000) to controller, mid=0x" << std::hex << mid << std::dec;
++    LOG(DEBUG) << "Sending ACK (0x8000) to controller: mid=0x" 
++               << std::hex << mid << std::dec;
+     return send_cmdu_to_controller(radio->front.iface_name, cmdu_tx);
+ }
+ 
+diff --git a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+index 7a0a4b5e3..c24d32c26 100644
+--- a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+@@ -501,6 +501,15 @@ void LinkMetricsCollectionTask::handle_beacon_metrics_query(ieee1905_1::CmduMess
+     }
+ 
+     const sMacAddr &requested_sta_mac = tlvBeaconMetricsQuery->associated_sta_mac();
++
++    LOG(DEBUG) << "Beacon Metric Query - Parameters RX: "
++               << "mid=" << std::hex << mid
++               << ", sta_mac=" << requested_sta_mac
++               << ", channel=" << int(tlvBeaconMetricsQuery->channel_number())
++               << ", op_class=" << int(tlvBeaconMetricsQuery->operating_class())
++               << ", bssid=" << tlvBeaconMetricsQuery->bssid()
++               << ", reporting_detail=" << int(tlvBeaconMetricsQuery->reporting_detail_value());
++
+     LOG(DEBUG) << "the requested STA mac is: " << requested_sta_mac;
+ 
+     // build ACK message CMDU
+@@ -653,8 +662,6 @@ void LinkMetricsCollectionTask::handle_unassociated_sta_link_metrics_query(
+ {
+     const auto message_id = cmdu_rx.getMessageId();
+ 
+-    LOG(DEBUG) << "Received Unassociated STA Link Metrics Query, mid=" << std::hex << message_id;
+-
+     const auto unassociated_sta_link_metrics_query_tlv =
+         cmdu_rx.getClass<wfa_map::tlvUnassociatedStaLinkMetricsQuery>();
+     if (!unassociated_sta_link_metrics_query_tlv) {
+@@ -663,6 +670,13 @@ void LinkMetricsCollectionTask::handle_unassociated_sta_link_metrics_query(
+         return;
+     }
+ 
++    LOG(DEBUG) << "Unassoc link metric Query - Dump parameters: "
++               << "mid=" << std::hex << message_id
++               << ", src_mac=" << src_mac
++               << ", agent_mac=" << agent_mac
++               << ", operating_class=" << int(unassociated_sta_link_metrics_query_tlv->operating_class_of_channel_list())
++               << ", channel_list_length=" << unassociated_sta_link_metrics_query_tlv->channel_list_length();
++
+     auto db = AgentDB::get();
+ 
+     //Now map stations to radios
+@@ -692,7 +706,18 @@ void LinkMetricsCollectionTask::handle_unassociated_sta_link_metrics_query(
+             std::get<1>(unassociated_sta_link_metrics_query_tlv->channel_list(
+                 count)); //1 channel that might contains a list of un_stations
+         auto channel = one_channel_params.channel_number();
++
++        LOG(DEBUG) << "Unassoc link metric query - slave parse: "
++                   << "operating_class=" << int(oper_class)
++                   << ", channel=" << int(channel)
++                   << ", sta_list_length=" << one_channel_params.sta_list_length();
++        
+         for (auto &radio : db->get_radios_list()) {
++            LOG(DEBUG) << "Unassoc link metric query - slave parse (radio check): "
++                       << "radio_mac=" << radio->front.iface_mac
++                       << ", radio_iface=" << radio->front.iface_name
++                       << ", channel=" << int(channel)
++                       << ", operating_class=" << int(oper_class);
+             //The telemtry does not contain any reference to the radio, thus the need to detect it using channel and operating_class
+             if (radio->channels_list.find(channel) != radio->channels_list.end() &&
+                 radio->wifi_channel.get_freq_type() ==
+@@ -773,6 +798,12 @@ void LinkMetricsCollectionTask::handle_unassociated_sta_link_metrics_query(
+         //send a different message to each monitor containig only its specific un_stations's list
+         auto monitor_fd =
+             m_btl_ctx.get_monitor_fd(db->get_radio_by_mac(radio.first)->front.iface_name);
++        
++        LOG(DEBUG) << "Prepare unassoc response - sending to monitor: "
++                   << "radio_mac=" << radio.first
++                   << ", total_stations=" << total_number_stations
++                   << ", message_id=" << std::hex << message_id;
++        
+         m_btl_ctx.send_cmdu(monitor_fd, m_cmdu_tx);
+     }
+ }
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 6895c98bb..edd1ecc71 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "ap_wlan_hal_nl80211.h"
++#include "mlo_utils.h"
+ #include <bcl/beerocks_os_utils.h>
+ #include <bcl/beerocks_utils.h>
+ #include <bcl/network/network_utils.h>
+@@ -1131,16 +1132,36 @@ bool ap_wlan_hal_nl80211::sta_allow(const sMacAddr &mac, const sMacAddr &bssid)
+ {
+     LOG(TRACE) << __func__ << " mac: " << mac << ", bssid: " << bssid;
+ 
+-    // Build command string
+-    // We use the DENY_ACL list only
+-    const std::string cmd = "DENY_ACL DEL_MAC " + tlvf::mac_to_string(mac);
+-
+     auto vap_id = get_vap_id_with_mac(tlvf::mac_to_string(bssid));
+     if (vap_id < 0) {
+         LOG(ERROR) << "no vap has bssid " << bssid;
+         return false;
+     }
++
+     std::string ifname = m_radio_info.available_vaps[vap_id].bss;
++    int8_t link_id = -1;
++
++    // For MLO support: Try to determine which link the STA is associated with
++    std::string sta_bssid = tlvf::mac_to_string(bssid);
++
++    if (!sta_bssid.empty()) {
++        link_id = get_link_id_from_bssid(ifname, bssid, m_nl80211_client.get());
++        std::string target_interface = get_interface_for_link(ifname, link_id);
++
++        LOG(DEBUG) << "Steering: sta_allow - sta_mac=" << mac
++                   << ", bssid=" << sta_bssid
++                   << ", interface=" << target_interface
++                   << ", link_id=" << int(link_id);
++
++        ifname = target_interface;
++    }
++
++    // Build command string
++    // We use the DENY_ACL list only
++    const std::string cmd = "DENY_ACL DEL_MAC " + tlvf::mac_to_string(mac);
++
++    LOG(DEBUG) << "Framed Hostapd CLI: '" << cmd 
++                << "' | interface=" << ifname << ", link_id=" << int(link_id);
+ 
+     // Send command
+     if (!wpa_ctrl_send_msg(cmd, ifname)) {
+@@ -1155,16 +1176,36 @@ bool ap_wlan_hal_nl80211::sta_deny(const sMacAddr &mac, const sMacAddr &bssid)
+ {
+     LOG(TRACE) << __func__ << " mac: " << mac << ", bssid: " << bssid;
+ 
+-    // Build command string
+-    // We use the DENY_ACL list only
+-    const std::string cmd = "DENY_ACL ADD_MAC " + tlvf::mac_to_string(mac);
+-
+     auto vap_id = get_vap_id_with_mac(tlvf::mac_to_string(bssid));
+     if (vap_id < 0) {
+         LOG(ERROR) << "no vap has bssid " << bssid;
+         return false;
+     }
++
+     std::string ifname = m_radio_info.available_vaps[vap_id].bss;
++    int8_t link_id = -1;
++
++    // For MLO support: Try to determine which link the STA is associated with
++    std::string sta_bssid = tlvf::mac_to_string(bssid);
++
++    if (!sta_bssid.empty()) {
++        link_id = get_link_id_from_bssid(ifname, bssid, m_nl80211_client.get());
++        std::string target_interface = get_interface_for_link(ifname, link_id);
++
++        LOG(DEBUG) << "Steering: sta_deny - sta_mac=" << mac
++                   << ", bssid=" << sta_bssid
++                   << ", interface=" << target_interface
++                   << ", link_id=" << int(link_id);
++
++        ifname = target_interface;
++    }
++
++    // Build command string
++    // We use the DENY_ACL list only
++    const std::string cmd = "DENY_ACL ADD_MAC " + tlvf::mac_to_string(mac);
++
++    LOG(DEBUG) << "Framed Hostapd CLI: '" << cmd
++               << "' | interface=" << ifname << ", link_id=" << int(link_id);
+ 
+     // Send command
+     if (!wpa_ctrl_send_msg(cmd, ifname)) {
+@@ -1184,6 +1225,8 @@ bool ap_wlan_hal_nl80211::clear_blacklist()
+ bool ap_wlan_hal_nl80211::sta_acceptlist_modify(const sMacAddr &mac, const sMacAddr &bssid,
+                                                 bwl::sta_acl_action action)
+ {
++    LOG(TRACE) << __func__ << " mac: " << mac << ", bssid: " << bssid;
++
+     const std::string cmd = "ACCEPT_ACL ";
+     std::string action_cmd;
+ 
+@@ -1203,16 +1246,30 @@ bool ap_wlan_hal_nl80211::sta_acceptlist_modify(const sMacAddr &mac, const sMacA
+     }
+     }
+ 
+-    LOG(TRACE) << __func__ << " mac: " << mac << ", bssid: " << bssid
+-               << " action cmd: " << action_cmd;
+-
+     auto vap_id = get_vap_id_with_mac(tlvf::mac_to_string(bssid));
+     if (vap_id < 0) {
+         LOG(ERROR) << "no vap has bssid " << bssid;
+         return false;
+     }
++
+     std::string ifname = m_radio_info.available_vaps[vap_id].bss;
+ 
++    // For MLO support: Try to determine which link the STA is associated with
++    std::string sta_bssid = tlvf::mac_to_string(bssid);
++
++    if (!sta_bssid.empty()) {
++        int8_t link_id = get_link_id_from_bssid(ifname, bssid, m_nl80211_client.get());
++        std::string target_interface = get_interface_for_link(ifname, link_id);
++
++        LOG(DEBUG) << "Steering: sta_acceptlist_modify - sta_mac=" << mac
++                   << ", bssid=" << sta_bssid
++                   << ", action=" << action_cmd
++                   << ", interface=" << target_interface
++                   << ", link_id=" << int(link_id);
++
++        ifname = target_interface;
++    }
++
+     // Send command
+     if (!wpa_ctrl_send_msg(cmd + action_cmd, ifname)) {
+         LOG(ERROR) << __func__ << " failed!";
+@@ -1267,11 +1324,28 @@ bool ap_wlan_hal_nl80211::sta_disassoc(int8_t vap_id, const std::string &mac, ui
+         return false;
+     }
+ 
++    std::string ifname = m_radio_info.available_vaps[vap_id].bss;
++
++    // For MLO support: Try to determine which link the STA is associated with
++    std::string sta_bssid = m_radio_info.available_vaps[vap_id].mac;
++
++    if (!sta_bssid.empty()) {
++        sMacAddr bssid = tlvf::mac_from_string(sta_bssid);
++        int8_t link_id = get_link_id_from_bssid(ifname, bssid, m_nl80211_client.get());
++        std::string target_interface = get_interface_for_link(ifname, link_id);
++
++        LOG(DEBUG) << "Steering: sta_disassoc - sta_mac=" << mac
++                   << ", bssid=" << sta_bssid
++                   << ", reason=" << reason
++                   << ", interface=" << target_interface
++                   << ", link_id=" << int(link_id);
++
++        ifname = target_interface;
++    }
++
+     // Build command string
+     const std::string cmd = "DISASSOCIATE " + mac + " reason=" + std::to_string(reason) + " tx=0";
+ 
+-    std::string ifname = m_radio_info.available_vaps[vap_id].bss;
+-
+     // Send command
+     if (!wpa_ctrl_send_msg(cmd, ifname)) {
+         LOG(ERROR) << "sta_disassoc() failed!";
+@@ -1290,14 +1364,31 @@ bool ap_wlan_hal_nl80211::sta_deauth(int8_t vap_id, const std::string &mac, uint
+         return false;
+     }
+ 
++    std::string ifname = m_radio_info.available_vaps[vap_id].bss;
++
++    // For MLO support: Try to determine which link the STA is associated with
++    std::string sta_bssid = m_radio_info.available_vaps[vap_id].mac;
++
++    if (!sta_bssid.empty()) {
++        sMacAddr bssid = tlvf::mac_from_string(sta_bssid);
++        int8_t link_id = get_link_id_from_bssid(ifname, bssid, m_nl80211_client.get());
++        std::string target_interface = get_interface_for_link(ifname, link_id);
++
++        LOG(DEBUG) << "Steering: sta_deauth - sta_mac=" << mac
++                   << ", bssid=" << sta_bssid
++                   << ", reason=" << reason
++                   << ", interface=" << target_interface
++                   << ", link_id=" << int(link_id);
++
++        ifname = target_interface;
++    }
++
+     // Build command string
+     const std::string cmd = "DEAUTHENTICATE " + mac + " reason=" + std::to_string(reason) + " tx=0";
+ 
+-    std::string ifname = m_radio_info.available_vaps[vap_id].bss;
+-
+     // Send command
+     if (!wpa_ctrl_send_msg(cmd, ifname)) {
+-        LOG(ERROR) << "sta_disassoc() failed!";
++        LOG(ERROR) << "sta_deauth() failed!";
+         return false;
+     }
+ 
+@@ -2446,6 +2537,12 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+             }
+         }
+ 
++        LOG(DEBUG) << "Driver EVENT to Mesh Agent: BSS_TM_Response - "
++                   << "sta_mac=" << msg->params.mac
++                   << ", status_code=" << int(msg->params.status_code)
++                   << ", target_bssid=" << msg->params.target_bssid
++                   << ", source_bssid=" << msg->params.source_bssid;
++
+         // Add the message to the queue
+         event_queue_push(Event::BSS_TM_Response, msg_buff);
+ 
+diff --git a/common/beerocks/bwl/nl80211/mlo_utils.h b/common/beerocks/bwl/nl80211/mlo_utils.h
+new file mode 100644
+index 000000000..e4b67480b
+--- /dev/null
++++ b/common/beerocks/bwl/nl80211/mlo_utils.h
+@@ -0,0 +1,74 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++#ifndef _BWL_MLO_UTILS_H_
++#define _BWL_MLO_UTILS_H_
++
++#include <string>
++#include <memory>
++#include <tlvf/common/sMacAddr.h>
++
++namespace bwl {
++
++// Forward declaration
++class nl80211_client;
++
++namespace nl80211 {
++
++/**
++ * @brief Get the Link ID from a BSSID
++ *
++ * This function queries the nl80211 interface to determine which Link ID
++ * corresponds to a given BSSID in an MLO (Multi-Link Operation) setup.
++ *
++ * @param ifname Base interface name (e.g., "wlan0")
++ * @param bssid The BSSID to look up
++ * @param nl80211_client Pointer to the nl80211 client for querying
++ * @return int8_t The Link ID (0-based), or -1 if not found or not MLO
++ */
++inline int8_t get_link_id_from_bssid(const std::string &ifname, const sMacAddr &bssid,
++                                     bwl::nl80211_client *nl80211_client)
++{
++    int8_t link_id = -1;
++
++    if (!nl80211_client) {
++        return link_id;
++    }
++
++    // Query the nl80211 client to get the link ID for this BSSID
++    // Create mutable copies for the API call
++    std::string ifname_copy = ifname;
++    std::string bssid_str = tlvf::mac_to_string(bssid);
++    if (!nl80211_client->get_bss_link_id(ifname_copy, bssid_str, link_id)) {
++        // If query fails, assume non-MLO (link_id = -1)
++        return -1;
++    }
++
++    return link_id;
++}
++
++/**
++ * @brief Get the interface name for a specific link
++ *
++ * This function constructs the interface name for a specific link in an MLO setup.
++ * For non-MLO or invalid link IDs, it returns the base interface name.
++ *
++ * @param base_ifname Base interface name (e.g., "wlan0")
++ * @param link_id The Link ID (0-based)
++ * @return std::string The link-specific interface name (e.g., "wlan0_link0") or base name
++ */
++inline std::string get_interface_for_link(const std::string &base_ifname, int8_t link_id)
++{
++    // If link_id is invalid or -1 (non-MLO), return base interface
++    if (link_id < 0) {
++        return base_ifname;
++    }
++
++    // Construct link-specific interface name
++    return base_ifname + "_link" + std::to_string(link_id);
++}
++
++} // namespace nl80211
++} // namespace bwl
++
++#endif // _BWL_MLO_UTILS_H_
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 1fe3c188b..0bf8513d4 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "mon_wlan_hal_nl80211.h"
++#include "mlo_utils.h"
+ 
+ #include <bwl/nl80211_client.h>
+ #include <bcl/beerocks_utils.h>
+@@ -379,6 +380,14 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+ {
+     LOG(TRACE) << __func__;
+ 
++    // Determine if this is an MLO BSSID and get link ID
++    sMacAddr bssid_addr;
++    std::copy(std::begin(req.bssid.oct), std::end(req.bssid.oct), std::begin(bssid_addr.oct));
++    int8_t link_id = get_link_id_from_bssid(vap_iface_name, bssid_addr, m_nl80211_client.get());
++
++    // Construct the appropriate interface name for MLO or non-MLO
++    std::string target_interface = get_interface_for_link(vap_iface_name, link_id);
++
+     // parameters preperations
+ 
+     // Mode
+@@ -472,9 +481,21 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+     // Print the command
+     LOG(DEBUG) << __func__ << " - " << cmd;
+ 
++    LOG(DEBUG) << "Beacon Metric Query - Hostapd command preparation: "
++                << "sta_mac=" << tlvf::mac_to_string(req.sta_mac.oct)
++                << ", bssid=" << tlvf::mac_to_string(req.bssid.oct)
++                << ", op_class=" << int(op_class)
++                << ", channel=" << int(req.channel)
++                << ", duration=" << req.duration
++                << ", measurement_mode=" << int(measurement_mode)
++                << ", req_mode=0x" << std::hex << int(req_mode) << std::dec
++                << ", interface=" << target_interface
++                << ", link_id=" << int(link_id)
++                << ", cmd=[" << cmd << "]";
++
+     // Send the command
+     parsed_obj_map_t reply;
+-    if (!wpa_ctrl_send_msg(cmd, reply, vap_iface_name)) {
++    if (!wpa_ctrl_send_msg(cmd, reply, target_interface)) {
+         LOG(ERROR) << __func__ << " failed";
+         return false;
+     }
+@@ -749,17 +770,20 @@ bool mon_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+         // WLAN_BEACON_REPORT_SUBELEM_FRAME_BODY == 01
+         // frame_body.length = ??
+ 
+-        LOG(DEBUG) << "Beacon Response:" << std::endl
+-                   << "  op_class = " << int(resp->op_class) << std::endl
+-                   << "  channel = " << int(resp->channel) << std::endl
+-                   << "  start_time = " << int(resp->start_time) << std::endl
+-                   << "  duration = " << int(resp->duration) << std::endl
+-                   << "  phy_type = " << int(resp->phy_type) << std::endl
+-                   << "  rcpi = " << int(resp->rcpi) << std::endl
+-                   << "  rsni = " << int(resp->rsni) << std::endl
+-                   << "  bssid = " << resp->bssid.oct << std::endl
+-                   << "  ant_id = " << int(resp->ant_id) << std::endl
+-                   << "  parent_tfs = " << int(resp->parent_tsf);
++        LOG(DEBUG) << "Driver EVENT to Mesh Agent: RRM_Beacon_Response - "
++                    << "sta_mac=" << tlvf::mac_to_string(resp->sta_mac.oct)
++                    << ", dialog_token=" << int(resp->dialog_token)
++                    << ", rep_mode=" << int(resp->rep_mode)
++                    << ", op_class=" << int(resp->op_class)
++                    << ", channel=" << int(resp->channel)
++                    << ", start_time=" << resp->start_time
++                    << ", duration=" << int(resp->duration)
++                    << ", phy_type=" << int(resp->phy_type)
++                    << ", rcpi=" << int(resp->rcpi)
++                    << ", rsni=" << int(resp->rsni)
++                    << ", bssid=" << tlvf::mac_to_string(resp->bssid.oct)
++                    << ", ant_id=" << int(resp->ant_id)
++                    << ", parent_tsf=" << resp->parent_tsf;
+ 
+         // Add the message to the queue
+         event_queue_push(event, resp_buff);
+@@ -958,13 +982,15 @@ bool mon_wlan_hal_nl80211::read_peer_neighbor_rssi(const std::string &mac_addres
+ 
+ bool mon_wlan_hal_nl80211::trigger_roc_scan(uint8_t channel, uint32_t duration_ms)
+ {
+-    LOG(DEBUG) << "Triggering ROC scan on channel " << int(channel) << " for " << duration_ms
+-        << "ms";
+-
+     std::string interface_name = get_iface_name();
++
+     std::string base_interface;
+     extractBase1Interface(interface_name, base_interface);
+ 
++    LOG(DEBUG) << "Steering: trigger_roc_scan - interface=" << interface_name
++               << ", base=" << base_interface
++               << ", channel=" << int(channel);
++
+     // Get the interface index required for the NL80211 command
+     int iface_index = if_nametoindex(base_interface.c_str());
+     if (0 == iface_index) {
+@@ -987,6 +1013,14 @@ bool mon_wlan_hal_nl80211::trigger_roc_scan(uint8_t channel, uint32_t duration_m
+         return false;
+     }
+ 
++    LOG(DEBUG) << "Unassoc link metric query - slave post ROC scan: "
++                << "interface=" << interface_name
++                << ", base_interface=" << base_interface
++                << ", channel=" << int(channel)
++                << ", freq=" << freq
++                << ", duration_ms=" << duration_ms
++                << ", iface_index=" << iface_index;
++
+     LOG(DEBUG) << "Requesting remain-on-channel on interface " << interface_name << " (idx "
+         << iface_index << ") for " << duration_ms << "ms on channel " << int(channel)
+         << " (freq " << freq << " MHz)";
+@@ -1040,7 +1074,8 @@ static inline int rssi_db_to_dbm(int rssi_db, int noise_floor_to_chanwidth = 94)
+ 
+ bool mon_wlan_hal_nl80211::process_roc_expired_event()
+ {
+-    LOG(DEBUG) << "ROC expired, reading RSSI values";
++    LOG(DEBUG) << "Unassoc link metric query - slave gets driver event on scan complete: "
++                << "pending_measurements=" << m_pending_unassoc_measurements.size();
+ 
+     sUnassociatedStationsStats stats_out;
+ 
+@@ -1068,11 +1103,16 @@ bool mon_wlan_hal_nl80211::process_roc_expired_event()
+                     std::chrono::steady_clock::now() - measurement.start_time);
+             new_stat.time_stamp = time_delta.count();
+ 
+-            stats_out.un_stations_stats.push_back(new_stat);
++            LOG(DEBUG) << "Driver EVENT to Mesh Agent: Unassoc_STA_Stats - "
++                        << "sta_mac=" << new_stat.mac_adress
++                        << ", channel=" << int(new_stat.channel)
++                        << ", operating_class=" << int(new_stat.operating_class)
++                        << ", rssi_raw_db=" << int(rssi)
++                        << ", rssi_dbm=" << rssi_dbm
++                        << ", rcpi=" << int(new_stat.signal_strength)
++                        << ", time_stamp_ms=" << new_stat.time_stamp;
+ 
+-            LOG(DEBUG) << "STA " << measurement.mac_address << " RSSI(raw dB): " << int(rssi)
+-                << " RSSI[dBm]: " << rssi_dbm << " RCPI: " << int(new_stat.signal_strength)
+-                << ", channel: " << int(new_stat.channel);
++            stats_out.un_stations_stats.push_back(new_stat);
+         } else {
+             LOG(ERROR) << "Failed to read RSSI for STA: " << measurement.mac_address;
+         }
+-- 
+2.34.1
+
