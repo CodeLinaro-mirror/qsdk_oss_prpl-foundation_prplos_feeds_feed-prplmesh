@@ -1,0 +1,1074 @@
+From d91a500eba3b8bc83ef6c6f0de9d8735f300827b Mon Sep 17 00:00:00 2001
+From: Shreeram Ramamoorthy Swaminathan <shrerama@qti.qualcomm.com>
+Date: Fri, 20 Mar 2026 00:46:12 +0530
+Subject: [PATCH] [GWAPPS][RDK][QMESH]: Implement JSON-based configuration and
+ qmesh_cli
+
+DESCRIPTION:
+Implement a configuration backend for RDK-B using a JSON file (`/etc/config/prplmesh.json`) since UCI is not available. This includes the BPL adaptation layer, a default config generator script, and a CLI tool (`qmesh_cli`) to view and modify the configuration.
+
+PROBLEM:
+The RDK-B platform does not include the UCI (Unified Configuration Interface) system used by OpenWrt. Consequently, prplMesh cannot store or retrieve its configuration settings (like management mode, radio settings, etc.) when running on RDK-B, preventing proper operation.
+
+ANALYSIS:
+The platform abstraction layer (BPL) handles configuration access. On OpenWrt, this maps to UCI calls. On RDK-B, a different storage mechanism is required. A JSON file structure closely mirroring the existing UCI schema was selected for portability and simplicity.
+
+FIX:
+1. Created `create_rdk_default_config.sh`: A script to generate a default `/etc/config/prplmesh.json` with detected backhaul interfaces and standard defaults.
+2. Implemented `framework/platform/bpl/cfg/rdk/bpl_cfg_helper.cpp`: Provides functions to read and write parameters to the JSON file using the `cJSON` library.
+3. Updated `framework/platform/bpl/CMakeLists.txt`: Adjusted to compile the new helper and link against `cJSON` for the RDK-B target.
+4. Added `tools/qmesh_cli`: A new C-based CLI utility (`qmesh_cli`) that supports `get`, `set`, and `show` commands to manipulate the JSON configuration, mimicking basic `uci` command functionality.
+5. Updated root `CMakeLists.txt` to include the new tool in the build.
+
+IMPACT ANALYSIS:
+Design change: Yes, introduces JSON-based config storage for RDK-B.
+Impacted areas: RDK-B platform builds, configuration loading sequence.
+Behavior change: None for OpenWrt. RDK-B now requires `cJSON` and uses `/etc/config/prplmesh.json`.
+
+UNIT TEST RESULTS:
+- Verified successful compilation.
+
+BRANCH: master
+Change-Id: I0b157be43197b5fcc84fe97a25283171543e7fb8
+Signed-off-by: Shreeram Ramamoorthy Swaminathan <shrerama@qti.qualcomm.com>
+---
+ CMakeLists.txt                                |   5 +
+ create_rdk_default_config.sh                  | 121 ++++++
+ framework/platform/bpl/CMakeLists.txt         |   6 +-
+ .../platform/bpl/cfg/rdk/bpl_cfg_helper.cpp   | 328 +++++++++++++++++
+ .../platform/bpl/cfg/rdk/bpl_cfg_helper.h     | 135 +++++++
+ tools/qmesh_cli/CMakeLists.txt                |  26 ++
+ tools/qmesh_cli/qmesh_cli.c                   | 348 ++++++++++++++++++
+ 7 files changed, 967 insertions(+), 2 deletions(-)
+ create mode 100755 create_rdk_default_config.sh
+ create mode 100644 framework/platform/bpl/cfg/rdk/bpl_cfg_helper.cpp
+ create mode 100644 framework/platform/bpl/cfg/rdk/bpl_cfg_helper.h
+ create mode 100644 tools/qmesh_cli/CMakeLists.txt
+ create mode 100644 tools/qmesh_cli/qmesh_cli.c
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9926f3445..bd3de3986 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -279,6 +279,11 @@ if (BUILD_CONTROLLER)
+     add_subdirectory(controller)
+ endif()
+ 
++# qmesh_cli: JSON config CLI utility for RDK-B
++if (TARGET_PLATFORM STREQUAL "rdkb")
++    add_subdirectory(tools/qmesh_cli)
++endif()
++
+ ## Version
+ configure_file(
+     "${CMAKE_CURRENT_SOURCE_DIR}/version.in"
+diff --git a/create_rdk_default_config.sh b/create_rdk_default_config.sh
+new file mode 100755
+index 000000000..952eb7a51
+--- /dev/null
++++ b/create_rdk_default_config.sh
+@@ -0,0 +1,121 @@
++#!/bin/bash
++# SPDX-License-Identifier: BSD-2-Clause-Patent
++#
++# SPDX-FileCopyrightText: 2022 the prplMesh contributors (see AUTHORS.md)
++#
++# This code is subject to the terms of the BSD+Patent license.
++# See LICENSE file for more details.
++#
++# create_rdk_default_config.sh
++#
++# Generates the default /etc/config/prplmesh.json for RDK-B platforms.
++# This is the JSON equivalent of the UCI defaults script at:
++#   etc/uci-defaults/prplmesh
++#
++# Usage:
++#   ./create_rdk_default_config.sh [output_file]
++#
++# If output_file is not specified, defaults to /etc/config/prplmesh.json.
++#
++# The generated JSON schema mirrors the UCI prplmesh config structure:
++#   - "config" section: global prplmesh settings
++#   - "radio0", "radio1", "radio2" sections: per-radio settings
++
++OUTPUT_FILE="${1:-/etc/config/prplmesh.json}"
++
++# Detect wired backhaul interface from /etc/board.json if available
++BH_IFACE="none"
++if [ -f /etc/board.json ]; then
++    # Try to extract the first LAN port from board.json using grep/awk
++    # (avoids dependency on jshn.sh which may not be present on RDK)
++    BH_IFACE=$(grep -A 20 '"lan"' /etc/board.json | grep '"ports"' -A 5 | grep -oP '"[a-z0-9]+"' | head -1 | tr -d '"')
++    if [ -z "$BH_IFACE" ]; then
++        BH_IFACE="none"
++    fi
++fi
++
++# If still not found, try to detect the first ethernet interface
++if [ "$BH_IFACE" = "none" ]; then
++    for iface in eth0 eth1 br-lan; do
++        if ip link show "$iface" > /dev/null 2>&1; then
++            BH_IFACE="$iface"
++            break
++        fi
++    done
++fi
++
++if [ "$BH_IFACE" = "none" ]; then
++    echo "WARNING: No default wired backhaul interface was detected. Please set 'config.backhaul_wire_iface' manually in $OUTPUT_FILE." >&2
++else
++    echo "INFO: Using $BH_IFACE as backhaul_wire_iface" >&2
++fi
++
++# Create output directory if needed
++mkdir -p "$(dirname "$OUTPUT_FILE")"
++
++# Do not overwrite if already exists
++if [ -f "$OUTPUT_FILE" ]; then
++    echo "INFO: $OUTPUT_FILE already exists, skipping creation." >&2
++    exit 0
++fi
++
++cat > "$OUTPUT_FILE" << JSONEOF
++{
++    "config": {
++        "management_mode": "Multi-AP-Agent",
++        "operating_mode": "WDS-Repeater",
++        "enable": 0,
++        "onboarding": 0,
++        "master": 0,
++        "gateway": 0,
++        "rdkb_extensions": 0,
++        "band_steering": 0,
++        "client_roaming": 0,
++        "dfs_reentry": 0,
++        "passive_mode": 1,
++        "wired_backhaul": 1,
++        "operational": 0,
++        "ssid": "test_ssid",
++        "mode_enabled": "WPA2-Personal",
++        "wep_key": "123456789a",
++        "key_passphrase": "test_passphrase",
++        "mem_only_psk": 0,
++        "backhaul_band": "auto",
++        "certification_mode": 0,
++        "stop_on_failure_attempts": 1,
++        "backhaul_wire_iface": "$BH_IFACE",
++        "TrafficSeparation_bridge_mapping_enable": 0,
++        "TrafficSeparation_persistence_enable": 0
++    },
++    "radio0": {
++        "hostap_iface": "wlan0",
++        "sta_iface": "wlan0",
++        "dcs_enable": 0,
++        "dcs_channel_pool": "1,6,11",
++        "dcs_interval_sec": 15,
++        "dcs_dwell_msec": 40,
++        "dcs_refresh_sec": 86400
++    },
++    "radio1": {
++        "hostap_iface": "wlan1",
++        "sta_iface": "wlan1",
++        "dcs_enable": 0,
++        "dcs_channel_pool": "36-48,149-165",
++        "dcs_interval_sec": 15,
++        "dcs_dwell_msec": 40,
++        "dcs_refresh_sec": 86400
++    },
++    "radio2": {
++        "hostap_iface": "wlan2",
++        "sta_iface": "wlan2",
++        "dcs_enable": 0,
++        "dcs_channel_pool": "2-233",
++        "dcs_interval_sec": 15,
++        "dcs_dwell_msec": 40,
++        "dcs_refresh_sec": 86400
++    }
++}
++JSONEOF
++
++echo "INFO: Created $OUTPUT_FILE" >&2
++exit 0
+diff --git a/framework/platform/bpl/CMakeLists.txt b/framework/platform/bpl/CMakeLists.txt
+index 81265ffb6..525ccae5a 100644
+--- a/framework/platform/bpl/CMakeLists.txt
++++ b/framework/platform/bpl/CMakeLists.txt
+@@ -154,6 +154,7 @@ elseif (TARGET_PLATFORM STREQUAL "rdkb")
+     # RDK BPL
+     set(bpl_platform_sources 
+         ${MODULE_PATH}/cfg/rdk/bpl_cfg.cpp
++        ${MODULE_PATH}/cfg/rdk/bpl_cfg_helper.cpp
+         # Include necessary dummies until fully implemented
+         ${MODULE_PATH}/arp/dummy/arp_dummy.cpp
+         ${MODULE_PATH}/dhcp/dummy/dhcp_dummy.cpp
+@@ -166,6 +167,7 @@ elseif (TARGET_PLATFORM STREQUAL "rdkb")
+     # find_package(rbus REQUIRED) # Should be found via pkg-config setup in environment
+     
+     # Placeholder for Rbus library
++    list(APPEND BPL_LIBS cjson)
+     list(APPEND BPL_LIBS dl rbus)
+ 
+ elseif (TARGET_PLATFORM STREQUAL "linux")
+diff --git a/framework/platform/bpl/cfg/rdk/bpl_cfg_helper.cpp b/framework/platform/bpl/cfg/rdk/bpl_cfg_helper.cpp
+new file mode 100644
+index 000000000..11a04f072
+--- /dev/null
++++ b/framework/platform/bpl/cfg/rdk/bpl_cfg_helper.cpp
+@@ -0,0 +1,328 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent
++ *
++ * SPDX-FileCopyrightText: 2022 the prplMesh contributors (see AUTHORS.md)
++ *
++ * This code is subject to the terms of the BSD+Patent license.
++ * See LICENSE file for more details.
++ */
++
++#include "bpl_cfg_helper.h"
++#include <mapf/common/logger.h>
++#include <mapf/common/utils.h>
++#include "../../common/utils/utils.h"
++
++#include <cJSON.h>
++#include <fstream>
++#include <sstream>
++
++#define MAX_JSON_BUF_LEN 256
++
++namespace beerocks {
++namespace bpl {
++
++static cJSON* load_json_config()
++{
++    std::ifstream file(PRPLMESH_JSON_PATH);
++    if (!file.is_open()) {
++        MAPF_ERR("Failed to open JSON config file: " << PRPLMESH_JSON_PATH);
++        return nullptr;
++    }
++
++    std::stringstream buffer;
++    buffer << file.rdbuf();
++
++    cJSON *json = cJSON_Parse(buffer.str().c_str());
++    if (!json) {
++        const char *error_ptr = cJSON_GetErrorPtr();
++        if (error_ptr != nullptr) {
++            MAPF_ERR("Error parsing JSON before: " << error_ptr);
++        }
++        return nullptr;
++    }
++
++    return json;
++}
++
++static bool save_json_config(cJSON *json)
++{
++    if (!json) return false;
++
++    char *string = cJSON_Print(json);
++    if (!string) {
++        MAPF_ERR("Failed to print JSON to string");
++        return false;
++    }
++
++    std::ofstream file(PRPLMESH_JSON_PATH);
++    if (!file.is_open()) {
++        MAPF_ERR("Failed to open JSON config file for writing: " << PRPLMESH_JSON_PATH);
++        free(string);
++        return false;
++    }
++
++    file << string;
++    file.close();
++    free(string);
++    return true;
++}
++
++int cfg_get_prplmesh_param(const std::string &param, char *buf, size_t buf_len)
++{
++    cJSON *json = load_json_config();
++    if (!json) return RETURN_ERR;
++
++    cJSON *config = cJSON_GetObjectItemCaseSensitive(json, "config");
++    if (!config) {
++        cJSON_Delete(json);
++        return RETURN_ERR;
++    }
++
++    cJSON *item = cJSON_GetObjectItemCaseSensitive(config, param.c_str());
++    if (!item) {
++        cJSON_Delete(json);
++        return RETURN_ERR;
++    }
++
++    if (cJSON_IsString(item)) {
++        mapf::utils::copy_string(buf, item->valuestring, buf_len);
++    } else if (cJSON_IsNumber(item)) {
++        snprintf(buf, buf_len, "%d", item->valueint);
++    } else if (cJSON_IsBool(item)) {
++        snprintf(buf, buf_len, "%d", cJSON_IsTrue(item) ? 1 : 0);
++    } else {
++        cJSON_Delete(json);
++        return RETURN_ERR;
++    }
++
++    cJSON_Delete(json);
++    return RETURN_OK;
++}
++
++int cfg_get_prplmesh_hostapd_ifaces(std::unordered_map<std::string, std::string> &hostapd_ifaces)
++{
++    cJSON *json = load_json_config();
++    if (!json) return RETURN_ERR;
++
++    cJSON *radios = cJSON_GetObjectItemCaseSensitive(json, "radios");
++    if (!radios || !cJSON_IsArray(radios)) {
++        cJSON_Delete(json);
++        return RETURN_ERR;
++    }
++
++    cJSON *radio = nullptr;
++    cJSON_ArrayForEach(radio, radios) {
++        cJSON *iface = cJSON_GetObjectItemCaseSensitive(radio, "hostap_iface");
++        cJSON *name = cJSON_GetObjectItemCaseSensitive(radio, "name"); // e.g. wlan0
++
++        if (iface && cJSON_IsString(iface) && name && cJSON_IsString(name)) {
++            hostapd_ifaces[name->valuestring] = iface->valuestring;
++        }
++    }
++
++    cJSON_Delete(json);
++    return RETURN_OK;
++}
++
++int cfg_get_prplmesh_radio_param(int radio_id, const std::string &radio_param, char *buf,
++                                 size_t buf_len)
++{
++    cJSON *json = load_json_config();
++    if (!json) return RETURN_ERR;
++
++    char radio_name[32];
++    snprintf(radio_name, sizeof(radio_name), "radio%d", radio_id);
++
++    cJSON *radio = cJSON_GetObjectItemCaseSensitive(json, radio_name);
++    if (!radio) {
++        cJSON_Delete(json);
++        return RETURN_ERR;
++    }
++
++    cJSON *item = cJSON_GetObjectItemCaseSensitive(radio, radio_param.c_str());
++    if (!item) {
++        cJSON_Delete(json);
++        return RETURN_ERR;
++    }
++
++    if (cJSON_IsString(item)) {
++        mapf::utils::copy_string(buf, item->valuestring, buf_len);
++    } else if (cJSON_IsNumber(item)) {
++        snprintf(buf, buf_len, "%d", item->valueint);
++    } else if (cJSON_IsBool(item)) {
++        snprintf(buf, buf_len, "%d", cJSON_IsTrue(item) ? 1 : 0);
++    } else {
++        cJSON_Delete(json);
++        return RETURN_ERR;
++    }
++
++    cJSON_Delete(json);
++    return RETURN_OK;
++}
++
++static int cfg_get_prplmesh_param_int_raw(const std::string &param, int *buf)
++{
++    int status;
++    char val[MAX_JSON_BUF_LEN] = "";
++
++    status = cfg_get_prplmesh_param(param, val, MAX_JSON_BUF_LEN);
++    if (status == RETURN_ERR)
++        return RETURN_ERR_NOT_FOUND;
++
++    status = sscanf(val, "%d", buf);
++    if (status != 1)
++        return RETURN_ERR_PARSE;
++
++    return RETURN_OK;
++}
++
++int cfg_get_prplmesh_param_int(const std::string &param, int *buf)
++{
++    int status = cfg_get_prplmesh_param_int_raw(param, buf);
++    return status == RETURN_OK ? RETURN_OK : RETURN_ERR;
++}
++
++int cfg_get_prplmesh_param_int_default(const std::string &param, int *buf, int default_value)
++{
++    int status = cfg_get_prplmesh_param_int_raw(param, buf);
++    switch (status) {
++    case RETURN_OK:
++        return RETURN_OK;
++    case RETURN_ERR_NOT_FOUND:
++        *buf = default_value;
++        MAPF_INFO(__FUNCTION__ << ": missing parameter '" << param
++                               << "', using default: " << default_value);
++        return RETURN_OK;
++    case RETURN_ERR_PARSE:
++        MAPF_ERR(__FUNCTION__ << ": can't parse value for '" << param << "'");
++        return RETURN_ERR;
++    default:
++        MAPF_ERR(__FUNCTION__ << ": cfg_get_prplmesh_param_int_raw returned unexpected value");
++        return RETURN_ERR;
++    }
++}
++
++int cfg_get_channel(const std::string &interface_name, int *channel)
++{
++    if (!channel) {
++        return RETURN_ERR;
++    }
++
++    cJSON *json = load_json_config();
++    if (!json) return RETURN_ERR;
++
++    cJSON *radios = cJSON_GetObjectItemCaseSensitive(json, "radios");
++    if (!radios || !cJSON_IsArray(radios)) {
++        cJSON_Delete(json);
++        return RETURN_ERR;
++    }
++
++    cJSON *radio = nullptr;
++    cJSON_ArrayForEach(radio, radios) {
++        cJSON *iface = cJSON_GetObjectItemCaseSensitive(radio, "name");
++        if (iface && cJSON_IsString(iface) && std::string(iface->valuestring) == interface_name) {
++            cJSON *chan = cJSON_GetObjectItemCaseSensitive(radio, "channel");
++            if (chan) {
++                if (cJSON_IsString(chan)) {
++                    std::string channel_str(chan->valuestring);
++                    if (channel_str == "auto") {
++                        *channel = 0;
++                    } else if (channel_str.find_first_not_of("0123456789") != std::string::npos) {
++                        *channel = 0;
++                    } else {
++                        *channel = utils::stoi(channel_str);
++                    }
++                } else if (cJSON_IsNumber(chan)) {
++                    *channel = chan->valueint;
++                }
++                cJSON_Delete(json);
++                return RETURN_OK;
++            }
++        }
++    }
++
++    cJSON_Delete(json);
++    return RETURN_ERR;
++}
++
++int cfg_get_wep_key(const std::string &interface_name, int keyIndex, char *key)
++{
++    /*TODO: implement using OneWifi/Rbus apis*/
++    return RETURN_OK;
++}
++
++int cfg_set_prplmesh_config(const std::string &option, const std::string &value)
++{
++    cJSON *json = load_json_config();
++    if (!json) {
++        // Create new JSON if it doesn't exist
++        json = cJSON_CreateObject();
++        if (!json) return RETURN_ERR;
++    }
++
++    cJSON *config = cJSON_GetObjectItemCaseSensitive(json, "config");
++    if (!config) {
++        config = cJSON_CreateObject();
++        cJSON_AddItemToObject(json, "config", config);
++    }
++
++    cJSON *item = cJSON_GetObjectItemCaseSensitive(config, option.c_str());
++    if (item) {
++        cJSON_ReplaceItemInObject(config, option.c_str(), cJSON_CreateString(value.c_str()));
++    } else {
++        cJSON_AddStringToObject(config, option.c_str(), value.c_str());
++    }
++
++    bool success = save_json_config(json);
++    cJSON_Delete(json);
++
++    return success ? RETURN_OK : RETURN_ERR;
++}
++
++int cfg_set_prplmesh_config_no_commit(const std::string &option, const std::string &value)
++{
++    // For JSON, we don't have a separate "commit" mechanism like UCI
++    // We just write it. Alternatively, we could hold it in memory, but that's complex.
++    return cfg_set_prplmesh_config(option, value);
++}
++
++bool cfg_update_prplmesh_option_commit(const std::string &package_name,
++                            const std::string &section_type,
++                            const std::string &option_name,
++                            const std::string &old_value,
++                            const std::string &new_value)
++{
++    // Not directly applicable to JSON without a matching schema mapping,
++    // but we can try to update under the specified section type if it's an array/object
++    cJSON *json = load_json_config();
++    if (!json) return false;
++
++    // Simplified: Just update under 'config' if section_type is empty or "config"
++    // Since this is a generic update, we'll try to find the old value and replace it
++    cJSON *section = nullptr;
++
++    if (section_type == "config" || section_type.empty()) {
++        section = cJSON_GetObjectItemCaseSensitive(json, "config");
++    } else {
++        section = cJSON_GetObjectItemCaseSensitive(json, section_type.c_str());
++    }
++
++    if (!section) {
++        cJSON_Delete(json);
++        return false;
++    }
++
++    cJSON *item = cJSON_GetObjectItemCaseSensitive(section, option_name.c_str());
++    if (item && cJSON_IsString(item) && std::string(item->valuestring) == old_value) {
++        cJSON_ReplaceItemInObject(section, option_name.c_str(), cJSON_CreateString(new_value.c_str()));
++        bool success = save_json_config(json);
++        cJSON_Delete(json);
++        return success;
++    }
++
++    cJSON_Delete(json);
++    return false;
++}
++
++
++} // namespace bpl
++} // namespace beerocks
+diff --git a/framework/platform/bpl/cfg/rdk/bpl_cfg_helper.h b/framework/platform/bpl/cfg/rdk/bpl_cfg_helper.h
+new file mode 100644
+index 000000000..ccc33dfc5
+--- /dev/null
++++ b/framework/platform/bpl/cfg/rdk/bpl_cfg_helper.h
+@@ -0,0 +1,135 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent
++ *
++ * SPDX-FileCopyrightText: 2022 the prplMesh contributors (see AUTHORS.md)
++ *
++ * This code is subject to the terms of the BSD+Patent license.
++ * See LICENSE file for more details.
++ */
++
++#ifndef _BPL_CFG_HELPER_H
++#define _BPL_CFG_HELPER_H
++
++#include <string>
++#include <unordered_map>
++
++#include <bpl/bpl_cfg.h>
++
++namespace beerocks {
++namespace bpl {
++
++#define PRPLMESH_JSON_PATH "/etc/config/prplmesh.json"
++
++/* Return codes shared between bpl_cfg_helper and bpl_cfg */
++#ifndef RETURN_OK
++#define RETURN_OK 0
++#define RETURN_ERR -1
++#define RETURN_ERR_NOT_FOUND -2
++#define RETURN_ERR_PARSE -3
++#endif /* RETURN_OK */
++
++/**
++ * Returns the hostap interfaces from the DB
++ *
++ * @param [out] hostapd_ifaces map to contain the hostap interfaces
++ *
++ * @return 0 on success or -1 on error.
++ **/
++int cfg_get_prplmesh_hostapd_ifaces(std::unordered_map<std::string, std::string> &hostapd_ifaces);
++
++/**
++ * Returns the value of requested param from DB
++ *
++ * @param [in] param prplmesh param key string
++ * @param [out] buf buffer to get value of requested param
++ * @param [in]  buf_len buffer length.
++ *
++ * @return 0 on success or -1 on error.
++ **/
++int cfg_get_prplmesh_param(const std::string &param, char *buf, size_t buf_len);
++
++/**
++ * Returns the value of requested param from DB for the specified radio
++ *
++ * @param [in] radio_id prplmesh radio id
++ * @param [in] param prplmesh param key string
++ * @param [out] buf buffer to get value of requested param
++ * @param [in]  buf_len buffer length.
++ *
++ * @return 0 on success or -1 on error.
++ **/
++int cfg_get_prplmesh_radio_param(int radio_id, const std::string &radio_param, char *buf,
++                                 size_t buf_len);
++
++/**
++ * Returns the value of requested integer type param from DB
++ *
++ * @param [in] param prplmesh param key string
++ * @param [out] buf buffer to get value of requested param
++ *
++ * @return 0 on success or -1 on error.
++ **/
++int cfg_get_prplmesh_param_int(const std::string &param, int *buf);
++
++/**
++ * Returns the value of requested integer type param from DB
++ *
++ * @param [in] param prplmesh param key string
++ * @param [in] default_value value to return if parameter is missing in DB
++ * @param [out] buf buffer to get value of requested param
++ *
++ * @return 0 on success or -1 on error.
++ **/
++int cfg_get_prplmesh_param_int_default(const std::string &param, int *buf, int default_value);
++
++/**
++ * Returns the value of ACS from DB
++ *
++ * @param [in] interface_name interface name string
++ * @param [out] channel channel number
++ *
++ * @return 0 on success or -1 on error.
++ **/
++int cfg_get_channel(const std::string &interface_name, int *channel);
++
++/** API currently not implemented **/
++int cfg_get_wep_key(const std::string &interface_name, int keyIndex, char *key);
++
++/**
++ * Sets and commits specified option under "config" section.
++ *
++ * If option is missing, it adds and sets at the same time. Otherwise, it updates the data.
++ *
++ * Option and value should not exceed MAX_JSON_BUF_LEN, othwise it aborts.
++ *
++ * @param [in] option option name.
++ * @param [in] value value to be written under option.
++ *
++ * @return 0 on success or -1 on error.
++ **/
++int cfg_set_prplmesh_config(const std::string &option, const std::string &value);
++
++/**
++ * Sets but does not commit specified option under "config" section.
++ *
++ * @param [in] option option name.
++ * @param [in] value value to be written under option.
++ *
++ * @return 0 on success or -1 on error.
++ **/
++int cfg_set_prplmesh_config_no_commit(const std::string &option, const std::string &value);
++
++/**
++ * Update the option in DB and commit
++ *
++ * @return true on success or false on error.
++ **/
++bool cfg_update_prplmesh_option_commit(const std::string &package_name,
++                            const std::string &section_type,
++                            const std::string &option_name,
++                            const std::string &old_value,
++                            const std::string &new_value);
++
++} // namespace bpl
++} // namespace beerocks
++
++#endif // _BPL_CFG_HELPER_H
+diff --git a/tools/qmesh_cli/CMakeLists.txt b/tools/qmesh_cli/CMakeLists.txt
+new file mode 100644
+index 000000000..21eaa9c57
+--- /dev/null
++++ b/tools/qmesh_cli/CMakeLists.txt
+@@ -0,0 +1,26 @@
++# SPDX-License-Identifier: BSD-2-Clause-Patent
++#
++# SPDX-FileCopyrightText: 2022 the prplMesh contributors (see AUTHORS.md)
++#
++# This code is subject to the terms of the BSD+Patent license.
++# See LICENSE file for more details.
++
++cmake_minimum_required(VERSION 3.10)
++project(qmesh_cli C)
++
++# Only build for RDKB platform
++if (NOT TARGET_PLATFORM STREQUAL "rdkb")
++    message(STATUS "qmesh_cli: skipping build for non-RDKB platform")
++    return()
++endif()
++
++# Find cJSON
++find_library(CJSON_LIB NAMES cjson REQUIRED)
++find_path(CJSON_INCLUDE_DIR NAMES cjson/cJSON.h cJSON.h REQUIRED)
++
++add_executable(qmesh_cli qmesh_cli.c)
++
++target_include_directories(qmesh_cli PRIVATE ${CJSON_INCLUDE_DIR})
++target_link_libraries(qmesh_cli PRIVATE ${CJSON_LIB})
++
++install(TARGETS qmesh_cli DESTINATION ${CMAKE_INSTALL_BINDIR})
+diff --git a/tools/qmesh_cli/qmesh_cli.c b/tools/qmesh_cli/qmesh_cli.c
+new file mode 100644
+index 000000000..c42c2605b
+--- /dev/null
++++ b/tools/qmesh_cli/qmesh_cli.c
+@@ -0,0 +1,348 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent
++ *
++ * SPDX-FileCopyrightText: 2022 the prplMesh contributors (see AUTHORS.md)
++ *
++ * This code is subject to the terms of the BSD+Patent license.
++ * See LICENSE file for more details.
++ */
++
++/*
++ * qmesh_cli - Lightweight CLI utility to read/modify /etc/config/prplmesh.json
++ *
++ * Usage:
++ *   qmesh_cli get <section>.<param>
++ *   qmesh_cli set <section>.<param> <value>
++ *   qmesh_cli show
++ *
++ * Examples:
++ *   qmesh_cli get config.management_mode
++ *   qmesh_cli set config.band_steering 1
++ *   qmesh_cli get radio0.hostap_iface
++ *   qmesh_cli set radio1.dcs_channel_pool "36-48,149-165"
++ *   qmesh_cli show
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++
++#include <cjson/cJSON.h>
++
++#define PRPLMESH_JSON_PATH "/etc/config/prplmesh.json"
++#define MAX_FILE_SIZE (64 * 1024)
++
++static char *read_file(const char *path)
++{
++    FILE *fp = fopen(path, "r");
++    char *buf = NULL;
++    long size = 0;
++
++    if (!fp) {
++        fprintf(stderr, "qmesh_cli: failed to open %s: %s\n", path, strerror(errno));
++        return NULL;
++    }
++
++    fseek(fp, 0, SEEK_END);
++    size = ftell(fp);
++    fseek(fp, 0, SEEK_SET);
++
++    if (size <= 0 || size > MAX_FILE_SIZE) {
++        fprintf(stderr, "qmesh_cli: invalid file size %ld for %s\n", size, path);
++        fclose(fp);
++        return NULL;
++    }
++
++    buf = malloc(size + 1);
++    if (!buf) {
++        fprintf(stderr, "qmesh_cli: out of memory\n");
++        fclose(fp);
++        return NULL;
++    }
++
++    if (fread(buf, 1, size, fp) != (size_t)size) {
++        fprintf(stderr, "qmesh_cli: failed to read %s\n", path);
++        free(buf);
++        fclose(fp);
++        return NULL;
++    }
++
++    buf[size] = '\0';
++    fclose(fp);
++    return buf;
++}
++
++static int write_file(const char *path, const char *content)
++{
++    FILE *fp = fopen(path, "w");
++
++    if (!fp) {
++        fprintf(stderr, "qmesh_cli: failed to open %s for writing: %s\n", path, strerror(errno));
++        return -1;
++    }
++
++    if (fputs(content, fp) == EOF) {
++        fprintf(stderr, "qmesh_cli: failed to write to %s\n", path);
++        fclose(fp);
++        return -1;
++    }
++
++    fclose(fp);
++    return 0;
++}
++
++static cJSON *load_json(void)
++{
++    char *content = read_file(PRPLMESH_JSON_PATH);
++    cJSON *json = NULL;
++
++    if (!content) {
++        return NULL;
++    }
++
++    json = cJSON_Parse(content);
++    free(content);
++
++    if (!json) {
++        const char *err = cJSON_GetErrorPtr();
++        if (err) {
++            fprintf(stderr, "qmesh_cli: JSON parse error near: %s\n", err);
++        }
++        return NULL;
++    }
++
++    return json;
++}
++
++static int save_json(cJSON *json)
++{
++    char *str = cJSON_Print(json);
++    int ret = 0;
++
++    if (!str) {
++        fprintf(stderr, "qmesh_cli: failed to serialize JSON\n");
++        return -1;
++    }
++
++    ret = write_file(PRPLMESH_JSON_PATH, str);
++    free(str);
++    return ret;
++}
++
++/*
++ * cmd_get: print the value of <section>.<param>
++ * e.g. "config.management_mode" or "radio0.hostap_iface"
++ */
++static int cmd_get(const char *key)
++{
++    char section[64] = {0};
++    char param[64] = {0};
++    const char *dot = strchr(key, '.');
++    cJSON *json = NULL;
++    cJSON *section_obj = NULL;
++    cJSON *item = NULL;
++
++    if (!dot) {
++        fprintf(stderr, "qmesh_cli: invalid key '%s', expected <section>.<param>\n", key);
++        return 1;
++    }
++
++    strlcpy(section, key, (size_t)(dot - key));
++    section[dot - key] = '\0';
++    strlcpy(param, dot + 1, sizeof(param) - 1);
++
++    json = load_json();
++    if (!json) {
++        return 1;
++    }
++
++    section_obj = cJSON_GetObjectItemCaseSensitive(json, section);
++    if (!section_obj) {
++        fprintf(stderr, "qmesh_cli: section '%s' not found\n", section);
++        cJSON_Delete(json);
++        return 1;
++    }
++
++    item = cJSON_GetObjectItemCaseSensitive(section_obj, param);
++    if (!item) {
++        fprintf(stderr, "qmesh_cli: param '%s' not found in section '%s'\n", param, section);
++        cJSON_Delete(json);
++        return 1;
++    }
++
++    if (cJSON_IsString(item)) {
++        printf("%s\n", item->valuestring);
++    } else if (cJSON_IsNumber(item)) {
++        /* Print as integer if it looks like one, else as double */
++        if (item->valuedouble == (double)(int)item->valuedouble) {
++            printf("%d\n", item->valueint);
++        } else {
++            printf("%g\n", item->valuedouble);
++        }
++    } else if (cJSON_IsBool(item)) {
++        printf("%s\n", cJSON_IsTrue(item) ? "true" : "false");
++    } else if (cJSON_IsNull(item)) {
++        printf("null\n");
++    } else {
++        char *str = cJSON_Print(item);
++        if (str) {
++            printf("%s\n", str);
++            free(str);
++        }
++    }
++
++    cJSON_Delete(json);
++    return 0;
++}
++
++/*
++ * cmd_set: set the value of <section>.<param> to <value>
++ * Tries to detect if value is an integer, boolean, or string.
++ */
++static int cmd_set(const char *key, const char *value)
++{
++    char section[64] = {0};
++    char param[64] = {0};
++    const char *dot = strchr(key, '.');
++    cJSON *json = NULL;
++    cJSON *section_obj = NULL;
++    cJSON *new_item = NULL;
++    char *endptr = NULL;
++    long int_val = 0;
++
++    if (!dot) {
++        fprintf(stderr, "qmesh_cli: invalid key '%s', expected <section>.<param>\n", key);
++        return 1;
++    }
++
++    strlcpy(section, key, (size_t)(dot - key));
++    section[dot - key] = '\0';
++    strlcpy(param, dot + 1, sizeof(param) - 1);
++
++    json = load_json();
++    if (!json) {
++        return 1;
++    }
++
++    section_obj = cJSON_GetObjectItemCaseSensitive(json, section);
++    if (!section_obj) {
++        /* Create the section if it doesn't exist */
++        section_obj = cJSON_CreateObject();
++        if (!section_obj) {
++            fprintf(stderr, "qmesh_cli: failed to create section '%s'\n", section);
++            cJSON_Delete(json);
++            return 1;
++        }
++        cJSON_AddItemToObject(json, section, section_obj);
++    }
++
++    /* Detect value type: boolean, integer, or string */
++    if (strcmp(value, "true") == 0) {
++        new_item = cJSON_CreateTrue();
++    } else if (strcmp(value, "false") == 0) {
++        new_item = cJSON_CreateFalse();
++    } else {
++        int_val = strtol(value, &endptr, 10);
++        if (endptr != value && *endptr == '\0') {
++            /* Pure integer */
++            new_item = cJSON_CreateNumber((double)int_val);
++        } else {
++            /* String */
++            new_item = cJSON_CreateString(value);
++        }
++    }
++
++    if (!new_item) {
++        fprintf(stderr, "qmesh_cli: failed to create JSON value for '%s'\n", value);
++        cJSON_Delete(json);
++        return 1;
++    }
++
++    /* Replace or add the item */
++    if (cJSON_GetObjectItemCaseSensitive(section_obj, param)) {
++        cJSON_ReplaceItemInObjectCaseSensitive(section_obj, param, new_item);
++    } else {
++        cJSON_AddItemToObject(section_obj, param, new_item);
++    }
++
++    if (save_json(json) != 0) {
++        cJSON_Delete(json);
++        return 1;
++    }
++
++    cJSON_Delete(json);
++    return 0;
++}
++
++/*
++ * cmd_show: pretty-print the entire JSON config
++ */
++static int cmd_show(void)
++{
++    cJSON *json = load_json();
++    char *str = NULL;
++
++    if (!json) {
++        return 1;
++    }
++
++    str = cJSON_Print(json);
++    if (str) {
++        printf("%s\n", str);
++        free(str);
++    }
++
++    cJSON_Delete(json);
++    return 0;
++}
++
++static void print_usage(const char *prog)
++{
++    fprintf(stderr,
++            "Usage:\n"
++            "  %s get <section>.<param>\n"
++            "  %s set <section>.<param> <value>\n"
++            "  %s show\n"
++            "\n"
++            "Examples:\n"
++            "  %s get config.management_mode\n"
++            "  %s set config.band_steering 1\n"
++            "  %s get radio0.hostap_iface\n"
++            "  %s set radio1.dcs_channel_pool \"36-48,149-165\"\n"
++            "  %s show\n",
++            prog, prog, prog, prog, prog, prog, prog, prog);
++}
++
++int main(int argc, char *argv[])
++{
++    if (argc < 2) {
++        print_usage(argv[0]);
++        return 1;
++    }
++
++    if (strcmp(argv[1], "get") == 0) {
++        if (argc < 3) {
++            fprintf(stderr, "qmesh_cli: 'get' requires a key argument\n");
++            print_usage(argv[0]);
++            return 1;
++        }
++        return cmd_get(argv[2]);
++    }
++
++    if (strcmp(argv[1], "set") == 0) {
++        if (argc < 4) {
++            fprintf(stderr, "qmesh_cli: 'set' requires a key and value argument\n");
++            print_usage(argv[0]);
++            return 1;
++        }
++        return cmd_set(argv[2], argv[3]);
++    }
++
++    if (strcmp(argv[1], "show") == 0) {
++        return cmd_show();
++    }
++
++    fprintf(stderr, "qmesh_cli: unknown command '%s'\n", argv[1]);
++    print_usage(argv[0]);
++    return 1;
++}
+-- 
+2.34.1
