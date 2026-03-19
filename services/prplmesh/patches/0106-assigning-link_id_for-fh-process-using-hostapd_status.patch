@@ -1,0 +1,540 @@
+From e36d237d4d2253b0765c01a786a79c8642b33d7f Mon Sep 17 00:00:00 2001
+From: Nirmal Raj S <nirm@qti.qualcomm.com>
+Date: Thu, 19 Mar 2026 12:49:29 +0530
+Subject: [PATCH] fetch freq param using hostapd status
+
+Signed-off-by: Nirmal Raj S <nirm@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 |   9 +-
+ .../beerocks/slave/beerocks_agent_main.cpp    | 273 +++++++++++++++---
+ .../bwl/shared/nl80211_client_impl.cpp        | 169 ++++++-----
+ 3 files changed, 336 insertions(+), 115 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 9cc7df9ef..927af33ed 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -2689,8 +2689,15 @@ bool ApManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+             return false;
+         }
+ 
++        if (!vap_node->second.ap_mld_mac.empty()) {
++            LOG(DEBUG) << "AP_MLD_MAC is not empty - use ap_mld_mac as parent bssid";
++            notification->params().bssid        = tlvf::mac_from_string(vap_node->second.ap_mld_mac);
++        } else {
++            LOG(DEBUG) << "AP_MLD_MAC is empty - use ap_mac as parent bssid";
++            notification->params().bssid        = tlvf::mac_from_string(vap_node->second.mac);
++        }
++
+         notification->params().mac    = msg->params.mac;
+-        notification->params().bssid  = tlvf::mac_from_string(vap_node->second.mac);
+         notification->params().vap_id = msg->params.vap_id;
+         notification->params().reason = msg->params.reason;
+         notification->params().source = msg->params.source;
+diff --git a/agent/src/beerocks/slave/beerocks_agent_main.cpp b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+index 20f21a4ed..820ce8ff8 100644
+--- a/agent/src/beerocks/slave/beerocks_agent_main.cpp
++++ b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+@@ -44,6 +44,8 @@ static std::shared_ptr<beerocks::nbapi::Amxrt> guarantee = nullptr;
+ 
+ #include <easylogging++.h>
+ 
++#include <dirent.h>
++
+ #ifdef ENABLE_NBAPI
+ 
+ #include "ambiorix_impl.h"
+@@ -160,17 +162,130 @@ static bool parse_arguments(int argc, char *argv[])
+     return true;
+ }
+ 
+-
++/**
++ * @brief Get operational interface from hostapd using hostapd_cli status command
++ * 
++ * This function discovers the operational interface by:
++ * 1. Scanning /var/run/hostapd for interfaces matching the base interface pattern
++ * 2. Querying each interface using hostapd_cli status to get frequency
++ * 3. Matching the frequency with the radio_idx to find the correct interface
++ * 
++ * @param base_iface Base interface name (e.g., "wlan0")
++ * @param radio_idx Radio index (0=2.4GHz, 1=5GHz, 2=6GHz, 3=5GHz-High)
++ * @return std::string Operational interface name, or empty string if not found
++ */
+ #ifdef USE_PRPLMESH_NLHAL
++static std::string get_operational_iface_from_hostapd(const std::string &base_iface, int radio_idx)
++{
++    LOG(INFO) << "Attempting to get operational interface from hostapd for base_iface: "
++              << base_iface << ", radio_idx: " << radio_idx;
++
++    // Collect interfaces from /var/run/hostapd that match the base interface pattern
++    std::string hostapd_path = "/var/run/hostapd";
++    std::vector<std::string> matching_ifaces;
++
++    DIR *dir = opendir(hostapd_path.c_str());
++    if (dir != nullptr) {
++        struct dirent *entry;
++        while ((entry = readdir(dir)) != nullptr) {
++            std::string filename(entry->d_name);
++            // Match base interface (e.g., wlan0) or link interfaces (e.g., wlan0_link*)
++            if ((filename.find(base_iface + "_link") == 0)) {
++                matching_ifaces.push_back(filename);
++                LOG(DEBUG) << "Found matching interface in hostapd: " << filename;
++            }
++        }
++        closedir(dir);
++    } else {
++        LOG(ERROR) << "Failed to open directory " << hostapd_path << ": " << strerror(errno);
++        return std::string();
++    }
++
++    if (matching_ifaces.empty()) {
++        LOG(ERROR) << "No matching interfaces found in " << hostapd_path << " for base interface "
++                   << base_iface;
++        return std::string();
++    }
++
++    // Verify each interface using hostapd_cli status and match frequency with radio_idx
++    std::string operational_iface;
++
++    for (const auto &iface : matching_ifaces) {
++        std::string cmd = "hostapd_cli -i " + iface + " status 2>&1 | grep freq=";
++        LOG(DEBUG) << "Executing: " << cmd;
++
++        FILE *pipe = popen(cmd.c_str(), "r");
++        if (pipe) {
++            char buffer[256];
++            std::string result;
++            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
++                result += buffer;
++            }
++            pclose(pipe);
++
++            // Extract frequency from the output
++            size_t freq_pos = result.find("freq=");
++            if (freq_pos != std::string::npos) {
++                freq_pos += 5; // Move past "freq="
++                size_t end_pos       = result.find('\n', freq_pos);
++                std::string freq_str = result.substr(freq_pos, end_pos - freq_pos);
++                int freq             = std::stoi(freq_str);
++
++                LOG(DEBUG) << "Interface " << iface << " frequency: " << freq;
++
++                // Match frequency with radio_idx
++                bool match = false;
++                switch (radio_idx) {
++                case 0: // RADIOIDX_2G
++                    match = (freq >= 2400 && freq <= 2500);
++                    break;
++                case 1: // RADIOIDX_5G
++                    match = (freq >= 4900 && freq <= 5900);
++                    break;
++                case 2: // RADIOIDX_6G
++                    match = (freq >= 5925 && freq <= 7125);
++                    break;
++                case 3: // RADIOIDX_5GH
++                    match = (freq >= 5490 && freq <= 5835);
++                    break;
++                default:
++                    LOG(ERROR) << "Invalid radio_idx: " << radio_idx;
++                    break;
++                }
++
++                if (match) {
++                    operational_iface = iface;
++                    LOG(INFO) << "Interface " << iface << " matches radio_idx " << radio_idx
++                              << " with frequency " << freq;
++                    break;
++                } else {
++                    LOG(DEBUG) << "Interface " << iface << " frequency " << freq
++                               << " does not match radio_idx " << radio_idx;
++                }
++            }
++        } else {
++            LOG(WARNING) << "Failed to execute hostapd_cli for interface " << iface;
++        }
++    }
++
++    if (operational_iface.empty()) {
++        LOG(ERROR) << "No operational interface found matching radio_idx " << radio_idx
++                   << " for base interface " << base_iface;
++    }
++
++    return operational_iface;
++}
++
+ static std::string get_sta_iface_from_hostap_iface(const std::string &hostap_iface, int radio_num)
+ {
+-    LOG(INFO) << "BEEROCKS_AGENT: get_sta_iface radio_num: " << radio_num << " hostapd_iface:" << hostap_iface;
++    LOG(INFO) << "BEEROCKS_AGENT: get_sta_iface radio_num: " << radio_num
++              << " hostapd_iface:" << hostap_iface;
+ 
+     // read the sta_iface from bpl and verify it is available
+     char sta_iface_str[BPL_IFNAME_LEN];
+     std::string sta_iface;
+ 
+-    if (beerocks::bpl::cfg_get_sta_iface_with_radio_id(radio_num, sta_iface_str) < 0){
++    if (beerocks::bpl::cfg_get_sta_iface_with_radio_id(radio_num, sta_iface_str) < 0) {
+         LOG(ERROR) << "failed to read sta_iface for slave ";
+         return std::string();
+     } else {
+@@ -233,36 +349,100 @@ static void fill_son_slave_config(const beerocks::config_file::sConfigSlave &bee
+     std::string fh_iface_link_idxd;
+ 
+     auto socket = std::make_unique<bwl::nl80211_socket>();
+-        if (!socket->connect()) {
+-            LOG(ERROR) << "Failed to connect nl80211 socket!";
+-            return;
+-        }
++    if (!socket->connect()) {
++        LOG(ERROR) << "Failed to connect nl80211 socket!";
++        return;
++    }
+ 
+     auto nl80211_client = std::make_unique<bwl::nl80211_client_impl>(std::move(socket));
++
++    // Store failed fronthaul interfaces for retry
++    std::vector<std::pair<int, std::string>> failed_fh_ifaces;
+ #endif
+ 
+     for (const auto &iface_element : interfaces_map) {
+-        auto fronthaul_num    = iface_element.first;
++        auto fronthaul_num = iface_element.first;
+ 
+ #ifdef USE_PRPLMESH_NLHAL
+-/* Use interface name with _link<idx> as radio identifiers, previously used interface name as radio identifier,
++        /* Use interface name with _link<idx> as radio identifiers, previously used interface name as radio identifier,
+  * that will introduce duplicate in interface name for being used as radio identifier
+  * when there is only one 3 link mld (or) 1 slo/legacy with 1 two link mld */
+ 
+         std::string fh_iface_rad_idxd = iface_element.second + "##" + std::to_string(fronthaul_num);
+ 
+-/* Fetch link idx via nl call as because idx can be any value for a band and not fixed and assigned by driver */
+-        if (!nl80211_client->get_iface_with_link_idx(fh_iface_rad_idxd, fh_iface_link_idxd)) {
+-            LOG(ERROR) << "Failed to base interface name for " << fh_iface_rad_idxd;
+-            return;
++        /* Fetch link idx via nl call as because idx can be any value for a band and not fixed and assigned by driver */
++        if (nl80211_client->get_iface_with_link_idx(fh_iface_rad_idxd, fh_iface_link_idxd)) {
++            LOG(INFO) << "Base iface link indexed via nl80211: " << fh_iface_link_idxd;
++        } else if (!(fh_iface_link_idxd =
++                         get_operational_iface_from_hostapd(iface_element.second, fronthaul_num))
++                        .empty()) {
++            LOG(INFO) << "Using operational interface from hostapd: " << fh_iface_link_idxd;
++        } else {
++            LOG(WARNING) << "Failed to get interface name via both nl80211 and hostapd for "
++                         << fh_iface_rad_idxd
++                         << ", will retry after processing remaining interfaces";
++            // Store failed interface info for retry
++            failed_fh_ifaces.push_back({fronthaul_num, iface_element.second});
++            continue; // Skip this interface for now
+         }
+-        LOG(INFO) << "Base iface link indexed:"<< fh_iface_link_idxd;
+         auto &fronthaul_iface = fh_iface_link_idxd;
+ #else
+-	auto &fronthaul_iface = iface_element.second;
++        auto &fronthaul_iface = iface_element.second;
+ 
+ #endif
+-            // Fill configuration
++        // Fill configuration
++        agent_conf.radios[fronthaul_iface].enable_repeater_mode =
++            beerocks_slave_conf.enable_repeater_mode[fronthaul_num] == "1";
++        agent_conf.radios[fronthaul_iface].hostap_iface_type =
++            beerocks::utils::get_iface_type_from_string(
++                beerocks_slave_conf.hostap_iface_type[fronthaul_num]);
++        agent_conf.radios[fronthaul_iface].hostap_ant_gain =
++            (!beerocks_slave_conf.hostap_ant_gain[fronthaul_num].empty())
++                ? beerocks::string_utils::stoi(beerocks_slave_conf.hostap_ant_gain[fronthaul_num])
++                : 0;
++#ifdef USE_PRPLMESH_NLHAL
++        agent_conf.radios[fronthaul_iface].backhaul_wireless_iface =
++            get_sta_iface_from_hostap_iface(iface_element.second, iface_element.first);
++#else
++        agent_conf.radios[fronthaul_iface].backhaul_wireless_iface =
++            get_sta_iface_from_hostap_iface(iface_element.second);
++#endif
++        agent_conf.radios[fronthaul_iface].backhaul_wireless_iface_filter_low =
++            (!beerocks_slave_conf.sta_iface_filter_low[fronthaul_num].empty())
++                ? beerocks::string_utils::stoi(
++                      beerocks_slave_conf.sta_iface_filter_low[fronthaul_num])
++                : 0;
++    }
++
++#ifdef USE_PRPLMESH_NLHAL
++    // Retry failed fronthaul interfaces
++    if (!failed_fh_ifaces.empty()) {
++        LOG(INFO) << "Retrying " << failed_fh_ifaces.size() << " failed fronthaul interface(s)";
++
++        for (const auto &failed_iface : failed_fh_ifaces) {
++            int fronthaul_num      = failed_iface.first;
++            std::string base_iface = failed_iface.second;
++
++            std::string fh_iface_rad_idxd = base_iface + "##" + std::to_string(fronthaul_num);
++
++            LOG(INFO) << "Retry attempt for interface: " << fh_iface_rad_idxd;
++
++            // Retry nl80211 method first
++            if (nl80211_client->get_iface_with_link_idx(fh_iface_rad_idxd, fh_iface_link_idxd)) {
++                LOG(INFO) << "Retry successful via nl80211: " << fh_iface_link_idxd;
++            } else if (!(fh_iface_link_idxd =
++                             get_operational_iface_from_hostapd(base_iface, fronthaul_num))
++                            .empty()) {
++                LOG(INFO) << "Retry successful via hostapd: " << fh_iface_link_idxd;
++            } else {
++                LOG(ERROR) << "Retry failed for interface " << fh_iface_rad_idxd
++                           << " - both nl80211 and hostapd methods failed";
++                continue; // Skip configuration for this interface
++            }
++
++            auto &fronthaul_iface = fh_iface_link_idxd;
++
++            // Fill configuration for the retried interface
+             agent_conf.radios[fronthaul_iface].enable_repeater_mode =
+                 beerocks_slave_conf.enable_repeater_mode[fronthaul_num] == "1";
+             agent_conf.radios[fronthaul_iface].hostap_iface_type =
+@@ -270,27 +450,25 @@ static void fill_son_slave_config(const beerocks::config_file::sConfigSlave &bee
+                     beerocks_slave_conf.hostap_iface_type[fronthaul_num]);
+             agent_conf.radios[fronthaul_iface].hostap_ant_gain =
+                 (!beerocks_slave_conf.hostap_ant_gain[fronthaul_num].empty())
+-                    ? beerocks::string_utils::stoi(beerocks_slave_conf.hostap_ant_gain[fronthaul_num])
++                    ? beerocks::string_utils::stoi(
++                          beerocks_slave_conf.hostap_ant_gain[fronthaul_num])
+                     : 0;
+-#ifdef USE_PRPLMESH_NLHAL
+-            agent_conf.radios[fronthaul_iface].backhaul_wireless_iface =
+-                get_sta_iface_from_hostap_iface(iface_element.second,iface_element.first);
+-#else
+             agent_conf.radios[fronthaul_iface].backhaul_wireless_iface =
+-                get_sta_iface_from_hostap_iface(iface_element.second);
+-#endif
++                get_sta_iface_from_hostap_iface(base_iface, fronthaul_num);
+             agent_conf.radios[fronthaul_iface].backhaul_wireless_iface_filter_low =
+                 (!beerocks_slave_conf.sta_iface_filter_low[fronthaul_num].empty())
+                     ? beerocks::string_utils::stoi(
+-                        beerocks_slave_conf.sta_iface_filter_low[fronthaul_num])
++                          beerocks_slave_conf.sta_iface_filter_low[fronthaul_num])
+                     : 0;
++        }
+     }
++#endif
+ 
+-        int8_t num_of_bands = 0;
++    int8_t num_of_bands = 0;
+ #ifdef USE_PRPLMESH_NLHAL
+-        if (!nl80211_client->get_radio_band_info(num_of_bands)) {
+-            LOG(ERROR) << "Failed to get number of band ";
+-        }
++    if (!nl80211_client->get_radio_band_info(num_of_bands)) {
++        LOG(ERROR) << "Failed to get number of band ";
++    }
+ #endif
+ 
+     LOG(DEBUG) << "NUM_OF_BAND Updated in get_radio_band_info= " << num_of_bands;
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.cpp b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+index a880d86e9..ee7d17898 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -104,99 +104,132 @@ bool nl80211_client_impl::get_interfaces(std::vector<std::string> &interfaces)
+         });
+ }
+ 
+-bool nl80211_client_impl::get_iface_with_link_idx(const std::string &iface_rad_idxd, std::string &iface_link_idxd)
++bool nl80211_client_impl::get_iface_with_link_idx(const std::string &iface_rad_idxd,
++                                                  std::string &iface_link_idxd)
+ {
+-    int  radio_idx;
++    int radio_idx;
+     std::string base_interface;
+     bwl::base_wlan_hal::extractLinkBaseInterface(iface_rad_idxd, base_interface);
+     bwl::base_wlan_hal::extractRadioId(iface_rad_idxd, radio_idx);
+-    int link_id = 0;
++    int link_id      = 0;
++    bool match_found = false;
+ 
+-    LOG(INFO) << "iface_rad_idxd: " << iface_rad_idxd << " radio:" << radio_idx <<  "base_interface: " << base_interface;
++    LOG(INFO) << "iface_rad_idxd: " << iface_rad_idxd << " radio:" << radio_idx
++              << "base_interface: " << base_interface;
+     if (!m_socket) {
+-            LOG(ERROR) << "Socket is NULL!";
+-            return false;
++        LOG(ERROR) << "Socket is NULL!";
++        return false;
+     }
+ 
+     int iface_index = if_nametoindex(base_interface.c_str());
+     if (0 == iface_index) {
+-            LOG(ERROR) << "Failed to read the index of interface " << iface_rad_idxd << "base_interface:" << base_interface << ": "
+-                    << strerror(errno);
+-            return false;
++        LOG(ERROR) << "Failed to read the index of interface " << iface_rad_idxd
++                   << "base_interface:" << base_interface << ": " << strerror(errno);
++        return false;
+     }
+     LOG(INFO) << "iface_index: " << iface_index;
+ 
+-    return m_socket.get()->send_receive_msg(
+-    NL80211_CMD_GET_INTERFACE, 0,
+-    [&](struct nl_msg *msg) -> bool {
+-    nla_put_u32(msg, NL80211_ATTR_IFINDEX, iface_index);
+-    return true;
+-    },
+-    [&](struct nl_msg *msg) {
+-    struct nlattr *tb[NL80211_ATTR_MAX + 1];
+-    struct genlmsghdr *gnlh = (struct genlmsghdr *)nlmsg_data(nlmsg_hdr(msg));
+-
+-    // Parse the netlink message
+-    if (nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0),
+-                            NULL)) {
+-    LOG(ERROR) << "Failed to parse netlink message!";
+-    return;
+-    }
++    bool result = m_socket.get()->send_receive_msg(
++        NL80211_CMD_GET_INTERFACE, 0,
++        [&](struct nl_msg *msg) -> bool {
++            nla_put_u32(msg, NL80211_ATTR_IFINDEX, iface_index);
++            return true;
++        },
++        [&](struct nl_msg *msg) {
++            struct nlattr *tb[NL80211_ATTR_MAX + 1];
++            struct genlmsghdr *gnlh = (struct genlmsghdr *)nlmsg_data(nlmsg_hdr(msg));
+ 
+-    if ((tb[NL80211_ATTR_MLO_LINKS])) {
+-            LOG(INFO) << "MLO supported and MLO links attr present";
+-        int ret = 0;
+-        struct nlattr *attrs, *link[NL80211_ATTR_MAX + 1];
+-        nla_for_each_nested(attrs, tb[NL80211_ATTR_MLO_LINKS], ret) {
+-                nla_parse_nested(link, NL80211_ATTR_MAX, attrs, NULL);
+-                if (link[NL80211_ATTR_WIPHY_FREQ]) {
+-                    int freq = nla_get_u32(link[NL80211_ATTR_WIPHY_FREQ]);
+-
+-                    LOG(INFO) << "freq: " << freq ;
+-                    bool match = false;
+-                    switch (radio_idx) {
+-                            case RADIOIDX_2G: match = (freq >= 2400 && freq <= 2500); break;
+-                            case RADIOIDX_5G: match = (freq >= 4900 && freq <= 5900); break;
+-                            case RADIOIDX_6G: match = (freq >= 5925 && freq <= 7125); break;
+-                            case RADIOIDX_5GH: match = (freq >= 5490 && freq <= 5835); break;
+-                            default: LOG(ERROR) << "Invalid radio_type"; break;
+-                    }
++            // Parse the netlink message
++            if (nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0),
++                          NULL)) {
++                LOG(ERROR) << "Failed to parse netlink message!";
++                return;
++            }
++
++            if ((tb[NL80211_ATTR_MLO_LINKS])) {
++                LOG(INFO) << "MLO supported and MLO links attr present";
++                int ret = 0;
++                struct nlattr *attrs, *link[NL80211_ATTR_MAX + 1];
++                bool match = false;
++                nla_for_each_nested(attrs, tb[NL80211_ATTR_MLO_LINKS], ret)
++                {
++                    nla_parse_nested(link, NL80211_ATTR_MAX, attrs, NULL);
++                    if (link[NL80211_ATTR_WIPHY_FREQ]) {
++                        int freq = nla_get_u32(link[NL80211_ATTR_WIPHY_FREQ]);
+ 
+-                    if (!match) {
+-                            LOG(INFO) << "Skipping MLO link with freq " << freq << " not matching radio_type: " << radio_idx;
++                        LOG(INFO) << "freq: " << freq;
++                        switch (radio_idx) {
++                        case RADIOIDX_2G:
++                            match = (freq >= 2400 && freq <= 2500);
++                            break;
++                        case RADIOIDX_5G:
++                            match = (freq >= 4900 && freq <= 5900);
++                            break;
++                        case RADIOIDX_6G:
++                            match = (freq >= 5925 && freq <= 7125);
++                            break;
++                        case RADIOIDX_5GH:
++                            match = (freq >= 5490 && freq <= 5835);
++                            break;
++                        default:
++                            LOG(ERROR) << "Invalid radio_type";
++                            break;
++                        }
++
++                        if (!match) {
++                            LOG(INFO) << "Skipping MLO link with freq " << freq
++                                      << " not matching radio_type: " << radio_idx;
+                             continue;
+-                    }
+-                    link_id = nla_get_u8(link[NL80211_ATTR_MLO_LINK_ID]);
+-                    LOG(INFO) << "Match found: Update link_id : " << link_id;
+-                    break;
+-                } else {
+-                    // No freq: still try to read link_id
+-                    if (link[NL80211_ATTR_MLO_LINK_ID]) {
++                        }
+                         link_id = nla_get_u8(link[NL80211_ATTR_MLO_LINK_ID]);
+-                        LOG(INFO) << "No freq reported; capturing link_id only: "
+-                                  << static_cast<int>(link_id);
++                        LOG(INFO) << "Match found: Update link_id : " << link_id;
++                        match_found = true;
++                        break;
+                     } else {
+-                        LOG(WARNING) << "MLO link missing both FREQ and LINK_ID";
++                        // No freq: still try to read link_id
++                        if (link[NL80211_ATTR_MLO_LINK_ID]) {
++                            link_id = nla_get_u8(link[NL80211_ATTR_MLO_LINK_ID]);
++                            LOG(INFO) << "No freq reported; capturing link_id only: "
++                                      << static_cast<int>(link_id);
++                        } else {
++                            LOG(WARNING) << "MLO link missing both FREQ and LINK_ID";
++                        }
++                        // continue looping to see if a later entry has freq & matches
+                     }
+-                    // continue looping to see if a later entry has freq & matches
+                 }
+-        }
+-        iface_link_idxd = base_interface + "_link" + std::to_string(link_id);
+-        LOG(INFO) << "iface_link_idxd : " << iface_link_idxd;
+-        return;
+-    } else {
+-            iface_link_idxd = base_interface;
+-            LOG(ERROR) << "iface_link_idxd : " << iface_link_idxd;
+-            return;
++                if (match_found) {
++                    iface_link_idxd = base_interface + "_link" + std::to_string(link_id);
++                    LOG(INFO) << "MLO link matched - iface_link_idxd: " << iface_link_idxd;
++                } else {
++                    LOG(WARNING) << "No matching MLO link found for radio_idx: " << radio_idx;
++                }
++            } else {
++                // Non-MLO case
++                iface_link_idxd = base_interface;
++                match_found     = true;
++                LOG(INFO) << "Non-MLO interface - iface_link_idxd: " << iface_link_idxd;
++            }
++        });
++
++    // Return status based on match_found when MLO_LINKS is present
++    if (!result) {
++        LOG(ERROR) << "Failed to send/receive netlink message";
++        return false;
+     }
+ 
+-    });
++    if (!match_found) {
++        LOG(ERROR) << "Failed to find matching link for radio_idx: " << radio_idx;
++        return false;
++    }
++
++    return true;
+ }
+ 
+-bool nl80211_client_impl::getMLDLinkIfaceMacAddr(std::string &interface_name, std::string &mac_out) {
+-    LOG(INFO) <<"INSIDE get_mld_mac_for_interface";
++bool nl80211_client_impl::getMLDLinkIfaceMacAddr(std::string &interface_name, std::string &mac_out)
++{
++    LOG(INFO) << "INSIDE get_mld_mac_for_interface";
+ 
+-    int  link_idx;
++    int link_idx;
+     std::string base_interface;
+     bwl::base_wlan_hal::extractLinkBaseInterface(interface_name, base_interface);
+     bwl::base_wlan_hal::extractLinkId(interface_name, link_idx);
+-- 
+2.34.1
+
