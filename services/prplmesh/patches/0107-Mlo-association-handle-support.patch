@@ -1,0 +1,739 @@
+From 649ce70b374cf9fcd4e0c448c774c27525fd80b9 Mon Sep 17 00:00:00 2001
+From: Sureshkumar <suresure@qti.qualcomm.com>
+Date: Tue, 24 Mar 2026 15:25:46 +0530
+Subject: [PATCH]  Mlo association handle support
+
+         1.Fix beacon request tx in MLO scenario
+         2.Fix Tx BTM request from any non primary link
+         3.Fix misleading debug & 1905 ACK Error code for 1905 ACK
+         4.Add support for common APIs to check Assoc Handle that considers both MLO & Non MLO scenarios
+         5.Propagate link address from Assoc notification event
+         6.Fix 11ax STA bandsteering on MLO vap scenario
+
+Signed-off-by: Sureshkumar <suresure@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 |   7 +-
+ .../fronthaul_manager/monitor/monitor.cpp     |  11 +-
+ agent/src/beerocks/slave/agent_db.cpp         | 117 ++++++++
+ agent/src/beerocks/slave/agent_db.h           |  63 ++++-
+ agent/src/beerocks/slave/son_slave_thread.cpp | 258 ++++++++++++++----
+ .../tlvf/beerocks_message_apmanager.yaml      |   1 +
+ .../src/beerocks/master/son_actions.cpp       |  23 +-
+ 7 files changed, 411 insertions(+), 69 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 1c8196e91..26eb3b4f4 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -2607,9 +2607,10 @@ bool ApManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+ 
+         notification->mac()          = msg->params.mac;
+         notification->vap_id()       = msg->params.vap_id;
++        notification->link_mac()     = tlvf::mac_from_string(vap_node->second.mac);
+ 
+         LOG(DEBUG) << "BSSID: " << vap_node->second.mac << " AP_MLD_MAC: " << vap_node->second.ap_mld_mac;
+-  
++
+         if (!vap_node->second.ap_mld_mac.empty()) {
+             LOG(DEBUG) << "AP_MLD_MAC is not empty - use ap_mld_mac as parent bssid";
+             notification->bssid()        = tlvf::mac_from_string(vap_node->second.ap_mld_mac);
+@@ -2617,13 +2618,13 @@ bool ApManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+             LOG(DEBUG) << "AP_MLD_MAC is empty - use ap_mac as parent bssid";
+             notification->bssid()        = tlvf::mac_from_string(vap_node->second.mac);
+         }
+- 
++
+         notification->capabilities() = msg->params.capabilities;
+         if (msg->params.association_frame_length == 0) {
+             LOG(DEBUG) << "no association frame";
+         } else {
+             notification->set_association_frame(msg->params.association_frame,
+-                                                msg->params.association_frame_length);
++                    msg->params.association_frame_length);
+         }
+ 
+         notification->multi_ap_profile() = msg->params.multi_ap_profile;
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+index eb0160b71..9b4d893cb 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+@@ -1636,10 +1636,15 @@ void Monitor::handle_cmdu_vs_message(ieee1905_1::CmduMessageRx &cmdu_rx)
+         }
+ 
+         std::string sta_mac = tlvf::mac_to_string(request->params().sta_mac);
+-        auto sta_node       = mon_db.sta_find(sta_mac);
++
++        LOG(DEBUG) << "Beacon 11k Request: STA " << sta_mac 
++                   << ", requested_bssid=" << tlvf::mac_to_string(request->params().bssid)
++                   << ", id=" << beerocks_header->id();
++
++        auto sta_node = mon_db.sta_find(sta_mac);
+         if (sta_node == nullptr) {
+-            LOG(ERROR) << "CLIENT_BEACON_11K_REQUEST sta_mac=" << sta_mac
+-                       << " sta not assoc, id=" << beerocks_header->id();
++            LOG(ERROR) << "Beacon 11k Request: STA " << sta_mac
++                       << " not found in monitor DB, id=" << beerocks_header->id();
+             return;
+         }
+         auto vap_node = mon_db.vap_get_by_id(sta_node->get_vap_id());
+diff --git a/agent/src/beerocks/slave/agent_db.cpp b/agent/src/beerocks/slave/agent_db.cpp
+index 7b7ce6275..267656a6c 100644
+--- a/agent/src/beerocks/slave/agent_db.cpp
++++ b/agent/src/beerocks/slave/agent_db.cpp
+@@ -101,6 +101,35 @@ AgentDB::sRadio *AgentDB::get_radio_by_mac(const sMacAddr &mac, eMacType mac_typ
+     return radio_it == m_radios.end() ? nullptr : &(*radio_it);
+ }
+ 
++const AgentDB::sRadio *AgentDB::get_radio_by_mac(const sMacAddr &mac, eMacType mac_type_hint) const
++{
++    bool all_mac_types = mac_type_hint == eMacType::ALL;
++    auto radio_it = std::find_if(m_radios.begin(), m_radios.end(), [&](const sRadio &radio_entry) {
++        if (all_mac_types || mac_type_hint == eMacType::RADIO) {
++            if (radio_entry.front.iface_mac == mac || radio_entry.back.iface_mac == mac) {
++                return true;
++            }
++        }
++        if (all_mac_types || mac_type_hint == eMacType::BSSID) {
++            auto &bssid_list = radio_entry.front.bssids;
++            auto bssid_it =
++                std::find_if(bssid_list.begin(), bssid_list.end(),
++                             [&](const sRadio::sFront::sBssid &bssid) { return bssid.mac == mac; });
++            if (bssid_it != bssid_list.end()) {
++                return true;
++            }
++        }
++        if (all_mac_types || mac_type_hint == eMacType::CLIENT) {
++            auto client_it = radio_entry.associated_clients.find(mac);
++            return client_it != radio_entry.associated_clients.end();
++        }
++        // MAC is not one of the front\back radio MACs nor bssid MAC.
++        return false;
++    });
++
++    return radio_it == m_radios.end() ? nullptr : &(*radio_it);
++}
++
+ void AgentDB::erase_client(const sMacAddr &client_mac, sMacAddr bssid)
+ {
+     if (bssid != net::network_utils::ZERO_MAC) {
+@@ -147,6 +176,94 @@ bool AgentDB::get_ap_mld_mac_by_ssid(const std::string &ssid, sMacAddr &value)
+     return false;
+ }
+ 
++sMacAddr AgentDB::get_ap_mld_mac_for_bssid(const sMacAddr& bssid) const
++{
++    // Iterate through all radios to find the BSSID
++    for (const auto &radio : m_radios) {
++        for (const auto &bssid_entry : radio.front.bssids) {
++            if (bssid_entry.mac == bssid) {
++                // Found the BSSID, return its AP MLD MAC (or ZERO_MAC if not part of an MLD)
++                return bssid_entry.apmld_mac;
++            }
++        }
++    }
++    // BSSID not found
++    return net::network_utils::ZERO_MAC;
++}
++
++std::vector<sMacAddr> AgentDB::get_all_bssids_for_ap_mld(const sMacAddr& ap_mld_mac) const
++{
++    std::vector<sMacAddr> bssids;
++
++    // If the provided MLD MAC is ZERO_MAC, return empty vector
++    if (ap_mld_mac == net::network_utils::ZERO_MAC) {
++        return bssids;
++    }
++
++    // Iterate through all radios and collect BSSIDs that belong to this MLD
++    for (const auto &radio : m_radios) {
++        for (const auto &bssid_entry : radio.front.bssids) {
++            if (bssid_entry.apmld_mac == ap_mld_mac) {
++                bssids.push_back(bssid_entry.mac);
++            }
++        }
++    }
++
++    return bssids;
++}
++
++AgentDB::StaAssociationInfo AgentDB::get_sta_association_details(const sMacAddr& sta_mac, const sMacAddr& tlv_bssid) const
++{
++    StaAssociationInfo info;
++
++    bool is_wildcard = (tlv_bssid == sMacAddr({0xff, 0xff, 0xff, 0xff, 0xff, 0xff}));
++
++    // Search across ALL radios to find where the STA is actually associated
++    for (const auto &radio : m_radios) {
++        auto client_it = radio.associated_clients.find(sta_mac);
++        if (client_it != radio.associated_clients.end()) {
++            // Found the STA - it's associated
++            info.is_associated = true;
++            info.actual_associated_bssid = client_it->second.bssid;
++            info.associated_link_mac = client_it->second.link_mac;
++
++            // Determine if this is an MLD association
++            sMacAddr actual_ap_mld_mac = get_ap_mld_mac_for_bssid(info.actual_associated_bssid);
++            info.is_mld_client_association = (actual_ap_mld_mac != net::network_utils::ZERO_MAC);
++
++            if (info.is_mld_client_association) {
++                // Check if tlv_bssid is a partner of the actual associated BSSID
++                if (!is_wildcard) {
++                    sMacAddr tlv_ap_mld_mac = get_ap_mld_mac_for_bssid(tlv_bssid);
++                    info.is_requested_bssid_mld_partner = (tlv_ap_mld_mac == actual_ap_mld_mac) && 
++                        (tlv_ap_mld_mac != net::network_utils::ZERO_MAC);
++                } else {
++                    // Wildcard case - consider it as a valid partner for MLO
++                    info.is_requested_bssid_mld_partner = true;
++                }
++            } else {
++                // Non-MLD case: check if tlv_bssid matches actual_associated_bssid (or is wildcard)
++                info.is_requested_bssid_mld_partner = is_wildcard || (tlv_bssid == info.actual_associated_bssid);
++            }
++
++            LOG(DEBUG) << "STA association check: sta=" << sta_mac 
++                << ", requested_bssid=" << tlv_bssid
++                << ", actual_bssid=" << info.actual_associated_bssid
++                << ", associated_link_mac=" << info.associated_link_mac
++                << ", is_mld=" << info.is_mld_client_association
++                << ", is_partner=" << info.is_requested_bssid_mld_partner;
++
++            break; // Found the STA, no need to continue searching
++        }
++    }
++
++    if (!info.is_associated) {
++        LOG(DEBUG) << "STA " << sta_mac << " not associated to any BSSID on this agent";
++    }
++
++    return info;
++}
++
+ bool AgentDB::init_data_model(std::shared_ptr<beerocks::nbapi::Ambiorix> dm)
+ {
+     LOG_IF(!dm, FATAL) << "Ambiorix datamodel not specified";
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 0bb30d86e..6f7f40e3d 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -313,14 +313,15 @@ public:
+ 
+         struct sClient {
+             sClient(sMacAddr bssid_, size_t association_frame_length_, uint8_t *association_frame_,
+-                    uint8_t btm_supported_)
+-                : bssid(bssid_), association_time(std::chrono::steady_clock::now()),
++                    uint8_t btm_supported_, sMacAddr link_mac_ = net::network_utils::ZERO_MAC)
++                : bssid(bssid_), link_mac(link_mac_), association_time(std::chrono::steady_clock::now()),
+                   association_frame_length(association_frame_length_), supports_11v(btm_supported_)
+             {
+                 std::copy_n(association_frame_, association_frame_length_,
+                             association_frame.begin());
+             }
+             sMacAddr bssid;
++            sMacAddr link_mac;
+             std::chrono::steady_clock::time_point association_time;
+             size_t association_frame_length;
+             std::array<uint8_t, ASSOCIATION_FRAME_SIZE> association_frame;
+@@ -550,6 +551,15 @@ public:
+      * @return sRadio* A pointer to the radio struct containing the given MAC address.
+      */
+     sRadio *get_radio_by_mac(const sMacAddr &mac, eMacType mac_type_hint = eMacType::ALL);
++    
++    /**
++     * @brief Get a const pointer to the parent radio struct of given MAC address (const version).
++     *
++     * @param mac MAC address of radio interface or bssid.
++     * @param mac_type_hint Hint for the MAC type, for faster lookup.
++     * @return const sRadio* A const pointer to the radio struct containing the given MAC address.
++     */
++    const sRadio *get_radio_by_mac(const sMacAddr &mac, eMacType mac_type_hint = eMacType::ALL) const;
+ 
+     /**
+      * @brief Erase client from associated_clients list.
+@@ -580,6 +590,55 @@ public:
+      */
+     bool get_ap_mld_mac_by_ssid(const std::string &ssid, sMacAddr &value);
+ 
++    /**
++     * @brief Get the AP MLD MAC for a given BSSID.
++     *
++     * @param[in] bssid The BSSID to look up.
++     * @return The AP MLD MAC if the BSSID belongs to an MLD, otherwise ZERO_MAC.
++     */
++    sMacAddr get_ap_mld_mac_for_bssid(const sMacAddr& bssid) const;
++
++    /**
++     * @brief Get all BSSIDs (link MACs) that belong to a given AP MLD on this agent.
++     *
++     * @param[in] ap_mld_mac The AP MLD MAC.
++     * @return A vector of BSSIDs belonging to the specified MLD.
++     */
++    std::vector<sMacAddr> get_all_bssids_for_ap_mld(const sMacAddr& ap_mld_mac) const;
++
++
++    /**
++     * @brief Structure containing comprehensive STA association information.
++     *
++     * This structure provides detailed information about a STA's association status,
++     * including MLO-specific details such as the actual associated BSSID, whether the
++     * association involves an MLD, and whether a requested BSSID is a partner link.
++     */
++    struct StaAssociationInfo {
++        bool is_associated = false;
++        sMacAddr actual_associated_bssid = net::network_utils::ZERO_MAC;
++        sMacAddr associated_link_mac = net::network_utils::ZERO_MAC;  // Link MAC (BSSID) where STA is associated
++        bool is_mld_client_association = false;
++        bool is_requested_bssid_mld_partner = false;
++    };
++
++    /**
++     * @brief Get comprehensive STA association details with MLO awareness.
++     *
++     * This is a unified API that provides complete association information for a STA,
++     * including whether it's associated, the actual BSSID it's associated with, whether
++     * the association involves an MLD, and whether the requested BSSID is a partner link.
++     *
++     * This function consolidates the logic needed by multiple handlers (BTM steering,
++     * client association control, beacon requests) to avoid code duplication.
++     *
++     * @param[in] sta_mac The MAC address of the STA to check.
++     * @param[in] tlv_bssid The BSSID from the TLV to check against
++     *                      (can be a link BSSID, a non-MLD BSSID, or wildcard).
++     * @return StaAssociationInfo structure containing all association details.
++     */
++    StaAssociationInfo get_sta_association_details(const sMacAddr& sta_mac, const sMacAddr& tlv_bssid) const;
++
+     /**
+      * @brief Initialize Agent Data model.
+      *
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index e154ce885..0fd0630d5 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -1393,6 +1393,55 @@ bool slave_thread::handle_cmdu_control_message(int fd,
+ 
+         auto db = AgentDB::get();
+ 
++        // Extract STA MAC and target BSSID for validation
++        auto sta_mac = request_in->params().sta_mac;
++        auto bssid = request_in->params().bssid;
++
++        const sMacAddr wildcard_bssid = tlvf::mac_from_string("ff:ff:ff:ff:ff:ff");
++        bool is_wildcard_bssid = (bssid == wildcard_bssid);
++
++        // Perform MLO-aware association validation using unified API
++        auto sta_info = db->get_sta_association_details(sta_mac, bssid);
++
++        LOG(DEBUG) << "Beacon 11k validation: sta=" << sta_mac 
++                   << ", bssid=" << bssid
++                   << ", wildcard=" << is_wildcard_bssid
++                   << ", associated=" << sta_info.is_associated
++                   << ", mld=" << sta_info.is_mld_client_association;
++
++        // Validate: STA must be associated
++        if (!sta_info.is_associated) {
++            LOG(ERROR) << "Beacon 11k validation failed: STA " << sta_mac 
++                       << " not associated to any agent BSSID";
++            return false;
++        }
++
++        // Handle wildcard BSSID case
++        if (is_wildcard_bssid) {
++            LOG(DEBUG) << "Beacon 11k: wildcard BSSID accepted for associated STA " << sta_mac;
++        } else {
++            // For specific BSSID: Validate BSSID matches (actual or MLO partner)
++            if (sta_info.is_mld_client_association) {
++                // For MLO clients, accept if requested BSSID is either the actual BSSID or an MLO partner
++                if (bssid != sta_info.associated_link_mac && !sta_info.is_requested_bssid_mld_partner) {
++                    LOG(ERROR) << "Beacon 11k validation failed: MLO STA " << sta_mac 
++                               << " requested BSSID " << bssid 
++                               << " not actual (" << sta_info.associated_link_mac << ") or partner link";
++                    return false;
++                }
++            } else {
++                // For non-MLO clients, BSSID must match exactly
++                if (bssid != sta_info.associated_link_mac) {
++                    LOG(ERROR) << "Beacon 11k validation failed: STA " << sta_mac 
++                               << " requested BSSID " << bssid 
++                               << " != actual " << sta_info.associated_link_mac;
++                    return false;
++                }
++            }
++        }
++
++        LOG(DEBUG) << "Beacon 11k validation passed: forwarding request for STA " << sta_mac;
++
+         //LOG(DEBUG) << "ACTION_CONTROL_CLIENT_BEACON_11K_REQUEST";
+         // override ssid in case of:
+         if (request_in->params().use_optional_ssid &&
+@@ -3094,7 +3143,7 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+                                 return sta.first == steering_btm_report_tlv->sta_mac();
+                             });
+                 if (sta != radio->associated_clients.end()) {
+-                    steering_btm_report_tlv->bssid() = sta->second.bssid;
++                    steering_btm_report_tlv->bssid() = sta->second.link_mac;
+                     break;
+                 }
+             }
+@@ -3264,10 +3313,14 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+             }
+         }
+ 
++        // Parse link_mac from the notification message
++        auto &link_mac = notification_in->link_mac();
++        
+         radio->associated_clients.emplace(
+             client_mac, AgentDB::sRadio::sClient{bssid, notification_in->association_frame_length(),
+                                                  notification_in->association_frame(),
+-                                                 notification_in->capabilities().btm_supported});
++                                                 notification_in->capabilities().btm_supported,
++                                                 link_mac});
+ 
+         if (!link_to_controller()) {
+             LOG(DEBUG) << "Controller is not connected";
+@@ -5187,27 +5240,27 @@ bool slave_thread::handle_client_association_request(ieee1905_1::CmduMessageRx &
+     LOG(DEBUG) << "Radio found: iface=" << radio->front.iface_name
+                << ", radio_mac=" << radio->front.iface_mac;
+ 
+-    // Map of STA MAC to connection status (true if connected)
+-    std::multimap<bool, sMacAddr> sta_connected = {};
+-    
++    // Map of STA MAC to association info
++    std::unordered_map<sMacAddr, AgentDB::StaAssociationInfo> sta_association_info;
++
+     if (control_type == wfa_map::tlvClientAssociationControlRequest::UNBLOCK) {
+         LOG(DEBUG) << "Processing UNBLOCK request for " 
+-                   << association_control_request_tlv->sta_list_length() << " STAs";
+-        
++            << association_control_request_tlv->sta_list_length() << " STAs";
++
+         auto request_out = message_com::create_vs_message<
+             beerocks_message::cACTION_APMANAGER_CLIENT_ALLOW_REQUEST>(cmdu_tx, mid);
+         if (!request_out) {
+             LOG(ERROR) << "Failed to create CLIENT_ALLOW_REQUEST";
+             return false;
+         }
+-        
++
+         if (!request_out->alloc_mac(association_control_request_tlv->sta_list_length())) {
+             LOG(ERROR) << "Failed to allocate STA list";
+             return false;
+         }
+-        
++
+         for (size_t sta_idx = 0; sta_idx < association_control_request_tlv->sta_list_length();
+-             sta_idx++) {
++                sta_idx++) {
+             auto sta_tuple = association_control_request_tlv->sta_list(sta_idx);
+             if (!std::get<0>(sta_tuple)) {
+                 LOG(ERROR) << "Failed to get STA at index " << sta_idx;
+@@ -5218,15 +5271,15 @@ bool slave_thread::handle_client_association_request(ieee1905_1::CmduMessageRx &
+         request_out->bssid() = bssid;
+ 
+         LOG(DEBUG) << "Sending CLIENT_ALLOW_REQUEST to AP Manager: "
+-                   << "bssid=" << bssid
+-                   << ", sta_count=" << association_control_request_tlv->sta_list_length();
+-        
++            << "bssid=" << bssid
++            << ", sta_count=" << association_control_request_tlv->sta_list_length();
++
+     } else {
+         LOG(DEBUG) << "Processing BLOCK/DISALLOW request";
+-        
+-        // Build list of STAs with connection status
++
++        // Build list of STAs with association info using the unified API
+         for (size_t sta_idx = 0; sta_idx < association_control_request_tlv->sta_list_length();
+-             sta_idx++) {
++                sta_idx++) {
+             auto sta_tuple = association_control_request_tlv->sta_list(sta_idx);
+             if (!std::get<0>(sta_tuple)) {
+                 LOG(ERROR) << "Failed to get STA at index " << sta_idx;
+@@ -5234,14 +5287,19 @@ bool slave_thread::handle_client_association_request(ieee1905_1::CmduMessageRx &
+             }
+ 
+             auto sta_mac = std::get<1>(sta_tuple);
+-            auto associated_sta = find_if(
+-                radio->associated_clients.begin(), radio->associated_clients.end(),
+-                [&](const std::pair<sMacAddr, AgentDB::sRadio::sClient> &sta) {
+-                    return (sta.first == sta_mac) && (sta.second.bssid == bssid);
+-                });
+-            
+-            bool is_connected = (associated_sta != radio->associated_clients.end());
+-            sta_connected.insert({is_connected, sta_mac});
++
++            // Use unified MLO-aware association check API
++            auto sta_info = db->get_sta_association_details(sta_mac, bssid);
++
++            LOG(DEBUG) << "AssocCtrl - STA " << sta_mac 
++                << ", is_associated=" << sta_info.is_associated
++                << ", actual_bssid=" << sta_info.actual_associated_bssid
++                << ", actual_linkid=" << sta_info.associated_link_mac
++                << ", is_mld=" << sta_info.is_mld_client_association
++                << ", is_partner=" << sta_info.is_requested_bssid_mld_partner;
++
++            // Store the association info for this STA
++            sta_association_info[sta_mac] = sta_info;
+         }
+ 
+         auto request_out = message_com::create_vs_message<
+@@ -5250,41 +5308,57 @@ bool slave_thread::handle_client_association_request(ieee1905_1::CmduMessageRx &
+             LOG(ERROR) << "Failed to create CLIENT_DISALLOW_REQUEST";
+             return false;
+         }
+-        
+-        // For BLOCK mode, only include unconnected STAs; for others, include all
+-        size_t disallow_sta_length = 
+-            (control_type == wfa_map::tlvClientAssociationControlRequest::BLOCK)
+-                ? sta_connected.count(false)
+-                : sta_connected.size();
+-        
++
++        // For BLOCK mode, only exclude STAs whose associated link MAC matches the requested BSSID
++        // (those will get an error code in the ACK). All others are included in the disallow list.
++        size_t disallow_sta_length = 0;
++        if (control_type == wfa_map::tlvClientAssociationControlRequest::BLOCK) {
++            for (const auto &entry : sta_association_info) {
++                // Skip only if STA is associated on the exact requested link
++                if (entry.second.is_associated &&
++                        entry.second.associated_link_mac == bssid) {
++                    continue;
++                }
++                disallow_sta_length++;
++            }
++        } else {
++            disallow_sta_length = sta_association_info.size();
++        }
++
+         if (!request_out->alloc_sta(disallow_sta_length)) {
+             LOG(ERROR) << "Failed to allocate STA list for " << disallow_sta_length << " STAs";
+             return false;
+         }
+-        
++
+         size_t sta_idx = 0;
+-        for (auto &sta : sta_connected) {
+-            // Skip connected STAs in BLOCK mode (they'll get error codes in ACK)
+-            if ((control_type == wfa_map::tlvClientAssociationControlRequest::BLOCK) && sta.first) {
++        for (const auto &entry : sta_association_info) {
++            const auto &sta_mac = entry.first;
++            const auto &sta_info = entry.second;
++
++            // In BLOCK mode, only skip STAs whose associated link MAC matches the requested BSSID
++            // (they will get an error code in the ACK). STAs on a different link are still blocked.
++            if ((control_type == wfa_map::tlvClientAssociationControlRequest::BLOCK) &&
++                    sta_info.is_associated &&
++                    sta_info.associated_link_mac == bssid) {
+                 continue;
+             }
+-            
+-            auto &sta_info    = std::get<1>(request_out->sta(sta_idx));
+-            sta_info.disassoc = sta.first;
+-            sta_info.mac      = sta.second;
++
++            auto &sta_info_out    = std::get<1>(request_out->sta(sta_idx));
++            sta_info_out.disassoc = sta_info.is_associated;
++            sta_info_out.mac      = sta_mac;
+             sta_idx++;
+         }
+-        
++
+         request_out->bssid() = bssid;
+         request_out->validity_period_sec() =
+             (control_type != wfa_map::tlvClientAssociationControlRequest::INDEFINITE_BLOCK)
+-                ? association_control_request_tlv->validity_period_sec()
+-                : 0;
++            ? association_control_request_tlv->validity_period_sec()
++            : 0;
+ 
+         LOG(DEBUG) << "Sending CLIENT_DISALLOW_REQUEST to AP Manager: "
+-                   << "bssid=" << bssid
+-                   << ", disallow_sta_count=" << disallow_sta_length
+-                   << ", validity_period_sec=" << request_out->validity_period_sec();
++            << "bssid=" << bssid
++            << ", disallow_sta_count=" << disallow_sta_length
++            << ", validity_period_sec=" << request_out->validity_period_sec();
+     }
+ 
+     const auto &radio_manager = m_radio_managers[radio->front.iface_name];
+@@ -5301,33 +5375,59 @@ bool slave_thread::handle_client_association_request(ieee1905_1::CmduMessageRx &
+         return false;
+     }
+ 
+-    // Add error codes for connected STAs in BLOCK mode
++    // Add error codes for STAs connected to the requested BSSID (or its MLO partner links) in BLOCK mode
++    std::string ack_radio_iface = radio->front.iface_name; // Default to requested radio
++    
+     if (control_type == wfa_map::tlvClientAssociationControlRequest::BLOCK) {
+         size_t error_count = 0;
+-        for (const auto &sta : sta_connected) {
+-            if (sta.first) {
++        for (const auto &entry : sta_association_info) {
++            const auto &sta_mac = entry.first;
++            const auto &sta_info = entry.second;
++
++            bool add_error_code = false;
++            
++            if (sta_info.is_associated) {
++                if (sta_info.is_mld_client_association) {
++                    // For MLO associations, check if the requested BSSID is a partner link
++                    add_error_code = (sta_info.associated_link_mac == bssid); 
++                } else {
++                    // For non-MLO associations, check if the actual BSSID matches the requested BSSID
++                    add_error_code = (sta_info.associated_link_mac == bssid);
++                }
++            }
++
++            if (add_error_code) {
+                 auto error_code_tlv = cmdu_tx.addClass<wfa_map::tlvErrorCode>();
+                 if (!error_code_tlv) {
+-                    LOG(ERROR) << "Failed to add error code TLV for STA " << sta.second;
++                    LOG(ERROR) << "Failed to add error code TLV for STA " << sta_mac;
+                     continue;
+                 }
+ 
+                 error_code_tlv->reason_code() =
+                     wfa_map::tlvErrorCode::STA_ASSOCIATED_WITH_A_BSS_OPERATED_BY_THE_AGENT;
+ 
+-                error_code_tlv->sta_mac() = sta.second;
++                error_code_tlv->sta_mac() = sta_mac;
+                 error_count++;
++                
++                // Find the radio where this STA is actually associated to send ACK from correct radio
++                auto actual_radio = db->get_radio_by_mac(sta_info.associated_link_mac, AgentDB::eMacType::BSSID);
++                if (actual_radio) {
++                    ack_radio_iface = actual_radio->front.iface_name;
++                    LOG(DEBUG) << "AssocCtrl - STA " << sta_mac << " is associated to Link addr " 
++                               << sta_info.associated_link_mac << " on radio " << ack_radio_iface
++                               << " (requested BSSID: " << bssid << ")";
++                }
+             }
+         }
+         if (error_count > 0) {
+-            LOG(DEBUG) << "AssocCtrl - Added " << error_count 
+-                       << " error code TLVs for connected STAs in BLOCK mode";
++            LOG(DEBUG) << "AssocCtrl - Added " << error_count
++                       << " error code TLVs for STAs connected to requested BSSID or its MLO partner links in BLOCK mode";
+         }
+     }
+ 
+     LOG(DEBUG) << "Sending ACK (0x8000) to controller: mid=0x" 
+-               << std::hex << mid << std::dec;
+-    return send_cmdu_to_controller(radio->front.iface_name, cmdu_tx);
++               << std::hex << mid << std::dec << " from radio " << ack_radio_iface;
++    return send_cmdu_to_controller(ack_radio_iface, cmdu_tx);
+ }
+ 
+ bool slave_thread::handle_1905_higher_layer_data_message(int fd, ieee1905_1::CmduMessageRx &cmdu_rx)
+@@ -5405,8 +5505,20 @@ bool slave_thread::handle_client_steering_request(ieee1905_1::CmduMessageRx &cmd
+             return false;
+         }
+ 
+-        auto associated_sta = radio->associated_clients.find(sta_mac);
+-        if (associated_sta == radio->associated_clients.end()) {
++        // Use the unified API to check STA association status with MLO awareness
++        auto sta_info = db->get_sta_association_details(sta_mac, source_bssid);
++
++        LOG(DEBUG) << "BTM Steering: STA " << sta_mac 
++                   << ", requested_bssid=" << source_bssid
++                   << ", is_associated=" << sta_info.is_associated
++                   << ", actual_bssid=" << sta_info.actual_associated_bssid
++                   << ", actual_linkid=" << sta_info.associated_link_mac
++                   << ", is_mld=" << sta_info.is_mld_client_association
++                   << ", is_partner=" << sta_info.is_requested_bssid_mld_partner;
++
++        // First check: Is the STA associated at all?
++        if (!sta_info.is_associated) {
++            LOG(ERROR) << "BTM Steering: STA " << sta_mac << " not associated to any BSSID on this agent";
+             if (!cmdu_tx.create(mid, ieee1905_1::eMessageType::ACK_MESSAGE)) {
+                 LOG(ERROR) << "cmdu creation of type ACK_MESSAGE, has failed";
+                 return false;
+@@ -5423,6 +5535,40 @@ bool slave_thread::handle_client_steering_request(ieee1905_1::CmduMessageRx &cmd
+             return send_cmdu_to_controller({}, cmdu_tx);
+         }
+ 
++        if (!sta_info.is_requested_bssid_mld_partner) {
++            LOG(ERROR) << "BTM Steering: STA " << sta_mac 
++                       << " is associated to BSSID " << sta_info.associated_link_mac
++                       << " which is not the requested BSSID " << source_bssid
++                       << " or its partner link";
++            if (!cmdu_tx.create(mid, ieee1905_1::eMessageType::ACK_MESSAGE)) {
++                LOG(ERROR) << "cmdu creation of type ACK_MESSAGE, has failed";
++                return false;
++            }
++            auto error_code_tlv = cmdu_tx.addClass<wfa_map::tlvErrorCode>();
++            if (!error_code_tlv) {
++                LOG(ERROR) << "addClass wfa_map::tlvErrorCode has failed";
++                return false;
++            }
++            error_code_tlv->reason_code() =
++                wfa_map::tlvErrorCode::STA_NOT_ASSOCIATED_WITH_ANY_BSS_OPERATED_BY_THE_AGENT;
++            error_code_tlv->sta_mac() = sta_mac;
++            LOG(DEBUG) << "sending ACK message back to controller with mid: " << std::hex << mid;
++            return send_cmdu_to_controller({}, cmdu_tx);
++        }
++
++        // Both checks passed - proceed with steering request
++        LOG(DEBUG) << "BTM Steering: Validation passed for STA " << sta_mac
++                   << ", forwarding request to driver";
++
++        // Find the radio where the STA is actually associated (MLD-safe)
++        auto sta_radio = db->get_radio_by_mac(sta_mac, AgentDB::eMacType::CLIENT);
++        if (!sta_radio) {
++            LOG(ERROR) << "BTM Steering: STA " << sta_mac
++                       << " not found in any radio's associated_clients";
++            return false;
++        }
++        auto associated_sta = sta_radio->associated_clients.find(sta_mac);
++
+         /* Skip BTM steering if:
+          * 1. The STA is explicitly listed in the BTM steering disallowed set.
+          * 2. The STA does not support 802.11v and the configuration disallows
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+index 8ebc969cb..bde14e5e9 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+@@ -169,6 +169,7 @@ cACTION_APMANAGER_CLIENT_ASSOCIATED_NOTIFICATION:
+   _type: class
+   mac: sMacAddr
+   bssid: sMacAddr
++  link_mac: sMacAddr
+   capabilities: beerocks::message::sRadioCapabilities
+   vap_id: int8_t
+   multi_ap_profile:
+diff --git a/controller/src/beerocks/master/son_actions.cpp b/controller/src/beerocks/master/son_actions.cpp
+index 1ccd8ae40..1ef03420d 100644
+--- a/controller/src/beerocks/master/son_actions.cpp
++++ b/controller/src/beerocks/master/son_actions.cpp
+@@ -558,11 +558,24 @@ bool son_actions::send_client_association_control(
+         sta_list_str << tlvf::mac_to_string(station) << ", ";
+     }
+ 
+-    std::string action_str =
+-        (association_flag == wfa_map::tlvClientAssociationControlRequest::BLOCK ||
+-         association_flag == wfa_map::tlvClientAssociationControlRequest::TIMED_BLOCK)
+-            ? "block"
+-            : "unblock";
++    std::string action_str;
++    switch (association_flag) {
++    case wfa_map::tlvClientAssociationControlRequest::BLOCK:
++        action_str = "block";
++        break;
++    case wfa_map::tlvClientAssociationControlRequest::TIMED_BLOCK:
++        action_str = "timed block";
++        break;
++    case wfa_map::tlvClientAssociationControlRequest::INDEFINITE_BLOCK:
++        action_str = "indefinite block";
++        break;
++    case wfa_map::tlvClientAssociationControlRequest::UNBLOCK:
++        action_str = "unblock";
++        break;
++    default:
++        action_str = "unknown (" + std::to_string(static_cast<int>(association_flag)) + ")";
++        break;
++    }
+ 
+     std::string duration_str =
+         duration_sec != 0 ? "for " + std::to_string(duration_sec) + " seconds" : "";
+-- 
+2.34.1
+
