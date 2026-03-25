@@ -1,0 +1,379 @@
+From 35734798a5ec9b8869722e70b6cf97d78131fbad Mon Sep 17 00:00:00 2001
+From: Vignesh Sridharan <vignsrid@qti.qualcomm.com>
+Date: Tue, 24 Mar 2026 16:48:13 +0530
+Subject: [PATCH 1/1] Refactor Agent to AP manager interface for SMD
+
+* Previously agent stored SMD policies mapped to radio id which is not
+  a unique key since, on the same radio multiple SMDs can exist. Now
+  the SMD policies are stored in a plain list.
+* To map SMD to correct MLD, now the Agent AP MLD config TLV carries
+  SMD mac address which allows agent to map individual BSS config to
+  correct MLD and SMD.
+* In AP manager, while handling the creadtial update request, the BSS
+  config now contains the correct SMD/MLD mapping along with the SMD
+  policies shared as a list, allowing AP manager to populate SMD info
+  correctly for each individual BSS (i.e., links) in the bss config
+  list.
+
+Signed-off-by: Vignesh Sridharan <vignsrid@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 | 75 ++++++++++---------
+ .../slave/tasks/ap_autoconfiguration_task.cpp | 67 ++++++++++-------
+ .../slave/tasks/ap_autoconfiguration_task.h   | 23 ++++--
+ .../tlvf/yaml/tlvf/WSC/WSC_Attributes.yaml    |  2 +
+ .../wfa_map/tlvAgentApMldConfiguration.yaml   | 11 ++-
+ 5 files changed, 107 insertions(+), 71 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 239af9e52..9a3fd04fb 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -1903,8 +1903,8 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+         auto smd_policy_list_size = request->smd_policy_list_size();
+         LOG(DEBUG) << "Received " << int(smd_policy_list_size) << " SMD policies";
+ 
+-        // Store SMD policies in a map keyed by RUID for easy lookup
+-        std::unordered_map<sMacAddr, beerocks_message::sSmdPolicyConfig> smd_policies_by_ruid;
++        // Store SMD policies in a map keyed by smd_identifier
++        std::unordered_map<sMacAddr, beerocks_message::sSmdPolicyConfig> smd_policies_by_mac;
+ 
+         for (auto i = 0; i < smd_policy_list_size; i++) {
+             auto smd_policy_tuple = request->smd_policy_list(i);
+@@ -1924,11 +1924,10 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+             policy_data.smd_type                  = smd_policy.smd_type;
+             policy_data.smd_default_dl_drain_time = smd_policy.smd_default_dl_drain_time;
+ 
+-            smd_policies_by_ruid[smd_policy.ruid] = policy_data;
++            smd_policies_by_mac[smd_policy.smd_identifier] = policy_data;
+ 
+-            LOG(DEBUG) << "Stored SMD policy for RUID: " << smd_policy.ruid
+-                       << ", smd_identifier: " << policy_data.smd_identifier
+-                       << ", timeout: " << policy_data.smd_timeout;
++            LOG(DEBUG) << "Stored SMD policy with smd_identifier: " << smd_policy.smd_identifier
++                       << ", RUID: " << smd_policy.ruid << ", timeout: " << policy_data.smd_timeout;
+         }
+ 
+         std::string backhaul_wps_ssid, backhaul_wps_passphrase;
+@@ -1982,36 +1981,42 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+                 static_cast<son::wireless_utils::eAdditionalAuth>(config_data.additional_auth());
+             bss_info_conf.vap_type = config_data.vap_type();
+ 
+-            // Match SMD policy by RUID and populate sBssInfoConf SMD fields
+-            // Get the radio UID (RUID) for this radio
+-            auto radio_mac     = tlvf::mac_from_string(ap_wlan_hal->get_radio_mac());
+-            auto smd_policy_it = smd_policies_by_ruid.find(radio_mac);
+-            if (smd_policy_it != smd_policies_by_ruid.end()) {
+-                const auto &policy = smd_policy_it->second;
+-
+-                // Populate SMD fields in sBssInfoConf
+-                bss_info_conf.has_smd_policy            = true;
+-                bss_info_conf.smd_identifier            = policy.smd_identifier;
+-                bss_info_conf.smd_timeout               = policy.smd_timeout;
+-                bss_info_conf.smd_max_prepared_ap_mlds  = policy.smd_max_prepared_ap_mlds;
+-                bss_info_conf.smd_dl_forwarding         = policy.smd_dl_forwarding;
+-                bss_info_conf.smd_ptk_mode              = policy.smd_ptk_mode;
+-                bss_info_conf.smd_type                  = policy.smd_type;
+-                bss_info_conf.smd_default_dl_drain_time = policy.smd_default_dl_drain_time;
+-
+-                LOG(DEBUG) << "Applied SMD policy to BSS " << bss_info_conf.bssid
+-                           << " for RUID: " << radio_mac
+-                           << ", smd_identifier: " << bss_info_conf.smd_identifier
+-                           << ", timeout: " << bss_info_conf.smd_timeout
+-                           << ", max_prepared_ap_mlds: "
+-                           << int(bss_info_conf.smd_max_prepared_ap_mlds)
+-                           << ", dl_forwarding: " << int(bss_info_conf.smd_dl_forwarding)
+-                           << ", ptk_mode: " << int(bss_info_conf.smd_ptk_mode)
+-                           << ", type: " << int(bss_info_conf.smd_type)
+-                           << ", default_dl_drain_time: "
+-                           << int(bss_info_conf.smd_default_dl_drain_time);
++            // Extract smd_mac from credentials
++            auto smd_mac = config_data.smd_mac();
++
++            // Match SMD policy by full smd_mac if valid
++            if (smd_mac != net::network_utils::ZERO_MAC) {
++                auto smd_policy_it = smd_policies_by_mac.find(smd_mac);
++                if (smd_policy_it != smd_policies_by_mac.end()) {
++                    const auto &policy = smd_policy_it->second;
++
++                    // Populate SMD fields in sBssInfoConf
++                    bss_info_conf.has_smd_policy            = true;
++                    bss_info_conf.smd_identifier            = policy.smd_identifier;
++                    bss_info_conf.smd_timeout               = policy.smd_timeout;
++                    bss_info_conf.smd_max_prepared_ap_mlds  = policy.smd_max_prepared_ap_mlds;
++                    bss_info_conf.smd_dl_forwarding         = policy.smd_dl_forwarding;
++                    bss_info_conf.smd_ptk_mode              = policy.smd_ptk_mode;
++                    bss_info_conf.smd_type                  = policy.smd_type;
++                    bss_info_conf.smd_default_dl_drain_time = policy.smd_default_dl_drain_time;
++
++                    LOG(DEBUG) << "Applied SMD policy to BSS " << bss_info_conf.bssid
++                               << " via smd_mac: " << smd_mac
++                               << ", smd_identifier: " << bss_info_conf.smd_identifier
++                               << ", timeout: " << bss_info_conf.smd_timeout
++                               << ", max_prepared_ap_mlds: "
++                               << int(bss_info_conf.smd_max_prepared_ap_mlds)
++                               << ", dl_forwarding: " << int(bss_info_conf.smd_dl_forwarding)
++                               << ", ptk_mode: " << int(bss_info_conf.smd_ptk_mode)
++                               << ", type: " << int(bss_info_conf.smd_type)
++                               << ", default_dl_drain_time: "
++                               << int(bss_info_conf.smd_default_dl_drain_time);
++                } else {
++                    LOG(DEBUG) << "No SMD policy found for smd_mac: " << smd_mac;
++                    bss_info_conf.has_smd_policy = false;
++                }
+             } else {
+-                LOG(DEBUG) << "No SMD policy found for RUID: " << radio_mac;
++                LOG(DEBUG) << "No smd_mac provided for BSS " << bss_info_conf.bssid;
+                 bss_info_conf.has_smd_policy = false;
+             }
+ 
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index b7227cf5c..1f8f57e72 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -568,8 +568,8 @@ bool ApAutoConfigurationTask::handle_ap_mld_configuration_request(
+     for (auto radio : db->get_radios_list()) {
+         for (auto &ap_mld_request : m_ap_mld_requests_infos[radio->front.iface_name]) {
+             send_ap_mld_configuration(radio->front.iface_name, ap_mld_request.first,
+-                                      std::get<0>(ap_mld_request.second),
+-                                      std::get<1>(ap_mld_request.second));
++                                      ap_mld_request.second.mld_unit,
++                                      ap_mld_request.second.mld_mode);
+         }
+     }
+ 
+@@ -1529,11 +1529,11 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_wsc(ieee1905_1::CmduMe
+     }
+ 
+     // Parse SMD Policy Config TLVs from M2 (already parsed by multi-vendor framework)
+-    // Use getClassList to retrieve ALL SMD Policy TLVs (there can be multiple, one per radio/RUID)
++    // Use getClassList to retrieve ALL SMD Policy TLVs (there can be multiple)
+     auto smd_policy_tlv_list = cmdu_rx.getClassList<qca::tlvQcaSmdPolicyConfig>();
+ 
+-    // Clear any previously stored SMD policies for this radio
+-    m_smd_policies_by_iface[radio->front.iface_name].clear();
++    // Clear any previously stored SMD policies (simple list, not per-radio)
++    m_smd_policies.clear();
+ 
+     if (!smd_policy_tlv_list.empty()) {
+         LOG(DEBUG) << "Found " << smd_policy_tlv_list.size() << " SMD Policy TLV(s) in M2";
+@@ -1545,7 +1545,8 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_wsc(ieee1905_1::CmduMe
+                 continue;
+             }
+ 
+-            LOG(DEBUG) << "Processing SMD Policy TLV for RUID: " << smd_policy_tlv->ruid();
++            LOG(DEBUG) << "Processing SMD Policy TLV: smd_identifier="
++                       << smd_policy_tlv->smd_identifier();
+ 
+             // Convert QCA TLV to beerocks_message::sSmdPolicyConfig
+             beerocks_message::sSmdPolicyConfig smd_policy;
+@@ -1558,20 +1559,17 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_wsc(ieee1905_1::CmduMe
+             smd_policy.smd_type                  = smd_policy_tlv->smd_type();
+             smd_policy.smd_default_dl_drain_time = smd_policy_tlv->smd_default_dl_drain_time();
+ 
+-            // Store SMD policy for this radio interface
+-            m_smd_policies_by_iface[radio->front.iface_name].push_back(smd_policy);
++            // Store SMD policy in simple list (matching will be done by smd_identifier)
++            m_smd_policies.push_back(smd_policy);
+ 
+-            LOG(DEBUG) << "Stored SMD policy for radio " << radio->front.iface_name << " with RUID "
+-                       << smd_policy.ruid << ": smd_identifier=" << smd_policy.smd_identifier
++            LOG(DEBUG) << "Stored SMD policy: smd_identifier=" << smd_policy.smd_identifier
+                        << ", timeout=" << smd_policy.smd_timeout
+                        << ", max_prepared_ap_mlds=" << int(smd_policy.smd_max_prepared_ap_mlds);
+         }
+ 
+-        LOG(INFO) << "Successfully stored "
+-                  << m_smd_policies_by_iface[radio->front.iface_name].size()
+-                  << " SMD policy/policies for radio " << radio->front.iface_name;
++        LOG(INFO) << "Successfully stored " << m_smd_policies.size() << " SMD policy/policies";
+     } else {
+-        LOG(DEBUG) << "No SMD Policy TLVs found in M2 for radio " << radio->front.iface_name;
++        LOG(DEBUG) << "No SMD Policy TLVs found in M2";
+     }
+ 
+     std::vector<sBssConfig> bss_infos;
+@@ -2370,8 +2368,17 @@ bool ApAutoConfigurationTask::handle_agent_ap_mld_configuration_tlv(
+                 continue;
+             }
+             auto rad_iface = radio->front.iface_name;
++
++            // Extract SMD MAC address if valid (now part of modes structure)
++            sMacAddr smd_mac = net::network_utils::ZERO_MAC;
++            if (ap_mld.modes().affiliated_ap_smd_mac_addr_valid) {
++                smd_mac = ap_mld.affiliated_ap_smd_mac_addr();
++                LOG(DEBUG) << "SMD MAC for SSID " << ssid << ": " << smd_mac;
++            }
++
+             m_ap_mld_requests_infos[rad_iface][current_ap_mld_conf.mld_config.mld_ssid] = {
+-                current_ap_mld_conf.mld_config.mld_unit, current_ap_mld_conf.mld_config.mld_mode};
++                current_ap_mld_conf.mld_config.mld_unit, current_ap_mld_conf.mld_config.mld_mode,
++                smd_mac};
+         }
+ 
+         LOG(DEBUG) << "Storing MLD configuration for AP MLD " << ssid
+@@ -3295,20 +3302,18 @@ bool ApAutoConfigurationTask::send_ap_bss_configuration_message(
+         c->additional_auth() =
+             static_cast<son::wireless_utils::eAdditionalAuth>(info.additional_auth);
+         c->vap_type() = info.m2_config.vap_type;
++        c->smd_mac()  = info.smd_mac;
+         request->add_wifi_credentials(c);
+     }
+ 
+-    // Populate SMD policy list if available for this radio
+-    auto smd_policy_it = m_smd_policies_by_iface.find(radio_iface);
+-    if (smd_policy_it != m_smd_policies_by_iface.end() && !smd_policy_it->second.empty()) {
+-        const auto &smd_policies = smd_policy_it->second;
+-
+-        if (!request->alloc_smd_policy_list(smd_policies.size())) {
++    // Populate SMD policy list from simple list (not per-radio)
++    if (!m_smd_policies.empty()) {
++        if (!request->alloc_smd_policy_list(m_smd_policies.size())) {
+             LOG(ERROR) << "Failed to allocate SMD policy list";
+             return false;
+         }
+ 
+-        for (size_t i = 0; i < smd_policies.size(); i++) {
++        for (size_t i = 0; i < m_smd_policies.size(); i++) {
+             auto smd_policy_tuple = request->smd_policy_list(i);
+             if (!std::get<0>(smd_policy_tuple)) {
+                 LOG(ERROR) << "Failed to get SMD policy at index " << i;
+@@ -3316,7 +3321,7 @@ bool ApAutoConfigurationTask::send_ap_bss_configuration_message(
+             }
+ 
+             auto &policy_dest      = std::get<1>(smd_policy_tuple);
+-            const auto &policy_src = smd_policies[i];
++            const auto &policy_src = m_smd_policies[i];
+ 
+             policy_dest.ruid                      = policy_src.ruid;
+             policy_dest.smd_identifier            = policy_src.smd_identifier;
+@@ -3328,10 +3333,10 @@ bool ApAutoConfigurationTask::send_ap_bss_configuration_message(
+             policy_dest.smd_default_dl_drain_time = policy_src.smd_default_dl_drain_time;
+         }
+ 
+-        LOG(DEBUG) << "Added " << smd_policies.size()
+-                   << " SMD policies to credentials update message for " << radio_iface;
++        LOG(DEBUG) << "Added " << m_smd_policies.size()
++                   << " SMD policies to credentials update message";
+     } else {
+-        LOG(DEBUG) << "No SMD policies to send for radio " << radio_iface;
++        LOG(DEBUG) << "No SMD policies to send";
+     }
+ 
+     LOG(INFO) << "Sending reconfiguration: " << std::endl << ss.str();
+@@ -3612,10 +3617,14 @@ bool ApAutoConfigurationTask::populate_mld_id_in_bss_infos(const std::string &ra
+         const std::string &ssid = bss_info.payload_config.ssid;
+         auto ssid_it            = ssid_mld_map.find(ssid);
+         if (ssid_it != ssid_mld_map.end()) {
+-            int8_t mld_unit = std::get<0>(ssid_it->second);
+-            bss_info.mld_id = mld_unit;
++            const auto &mld_info = ssid_it->second;
++            bss_info.mld_id      = mld_info.mld_unit;
++            bss_info.smd_mac     = mld_info.smd_mac;
++            LOG(DEBUG) << "Populated BSS config for SSID " << ssid
++                       << ": mld_id=" << int(bss_info.mld_id) << ", smd_mac=" << bss_info.smd_mac;
+         } else {
+-            bss_info.mld_id = DISABLED_MLDUNIT;
++            bss_info.mld_id  = DISABLED_MLDUNIT;
++            bss_info.smd_mac = net::network_utils::ZERO_MAC;
+         }
+     }
+ 
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+index f0bee7635..e39d09b04 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+@@ -19,6 +19,7 @@
+ #include <tlvf/wfa_map/tlvProfile2ErrorCode.h>
+ 
+ #include <bcl/son/son_wireless_utils.h>
++#include <bcl/network/network_utils.h>
+ #include <beerocks/tlvf/structs/sSmdPolicyConfig.h>
+ 
+ namespace beerocks {
+@@ -95,6 +96,7 @@ private:
+         int8_t mld_id = DISABLED_MLDUNIT;
+         son::wireless_utils::eAdditionalAuth additional_auth =
+             son::wireless_utils::eAdditionalAuth::NONE;
++        sMacAddr smd_mac = beerocks::net::network_utils::ZERO_MAC;
+     };
+ 
+     /**
+@@ -154,14 +156,25 @@ private:
+ 
+     // <RUID, <mld_unit, mld_mode>>
+     std::unordered_map<sMacAddr, std::pair<int8_t, uint8_t>> bsta_mld_requests_infos;
+-    // <iface, <ssid, <mld_unit, mld_mode>>>
+-    std::unordered_map<std::string, std::unordered_map<std::string, std::tuple<int8_t, uint8_t>>>
++
++    /**
++     * @brief AP MLD configuration storage.
++     * 
++     * Structure to hold MLD configuration including SMD MAC address.
++     */
++    struct sApMldRequestInfo {
++        int8_t mld_unit;
++        uint8_t mld_mode;
++        sMacAddr smd_mac;
++    };
++
++    // <iface, <ssid, sApMldRequestInfo>>
++    std::unordered_map<std::string, std::unordered_map<std::string, sApMldRequestInfo>>
+         m_ap_mld_requests_infos;
+ 
+-    // SMD Policy storage: <radio_iface, vector of SMD policies>
++    // SMD Policy storage: Simple list of SMD policies
+     // Stores SMD policies parsed from M2 to be sent to AP Manager with credentials
+-    std::unordered_map<std::string, std::vector<beerocks_message::sSmdPolicyConfig>>
+-        m_smd_policies_by_iface;
++    std::vector<beerocks_message::sSmdPolicyConfig> m_smd_policies;
+ 
+     /* Message handlers: */
+ 
+diff --git a/framework/tlvf/yaml/tlvf/WSC/WSC_Attributes.yaml b/framework/tlvf/yaml/tlvf/WSC/WSC_Attributes.yaml
+index 4cb61e6c7..f18986250 100644
+--- a/framework/tlvf/yaml/tlvf/WSC/WSC_Attributes.yaml
++++ b/framework/tlvf/yaml/tlvf/WSC/WSC_Attributes.yaml
+@@ -160,6 +160,8 @@ cEncryptedSettingsPayload:
+   vap_type:
+     _type: eVapType
+     _value: eVapType::OTHER
++  smd_mac:
++    _type: sMacAddr
+ 
+ cWscAttrEncryptedSettings:
+   _type: class
+diff --git a/framework/tlvf/yaml/tlvf/wfa_map/tlvAgentApMldConfiguration.yaml b/framework/tlvf/yaml/tlvf/wfa_map/tlvAgentApMldConfiguration.yaml
+index 04be8ce1a..732575137 100644
+--- a/framework/tlvf/yaml/tlvf/wfa_map/tlvAgentApMldConfiguration.yaml
++++ b/framework/tlvf/yaml/tlvf/wfa_map/tlvAgentApMldConfiguration.yaml
+@@ -28,9 +28,11 @@ cApMld:
+   ap_mld_mac_addr:
+     _type: sMacAddr
+   modes: sModes
++  affiliated_ap_smd_mac_addr:
++    _type: sMacAddr
+   reserved:
+     _type: uint8_t
+-    _length: [20]
++    _length: [14]
+   num_affiliated_ap:
+     _type: uint8_t
+     _length_var: True
+@@ -72,8 +74,13 @@ sModes:
+     _comment: |
+       0: disabled
+       1: enabled
++  affiliated_ap_smd_mac_addr_valid:
++    _bit_range: [3,3]
++    _comment: |
++      0: not valid
++      1: valid
+   reserved:
+-    _bit_range: [3,0]
++    _bit_range: [2,0]
+ 
+ cAffiliatedAp:
+   _type: class
+-- 
+2.34.1
+
