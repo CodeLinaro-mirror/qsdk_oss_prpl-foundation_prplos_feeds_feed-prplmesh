@@ -1,0 +1,271 @@
+From 3e64a0a9fb9736f9b808d5754c51f1c64a6cabf5 Mon Sep 17 00:00:00 2001
+From: Vignesh Sridharan <vignsrid@qti.qualcomm.com>
+Date: Wed, 25 Mar 2026 16:20:31 +0530
+Subject: [PATCH 1/1] multi-vendor: Add per-profile SMD Policy Config TLV
+ generation
+
+Populate QCA SMD Policy Config TLVs from controller config profiles
+instead of sending a single default TLV with zero values.
+
+- Add sQcaSmdPolicyProfile struct to tlvf_qca_utils.h to hold profile
+  data without depending on controller's db.h
+- Add static profile store (s_smd_profiles) with set/add/clear helpers
+  in tlvf_qca_utils.cpp
+- Rewrite add_qca_smd_policy_config_tlv() to emit one TLV per profile,
+  populated with identifier, timeout, max_prepared_ap_mlds, dl_forwarding,
+  ptk_mode, type and default_dl_drain_time from the stored profiles
+- Add C-linkage wrappers add_qca_smd_profile_entry() and
+  clear_qca_smd_profiles() in multi_vendor_qca.cpp
+- Load profiles from master_conf.smd_profiles into the static store
+  before registering SMD TLV handlers in beerocks_master_main.cpp
+
+Signed-off-by: Vignesh Sridharan <vignsrid@qti.qualcomm.com>
+---
+ .../multi_vendor/qca/include/tlvf_qca_utils.h | 44 ++++++++++
+ .../multi_vendor/qca/src/multi_vendor_qca.cpp | 11 +++
+ .../multi_vendor/qca/src/tlvf_qca_utils.cpp   | 85 +++++++++++++------
+ .../beerocks/master/beerocks_master_main.cpp  | 20 ++++-
+ 4 files changed, 133 insertions(+), 27 deletions(-)
+
+diff --git a/common/beerocks/multi_vendor/qca/include/tlvf_qca_utils.h b/common/beerocks/multi_vendor/qca/include/tlvf_qca_utils.h
+index 4b14dcd74..f52087242 100644
+--- a/common/beerocks/multi_vendor/qca/include/tlvf_qca_utils.h
++++ b/common/beerocks/multi_vendor/qca/include/tlvf_qca_utils.h
+@@ -5,12 +5,31 @@
+ #ifndef __TLVF_QCA_UTILS_H__
+ #define __TLVF_QCA_UTILS_H__
+ 
++#include <cstdint>
+ #include <memory>
+ #include <tlvf/CmduMessageRx.h>
+ #include <tlvf/CmduMessageTx.h>
++#include <vector>
+ 
+ namespace qca {
+ 
++/**
++ * @brief SMD policy profile data for TLV generation (controller-side only).
++ *
++ * This struct mirrors the controller's sDbMasterConfig::sSmdProfileConfig but is
++ * defined here in the common module to avoid a dependency on controller headers.
++ * It is populated from the controller's master config at initialization time.
++ */
++struct sQcaSmdPolicyProfile {
++    uint8_t identifier[6]         = {0}; ///< SMD identifier as raw MAC bytes
++    uint16_t timeout              = 0;   ///< ST prep-to-execution timeout (TU units)
++    uint8_t max_prepared_ap_mlds  = 0;   ///< Max number of prepared target AP MLDs
++    uint8_t dl_forwarding         = 0;   ///< DL data forwarding support (1=yes, 0=no)
++    uint8_t ptk_mode              = 0;   ///< PTK mode: 0=per-SMD PTK, 1=per-AP PTK
++    uint8_t type                  = 0;   ///< SMD type: 0=per-AP MLD MAC SAPs, 1=one MAC SAP
++    uint8_t default_dl_drain_time = 0;   ///< Default DL drain time (TU units)
++};
++
+ class tlvf_qca_utils {
+ public:
+     /**
+@@ -32,11 +51,36 @@ public:
+     /**
+      * @brief Adds QCA SMD policy config TLV to outgoing message (SEND side).
+      *
++     * One TLV is added per configured SMD profile (set via set_smd_profiles()).
++     * If no profiles are configured, the function returns true without adding any TLV.
++     *
+      * @param[in,out] cmdu_tx CMDU message.
+      * @return True on success and false otherwise.
+      */
+     static bool add_qca_smd_policy_config_tlv(ieee1905_1::CmduMessageTx &cmdu_tx);
+ 
++    /**
++     * @brief Set the SMD policy profiles to be used when building policy config TLVs.
++     *
++     * Should be called from controller initialization (before SMD TLVs are sent)
++     * with the profiles read from the controller configuration file.
++     *
++     * @param profiles Vector of SMD policy profiles.
++     */
++    static void set_smd_profiles(const std::vector<sQcaSmdPolicyProfile> &profiles);
++
++    /**
++     * @brief Clear all stored SMD policy profiles.
++     */
++    static void clear_smd_profiles();
++
++    /**
++     * @brief Append a single SMD policy profile to the stored list.
++     *
++     * @param profile SMD policy profile to add.
++     */
++    static void add_smd_profile(const sQcaSmdPolicyProfile &profile);
++
+     /**
+      * @brief Generic parser for QCA vendor-specific TLVs (RECEIVE side).
+      * 
+diff --git a/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp b/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp
+index 130fe7534..6546e6fc9 100644
+--- a/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp
++++ b/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp
+@@ -100,3 +100,14 @@ extern "C" void register_qca_smd_tlvs(bool enable_smd, bool is_controller)
+ {
+     MultiVendorQCA::register_smd_tlvs(enable_smd, is_controller);
+ }
++
++extern "C" void add_qca_smd_profile_entry(const qca::sQcaSmdPolicyProfile *profile)
++{
++    if (!profile) {
++        LOG(ERROR) << "add_qca_smd_profile_entry: null profile pointer";
++        return;
++    }
++    qca::tlvf_qca_utils::add_smd_profile(*profile);
++}
++
++extern "C" void clear_qca_smd_profiles() { qca::tlvf_qca_utils::clear_smd_profiles(); }
+diff --git a/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp b/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
+index fb4d5bc6b..50948ba6d 100644
+--- a/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
++++ b/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
+@@ -15,6 +15,22 @@
+ 
+ using namespace qca;
+ 
++// Static storage for SMD policy profiles (populated from controller config at init time)
++static std::vector<qca::sQcaSmdPolicyProfile> s_smd_profiles;
++
++void tlvf_qca_utils::set_smd_profiles(const std::vector<sQcaSmdPolicyProfile> &profiles)
++{
++    s_smd_profiles = profiles;
++    LOG(INFO) << "QCA SMD policy profiles set: " << s_smd_profiles.size() << " profile(s)";
++}
++
++void tlvf_qca_utils::clear_smd_profiles() { s_smd_profiles.clear(); }
++
++void tlvf_qca_utils::add_smd_profile(const sQcaSmdPolicyProfile &profile)
++{
++    s_smd_profiles.push_back(profile);
++}
++
+ // SEND side: Add version TLV to outgoing message
+ bool tlvf_qca_utils::add_qca_version_info_tlv(ieee1905_1::CmduMessageTx &cmdu_tx)
+ {
+@@ -73,37 +89,54 @@ bool tlvf_qca_utils::add_qca_smd_capabilities_tlv(ieee1905_1::CmduMessageTx &cmd
+     return true;
+ }
+ 
+-// SEND side: Add SMD policy config TLV to outgoing message
+-// Note: This handler is only registered on the controller, so it will only be called for M2 messages
++// SEND side: Add SMD policy config TLV(s) to outgoing message
++// Note: This handler is only registered on the controller, so it will only be called for M2 messages.
++// One TLV is added per configured SMD profile. Profiles are set via set_smd_profiles() at init time.
+ bool tlvf_qca_utils::add_qca_smd_policy_config_tlv(ieee1905_1::CmduMessageTx &cmdu_tx)
+ {
+-    auto tlv_smd_policy = cmdu_tx.addClass<qca::tlvQcaSmdPolicyConfig>();
+-    if (!tlv_smd_policy) {
+-        LOG(ERROR) << "Failed to add QCA SMD policy config TLV";
+-        return false;
++    if (s_smd_profiles.empty()) {
++        LOG(WARNING) << "No SMD profiles configured, skipping QCA SMD policy config TLV";
++        return true;
+     }
+ 
+-    // Set vendor OUI
+-    tlv_smd_policy->vendor_oui() = (sVendorOUI(qca::qcaVendorOUI::OUI_QCA));
+-
+-    // Set TLV ID
+-    tlv_smd_policy->tlv_id() = static_cast<int>(qca::eQcaTlVId::QCA_SMD_POLICY_CONFIG);
+-
+-    // Set RUID (Radio Unique Identifier) - initialize to zeros
+-    std::fill_n(tlv_smd_policy->ruid().oct, 6, 0);
+-
+-    // Set SMD Identifier - initialize to zeros
+-    std::fill_n(tlv_smd_policy->smd_identifier().oct, 6, 0);
+-
+-    // Set all policy fields to default values (0)
+-    tlv_smd_policy->smd_timeout()               = 0;
+-    tlv_smd_policy->smd_max_prepared_ap_mlds()  = 0;
+-    tlv_smd_policy->smd_dl_forwarding()         = 0;
+-    tlv_smd_policy->smd_ptk_mode()              = 0;
+-    tlv_smd_policy->smd_type()                  = 0;
+-    tlv_smd_policy->smd_default_dl_drain_time() = 0;
++    for (size_t i = 0; i < s_smd_profiles.size(); i++) {
++        const auto &profile = s_smd_profiles[i];
++
++        auto tlv_smd_policy = cmdu_tx.addClass<qca::tlvQcaSmdPolicyConfig>();
++        if (!tlv_smd_policy) {
++            LOG(ERROR) << "Failed to add QCA SMD policy config TLV for profile[" << i << "]";
++            return false;
++        }
++
++        // Set vendor OUI
++        tlv_smd_policy->vendor_oui() = (sVendorOUI(qca::qcaVendorOUI::OUI_QCA));
++
++        // Set TLV ID
++        tlv_smd_policy->tlv_id() = static_cast<int>(qca::eQcaTlVId::QCA_SMD_POLICY_CONFIG);
++
++        // Set RUID (Radio Unique Identifier) - initialize to zeros (not radio-specific)
++        std::fill_n(tlv_smd_policy->ruid().oct, 6, 0);
++
++        // Set SMD Identifier from profile
++        std::copy_n(profile.identifier, 6, tlv_smd_policy->smd_identifier().oct);
++
++        // Set policy fields from profile
++        tlv_smd_policy->smd_timeout()               = profile.timeout;
++        tlv_smd_policy->smd_max_prepared_ap_mlds()  = profile.max_prepared_ap_mlds;
++        tlv_smd_policy->smd_dl_forwarding()         = profile.dl_forwarding;
++        tlv_smd_policy->smd_ptk_mode()              = profile.ptk_mode;
++        tlv_smd_policy->smd_type()                  = profile.type;
++        tlv_smd_policy->smd_default_dl_drain_time() = profile.default_dl_drain_time;
++
++        LOG(INFO) << "Added QCA SMD policy config TLV for profile[" << i << "]"
++                  << " timeout=" << profile.timeout
++                  << " max_prepared_ap_mlds=" << static_cast<int>(profile.max_prepared_ap_mlds)
++                  << " dl_forwarding=" << static_cast<int>(profile.dl_forwarding)
++                  << " ptk_mode=" << static_cast<int>(profile.ptk_mode)
++                  << " type=" << static_cast<int>(profile.type)
++                  << " default_dl_drain_time=" << static_cast<int>(profile.default_dl_drain_time);
++    }
+ 
+-    LOG(INFO) << "Added QCA SMD policy config TLV";
+     return true;
+ }
+ 
+diff --git a/controller/src/beerocks/master/beerocks_master_main.cpp b/controller/src/beerocks/master/beerocks_master_main.cpp
+index 790378a9b..f7b8d8b03 100644
+--- a/controller/src/beerocks/master/beerocks_master_main.cpp
++++ b/controller/src/beerocks/master/beerocks_master_main.cpp
+@@ -64,8 +64,12 @@ static std::shared_ptr<beerocks::nbapi::Amxrt> guarantee = nullptr;
+ // It should only be there in one place in each executable module
+ BEEROCKS_INIT_BEEROCKS_VERSION
+ 
+-// External function to register QCA SMD TLVs
++#include <tlvf_qca_utils.h>
++
++// External functions for QCA SMD TLV support
+ extern "C" void register_qca_smd_tlvs(bool enable_smd, bool is_controller);
++extern "C" void add_qca_smd_profile_entry(const qca::sQcaSmdPolicyProfile *profile);
++extern "C" void clear_qca_smd_profiles();
+ 
+ static bool g_running     = true;
+ static bool s_kill_master = false;
+@@ -806,6 +810,20 @@ int main(int argc, char *argv[])
+     son::db::sDbMasterConfig master_conf;
+     fill_master_config(master_conf, beerocks_master_conf);
+ 
++    // Populate QCA SMD profiles from controller config before registering TLV handlers
++    clear_qca_smd_profiles();
++    for (const auto &p : master_conf.smd_profiles) {
++        qca::sQcaSmdPolicyProfile profile;
++        std::copy_n(p.identifier.oct, 6, profile.identifier);
++        profile.timeout               = p.timeout;
++        profile.max_prepared_ap_mlds  = p.max_prepared_ap_mlds;
++        profile.dl_forwarding         = p.dl_forwarding;
++        profile.ptk_mode              = p.ptk_mode;
++        profile.type                  = p.type;
++        profile.default_dl_drain_time = p.default_dl_drain_time;
++        add_qca_smd_profile_entry(&profile);
++    }
++
+     // Register SMD TLVs based on configuration (controller role)
+     register_qca_smd_tlvs(master_conf.enable_smd, true);
+ 
+-- 
+2.34.1
+
