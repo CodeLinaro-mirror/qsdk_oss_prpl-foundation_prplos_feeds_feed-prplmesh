@@ -1,0 +1,328 @@
+From ddaa90393f85de93df6d036ed6c8ca4716cc8c4a Mon Sep 17 00:00:00 2001
+From: Vignesh Sridharan <vignsrid@qti.qualcomm.com>
+Date: Mon, 23 Feb 2026 12:20:44 +0530
+Subject: [PATCH 1/1] multi-vendor: Add SMD Policy Config support in
+ AP-Autoconfiguration
+
+Implement support for QCA vendor-specific SMD Policy Config TLV in the
+AP-Autoconfiguration flow. The agent now parses SMD Policy Config TLVs
+from WSC M2 messages and forwards them to AP Manager along with the
+network credentials.
+
+Changes:
+- Parse SMD Policy Config TLVs from M2 messages in
+  handle_ap_autoconfiguration_wsc()
+- Store SMD policies per radio interface in m_smd_policies_by_iface map
+- Extend send_ap_bss_configuration_message() to include SMD policies in
+  the credential update request to AP Manager
+- Add smd_policy_list field to credential update request message
+
+This enables the agent to configure SMD (Seamless Multi-link Device)
+policies received from the controller during autoconfiguration, ensuring
+proper SMD behavior across all radios.
+
+Signed-off-by: Vignesh Sridharan <vignsrid@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 | 66 +++++++++++++++
+ .../slave/tasks/ap_autoconfiguration_task.cpp | 84 +++++++++++++++++++
+ .../slave/tasks/ap_autoconfiguration_task.h   |  6 ++
+ .../bcl/include/bcl/son/son_wireless_utils.h  | 10 +++
+ .../tlvf/beerocks_message_apmanager.yaml      |  7 ++
+ .../tlvf/structs/sSmdPolicyConfig.yaml        | 15 ++++
+ 6 files changed, 188 insertions(+)
+ create mode 100644 common/beerocks/tlvf/yaml/beerocks/tlvf/structs/sSmdPolicyConfig.yaml
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 1c8196e91..239af9e52 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -20,6 +20,7 @@
+ 
+ #include <beerocks/tlvf/beerocks_message.h>
+ #include <beerocks/tlvf/beerocks_message_apmanager.h>
++#include <beerocks/tlvf/structs/sSmdPolicyConfig.h>
+ 
+ #include "tlvf/wfa_map/tlvClientInfo.h"
+ #include <tlvf/wfa_map/tlv1905EncapDpp.h>
+@@ -1898,6 +1899,38 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+         std::list<son::wireless_utils::sBssInfoConf> bss_info_conf_list;
+         auto wifi_credentials_size = request->wifi_credentials_size();
+ 
++        // Read SMD policy list from the request
++        auto smd_policy_list_size = request->smd_policy_list_size();
++        LOG(DEBUG) << "Received " << int(smd_policy_list_size) << " SMD policies";
++
++        // Store SMD policies in a map keyed by RUID for easy lookup
++        std::unordered_map<sMacAddr, beerocks_message::sSmdPolicyConfig> smd_policies_by_ruid;
++
++        for (auto i = 0; i < smd_policy_list_size; i++) {
++            auto smd_policy_tuple = request->smd_policy_list(i);
++            if (!std::get<0>(smd_policy_tuple)) {
++                LOG(ERROR) << "Failed to get SMD policy at index " << i;
++                continue;
++            }
++            auto &smd_policy = std::get<1>(smd_policy_tuple);
++
++            beerocks_message::sSmdPolicyConfig policy_data;
++            policy_data.ruid                      = smd_policy.ruid;
++            policy_data.smd_identifier            = smd_policy.smd_identifier;
++            policy_data.smd_timeout               = smd_policy.smd_timeout;
++            policy_data.smd_max_prepared_ap_mlds  = smd_policy.smd_max_prepared_ap_mlds;
++            policy_data.smd_dl_forwarding         = smd_policy.smd_dl_forwarding;
++            policy_data.smd_ptk_mode              = smd_policy.smd_ptk_mode;
++            policy_data.smd_type                  = smd_policy.smd_type;
++            policy_data.smd_default_dl_drain_time = smd_policy.smd_default_dl_drain_time;
++
++            smd_policies_by_ruid[smd_policy.ruid] = policy_data;
++
++            LOG(DEBUG) << "Stored SMD policy for RUID: " << smd_policy.ruid
++                       << ", smd_identifier: " << policy_data.smd_identifier
++                       << ", timeout: " << policy_data.smd_timeout;
++        }
++
+         std::string backhaul_wps_ssid, backhaul_wps_passphrase;
+         for (auto i = 0; i < wifi_credentials_size; i++) {
+             son::wireless_utils::sBssInfoConf bss_info_conf;
+@@ -1949,6 +1982,39 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+                 static_cast<son::wireless_utils::eAdditionalAuth>(config_data.additional_auth());
+             bss_info_conf.vap_type = config_data.vap_type();
+ 
++            // Match SMD policy by RUID and populate sBssInfoConf SMD fields
++            // Get the radio UID (RUID) for this radio
++            auto radio_mac     = tlvf::mac_from_string(ap_wlan_hal->get_radio_mac());
++            auto smd_policy_it = smd_policies_by_ruid.find(radio_mac);
++            if (smd_policy_it != smd_policies_by_ruid.end()) {
++                const auto &policy = smd_policy_it->second;
++
++                // Populate SMD fields in sBssInfoConf
++                bss_info_conf.has_smd_policy            = true;
++                bss_info_conf.smd_identifier            = policy.smd_identifier;
++                bss_info_conf.smd_timeout               = policy.smd_timeout;
++                bss_info_conf.smd_max_prepared_ap_mlds  = policy.smd_max_prepared_ap_mlds;
++                bss_info_conf.smd_dl_forwarding         = policy.smd_dl_forwarding;
++                bss_info_conf.smd_ptk_mode              = policy.smd_ptk_mode;
++                bss_info_conf.smd_type                  = policy.smd_type;
++                bss_info_conf.smd_default_dl_drain_time = policy.smd_default_dl_drain_time;
++
++                LOG(DEBUG) << "Applied SMD policy to BSS " << bss_info_conf.bssid
++                           << " for RUID: " << radio_mac
++                           << ", smd_identifier: " << bss_info_conf.smd_identifier
++                           << ", timeout: " << bss_info_conf.smd_timeout
++                           << ", max_prepared_ap_mlds: "
++                           << int(bss_info_conf.smd_max_prepared_ap_mlds)
++                           << ", dl_forwarding: " << int(bss_info_conf.smd_dl_forwarding)
++                           << ", ptk_mode: " << int(bss_info_conf.smd_ptk_mode)
++                           << ", type: " << int(bss_info_conf.smd_type)
++                           << ", default_dl_drain_time: "
++                           << int(bss_info_conf.smd_default_dl_drain_time);
++            } else {
++                LOG(DEBUG) << "No SMD policy found for RUID: " << radio_mac;
++                bss_info_conf.has_smd_policy = false;
++            }
++
+             bss_info_conf_list.push_back(bss_info_conf);
+         }
+ 
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 73a9eab04..b7227cf5c 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -37,6 +37,7 @@
+ #include <tlvf/ieee_1905_1/tlvSearchedRole.h>
+ #include <tlvf/ieee_1905_1/tlvSupportedFreqBand.h>
+ #include <tlvf/ieee_1905_1/tlvSupportedRole.h>
++#include <tlvf/qca/tlvQcaSmdPolicyConfig.h>
+ #include <tlvf/wfa_map/tlvAgentApMldConfiguration.h>
+ #include <tlvf/wfa_map/tlvApRadioIdentifier.h>
+ #include <tlvf/wfa_map/tlvBackhaulStaMldConfiguration.h>
+@@ -1527,6 +1528,52 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_wsc(ieee1905_1::CmduMe
+         return;
+     }
+ 
++    // Parse SMD Policy Config TLVs from M2 (already parsed by multi-vendor framework)
++    // Use getClassList to retrieve ALL SMD Policy TLVs (there can be multiple, one per radio/RUID)
++    auto smd_policy_tlv_list = cmdu_rx.getClassList<qca::tlvQcaSmdPolicyConfig>();
++
++    // Clear any previously stored SMD policies for this radio
++    m_smd_policies_by_iface[radio->front.iface_name].clear();
++
++    if (!smd_policy_tlv_list.empty()) {
++        LOG(DEBUG) << "Found " << smd_policy_tlv_list.size() << " SMD Policy TLV(s) in M2";
++
++        // Process each SMD Policy TLV
++        for (auto smd_policy_tlv : smd_policy_tlv_list) {
++            if (!smd_policy_tlv) {
++                LOG(WARNING) << "Null SMD Policy TLV in list, skipping";
++                continue;
++            }
++
++            LOG(DEBUG) << "Processing SMD Policy TLV for RUID: " << smd_policy_tlv->ruid();
++
++            // Convert QCA TLV to beerocks_message::sSmdPolicyConfig
++            beerocks_message::sSmdPolicyConfig smd_policy;
++            smd_policy.ruid                      = smd_policy_tlv->ruid();
++            smd_policy.smd_identifier            = smd_policy_tlv->smd_identifier();
++            smd_policy.smd_timeout               = smd_policy_tlv->smd_timeout();
++            smd_policy.smd_max_prepared_ap_mlds  = smd_policy_tlv->smd_max_prepared_ap_mlds();
++            smd_policy.smd_dl_forwarding         = smd_policy_tlv->smd_dl_forwarding();
++            smd_policy.smd_ptk_mode              = smd_policy_tlv->smd_ptk_mode();
++            smd_policy.smd_type                  = smd_policy_tlv->smd_type();
++            smd_policy.smd_default_dl_drain_time = smd_policy_tlv->smd_default_dl_drain_time();
++
++            // Store SMD policy for this radio interface
++            m_smd_policies_by_iface[radio->front.iface_name].push_back(smd_policy);
++
++            LOG(DEBUG) << "Stored SMD policy for radio " << radio->front.iface_name << " with RUID "
++                       << smd_policy.ruid << ": smd_identifier=" << smd_policy.smd_identifier
++                       << ", timeout=" << smd_policy.smd_timeout
++                       << ", max_prepared_ap_mlds=" << int(smd_policy.smd_max_prepared_ap_mlds);
++        }
++
++        LOG(INFO) << "Successfully stored "
++                  << m_smd_policies_by_iface[radio->front.iface_name].size()
++                  << " SMD policy/policies for radio " << radio->front.iface_name;
++    } else {
++        LOG(DEBUG) << "No SMD Policy TLVs found in M2 for radio " << radio->front.iface_name;
++    }
++
+     std::vector<sBssConfig> bss_infos;
+     if (!handle_wsc_m2_tlv(cmdu_rx, radio->front.iface_name, m2_list, bss_infos,
+                            misconfigured_ssids)) {
+@@ -3250,6 +3297,43 @@ bool ApAutoConfigurationTask::send_ap_bss_configuration_message(
+         c->vap_type() = info.m2_config.vap_type;
+         request->add_wifi_credentials(c);
+     }
++
++    // Populate SMD policy list if available for this radio
++    auto smd_policy_it = m_smd_policies_by_iface.find(radio_iface);
++    if (smd_policy_it != m_smd_policies_by_iface.end() && !smd_policy_it->second.empty()) {
++        const auto &smd_policies = smd_policy_it->second;
++
++        if (!request->alloc_smd_policy_list(smd_policies.size())) {
++            LOG(ERROR) << "Failed to allocate SMD policy list";
++            return false;
++        }
++
++        for (size_t i = 0; i < smd_policies.size(); i++) {
++            auto smd_policy_tuple = request->smd_policy_list(i);
++            if (!std::get<0>(smd_policy_tuple)) {
++                LOG(ERROR) << "Failed to get SMD policy at index " << i;
++                return false;
++            }
++
++            auto &policy_dest      = std::get<1>(smd_policy_tuple);
++            const auto &policy_src = smd_policies[i];
++
++            policy_dest.ruid                      = policy_src.ruid;
++            policy_dest.smd_identifier            = policy_src.smd_identifier;
++            policy_dest.smd_timeout               = policy_src.smd_timeout;
++            policy_dest.smd_max_prepared_ap_mlds  = policy_src.smd_max_prepared_ap_mlds;
++            policy_dest.smd_dl_forwarding         = policy_src.smd_dl_forwarding;
++            policy_dest.smd_ptk_mode              = policy_src.smd_ptk_mode;
++            policy_dest.smd_type                  = policy_src.smd_type;
++            policy_dest.smd_default_dl_drain_time = policy_src.smd_default_dl_drain_time;
++        }
++
++        LOG(DEBUG) << "Added " << smd_policies.size()
++                   << " SMD policies to credentials update message for " << radio_iface;
++    } else {
++        LOG(DEBUG) << "No SMD policies to send for radio " << radio_iface;
++    }
++
+     LOG(INFO) << "Sending reconfiguration: " << std::endl << ss.str();
+ 
+     auto ap_manager_fd = m_btl_ctx.get_ap_manager_fd(radio_iface);
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+index a10e5d40b..f0bee7635 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+@@ -19,6 +19,7 @@
+ #include <tlvf/wfa_map/tlvProfile2ErrorCode.h>
+ 
+ #include <bcl/son/son_wireless_utils.h>
++#include <beerocks/tlvf/structs/sSmdPolicyConfig.h>
+ 
+ namespace beerocks {
+ 
+@@ -157,6 +158,11 @@ private:
+     std::unordered_map<std::string, std::unordered_map<std::string, std::tuple<int8_t, uint8_t>>>
+         m_ap_mld_requests_infos;
+ 
++    // SMD Policy storage: <radio_iface, vector of SMD policies>
++    // Stores SMD policies parsed from M2 to be sent to AP Manager with credentials
++    std::unordered_map<std::string, std::vector<beerocks_message::sSmdPolicyConfig>>
++        m_smd_policies_by_iface;
++
+     /* Message handlers: */
+ 
+     /**
+diff --git a/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h b/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
+index 39a315b2c..d29a2e136 100644
+--- a/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
++++ b/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
+@@ -315,6 +315,16 @@ public:
+ 
+         uint8_t bss_index                                 = 0;
+         eAdditionalAuth additional_auth                   = eAdditionalAuth::NONE;
++
++        // SMD (Seamless Multi-link Device) Policy Configuration
++        bool has_smd_policy               = false;
++        sMacAddr smd_identifier           = {};
++        uint16_t smd_timeout              = 0;
++        uint8_t smd_max_prepared_ap_mlds  = 0;
++        uint8_t smd_dl_forwarding         = 0;
++        uint8_t smd_ptk_mode              = 0;
++        uint8_t smd_type                  = 0;
++        uint8_t smd_default_dl_drain_time = 0;
+     } sBssInfoConf;
+ 
+     typedef struct sMldInfoConf {
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+index 8ebc969cb..cb1f655e9 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+@@ -5,6 +5,7 @@ _include:
+     beerocks/tlvf/beerocks_message_common.h,
+     classes/ChannelList.h,
+     structs/sCacStartedNotificationParams.h,
++    structs/sSmdPolicyConfig.h,
+     tlvf/WSC/WSC_Attributes.h,
+     tlvf/wfa_map/tlvProfile2MultiApProfile.h,
+     tlvf/airties/ACSChannelList.h,
+@@ -273,6 +274,12 @@ cACTION_APMANAGER_WIFI_CREDENTIALS_UPDATE_REQUEST:
+   wifi_credentials:
+     _type: WSC::cEncryptedSettingsPayload
+     _length: [wifi_credentials_size]
++  smd_policy_list_size:
++    _type: uint8_t
++    _length_var: True
++  smd_policy_list:
++    _type: sSmdPolicyConfig
++    _length: [smd_policy_list_size]
+ 
+ cACTION_APMANAGER_WIFI_CREDENTIALS_UPDATE_RESPONSE:
+   _type: class
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/structs/sSmdPolicyConfig.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/structs/sSmdPolicyConfig.yaml
+new file mode 100644
+index 000000000..bced96fe8
+--- /dev/null
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/structs/sSmdPolicyConfig.yaml
+@@ -0,0 +1,15 @@
++#
++---
++_include: { tlvf/common/sMacAddr.h }
++_namespace: beerocks_message
++
++sSmdPolicyConfig:
++  _type: struct
++  ruid: sMacAddr
++  smd_identifier: sMacAddr
++  smd_timeout: uint16_t
++  smd_max_prepared_ap_mlds: uint8_t
++  smd_dl_forwarding: uint8_t
++  smd_ptk_mode: uint8_t
++  smd_type: uint8_t
++  smd_default_dl_drain_time: uint8_t
+-- 
+2.34.1
+
