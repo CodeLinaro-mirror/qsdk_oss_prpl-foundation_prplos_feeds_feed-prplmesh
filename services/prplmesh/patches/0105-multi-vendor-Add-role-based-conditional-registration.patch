@@ -1,0 +1,208 @@
+From 02024684eab3a20a8c6bf2c066ee283413aa2dbc Mon Sep 17 00:00:00 2001
+From: Vignesh Sridharan <vignsrid@qti.qualcomm.com>
+Date: Wed, 18 Mar 2026 15:13:40 +0530
+Subject: [PATCH 1/1] multi-vendor: Add role-based conditional registration for
+ QCA SMD TLVs
+
+Implement conditional registration of SMD TLV handlers based on enable_smd
+config with role-based assignment (controller vs agent). Eliminates fragile
+M1/M2 detection logic by registering only role-appropriate handlers.
+
+- Add register_smd_tlvs(enable_smd, is_controller) to MultiVendorQCA
+- Controller registers Policy Config SEND + Capabilities RECEIVE
+- Agent registers Capabilities SEND + Policy Config RECEIVE
+- Remove AP Radio Basic Capabilities TLV check from policy handler
+- Improves maintainability and resource efficiency
+
+Signed-off-by: Vignesh Sridharan <vignsrid@qti.qualcomm.com>
+---
+ .../beerocks/slave/beerocks_agent_main.cpp    |  7 ++
+ .../multi_vendor/qca/src/multi_vendor_qca.cpp | 68 ++++++++++++++-----
+ .../multi_vendor/qca/src/tlvf_qca_utils.cpp   | 15 +---
+ .../beerocks/master/beerocks_master_main.cpp  |  6 ++
+ 4 files changed, 64 insertions(+), 32 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/beerocks_agent_main.cpp b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+index 6f36a085f..5a3946952 100644
+--- a/agent/src/beerocks/slave/beerocks_agent_main.cpp
++++ b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+@@ -60,6 +60,9 @@ static std::shared_ptr<beerocks::nbapi::Amxrt> guarantee = nullptr;
+ // It should only be there in one place in each executable module
+ BEEROCKS_INIT_BEEROCKS_VERSION
+ 
++// External function to register QCA SMD TLVs
++extern "C" void register_qca_smd_tlvs(bool enable_smd, bool is_controller);
++
+ static bool g_running = true;
+ static int s_signal   = 0;
+ 
+@@ -557,6 +560,10 @@ static int run_beerocks_slave(beerocks::config_file::sConfigSlave &beerocks_slav
+         db->device_conf.enable_auto_chansel_handling =
+             beerocks_slave_conf.enable_auto_chansel_handling == "1";
+         db->device_conf.enable_smd = beerocks_slave_conf.enable_smd == "1";
++
++        // Register SMD TLVs based on configuration (agent role)
++        register_qca_smd_tlvs(db->device_conf.enable_smd, false);
++
+         {
+             bool uci_enabled = false;
+             if (beerocks::bpl::cfg_get_traffic_separation_bridge_mapping_enabled(uci_enabled)) {
+diff --git a/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp b/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp
+index a9d3cf5f0..130fe7534 100644
+--- a/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp
++++ b/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp
+@@ -21,20 +21,25 @@ using namespace ieee1905_1;
+  *  2) Inherits from qca::tlvf_qca_utils to use QCA-specific TLV handler/parser functions
+  *  3) In constructor, calls register_handler() for SEND side and register_parser() for RECEIVE side
+  *  4) Static instance ensures registration happens at program startup
++ *  5) Optional SMD TLVs are registered via register_smd_tlvs() based on configuration
+  */
+ class MultiVendorQCA : public multi_vendor::tlvf_handler, public qca::tlvf_qca_utils {
++private:
++    static bool smd_tlvs_registered;
++
+ public:
+     /**
+      * @brief Constructor for the MultiVendorQCA class.
+      *
+-     * Registers QCA vendor-specific TLV handlers and parsers for supported message types.
++     * Registers QCA vendor-specific TLV handlers and parsers for always-needed message types.
+      * Uses the new registration API that doesn't require OUI-based maps.
++     * SMD TLVs are registered separately via register_smd_tlvs() based on configuration.
+      */
+     MultiVendorQCA()
+     {
+         LOG(INFO) << "MultiVendorQCA: registering QCA vendor-specific TLV handlers and parsers";
+ 
+-        // Register SEND handler for AP_AUTOCONFIGURATION_SEARCH_MESSAGE
++        // Register SEND handler for AP_AUTOCONFIGURATION_SEARCH_MESSAGE (QCA Version TLV)
+         multi_vendor::tlvf_handler::register_handler(
+             eMessageType::AP_AUTOCONFIGURATION_SEARCH_MESSAGE, add_qca_version_info_tlv);
+ 
+@@ -43,28 +48,55 @@ public:
+         multi_vendor::tlvf_handler::register_parser(
+             eMessageType::AP_AUTOCONFIGURATION_SEARCH_MESSAGE, parse_qca_vs_tlv);
+ 
+-        // Register SEND handler for EARLY_AP_CAPABILITY_REPORT_MESSAGE (Agent only)
+-        multi_vendor::tlvf_handler::register_handler(
+-            eMessageType::EARLY_AP_CAPABILITY_REPORT_MESSAGE, add_qca_smd_capabilities_tlv);
+-
+-        // Register RECEIVE parser for EARLY_AP_CAPABILITY_REPORT_MESSAGE (Both can receive)
+-        multi_vendor::tlvf_handler::register_parser(
+-            eMessageType::EARLY_AP_CAPABILITY_REPORT_MESSAGE, parse_qca_vs_tlv);
++        // Note: SMD TLVs are registered via register_smd_tlvs() based on enable_smd config
++    }
+ 
+-        // Register SEND handler for AP_AUTOCONFIGURATION_WSC_MESSAGE (Controller only)
+-        multi_vendor::tlvf_handler::register_handler(eMessageType::AP_AUTOCONFIGURATION_WSC_MESSAGE,
+-                                                     add_qca_smd_policy_config_tlv);
++    /**
++     * @brief Register SMD-related TLV handlers and parsers based on configuration and role.
++     *
++     * This method should be called from agent/controller initialization after reading
++     * the enable_smd configuration parameter. It performs role-based registration:
++     * - Controller: Registers to SEND Policy Config TLV and RECEIVE Capabilities TLV
++     * - Agent: Registers to SEND Capabilities TLV and RECEIVE Policy Config TLV
++     *
++     * @param enable_smd If true, registers SMD TLV handlers; if false, skips registration
++     * @param is_controller If true, registers controller-side handlers; if false, registers agent-side handlers
++     */
++    static void register_smd_tlvs(bool enable_smd, bool is_controller)
++    {
++        if (enable_smd && !smd_tlvs_registered) {
++            LOG(INFO) << "MultiVendorQCA: registering SMD TLV handlers (enable_smd=1, "
++                      << (is_controller ? "controller" : "agent") << ")";
+ 
+-        // Register RECEIVE parser for AP_AUTOCONFIGURATION_WSC_MESSAGE (Both can receive)
+-        multi_vendor::tlvf_handler::register_parser(eMessageType::AP_AUTOCONFIGURATION_WSC_MESSAGE,
+-                                                    parse_qca_vs_tlv);
++            if (is_controller) {
++                // Controller: SEND Policy Config TLV in M2, RECEIVE Capabilities TLV from agent
++                multi_vendor::tlvf_handler::register_handler(
++                    eMessageType::AP_AUTOCONFIGURATION_WSC_MESSAGE, add_qca_smd_policy_config_tlv);
++                multi_vendor::tlvf_handler::register_parser(
++                    eMessageType::EARLY_AP_CAPABILITY_REPORT_MESSAGE, parse_qca_vs_tlv);
++            } else {
++                // Agent: SEND Capabilities TLV, RECEIVE Policy Config TLV from controller
++                multi_vendor::tlvf_handler::register_handler(
++                    eMessageType::EARLY_AP_CAPABILITY_REPORT_MESSAGE, add_qca_smd_capabilities_tlv);
++                multi_vendor::tlvf_handler::register_parser(
++                    eMessageType::AP_AUTOCONFIGURATION_WSC_MESSAGE, parse_qca_vs_tlv);
++            }
+ 
+-        // Add more message type registrations as needed
+-        // multi_vendor::tlvf_handler::register_handler(<MessageType>, <YourSendHandler>);
+-        // multi_vendor::tlvf_handler::register_parser(<MessageType>, <YourReceiveParser>);
++            smd_tlvs_registered = true;
++        } else if (!enable_smd) {
++            LOG(INFO) << "MultiVendorQCA: SMD TLVs not registered (enable_smd=0)";
++        }
+     }
+ };
+ 
++bool MultiVendorQCA::smd_tlvs_registered = false;
++
+ // Static object of the QCA vendor object. This ensures the QCA vendor's handlers are
+ // registered during the program's initialization.
+ static MultiVendorQCA qca_vendor_obj;
++
++// C-linkage wrapper function to allow calling from other compilation units
++extern "C" void register_qca_smd_tlvs(bool enable_smd, bool is_controller)
++{
++    MultiVendorQCA::register_smd_tlvs(enable_smd, is_controller);
++}
+diff --git a/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp b/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
+index 4088e5771..fb4d5bc6b 100644
+--- a/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
++++ b/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
+@@ -74,22 +74,9 @@ bool tlvf_qca_utils::add_qca_smd_capabilities_tlv(ieee1905_1::CmduMessageTx &cmd
+ }
+ 
+ // SEND side: Add SMD policy config TLV to outgoing message
++// Note: This handler is only registered on the controller, so it will only be called for M2 messages
+ bool tlvf_qca_utils::add_qca_smd_policy_config_tlv(ieee1905_1::CmduMessageTx &cmdu_tx)
+ {
+-    // Check if this is M1 by looking for AP Radio Basic Capabilities TLV
+-    // AP_AUTOCONFIGURATION_WSC_MESSAGE is used bidirectionally:
+-    // - M1: Agent -> Controller (contains AP Radio Basic Capabilities TLV)
+-    // - M2: Controller -> Agent (does NOT contain AP Radio Basic Capabilities TLV)
+-    // This TLV should only be added in M2 (controller response)
+-
+-    auto ap_radio_basic_cap = cmdu_tx.getClass<wfa_map::tlvApRadioBasicCapabilities>();
+-    if (ap_radio_basic_cap) {
+-        LOG(DEBUG) << "AP Radio Basic Capabilities TLV found (M1 message), skipping QCA SMD policy "
+-                      "config TLV";
+-        return true;
+-    }
+-
+-    // This is M2 (no AP Radio Basic Capabilities TLV), proceed with adding policy config TLV
+     auto tlv_smd_policy = cmdu_tx.addClass<qca::tlvQcaSmdPolicyConfig>();
+     if (!tlv_smd_policy) {
+         LOG(ERROR) << "Failed to add QCA SMD policy config TLV";
+diff --git a/controller/src/beerocks/master/beerocks_master_main.cpp b/controller/src/beerocks/master/beerocks_master_main.cpp
+index a7f8989e7..9fc1f2fc7 100644
+--- a/controller/src/beerocks/master/beerocks_master_main.cpp
++++ b/controller/src/beerocks/master/beerocks_master_main.cpp
+@@ -64,6 +64,9 @@ static std::shared_ptr<beerocks::nbapi::Amxrt> guarantee = nullptr;
+ // It should only be there in one place in each executable module
+ BEEROCKS_INIT_BEEROCKS_VERSION
+ 
++// External function to register QCA SMD TLVs
++extern "C" void register_qca_smd_tlvs(bool enable_smd, bool is_controller);
++
+ static bool g_running     = true;
+ static bool s_kill_master = false;
+ static int s_signal       = 0;
+@@ -753,6 +756,9 @@ int main(int argc, char *argv[])
+     son::db::sDbMasterConfig master_conf;
+     fill_master_config(master_conf, beerocks_master_conf);
+ 
++    // Register SMD TLVs based on configuration (controller role)
++    register_qca_smd_tlvs(master_conf.enable_smd, true);
++
+     // Set Network.ID to the Data Model
+     if (!amb_dm_obj->set(DATAELEMENTS_ROOT_DM ".Network", "ID", bridge_info.mac)) {
+         LOG(ERROR) << "Failed to add Network.ID, mac: " << bridge_info.mac;
+-- 
+2.34.1
+
