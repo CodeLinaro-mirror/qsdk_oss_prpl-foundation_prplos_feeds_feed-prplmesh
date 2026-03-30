@@ -77,11 +77,13 @@ define Package/prplmesh
 		+!(TARGET_intel_x86||TARGET_intel_mips||TARGET_brcmbca||TARGET_ipq95xx||TARGET_ipq53xx||TARGET_ipq54xx):hostapd-openssl \
 		+!(TARGET_intel_x86||TARGET_intel_mips||TARGET_brcmbca||TARGET_ipq95xx||TARGET_ipq53xx||TARGET_ipq54xx):wpa-supplicant-openssl
 	DEPENDS+= \
-		+PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND:libamxb \
-		+PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND:libamxrt \
-		+PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND:mod-pcm-svc \
-		+PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND:pcm-manager \
-		+PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND:mod-amxb-ubus
+		+(PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND&&USE_PRPLMESH_NLHAL):amx-libs-bundle \
+		+(PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND&&USE_PRPLMESH_NLHAL):net-services-bundle \
+		+(PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND&&!USE_PRPLMESH_NLHAL):libamxb \
+		+(PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND&&!USE_PRPLMESH_NLHAL):libamxrt \
+		+(PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND&&!USE_PRPLMESH_NLHAL):mod-pcm-svc \
+		+(PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND&&!USE_PRPLMESH_NLHAL):pcm-manager \
+		+(PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND&&!USE_PRPLMESH_NLHAL):mod-amxb-ubus
 #	pwhm dependency:
 	DEPENDS+= +USE_PRPLMESH_WHM:pwhm
 endef
@@ -132,11 +134,13 @@ ifeq ($(CONFIG_USE_PRPLMESH_WHM),y)
 	CMAKE_OPTIONS += -DWBAPI_SOCK="-DAMBIORIX_WBAPI_BACKEND_PATH=\\\"/usr/bin/mods/amxb/mod-amxb-ubus.so\\\" -DAMBIORIX_WBAPI_BUS_URI=\\\"ubus:/var/run/ubus/ubus.sock\\\""
 	CMAKE_OPTIONS += -DUSE_PRPLMESH_NLHAL=OFF
 endif
-# Else if NLHAL is enabled and both Ambiorix and WHM are not enabled
-else ifeq ($(CONFIG_USE_PRPLMESH_NLHAL),y)
+endif
+
+# if NLHAL is enabled, WHM is not enabled
+ifeq ($(CONFIG_USE_PRPLMESH_NLHAL),y)
 	CMAKE_OPTIONS += -DUSE_PRPLMESH_NLHAL=ON
-	# disabling NBAPI and WHM
-	CMAKE_OPTIONS += -DENABLE_NBAPI=OFF
+	CMAKE_OPTIONS += -DENABLE_NBAPI=ON
+	# disabling WHM
 	CMAKE_OPTIONS += -DUSE_PRPLMESH_WHM=OFF
 endif
 
