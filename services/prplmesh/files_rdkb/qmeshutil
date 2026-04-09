@@ -1,0 +1,323 @@
+#!/bin/sh
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: ISC
+#
+## Adjust the below path if needed
+QMESH_CLI="/bin/qmesh_cli"
+NAME="qmesh"
+
+## Config file and generator script paths
+PRPLMESH_CONFIG="/etc/config/qmesh.json"
+
+## File paths and interface macros
+FACTORY_NVRAM_FILE="/tmp/factory_nvram.data"
+EASYMESH_CFG_FILE="/nvram/EasymeshCfg.json"
+PRIMARY_IFACE="wlan0"
+IFACE_ADDR_PATH="/sys/class/net/${PRIMARY_IFACE}/address"
+
+# --------------------------------------------------
+# Logging helpers
+# --------------------------------------------------
+log_msg() {
+    logger -t "$NAME" -p daemon.info "$1"
+    echo "MSG: $1"
+}
+
+log_warn() {
+    logger -t "$NAME" -p daemon.warn "$1"
+    echo "WARNING: $1"
+}
+
+log_err() {
+    logger -t "$NAME" -p daemon.err "$1"
+    echo "ERROR: $1"
+}
+
+# --------------------------------------------------
+# QMesh Agent platform db init
+# --------------------------------------------------
+qmesh_platform_db_init() {
+    local management_mode=${1}
+    local operating_mode=${2}
+
+    DB_PATH=/tmp
+
+    # Verify source file exists before copying
+    if [ ! -f /share/prplmesh_platform_db ]; then
+        log_err "Source platform_db not found: /share/prplmesh_platform_db"
+        return 1
+    fi
+
+    # Put generated prplmesh_platform_db file to the temporary directory
+    cp /share/prplmesh_platform_db "$DB_PATH/prplmesh_platform_db"
+
+    # Modify generated parameters to current
+    sed -i "s/management_mode=.*/management_mode=${management_mode}/g" "$DB_PATH/prplmesh_platform_db"
+    sed -i "s/operating_mode=.*/operating_mode=${operating_mode}/g" "$DB_PATH/prplmesh_platform_db"
+
+    return 0
+}
+
+# --------------------------------------------------
+# Check if QMesh is enabled
+# --------------------------------------------------
+is_qmesh_enabled() {
+    if [ ! -x "$QMESH_CLI" ]; then
+        log_warn "qmesh_cli not found at $QMESH_CLI"
+        return 1
+    fi
+
+    val="$($QMESH_CLI get config.enable 2>/dev/null)"
+    [ -z "$val" ] && return 1
+
+    [ "$val" = "1" ] && return 0
+
+    return 1
+}
+
+# --------------------------------------------------
+# Get operating mode
+# --------------------------------------------------
+get_operating_mode() {
+    opermode="$($QMESH_CLI get config.operating_mode 2>/dev/null)"
+    [ -n "$opermode" ] && echo "$opermode" || echo "Gateway"
+}
+
+# --------------------------------------------------
+# Get management mode
+# --------------------------------------------------
+get_management_mode() {
+    mgmtmode="$($QMESH_CLI get config.management_mode 2>/dev/null)"
+    [ -n "$mgmtmode" ] && echo "$mgmtmode" || echo "Non-Prpl-Controller-and-Agent"
+}
+
+# --------------------------------------------------
+# Show service status
+# --------------------------------------------------
+status_service() {
+    log_msg "QMesh status"
+
+    if [ -x "$QMESH_CLI" ]; then
+        log_msg "Enable flag: $($QMESH_CLI get config.enable 2>/dev/null)"
+        log_msg "Operating mode: $($QMESH_CLI get config.operating_mode 2>/dev/null)"
+        log_msg "Management mode: $($QMESH_CLI get config.management_mode 2>/dev/null)"
+    else
+        log_err "qmesh_cli not found at $QMESH_CLI"
+    fi
+}
+
+# --------------------------------------------------
+# Enable / Disable service
+# --------------------------------------------------
+enable_service() {
+    log_msg "Enabling QMesh"
+    [ -x "$QMESH_CLI" ] && $QMESH_CLI set config.enable 1
+}
+
+disable_service() {
+    log_msg "Disabling QMesh"
+    [ -x "$QMESH_CLI" ] && $QMESH_CLI set config.enable 0
+}
+
+# --------------------------------------------------
+# Gateway mode configuration
+# --------------------------------------------------
+gateway_mode() {
+    log_msg "Configuring Gateway mode"
+
+    if [ ! -x "$QMESH_CLI" ]; then
+        log_err "qmesh_cli not found at $QMESH_CLI"
+        return 1
+    fi
+
+    $QMESH_CLI set config.management_mode Non-Prpl-Controller-and-Agent
+    $QMESH_CLI set config.operating_mode Gateway
+    $QMESH_CLI set config.master 0
+    $QMESH_CLI set config.gateway 1
+    $QMESH_CLI set config.wired_backhaul 0
+
+    return 0
+}
+
+# --------------------------------------------------
+# Repeater mode configuration
+# --------------------------------------------------
+repeater_mode() {
+    backhaul="${1:-wired}"
+    log_msg "Configuring Repeater mode (backhaul: $backhaul)"
+
+    if [ ! -x "$QMESH_CLI" ]; then
+        log_err "qmesh_cli not found at $QMESH_CLI"
+        return 1
+    fi
+
+    $QMESH_CLI set config.management_mode Multi-AP-Agent
+    $QMESH_CLI set config.operating_mode WDS-Repeater
+    $QMESH_CLI set config.master 0
+    $QMESH_CLI set config.gateway 0
+
+    if [ "$backhaul" = "wireless" ]; then
+        $QMESH_CLI set config.wired_backhaul 0
+    else
+        $QMESH_CLI set config.wired_backhaul 1
+    fi
+
+    return 0
+}
+
+# --------------------------------------------------
+# Init for qmesh transport service (pre-start)
+# --------------------------------------------------
+qmesh_transport_init() {
+    log_msg "qmesh_transport_init: preparing directories and platform DB"
+
+    # Create required directories
+    mkdir -p /tmp/beerocks/pid
+    mkdir -p /tmp/beerocks/logs
+
+    # Set permissions
+    chmod 755 /tmp/beerocks
+    chmod 755 /tmp/beerocks/pid
+    chmod 755 /tmp/beerocks/logs
+
+    # Track if onewifi needs restart
+    restart_onewifi=0
+
+    # Check condition 1: factory_nvram.data doesn't exist but will be created now
+    if [ ! -f "$FACTORY_NVRAM_FILE" ]; then
+        log_msg "$FACTORY_NVRAM_FILE does not exist, will create it now"
+        restart_onewifi=1
+
+        # Create factory_nvram.data file
+        log_msg "Creating $FACTORY_NVRAM_FILE"
+        cat > "$FACTORY_NVRAM_FILE" <<EOF
+Serial 1234567890
+MODEL RDKB
+EOF
+    fi
+
+    # Check condition 2: EasymeshCfg.json doesn't have primary interface addr but will be updated now
+    if [ -f "$EASYMESH_CFG_FILE" ] && [ -f "$IFACE_ADDR_PATH" ]; then
+        al_mac="$(cat "$IFACE_ADDR_PATH")"
+        old_al_mac_addr=$(cat "$EASYMESH_CFG_FILE" | grep AL_MAC_ADDR | cut -d '"' -f4)
+        if [ "$old_al_mac_addr" != "$al_mac" ]; then
+            log_msg "AL_MAC_ADDR mismatch detected: $old_al_mac_addr != $al_mac"
+            log_msg "Updating AL_MAC_ADDR from $old_al_mac_addr to $al_mac in $EASYMESH_CFG_FILE"
+            sed -i "s/$old_al_mac_addr/$al_mac/g" "$EASYMESH_CFG_FILE"
+            restart_onewifi=1
+        else
+            log_msg "AL_MAC_ADDR already matches $PRIMARY_IFACE MAC ($al_mac), skipping update"
+        fi
+    else
+        log_warn "$EASYMESH_CFG_FILE or $PRIMARY_IFACE address not found, skipping AL_MAC_ADDR update"
+    fi
+
+    # Restart onewifi if conditions were met
+    if [ "$restart_onewifi" -eq 1 ]; then
+        log_msg "Conditions met for onewifi restart, restarting onewifi service"
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl restart onewifi.service
+            if [ $? -eq 0 ]; then
+                log_msg "onewifi service restarted successfully"
+            else
+                log_err "Failed to restart onewifi service"
+            fi
+        else
+            log_warn "systemctl not available, cannot restart onewifi"
+        fi
+    else
+        log_msg "No onewifi restart needed"
+    fi
+
+    # Decide mode based on syscfg Device.DeviceMode
+    mode=""
+    if command -v syscfg >/dev/null 2>&1; then
+        mode="$(syscfg get Device.DeviceMode 2>/dev/null)"
+    else
+        log_warn "syscfg not available, defaulting to gateway mode"
+    fi
+
+    # Set Gateway mode by default
+    [ -z "$mode" ] && mode="gateway"
+
+    case "$mode" in
+        repeater|Repeater|extender|Extender)
+            log_msg "qmesh_transport_init: Device.DeviceMode='$mode' -> starting in repeater mode"
+            if ! repeater_mode "wireless"; then
+                log_err "qmesh_transport_init: Failed to set repeater mode"
+                return 1
+            fi
+            ;;
+        gateway|Gateway|router|Router|*)
+            log_msg "qmesh_transport_init: Device.DeviceMode='$mode' -> starting in gateway mode"
+            if ! gateway_mode; then
+                log_err "qmesh_transport_init: Failed to set gateway mode"
+                return 1
+            fi
+            ;;
+    esac
+
+    operating_mode="$(get_operating_mode)"
+    management_mode="$(get_management_mode)"
+    log_msg "Operating mode: $operating_mode"
+    log_msg "management_mode: $management_mode"
+
+    # Initialise platform_db with the actual configured mode values
+    if ! qmesh_platform_db_init "$management_mode" "$operating_mode"; then
+        log_err "qmesh_transport_init: Failed to initialize platform_db"
+        return 1
+    fi
+
+    ebtables -A FORWARD -d 01:80:c2:00:00:13 -j DROP
+
+    return 0
+}
+
+qmesh_transport_deinit() {
+    ebtables -D FORWARD -d 01:80:c2:00:00:13 -j DROP
+    return 0
+}
+
+# Check if config file exists
+if [ ! -f "$PRPLMESH_CONFIG" ]; then
+    log_err "qmeshutil: Config $PRPLMESH_CONFIG is not present"
+    exit 1
+fi
+
+# --------------------------------------------------
+# Main command dispatcher
+# --------------------------------------------------
+case "$1" in
+    qmeshenable)
+        enable_service
+        ;;
+    qmeshdisable)
+        disable_service
+        ;;
+    check_qmeshenable)
+        is_qmesh_enabled
+        ;;
+    qmeshstatus)
+        status_service
+        ;;
+    gateway_mode)
+        gateway_mode
+        ;;
+    repeater_mode)
+        repeater_mode "$2"
+        ;;
+    transport_init)
+        qmesh_transport_init
+        ;;
+    transport_deinit)
+        qmesh_transport_deinit
+        ;;
+    *)
+        echo "Usage: $0 {qmeshstatus|qmeshenable|qmeshdisable|check_qmeshenable|gateway_mode|repeater_mode [wired|wireless]|transport_init|transport_deinit}"
+        exit 1
+        ;;
+esac
+
+exit $?
+
+
