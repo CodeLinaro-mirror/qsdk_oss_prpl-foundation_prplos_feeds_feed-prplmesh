@@ -1,0 +1,217 @@
+From 98df3fbc4b7654ff4a087f43bfb637863a5d1799 Mon Sep 17 00:00:00 2001
+From: Nirmal Raj S <nirm@qti.qualcomm.com>
+Date: Mon, 13 Apr 2026 10:27:02 +0530
+Subject: [PATCH] sync hostapd config channel params from STATUS in set_channel
+
+When the 5G BSTA connects to a root AP on a different channel (e.g.
+channel 36) than the one configured in the AP VAP hostapd config
+(e.g. channel 40), hostapd performs a CSA and moves the AP VAP to
+channel 36. However the hostapd config file retains the stale channel
+parameters (channel=40, vht/he/eht_oper_chwidth, centr_freq_seg0_idx).
+
+Fix set_channel() to query the live hostapd STATUS after updating the
+channel number in the config file. All STATUS keys whose name contains
+"_chwidth", "_idx", or "_channel" are written back into the config so
+that vht/he/eht oper_chwidth, centr_freq_seg0/1_idx and
+secondary_channel are kept consistent with the actual operating state.
+
+Added a fix for 20MHz and 40MHz channel switch
+
+Signed-off-by: Nirmal Raj S <nirm@qti.qualcomm.com>
+---
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 80 ++++++++++---------
+ .../platform/bpl/cfg/dm/bpl_cfg_wifi.cpp      |  8 ++
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     | 29 +++++++
+ framework/platform/bpl/include/bpl/bpl_cfg.h  | 12 +++
+ 4 files changed, 90 insertions(+), 39 deletions(-)
+
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 66a99cf9d..9a61851f8 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -1116,41 +1116,36 @@ bool ap_wlan_hal_nl80211::set_channel(int chan, beerocks::eWiFiBandwidth bw, int
+         return false;
+     }
+ 
+-    if (bw != beerocks::eWiFiBandwidth::BANDWIDTH_UNKNOWN) {
+-        int wifi_bw = 0;
+-        // based on hostapd.conf @ https://w1.fi/cgit/hostap/plain/hostapd/hostapd.conf
+-        // # 0 = 20 or 40 MHz operating Channel width
+-        // # 1 = 80 MHz channel width
+-        // # 2 = 160 MHz channel width
+-        // # 3 = 80+80 MHz channel width
+-        // #vht_oper_chwidth=1
+-
+-        if (bw == beerocks::eWiFiBandwidth::BANDWIDTH_20 ||
+-            bw == beerocks::eWiFiBandwidth::BANDWIDTH_40) {
+-            wifi_bw = 0;
+-        } else if (bw == beerocks::eWiFiBandwidth::BANDWIDTH_80) {
+-            wifi_bw = 1;
+-        } else if (bw == beerocks::eWiFiBandwidth::BANDWIDTH_160) {
+-            wifi_bw = 2;
+-        } else if (bw == beerocks::eWiFiBandwidth::BANDWIDTH_80_80) {
+-            wifi_bw = 3;
+-        } else {
+-            LOG(ERROR) << "Unknown BW " << bw;
+-            return false;
+-        }
+-
+-        if (!conf.set_create_head_value("vht_oper_chwidth", std::to_string(wifi_bw))) {
+-            LOG(ERROR) << "Failed setting vht_oper_chwidth";
+-            return false;
+-        }
+-    }
++    // Query hostapd STATUS to read the actual current channel parameters and
++    // sync them into the config file.  This handles the case where the AP VAP
++    // has already moved to a new channel (e.g. after the BSTA connects on a
++    // different channel and triggers a CSA) but the config file still holds
++    // stale values for bandwidth and center-frequency indices.
++    //
++    // All STATUS keys that contain "_chwidth", "_idx", or "_channel" are
++    // treated as channel-configuration parameters and are written back into
++    // the hostapd config so that vht/he/eht oper_chwidth, centr_freq_seg0/1_idx
++    // and secondary_channel are all kept consistent with the live state.
++    parsed_obj_map_t status_result;
++    if (wpa_ctrl_send_msg("STATUS", status_result)) {
++        LOG(DEBUG) << "Syncing channel parameters from hostapd STATUS into config";
++
++        for (const auto &entry : status_result) {
++            const std::string &key   = entry.first;
++            const std::string &value = entry.second;
++
++            if (value.empty()) {
++                continue;
++            }
+ 
+-    if (center_channel > 0) {
+-        if (!conf.set_create_head_value("vht_oper_centr_freq_seg0_idx",
+-                                        std::to_string(center_channel))) {
+-            LOG(ERROR) << "Failed setting vht_oper_centr_freq_seg0_idx";
+-            return false;
++            if (key.find("_chwidth")  != std::string::npos ||
++                key.find("_idx")      != std::string::npos) {
++                LOG(DEBUG) << "Updating config " << key << " = " << value;
++                conf.set_create_head_value(key, value);
++            }
+         }
++    } else {
++        LOG(WARNING) << "Failed to get STATUS from hostapd; channel-width parameters not synced";
+     }
+ 
+     // store the result:
+@@ -1159,11 +1154,15 @@ bool ap_wlan_hal_nl80211::set_channel(int chan, beerocks::eWiFiBandwidth bw, int
+         return false;
+     }
+ 
+-    // make hostapd reload its configuration file:
+-    const std::string cmd{"RELOAD_CONFIG"};
+-    if (!wpa_ctrl_send_msg(cmd)) {
+-        LOG(ERROR) << "'" << cmd << "' command to hostapd failed";
+-        return false;
++    // Persist the new channel in the UCI wireless config so it survives reboots.
++    if (!m_radio_info.radio_id.empty()) {
++        if (!beerocks::bpl::cfg_set_wireless_channel(m_radio_info.radio_id, chan)) {
++            LOG(WARNING) << "set_channel: failed to update channel in wireless config"
++                         << " for radio_id=" << m_radio_info.radio_id;
++        } else {
++            LOG(DEBUG) << "set_channel: updated wireless config channel=" << chan
++                       << " for radio_id=" << m_radio_info.radio_id;
++        }
+     }
+ 
+     LOG(DEBUG) << "set_channel done";
+@@ -2180,7 +2179,10 @@ bool ap_wlan_hal_nl80211::switch_channel(int chan, beerocks::eWiFiBandwidth bw,
+     and center_frequency_2 shall be the center frequency of the 160MHz channel
+     */
+     if (freq_type != beerocks::FREQ_6G) {
+-        if (bw == beerocks::BANDWIDTH_80 || bw == beerocks::BANDWIDTH_160) {
++        if (bw == beerocks::BANDWIDTH_20) {
++            // For 20MHz, center_freq1 should equal the primary frequency
++            cmd += " center_freq1=" + freq_str;
++        } else if (bw == beerocks::BANDWIDTH_40 || bw == beerocks::BANDWIDTH_80 || bw == beerocks::BANDWIDTH_160) {
+             cmd += " center_freq1=" + wave_vht_center_frequency;
+         }
+     } else {
+diff --git a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+index ac8204e7d..29df67834 100644
+--- a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+@@ -523,5 +523,13 @@ bool bpl_cfg_set_sta_vap_bh_credentials(const std::string &iface,
+ }
+ 
+ */
++
++bool cfg_set_wireless_channel(const std::string &radio_id, int channel)
++{
++    LOG(DEBUG) << "cfg_set_wireless_channel: not implemented for DM platform"
++               << " (radio_id=" << radio_id << ", channel=" << channel << ")";
++    return true;
++}
++
+ } // namespace bpl
+ } // namespace beerocks
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index 050069699..7c56a81f5 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -1278,5 +1278,34 @@ bool bpl_cfg_set_sta_vap_bh_credentials(const std::string &iface,
+ }
+ 
+ 
++bool cfg_set_wireless_channel(const std::string &radio_id, int channel)
++{
++    if (radio_id.empty()) {
++        LOG(ERROR) << "cfg_set_wireless_channel: radio_id is empty";
++        return false;
++    }
++
++    // Find the wifi-device section whose "radio" option matches radio_id
++    std::string device_section;
++    if (!uci_find_section_by_option("wireless", "wifi-device", "radio", radio_id,
++                                    device_section)) {
++        LOG(ERROR) << "cfg_set_wireless_channel: no wifi-device section found for radio: "
++                   << radio_id;
++        return false;
++    }
++
++    LOG(DEBUG) << "cfg_set_wireless_channel: updating channel=" << channel
++               << " in section=" << device_section << " for radio=" << radio_id;
++
++    OptionsUnorderedMap options = {{"channel", std::to_string(channel)}};
++    if (!uci_set_section("wireless", "wifi-device", device_section, options, true)) {
++        LOG(ERROR) << "cfg_set_wireless_channel: failed to set channel in wireless config"
++                   << " for radio: " << radio_id;
++        return false;
++    }
++
++    return true;
++}
++
+ } // namespace bpl
+ } // namespace beerocks
+diff --git a/framework/platform/bpl/include/bpl/bpl_cfg.h b/framework/platform/bpl/include/bpl/bpl_cfg.h
+index 236b0fc53..f248e340a 100644
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -1490,6 +1490,18 @@ bool cfg_set_wifi_iface_network(const std::string &iface_name, const std::string
+  */
+ bool cfg_commit_wireless_config();
+ 
++/**
++ * @brief Update the channel option in the wireless UCI config for the given radio.
++ *
++ * Finds the wifi-device section whose "radio" option matches @p radio_id and
++ * sets its "channel" option to @p channel, then commits the change.
++ *
++ * @param[in] radio_id  Radio identifier string (e.g. "radio0").
++ * @param[in] channel   New channel number to persist.
++ * @return true on success, false on failure.
++ */
++bool cfg_set_wireless_channel(const std::string &radio_id, int channel);
++
+ /**
+  * @brief Commit changes to prplmesh. uci package
+  *
+-- 
+2.34.1
+
