@@ -1,0 +1,1320 @@
+From d3f26b319fd0a6d7c162cd045a418f610e5efc6d Mon Sep 17 00:00:00 2001
+From: Arockiasathish S <arocs@qti.qualcomm.com>
+Date: Thu, 14 May 2026 15:53:35 +0530
+Subject: [PATCH 1/2] update ap_wlan_hal_onewifi.cpp
+
+Signed-off-by: Arockiasathish S <arocs@qti.qualcomm.com>
+---
+ .../bwl/onewifi/ap_wlan_hal_onewifi.cpp       | 1239 ++++++++++++++++-
+ 1 file changed, 1230 insertions(+), 9 deletions(-)
+
+diff --git a/common/beerocks/bwl/onewifi/ap_wlan_hal_onewifi.cpp b/common/beerocks/bwl/onewifi/ap_wlan_hal_onewifi.cpp
+index 8c2959d0e..79548ca04 100644
+--- a/common/beerocks/bwl/onewifi/ap_wlan_hal_onewifi.cpp
++++ b/common/beerocks/bwl/onewifi/ap_wlan_hal_onewifi.cpp
+@@ -2,10 +2,183 @@
+  * SPDX-License-Identifier: ISC
+  */
+ 
++// EM_APP MUST be defined FIRST before any includes that pull in wifi_webconfig.h
++// This enables EM-specific subdoc types: webconfig_subdoc_type_beacon_report,
++// webconfig_subdoc_type_em_sta_link_metrics, etc. (inside #ifdef EM_APP in wifi_webconfig.h)
++// Also enables EM-specific fields in webconfig_subdoc_decoded_data_t and wifi_base.h types.
++#ifndef EM_APP
++#define EM_APP
++#endif
++
++#include "onewifi_log.h"
+ #include "ap_wlan_hal_onewifi.h"
++#include "em_base.h"
++#include "onewifi_data_model.h"
++
++#include <bcl/beerocks_string_utils.h>
++#include <bcl/network/network_utils.h>
++#include <bcl/son/son_assoc_frame_utils.h>
++#include <bcl/son/son_wireless_utils.h>
++#include <bcl/beerocks_utils.h>
+ 
+ #include <easylogging++.h>
+ 
++#include <tlvf/AssociationRequestFrame/AssocReqFrame.h>
++#include <tlvf/wfa_map/tlvApCapability.h>
++
++// OneWifi webconfig includes
++extern "C" {
++#include "wifi_webconfig.h"
++#ifndef EASY_MESH_NODE
++#define EASY_MESH_NODE
++#endif
++
++#include "webconfig_external_proto_easymesh.h"
++#include "webconfig_external_proto.h"
++#include <cjson/cJSON.h>
++
++// Declaration for webconfig_easymesh_encode since it's not in the public headers
++webconfig_error_t webconfig_easymesh_encode(webconfig_t *config,
++                                            const webconfig_external_easymesh_t *data,
++                                            webconfig_subdoc_type_t type, char **str);
++
++// Declaration for webconfig_easymesh_decode since it's not in the public headers
++webconfig_error_t webconfig_easymesh_decode(webconfig_t *config, const char *str,
++                                            webconfig_external_easymesh_t *data,
++                                            webconfig_subdoc_type_t *type);
++}
++
++#include <bwl/mon_wlan_hal.h>
++
++#include <cstring>
++#include <sstream>
++#include <unordered_set>
++
++// OneWifi bus constants
++#ifndef WIFI_WEBCONFIG_DOC_DATA_SOUTH
++#define WIFI_WEBCONFIG_DOC_DATA_SOUTH "Device.WiFi.WebConfig.Data.Subdoc.South"
++#endif
++
++static webconfig_error_t webconfig_dummy_apply(webconfig_subdoc_t *doc,
++                                                                 webconfig_subdoc_data_t *data)
++ {
++    (void)doc;
++    (void)data;
++    return webconfig_error_none;
++ }
++
++// ============================================================================
++// Bus event callbacks - defined here in AP HAL (AP thread has large stack)
++// These are static free functions that cast ctx to base_wlan_hal_onewifi*
++// and dispatch to the appropriate virtual handler.
++// ============================================================================
++
++static bus_error_t onewifi_north_cb(char *event_name, bus_data_prop_t *p_data, void *ctx)
++{
++    auto self = static_cast<bwl::onewifi::base_wlan_hal_onewifi *>(ctx);
++    if (!self || !p_data || !p_data->value.raw_data.bytes || p_data->value.raw_data_len == 0) {
++        ONEWIFI_LOG_WARN("onewifi_north_cb: null or empty data");
++        return bus_error_invalid_input;
++    }
++    self->on_onewifi_north_data(static_cast<const char *>(p_data->value.raw_data.bytes),
++                                p_data->value.raw_data_len);
++    return bus_error_success;
++}
++
++static bus_error_t sta_assoc_cb(char *event_name, bus_data_prop_t *p_data, void *ctx)
++{
++    auto self = static_cast<bwl::onewifi::base_wlan_hal_onewifi *>(ctx);
++    if (!self || !p_data || !p_data->value.raw_data.bytes || p_data->value.raw_data_len == 0) {
++        ONEWIFI_LOG_WARN("sta_assoc_cb: null or empty data");
++        return bus_error_invalid_input;
++    }
++    self->on_sta_assoc_data(static_cast<const char *>(p_data->value.raw_data.bytes),
++                            p_data->value.raw_data_len);
++    return bus_error_success;
++}
++
++static bus_error_t sta_assoc_status_cb(char *event_name, bus_data_prop_t *p_data, void *ctx)
++{
++    auto self = static_cast<bwl::onewifi::base_wlan_hal_onewifi *>(ctx);
++    if (!self || !p_data || !p_data->value.raw_data.bytes || p_data->value.raw_data_len == 0) {
++        ONEWIFI_LOG_WARN("sta_assoc_status_cb: null or empty data");
++        return bus_error_invalid_input;
++    }
++    // Data is binary rdk_sta_data_t (bus_data_type_bytes), NOT JSON
++    self->on_sta_assoc_status_data(static_cast<const char *>(p_data->value.raw_data.bytes),
++                                   p_data->value.raw_data_len);
++    return bus_error_success;
++}
++
++static bus_error_t ap_metrics_cb(char *event_name, bus_data_prop_t *p_data, void *ctx)
++{
++    auto self = static_cast<bwl::onewifi::base_wlan_hal_onewifi *>(ctx);
++    if (!self || !p_data || !p_data->value.raw_data.bytes || p_data->value.raw_data_len == 0) {
++        ONEWIFI_LOG_WARN("ap_metrics_cb: null or empty data");
++        return bus_error_invalid_input;
++    }
++    self->on_ap_metrics_data(static_cast<const char *>(p_data->value.raw_data.bytes),
++                             p_data->value.raw_data_len);
++    return bus_error_success;
++}
++
++static bus_error_t channel_scan_cb(char *event_name, bus_data_prop_t *p_data, void *ctx)
++{
++    auto self = static_cast<bwl::onewifi::base_wlan_hal_onewifi *>(ctx);
++    if (!self || !p_data || !p_data->value.raw_data.bytes || p_data->value.raw_data_len == 0) {
++        ONEWIFI_LOG_WARN("channel_scan_cb: null or empty data");
++        return bus_error_invalid_input;
++    }
++    self->on_channel_scan_data(static_cast<const char *>(p_data->value.raw_data.bytes),
++                               p_data->value.raw_data_len);
++    return bus_error_success;
++}
++
++static bus_error_t beacon_report_cb(char *event_name, bus_data_prop_t *p_data, void *ctx)
++{
++    auto self = static_cast<bwl::onewifi::base_wlan_hal_onewifi *>(ctx);
++    if (!self || !p_data || !p_data->value.raw_data.bytes || p_data->value.raw_data_len == 0) {
++        ONEWIFI_LOG_WARN("beacon_report_cb: null or empty data");
++        return bus_error_invalid_input;
++    }
++    self->on_beacon_report_data(static_cast<const char *>(p_data->value.raw_data.bytes),
++                                p_data->value.raw_data_len);
++    return bus_error_success;
++}
++
++static bus_error_t sta_link_metrics_cb(char *event_name, bus_data_prop_t *p_data, void *ctx)
++{
++    auto self = static_cast<bwl::onewifi::base_wlan_hal_onewifi *>(ctx);
++    if (!self || !p_data || !p_data->value.raw_data.bytes || p_data->value.raw_data_len == 0) {
++        ONEWIFI_LOG_WARN("sta_link_metrics_cb: null or empty data");
++        return bus_error_invalid_input;
++    }
++    self->on_sta_link_metrics_data(static_cast<const char *>(p_data->value.raw_data.bytes),
++                                   p_data->value.raw_data_len);
++    return bus_error_success;
++}
++
++static bus_error_t bss_info_cb(char *event_name, bus_data_prop_t *p_data, void *ctx)
++{
++    if (!ctx || !p_data || !p_data->value.raw_data.bytes) return bus_error_invalid_input;
++    ONEWIFI_LOG_DEBUG("bss_info_cb: received %u bytes", p_data->value.raw_data_len);
++    return bus_error_success;
++}
++
++static bus_error_t link_report_cb(char *event_name, bus_data_prop_t *p_data, void *ctx)
++{
++    if (!ctx || !p_data || !p_data->value.raw_data.bytes) return bus_error_invalid_input;
++    ONEWIFI_LOG_DEBUG("link_report_cb: received %u bytes", p_data->value.raw_data_len);
++    return bus_error_success;
++}
++
++static bus_error_t csa_beacon_cb(char *event_name, bus_data_prop_t *p_data, void *ctx)
++{
++    if (!ctx || !p_data || !p_data->value.raw_data.bytes) return bus_error_invalid_input;
++    ONEWIFI_LOG_DEBUG("csa_beacon_cb: received %u bytes", p_data->value.raw_data_len);
++    return bus_error_success;
++}
++
+ namespace bwl {
+ namespace onewifi {
+ 
+@@ -19,6 +192,186 @@ ap_wlan_hal_onewifi::ap_wlan_hal_onewifi(std::string iface_name, hal_event_cb_t
+ 
+ ap_wlan_hal_onewifi::~ap_wlan_hal_onewifi()
+ {
++    detach();
++}
++
++bool ap_wlan_hal_onewifi::detach()
++{
++    ONEWIFI_LOG_DEBUG("Detaching OneWifi HAL for interface: %s", get_iface_name().c_str());
++    
++    wifi_bus_desc_t *bus_desc = get_bus_descriptor();
++    if (bus_desc && bus_desc->bus_event_unsubs_fn) {
++        bus_desc->bus_event_unsubs_fn(m_bus_hdl_ptr, ONEWIFI_WEBCONFIG_DOC_DATA_NORTH);
++        bus_desc->bus_event_unsubs_fn(m_bus_hdl_ptr, ONEWIFI_WEBCONFIG_GET_ASSOC);
++        bus_desc->bus_event_unsubs_fn(m_bus_hdl_ptr, ONEWIFI_ASSOC_STATUS_EVENT);
++        bus_desc->bus_event_unsubs_fn(m_bus_hdl_ptr, ONEWIFI_EM_AP_METRICS_REPORT);
++        bus_desc->bus_event_unsubs_fn(m_bus_hdl_ptr, ONEWIFI_EM_CHANNEL_SCAN_REPORT);
++        bus_desc->bus_event_unsubs_fn(m_bus_hdl_ptr, ONEWIFI_EM_BEACON_REPORT);
++        bus_desc->bus_event_unsubs_fn(m_bus_hdl_ptr, ONEWIFI_EM_STA_LINK_METRICS_REPORT);
++        bus_desc->bus_event_unsubs_fn(m_bus_hdl_ptr, ONEWIFI_EC_BSS_INFO);
++        bus_desc->bus_event_unsubs_fn(m_bus_hdl_ptr, ONEWIFI_LINK_REPORT);
++        bus_desc->bus_event_unsubs_fn(m_bus_hdl_ptr, ONEWIFI_CSA_BEACON_EVENT);
++        ONEWIFI_LOG_DEBUG("Unsubscribed from all OneWifi events");
++    }
++
++    if (bus_desc && bus_desc->bus_close_fn) {
++        bus_desc->bus_close_fn(m_bus_hdl_ptr);
++        ONEWIFI_LOG_DEBUG("Closed OneWifi bus connection");
++    }
++    if (m_bus_hdl_ptr) memset(m_bus_hdl_ptr, 0, sizeof(bus_handle_t));
++
++    ONEWIFI_LOG_INFO("OneWifi HAL detached for interface: %s", get_iface_name().c_str());
++    return base_wlan_hal_onewifi::detach();
++}
++
++HALState ap_wlan_hal_onewifi::attach(bool block)
++{
++    // Call base class to set up eventfd and mark operational
++    HALState state = base_wlan_hal_onewifi::attach(block);
++    if (state != HALState::Operational) return state;
++
++    ONEWIFI_LOG_INFO("AP: Attaching OneWifi HAL for interface: %s", get_iface_name().c_str());
++
++    // Open bus connection
++    if (!check_and_open_bus()) {
++        ONEWIFI_LOG_ERROR("AP: Failed to open OneWifi bus connection");
++        return (m_hal_state = HALState::Failed);
++    }
++    ONEWIFI_LOG_INFO("AP: Successfully opened OneWifi bus connection");
++
++    // Get bus descriptor for event subscriptions
++    wifi_bus_desc_t *bus_desc = get_bus_descriptor();
++    if (!bus_desc) {
++        ONEWIFI_LOG_ERROR("AP: Failed to get OneWifi bus descriptor");
++        return (m_hal_state = HALState::Failed);
++    }
++
++    typedef bus_error_t (*bus_event_sub_handler_t)(char*, bus_data_prop_t*, void*);
++    struct EventSubscription {
++        const char* event_name;
++        bus_event_sub_handler_t callback;
++        bool is_critical;
++        const char* description;
++    };
++
++    EventSubscription subscriptions[] = {
++        {ONEWIFI_WEBCONFIG_DOC_DATA_NORTH, onewifi_north_cb, true, "VAP/radio/mesh_sta config updates"},
++        {ONEWIFI_WEBCONFIG_GET_ASSOC, sta_assoc_cb, true, "STA association list updates"},
++        {ONEWIFI_ASSOC_STATUS_EVENT, sta_assoc_status_cb, true, "STA connect/disconnect events"},
++        {ONEWIFI_EM_AP_METRICS_REPORT, ap_metrics_cb, false, "AP metrics reports"},
++        {ONEWIFI_EM_CHANNEL_SCAN_REPORT, channel_scan_cb, false, "Channel scan results"},
++        {ONEWIFI_EM_BEACON_REPORT, beacon_report_cb, false, "11k beacon measurement reports"},
++        {ONEWIFI_EM_STA_LINK_METRICS_REPORT, sta_link_metrics_cb, false, "STA link quality metrics"},
++        {ONEWIFI_EC_BSS_INFO, bss_info_cb, false, "EasyConnect BSS info"},
++        {ONEWIFI_LINK_REPORT, link_report_cb, false, "Link quality reports"},
++        {ONEWIFI_CSA_BEACON_EVENT, csa_beacon_cb, false, "CSA beacon frames"}
++    };
++
++    for (const auto& sub : subscriptions) {
++        if (bus_desc->bus_event_subs_fn(m_bus_hdl_ptr, sub.event_name,
++                                        reinterpret_cast<void*>(sub.callback), this, 0) != bus_error_success) {
++            if (sub.is_critical) {
++                ONEWIFI_LOG_ERROR("AP: Failed to subscribe to CRITICAL event: %s", sub.event_name);
++                return (m_hal_state = HALState::Failed);
++            } else {
++                ONEWIFI_LOG_WARN("AP: Failed to subscribe to optional event: %s", sub.event_name);
++            }
++        } else {
++            ONEWIFI_LOG_DEBUG("AP: Subscribed to %s (%s)", sub.event_name, sub.description);
++        }
++    }
++
++    // Fetch initial DML data
++    raw_data_t init_data = {};
++    int num_retry = 0;
++    static constexpr int MAX_INIT_RETRIES = 10;
++    static constexpr int RETRY_SLEEP_MS = 500;
++
++    if (bus_desc->bus_data_get_fn) {
++        while (bus_desc->bus_data_get_fn(m_bus_hdl_ptr, ONEWIFI_WEBCONFIG_INIT_DML_DATA, &init_data) != bus_error_success) {
++            ONEWIFI_LOG_WARN("AP: Failed to get initial DML data, retry %d", num_retry + 1);
++            if (++num_retry >= MAX_INIT_RETRIES) {
++                ONEWIFI_LOG_ERROR("AP: Exceeded max retries for DML data. OneWifi may not be running.");
++                break;
++            }
++            usleep(RETRY_SLEEP_MS * 1000);
++        }
++    }
++
++    if (init_data.raw_data.bytes && init_data.raw_data_len > 0) {
++        ONEWIFI_LOG_INFO("AP: Received initial DML data from OneWifi");
++        on_onewifi_north_data(reinterpret_cast<const char *>(init_data.raw_data.bytes),
++                              init_data.raw_data_len);
++        free(init_data.raw_data.bytes);
++        init_data.raw_data.bytes = nullptr;
++    }
++
++    refresh_radio_info();
++    event_queue_push(static_cast<int>(bwl::ap_wlan_hal::Event::AP_Attached));
++
++    ONEWIFI_LOG_INFO("AP: OneWifi HAL attached successfully for interface: %s", get_iface_name().c_str());
++    return m_hal_state;
++}
++
++void ap_wlan_hal_onewifi::on_onewifi_init_data(const char *json_str)
++{
++    if (!json_str) return;
++    ONEWIFI_LOG_DEBUG("AP: on_onewifi_init_data: decoding initial DML data");
++    on_onewifi_north_data(json_str, strlen(json_str));
++}
++
++void ap_wlan_hal_onewifi::on_onewifi_north_data(const char *json_str, unsigned int len)
++{
++    if (!json_str || len == 0) return;
++    ONEWIFI_LOG_INFO("AP: on_onewifi_north_data: len=%u", len);
++
++    // Parse subdoc type
++    webconfig_subdoc_type_t type = webconfig_subdoc_type_private;
++    {
++        cJSON *json = cJSON_Parse(json_str);
++        if (!json) { ONEWIFI_LOG_ERROR("AP: failed to parse JSON"); return; }
++        cJSON *name_item = cJSON_GetObjectItemCaseSensitive(json, "SubDocName");
++        if (!cJSON_IsString(name_item) || !name_item->valuestring) {
++            cJSON_Delete(json); return;
++        }
++        const char *name = name_item->valuestring;
++        if (strcmp(name, "private") == 0) type = webconfig_subdoc_type_private;
++        else if (strcmp(name, "Vap_6G") == 0) type = webconfig_subdoc_type_vap_6G;
++        else if (strcmp(name, "Vap_5G") == 0) type = webconfig_subdoc_type_vap_5G;
++        else if (strcmp(name, "Vap_2.4G") == 0) type = webconfig_subdoc_type_vap_24G;
++        else if (strcmp(name, "radio") == 0) type = webconfig_subdoc_type_radio;
++        else if (strcmp(name, "radio_6G") == 0) type = webconfig_subdoc_type_radio_6G;
++        else if (strcmp(name, "radio_5G") == 0) type = webconfig_subdoc_type_radio_5G;
++        else if (strcmp(name, "radio_2.4G") == 0) type = webconfig_subdoc_type_radio_24G;
++        else if (strcmp(name, "mesh_sta") == 0 || strcmp(name, "mesh backhaul sta") == 0) type = webconfig_subdoc_type_mesh_sta;
++        else if (strcmp(name, "dml") == 0) type = webconfig_subdoc_type_dml;
++        else { ONEWIFI_LOG_DEBUG("AP: unhandled SubDocName=%s", name); cJSON_Delete(json); return; }
++        cJSON_Delete(json);
++    }
++
++    // Decode (large stack vars in this scope - freed when this function returns)
++    webconfig_external_easymesh_t ext_data = {};
++    webconfig_t config = {};
++    if (!init_webconfig_for_decode(ext_data, config)) {
++        ONEWIFI_LOG_ERROR("AP: webconfig init failed"); return;
++    }
++    webconfig_error_t rc = safe_webconfig_decode(&config, json_str, &ext_data, &type);
++    if (rc != webconfig_error_none) {
++        ONEWIFI_LOG_ERROR("AP: decode failed type=%d error=%d", type, rc); return;
++    }
++
++    ONEWIFI_LOG_DEBUG("AP: decoded subdoc type=%d radios=%u bss=%u",
++                      type, m_data_model->get_num_radios(), m_data_model->get_num_bss());
++
++    // Update radio info for DML/radio subdocs
++    if (type == webconfig_subdoc_type_dml || type == webconfig_subdoc_type_radio ||
++        type == webconfig_subdoc_type_radio_24G || type == webconfig_subdoc_type_radio_5G ||
++        type == webconfig_subdoc_type_radio_6G) {
++        if (m_data_model->get_num_radios() > 0) {
++            update_radio_info_from_data_model();
++            ONEWIFI_LOG_INFO("AP: radio info updated for subdoc type=%d", type);
++        }
++    }
+ }
+ 
+ bool ap_wlan_hal_onewifi::enable()
+@@ -41,8 +394,172 @@ bool ap_wlan_hal_onewifi::set_start_disabled(bool enable, int vap_id)
+ 
+ bool ap_wlan_hal_onewifi::set_channel(int chan, beerocks::eWiFiBandwidth bw, int center_channel)
+ {
+-    // TODO: Set channel via OneWifi Rbus
+-    return true;
++    ONEWIFI_LOG_INFO("set_channel: chan=%d bw=%d center_freq=%d", chan, bw, center_channel);
++
++    // Update local radio info
++    m_radio_info.channel = chan;
++    m_radio_info.bandwidth = bw;
++    m_radio_info.vht_center_freq = center_channel;
++
++    // Update the data model with new channel configuration
++    // Channel is stored in the current operating class entry
++    if (m_data_model->get_num_radios() == 0) {
++        ONEWIFI_LOG_ERROR("No radio info available in data model");
++        return false;
++    }
++
++    em_radio_info_t *radio_info = m_data_model->get_radio_info(0);
++    if (!radio_info) {
++        ONEWIFI_LOG_ERROR("Failed to get radio info from data model");
++        return false;
++    }
++
++    // Get MAC address from interface name (matching OneWifi's mac_address_from_name logic)
++    // OneWifi uses: mac_address_from_name(radio_iface_map->interface_name, em_op_class_info->id.ruid)
++    // So we must compare against the MAC derived from the interface name, not radio_info->intf.mac
++    mac_address_t iface_mac;
++    std::string mac_str;
++    if (!beerocks::net::network_utils::linux_iface_get_mac(get_iface_name(), mac_str)) {
++        ONEWIFI_LOG_ERROR("Failed to get MAC from interface %s", get_iface_name().c_str());
++        return false;
++    }
++    
++    // Convert MAC string to mac_address_t for comparison
++    // Use tlvf::mac_from_string which converts string to byte array
++    tlvf::mac_from_string(iface_mac, mac_str);
++    
++    // Debug: Log interface MAC for comparison
++    ONEWIFI_LOG_INFO("Interface %s MAC: %02x:%02x:%02x:%02x:%02x:%02x",
++                     get_iface_name().c_str(),
++                     iface_mac[0], iface_mac[1], iface_mac[2],
++                     iface_mac[3], iface_mac[4], iface_mac[5]);
++    
++    // Find and update ALL current operating classes with new channel and bandwidth
++    // CRITICAL FIX: There may be multiple current operating classes (type=1) for the same radio
++    // We must update ALL of them, not just the first one, because the encoder may read from any of them
++    int updated_count = 0;
++    for (unsigned int i = 0; i < m_data_model->get_num_op_class(); i++) {
++        em_op_class_info_t *op_class = m_data_model->get_op_class_info(i);
++        if (op_class && op_class->id.type == em_op_class_type_current) {
++            // Debug: Log operating class RUID for comparison
++            ONEWIFI_LOG_INFO("OpClass[%u] RUID: %02x:%02x:%02x:%02x:%02x:%02x (type=%d)",
++                             i,
++                             op_class->id.ruid[0], op_class->id.ruid[1], op_class->id.ruid[2],
++                             op_class->id.ruid[3], op_class->id.ruid[4], op_class->id.ruid[5],
++                             op_class->id.type);
++        }
++        
++        if (op_class && op_class->id.type == em_op_class_type_current &&
++            memcmp(op_class->id.ruid, iface_mac, sizeof(mac_address_t)) == 0) {
++            // Update channel in current operating class
++            op_class->channel = chan;
++            
++            // Update operating class number based on bandwidth (if needed)
++            unsigned int new_op_class = op_class->op_class;
++            
++            // Map bandwidth to appropriate operating class for the frequency band
++            if (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_24G) {
++                switch (bw) {
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_20:
++                        new_op_class = 81;
++                        break;
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_40:
++                        new_op_class = 83;
++                        break;
++                    default:
++                        new_op_class = 81;
++                        break;
++                }
++            } else if (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_5G) {
++                switch (bw) {
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_20:
++                        new_op_class = 115;
++                        break;
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_40:
++                        new_op_class = 116;
++                        break;
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_80:
++                        new_op_class = 128;
++                        break;
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_160:
++                        new_op_class = 129;
++                        break;
++                    default:
++                        break;
++                }
++            } else if (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_6G) {
++                switch (bw) {
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_20:
++                        new_op_class = 131;
++                        break;
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_40:
++                        new_op_class = 132;
++                        break;
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_80:
++                        new_op_class = 133;
++                        break;
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_160:
++                        new_op_class = 134;
++                        break;
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_320:
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_320_1:
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_320_2:
++                        new_op_class = 137;
++                        break;
++                    default:
++                        break;
++                }
++            }
++            
++            if (new_op_class != op_class->op_class) {
++                op_class->op_class = new_op_class;
++                op_class->id.op_class = new_op_class;
++                ONEWIFI_LOG_INFO("Updated current op_class[%u] to %u for bandwidth %d", 
++                                 i, new_op_class, static_cast<int>(bw));
++            }
++            
++            updated_count++;
++            ONEWIFI_LOG_INFO("Updated current op_class[%u]: class=%u channel=%d", 
++                             i, op_class->op_class, chan);
++            // DO NOT break - continue to update ALL current operating classes
++        }
++    }
++
++    if (updated_count == 0) {
++        ONEWIFI_LOG_WARN("No current operating class found, channel update may not take effect");
++    } else {
++        ONEWIFI_LOG_INFO("Updated %d current operating class entries with new channel", updated_count);
++    }
++
++    // Map frequency band to em_freq_band_t for subdoc type determination
++    em_freq_band_t freq_band;
++    if (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_24G) {
++        freq_band = em_freq_band_24;
++    } else if (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_5G) {
++        freq_band = em_freq_band_5;
++    } else if (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_6G) {
++        freq_band = em_freq_band_60;
++    } else {
++        ONEWIFI_LOG_ERROR("Unknown frequency band: %d", m_radio_info.frequency_band);
++        return false;
++    }
++
++    // Get subdoc type using helper function
++    webconfig_subdoc_type_t subdoc_type = get_subdoc_radio_type_for_freq(freq_band);
++
++    ONEWIFI_LOG_INFO("Sending Radio subdoc (type=%d) with channel=%d bw=%d to OneWifi", 
++                     subdoc_type, chan, static_cast<int>(bw));
++
++    // Send radio configuration to OneWifi via webconfig encoding
++    bool result = refresh_onewifi_subdoc("Radio", subdoc_type, nullptr, nullptr);
++
++    if (result) {
++        ONEWIFI_LOG_INFO("Successfully set channel %d on radio %s", chan, get_iface_name().c_str());
++    } else {
++        ONEWIFI_LOG_ERROR("Failed to set channel %d on radio %s", chan, get_iface_name().c_str());
++    }
++
++    return result;
+ }
+ 
+ bool ap_wlan_hal_onewifi::sta_allow(const sMacAddr &mac, const sMacAddr &bssid)
+@@ -80,8 +597,490 @@ bool ap_wlan_hal_onewifi::update_vap_credentials(
+     const std::string &backhaul_wps_ssid, const std::string &backhaul_wps_passphrase,
+     const std::string &bridge_ifname)
+ {
+-    // TODO: Update credentials via OneWifi Rbus
+-    return true;
++    ONEWIFI_LOG_INFO("update_vap_credentials: radio=%s num_bss=%zu", 
++                     get_iface_name().c_str(), bss_info_conf_list.size());
++
++    // Update available VAPs in m_radio_info for subsequent get_vap_status calls
++    // NOTE: In OneWifi/RDK, VAP interfaces use the base radio interface name directly
++    // (e.g., wlan0, wlan1, wlan6) not sub-interfaces (e.g., wlan0.0)
++    // The actual interface names will be updated later from OneWifi DML data
++    m_radio_info.available_vaps.clear();
++    int vap_id = 0;
++
++    for (const auto &bss_info_conf : bss_info_conf_list) {
++        if (bss_info_conf.teardown) {
++            continue;
++        }
++
++        VAPElement vap_elem = {};
++        vap_elem.mac = tlvf::mac_to_string(bss_info_conf.bssid);
++        // Use base radio interface name directly (e.g., wlan0) instead of sub-interface (e.g., wlan0.0)
++        // This matches the actual OneWifi/RDK interface naming convention
++        vap_elem.bss = m_radio_info.iface_name;
++
++        if (bss_info_conf.backhaul) {
++            vap_elem.ssid = backhaul_wps_ssid;
++            vap_elem.profile1_backhaul_sta_association_disallowed =
++                bss_info_conf.profile1_backhaul_sta_association_disallowed;
++            vap_elem.profile2_backhaul_sta_association_disallowed =
++                bss_info_conf.profile2_backhaul_sta_association_disallowed;
++        } else {
++            vap_elem.ssid = bss_info_conf.ssid;
++        }
++
++        vap_elem.fronthaul = bss_info_conf.fronthaul;
++        vap_elem.backhaul  = bss_info_conf.backhaul;
++
++        m_radio_info.available_vaps[vap_id++] = vap_elem;
++    }
++
++    // Build M2 control radio config structure for OneWifi
++    m2ctrl_radioconfig m2_cfg = {};
++    int bss_idx = 0;
++
++    for (const auto &bss_info : bss_info_conf_list) {
++        if (bss_idx >= EM_MAX_BSS_PER_RADIO) {
++            ONEWIFI_LOG_ERROR("Exceeded maximum number of BSS per radio (%d)", EM_MAX_BSS_PER_RADIO);
++            break;
++        }
++
++        // Skip teardown entries
++        if (bss_info.teardown) {
++            ONEWIFI_LOG_DEBUG("Skipping BSS with teardown flag set");
++            continue;
++        }
++
++        // Copy SSID - use backhaul WPS SSID for backhaul VAPs
++        const std::string &ssid = bss_info.backhaul ? backhaul_wps_ssid : bss_info.ssid;
++
++        // Skip entries with empty SSID
++        if (ssid.empty()) {
++            ONEWIFI_LOG_DEBUG("Skipping BSS with empty SSID");
++            continue;
++        }
++        beerocks::string_utils::copy_string(m2_cfg.ssid[bss_idx], ssid.c_str(),
++                                            sizeof(m2_cfg.ssid[bss_idx]));
++
++        // Copy password/network key - use backhaul WPS passphrase for backhaul VAPs
++        const std::string &password = bss_info.backhaul ? backhaul_wps_passphrase : bss_info.network_key;
++        beerocks::string_utils::copy_string(m2_cfg.password[bss_idx], password.c_str(),
++                                            sizeof(m2_cfg.password[bss_idx]));
++
++        // Always use WPA3 Personal security mode for M2 flow
++        // OneWifi security mode: wifi_security_mode_wpa3_personal = 0x00000200
++        m2_cfg.authtype[bss_idx] = 0x00000200;
++
++        // Set enable/disable based on teardown flag
++        m2_cfg.enable[bss_idx] = bss_info.teardown ? 0 : 1;
++
++        // Set haul type
++        if (bss_info.backhaul) {
++            m2_cfg.haultype[bss_idx] = em_haul_type_backhaul;
++        } else if (bss_info.fronthaul) {
++            m2_cfg.haultype[bss_idx] = em_haul_type_fronthaul;
++        } else {
++            m2_cfg.haultype[bss_idx] = em_haul_type_fronthaul; // Default to fronthaul
++        }
++
++        ONEWIFI_LOG_DEBUG("BSS[%d]: ssid=%s auth=%u enable=%u haul=%u", 
++                          bss_idx, m2_cfg.ssid[bss_idx], m2_cfg.authtype[bss_idx],
++                          m2_cfg.enable[bss_idx], m2_cfg.haultype[bss_idx]);
++
++        bss_idx++;
++    }
++
++    m2_cfg.noofbssconfig = bss_idx;
++
++    if (bss_idx == 0) {
++        ONEWIFI_LOG_WARN("No BSS configurations to apply");
++        return true;
++    }
++
++    // Use refresh_onewifi_subdoc to encode and send VAP configuration to OneWifi
++    // Determine subdoc type based on radio frequency band
++    webconfig_subdoc_type_t subdoc_type;
++    const char *subdoc_name;
++
++    if (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_24G) {
++        subdoc_type = webconfig_subdoc_type_vap_24G;
++        subdoc_name = "VAP_2.4G";
++    } else if (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_5G) {
++        subdoc_type = webconfig_subdoc_type_vap_5G;
++        subdoc_name = "VAP_5G";
++    } else if (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_6G) {
++        subdoc_type = webconfig_subdoc_type_vap_6G;
++        subdoc_name = "VAP_6G";
++    } else {
++        ONEWIFI_LOG_ERROR("Unknown frequency band: %d", m_radio_info.frequency_band);
++        return false;
++    }
++
++    ONEWIFI_LOG_INFO("Sending %s subdoc with %d BSS configurations to OneWifi", 
++                     subdoc_name, bss_idx);
++
++    // Send configuration to OneWifi via webconfig encoding and bus
++    bool result = refresh_onewifi_subdoc(subdoc_name, subdoc_type, &m2_cfg, nullptr);
++
++    if (result) {
++        ONEWIFI_LOG_INFO("Successfully updated VAP credentials for radio %s", 
++                         get_iface_name().c_str());
++    } else {
++        ONEWIFI_LOG_ERROR("Failed to update VAP credentials for radio %s", 
++                          get_iface_name().c_str());
++    }
++
++    return result;
++}
++
++bool ap_wlan_hal_onewifi::refresh_onewifi_subdoc(const char *logname, webconfig_subdoc_type_t type,
++                                                 m2ctrl_radioconfig *m2_cfg,
++                                                 void *policy_config)
++{
++    ONEWIFI_LOG_INFO("refresh_onewifi_subdoc: %s type=%d", logname, type);
++
++    // Check and open bus connection if needed (reuses existing connection if already open)
++    //if (!check_and_open_bus()) {
++    //    ONEWIFI_LOG_ERROR("Failed to open bus connection");
++    //    return false;
++    //}
++
++    // Get bus descriptor for sending data
++    wifi_bus_desc_t *desc = get_bus_descriptor();
++    if (!desc) {
++        ONEWIFI_LOG_ERROR("Bus descriptor is NULL, cannot send subdoc");
++        return false;
++    }
++    // Initialize webconfig for encoding
++    webconfig_external_easymesh_t ext_data;
++    webconfig_t config;
++    memset(&ext_data, 0, sizeof(webconfig_external_easymesh_t));
++    memset(&config, 0, sizeof(webconfig_t));
++    
++    // Note: For encoding (not decoding), we need to pass m2_cfg and policy_config
++    // So we can't use init_webconfig_for_decode() directly. Instead, we initialize
++    // the protocol with the encode-specific parameters, then init the config.
++    webconfig_proto_easymesh_init(&ext_data,
++                                  m_data_model.get(),
++                                  m2_cfg,
++                                  policy_config,
++                                  onewifi_data_model_t::get_num_radios,
++                                  onewifi_data_model_t::set_num_radios,
++                                  onewifi_data_model_t::get_num_op_class,
++                                  onewifi_data_model_t::set_num_op_class,
++                                  onewifi_data_model_t::get_num_bss,
++                                  onewifi_data_model_t::set_num_bss,
++                                  onewifi_data_model_t::get_device_info,
++                                  onewifi_data_model_t::get_network_info,
++                                  onewifi_data_model_t::get_radio_info,
++                                  onewifi_data_model_t::get_ieee_1905_security_info,
++                                  onewifi_data_model_t::get_bss_info,
++                                  onewifi_data_model_t::get_op_class_info,
++                                  onewifi_data_model_t::get_first_sta_info,
++                                  onewifi_data_model_t::get_next_sta_info,
++                                  onewifi_data_model_t::get_sta_info,
++                                  onewifi_data_model_t::put_sta_info,
++                                  onewifi_data_model_t::get_bss_info_with_mac,
++                                  onewifi_data_model_t::put_scan_results,
++                                  onewifi_data_model_t::update_ap_mld_info,
++                                  onewifi_data_model_t::update_bsta_mld_info,
++                                  onewifi_data_model_t::update_assoc_sta_mld_info,
++                                  onewifi_data_model_t::get_ap_mld_frm_bssid,
++                                  onewifi_data_model_t::get_radio_cap_info);
++    
++    config.initializer = webconfig_initializer_onewifi;
++    config.apply_data  = webconfig_dummy_apply;
++
++    if (webconfig_init(&config) != webconfig_error_none) {
++        ONEWIFI_LOG_ERROR("Failed to initialize webconfig");
++        return false;
++    }
++
++    // Encode M2 configuration to OneWifi format
++    char *encoded_str = nullptr;
++    ONEWIFI_LOG_INFO("Calling webconfig_easymesh_encode for type=%d", type);
++    webconfig_error_t encode_result = webconfig_easymesh_encode(&config, &ext_data, type, &encoded_str);
++    if (encode_result != webconfig_error_none) {
++        ONEWIFI_LOG_ERROR("Failed to encode webconfig subdoc: type=%d error=%d", type, encode_result);
++        ONEWIFI_LOG_ERROR("Data model state: num_radios=%u num_bss=%u", 
++                          m_data_model->get_num_radios(), m_data_model->get_num_bss());
++        return false;
++    }
++
++    ONEWIFI_LOG_INFO("Subdoc encode success, length=%zu", strlen(encoded_str));
++
++    // Prepare bus data
++    raw_data_t l_bus_data = {};
++    memset(&l_bus_data, 0, sizeof(raw_data_t));
++    l_bus_data.data_type      = bus_data_type_string;
++    l_bus_data.raw_data.bytes = encoded_str;
++    if (encoded_str != nullptr) {
++        l_bus_data.raw_data_len   = strlen(encoded_str);
++    }
++
++    // Send to OneWifi via bus
++    ONEWIFI_LOG_INFO("Sending subdoc to OneWifi via %s", WIFI_WEBCONFIG_DOC_DATA_SOUTH);
++    ONEWIFI_LOG_DEBUG("Subdoc data: type=%d len=%u", l_bus_data.data_type, l_bus_data.raw_data_len);
++    ONEWIFI_LOG_DEBUG("Subdoc content (first 500 chars): %.500s", encoded_str);
++    
++    // Error 11 means invalid bus handle - verify and log bus handle state
++    ONEWIFI_LOG_DEBUG("About to call bus_set_fn with bus_hdl, state=%d", static_cast<int>(get_state()));
++    
++    int bus_result = desc->bus_set_fn(m_bus_hdl_ptr, WIFI_WEBCONFIG_DOC_DATA_SOUTH, &l_bus_data);
++    bool success = (bus_result == 0);
++
++    if (success) {
++        ONEWIFI_LOG_INFO("Successfully sent %s subdoc to OneWifi", logname);
++    } else {
++        ONEWIFI_LOG_ERROR("Failed to send %s subdoc to OneWifi, bus_set_fn returned: %d", logname, bus_result);
++        ONEWIFI_LOG_ERROR("Bus state: %d, descriptor valid: %s", 
++                          static_cast<int>(get_state()),
++                          desc ? "yes" : "no");
++    }
++
++    return success;
++}
++
++
++void ap_wlan_hal_onewifi::on_sta_assoc_data(const char *json_str, unsigned int len)
++{
++    if (!json_str || len == 0) return;
++
++    ONEWIFI_LOG_DEBUG("on_sta_assoc_data: received STA association data from OneWifi");
++
++    webconfig_external_easymesh_t ext_data = {};
++    webconfig_t config = {};
++    if (!init_webconfig_for_decode(ext_data, config)) {
++        ONEWIFI_LOG_ERROR("on_sta_assoc_data: webconfig init failed");
++        return;
++    }
++
++    webconfig_subdoc_type_t type = webconfig_subdoc_type_associated_clients;
++    if (safe_webconfig_decode(&config, json_str, &ext_data, &type) != webconfig_error_none) {
++        ONEWIFI_LOG_ERROR("on_sta_assoc_data: safe_webconfig_decode failed");
++        return;
++    }
++
++    ONEWIFI_LOG_DEBUG("on_sta_assoc_data: decoded STA association data successfully");
++
++    // Iterate all associated STAs and push STA_Connected / STA_Disconnected
++    em_sta_info_t *sta = m_data_model->get_first_sta_info(em_target_sta_map_assoc);
++    while (sta) {
++        em_bss_info_t *bss = m_data_model->get_bss_info_with_mac(sta->bssid);
++        if (!bss) {
++            sta = m_data_model->get_next_sta_info(sta, em_target_sta_map_assoc);
++            continue;
++        }
++
++        int8_t vap_id = get_vap_id_with_bss(std::string(bss->bssid.name));
++        if (vap_id < 0) {
++            sta = m_data_model->get_next_sta_info(sta, em_target_sta_map_assoc);
++            continue;
++        }
++
++        if (sta->associated) {
++            auto msg_buff =
++                ALLOC_SMART_BUFFER(sizeof(sACTION_APMANAGER_CLIENT_ASSOCIATED_NOTIFICATION));
++            auto msg = reinterpret_cast<sACTION_APMANAGER_CLIENT_ASSOCIATED_NOTIFICATION *>(
++                msg_buff.get());
++            LOG_IF(!msg, FATAL) << "Memory allocation failed!";
++            memset(msg_buff.get(), 0, sizeof(sACTION_APMANAGER_CLIENT_ASSOCIATED_NOTIFICATION));
++
++            memcpy(msg->params.mac.oct, sta->id, sizeof(mac_address_t));
++            memcpy(msg->params.bssid.oct, sta->bssid, sizeof(mac_address_t));
++            msg->params.vap_id = vap_id;
++
++            // Copy raw association frame body if present
++            if (sta->frame_body_len > 0 &&
++                sta->frame_body_len <= beerocks::message::ASSOCIATION_MAX_LENGTH) {
++                memcpy(msg->params.association_frame, sta->frame_body, sta->frame_body_len);
++                msg->params.association_frame_length = sta->frame_body_len;
++
++                // Parse capabilities from the association frame
++                auto assoc_frame = assoc_frame::AssocReqFrame::parse(
++                    msg->params.association_frame, msg->params.association_frame_length,
++                    assoc_frame::AssocReqFrame::ASSOCIATION_REQUEST);
++                if (assoc_frame) {
++                    son::assoc_frame_utils::get_station_capabilities_from_assoc_frame(
++                        assoc_frame, msg->params.capabilities);
++                }
++            }
++
++            event_queue_push(static_cast<int>(Event::STA_Connected), msg_buff);
++            ONEWIFI_LOG_DEBUG("Pushed STA_Connected (assoc_data) vap_id=%d", int(vap_id));
++        } else {
++            auto msg_buff =
++                ALLOC_SMART_BUFFER(sizeof(sACTION_APMANAGER_CLIENT_DISCONNECTED_NOTIFICATION));
++            auto msg = reinterpret_cast<sACTION_APMANAGER_CLIENT_DISCONNECTED_NOTIFICATION *>(
++                msg_buff.get());
++            LOG_IF(!msg, FATAL) << "Memory allocation failed!";
++            memset(msg_buff.get(), 0, sizeof(sACTION_APMANAGER_CLIENT_DISCONNECTED_NOTIFICATION));
++
++            memcpy(msg->params.mac.oct, sta->id, sizeof(mac_address_t));
++            msg->params.vap_id = vap_id;
++            msg->params.reason = 0;
++            msg->params.source = 0;
++            msg->params.type   = 0;
++
++            event_queue_push(static_cast<int>(Event::STA_Disconnected), msg_buff);
++            ONEWIFI_LOG_DEBUG("Pushed STA_Disconnected (assoc_data) vap_id=%d", int(vap_id));
++        }
++
++        sta = m_data_model->get_next_sta_info(sta, em_target_sta_map_assoc);
++    }
++}
++
++void ap_wlan_hal_onewifi::on_ap_metrics_data(const char *json_str, unsigned int len)
++{
++    if (!json_str || len == 0) return;
++
++    ONEWIFI_LOG_DEBUG("on_ap_metrics_data: received AP metrics report from OneWifi (len=%u)", len);
++
++    webconfig_external_easymesh_t ext_data = {};
++    webconfig_t config = {};
++    if (!init_webconfig_for_decode(ext_data, config)) {
++        ONEWIFI_LOG_ERROR("on_ap_metrics_data: webconfig init failed");
++        return;
++    }
++
++    // Use em_ap_metrics_report subdoc type to decode radio + BSS + STA stats
++    webconfig_subdoc_type_t type = webconfig_subdoc_type_em_ap_metrics_report;
++    if (safe_webconfig_decode(&config, json_str, &ext_data, &type) != webconfig_error_none) {
++        ONEWIFI_LOG_ERROR("on_ap_metrics_data: safe_webconfig_decode failed");
++        return;
++    }
++
++    // Extract decoded report and update m_radio_info so Monitor HAL can read:
++    //   - Radio stats via update_radio_stats()  → m_radio_info.noise/utilization/transmit/receive
++    //   - BSS stats via update_vap_stats()      → m_radio_info.available_vaps (tx/rx bytes)
++    //   - STA stats via update_stations_stats() → data model STA entries
++  
++
++    ONEWIFI_LOG_INFO("on_ap_metrics_data: updated data model with AP metrics");
++}
++
++void ap_wlan_hal_onewifi::on_channel_scan_data(const char *json_str, unsigned int len)
++{
++    if (!json_str || len == 0) return;
++
++    ONEWIFI_LOG_DEBUG("on_channel_scan_data: received channel scan results from OneWifi (len=%u)", len);
++
++    webconfig_external_easymesh_t ext_data = {};
++    webconfig_t config = {};
++    if (!init_webconfig_for_decode(ext_data, config)) {
++        ONEWIFI_LOG_ERROR("on_channel_scan_data: webconfig init failed");
++        return;
++    }
++
++    webconfig_subdoc_type_t type = webconfig_subdoc_type_em_channel_stats;
++    if (safe_webconfig_decode(&config, json_str, &ext_data, &type) != webconfig_error_none) {
++        ONEWIFI_LOG_ERROR("on_channel_scan_data: safe_webconfig_decode failed");
++        return;
++    }
++
++    ONEWIFI_LOG_INFO("on_channel_scan_data: decoded channel scan results into data model (num_scan_results=%zu)",
++                     m_data_model->get_num_scan_results());
++
++    // Emit one Channel_Scan_New_Results_Ready per neighbor entry, then Channel_Scan_Finished
++    for (size_t r = 0; r < m_data_model->get_num_scan_results(); r++) {
++        em_scan_result_t *scan = m_data_model->get_scan_result(r);
++        if (!scan) continue;
++
++        for (int n = 0; n < scan->num_neighbors && n < EM_MAX_NEIGHBORS; n++) {
++            auto msg_buff = ALLOC_SMART_BUFFER(sizeof(sCHANNEL_SCAN_RESULTS_NOTIFICATION));
++            auto msg = reinterpret_cast<sCHANNEL_SCAN_RESULTS_NOTIFICATION *>(msg_buff.get());
++            LOG_IF(!msg, FATAL) << "Memory allocation failed!";
++            new (msg) sCHANNEL_SCAN_RESULTS_NOTIFICATION();
++
++            auto &res = msg->channel_scan_results;
++
++            strlcpy(res.ssid, scan->neighbor[n].ssid, sizeof(res.ssid));
++            memcpy(res.bssid.oct, scan->neighbor[n].bssid, sizeof(mac_address_t));
++            res.channel             = scan->id.channel;
++            res.signal_strength_dBm = static_cast<int32_t>(scan->neighbor[n].signal_strength);
++            res.noise_dBm           = static_cast<int32_t>(scan->noise);
++            res.utilization         = scan->util;
++            res.channel_utilization = scan->neighbor[n].channel_util;
++            res.station_count       = scan->neighbor[n].sta_count;
++
++            switch (scan->neighbor[n].bandwidth) {
++            case WIFI_CHANNELBANDWIDTH_20MHZ:
++                res.operating_channel_bandwidth =
++                    eChannelScanResultChannelBandwidth::eChannel_Bandwidth_20MHz;
++                break;
++            case WIFI_CHANNELBANDWIDTH_40MHZ:
++                res.operating_channel_bandwidth =
++                    eChannelScanResultChannelBandwidth::eChannel_Bandwidth_40MHz;
++                break;
++            case WIFI_CHANNELBANDWIDTH_80MHZ:
++                res.operating_channel_bandwidth =
++                    eChannelScanResultChannelBandwidth::eChannel_Bandwidth_80MHz;
++                break;
++            case WIFI_CHANNELBANDWIDTH_160MHZ:
++                res.operating_channel_bandwidth =
++                    eChannelScanResultChannelBandwidth::eChannel_Bandwidth_160MHz;
++                break;
++            default:
++                res.operating_channel_bandwidth =
++                    eChannelScanResultChannelBandwidth::eChannel_Bandwidth_NA;
++                break;
++            }
++
++            event_queue_push(static_cast<int>(bwl::mon_wlan_hal::Event::Channel_Scan_New_Results_Ready), msg_buff);
++            ONEWIFI_LOG_DEBUG("on_channel_scan_data: Pushed Channel_Scan_New_Results_Ready ch=%u ssid=%s",
++                              res.channel, res.ssid);
++        }
++    }
++
++    event_queue_push(static_cast<int>(bwl::mon_wlan_hal::Event::Channel_Scan_Finished));
++    ONEWIFI_LOG_INFO("on_channel_scan_data: Pushed Channel_Scan_Finished");
++}
++
++void ap_wlan_hal_onewifi::on_beacon_report_data(const char *json_str, unsigned int len)
++{
++    if (!json_str || len == 0) return;
++
++    ONEWIFI_LOG_DEBUG("on_beacon_report_data: received beacon report from OneWifi");
++
++    webconfig_external_easymesh_t ext_data = {};
++    webconfig_t config = {};
++    if (!init_webconfig_for_decode(ext_data, config)) {
++        ONEWIFI_LOG_ERROR("on_beacon_report_data: webconfig init failed");
++        return;
++    }
++
++    webconfig_subdoc_type_t type = webconfig_subdoc_type_beacon_report;
++    if (safe_webconfig_decode(&config, json_str, &ext_data, &type) != webconfig_error_none) {
++        ONEWIFI_LOG_ERROR("on_beacon_report_data: safe_webconfig_decode failed");
++        return;
++    }
++
++    // Beacon report events are pushed by the Monitor HAL (on_beacon_report_data in
++    // mon_wlan_hal_onewifi.cpp). The AP HAL only decodes into m_data_model.
++    ONEWIFI_LOG_DEBUG("on_beacon_report_data: decoded beacon report into data model");
++}
++
++void ap_wlan_hal_onewifi::on_sta_link_metrics_data(const char *json_str, unsigned int len)
++{
++    if (!json_str || len == 0) return;
++
++    ONEWIFI_LOG_DEBUG("on_sta_link_metrics_data: received STA link metrics from OneWifi");
++
++    webconfig_external_easymesh_t ext_data = {};
++    webconfig_t config = {};
++    if (!init_webconfig_for_decode(ext_data, config)) {
++        ONEWIFI_LOG_ERROR("on_sta_link_metrics_data: webconfig init failed");
++        return;
++    }
++
++    webconfig_subdoc_type_t type = webconfig_subdoc_type_em_sta_link_metrics;
++   if (safe_webconfig_decode(&config, json_str, &ext_data, &type) != webconfig_error_none) {
++        ONEWIFI_LOG_ERROR("on_sta_link_metrics_data: safe_webconfig_decode failed");
++        return;
++    }
++
++    // STA link metrics are polled by the monitor via update_stations_stats().
++    // Decoding into m_data_model is sufficient — no event push needed.
++    ONEWIFI_LOG_DEBUG("on_sta_link_metrics_data: decoded STA link metrics into data model");
+ }
+ 
+ bool ap_wlan_hal_onewifi::sta_unassoc_rssi_measurement(const std::string &mac, int chan,
+@@ -96,8 +1095,174 @@ bool ap_wlan_hal_onewifi::sta_unassoc_rssi_measurement(const std::string &mac, i
+ bool ap_wlan_hal_onewifi::switch_channel(int chan, beerocks::eWiFiBandwidth bw,
+                                          int vht_center_frequency, int csa_beacon_count)
+ {
+-    // TODO: Switch channel with CSA
+-    return true;
++    ONEWIFI_LOG_INFO("switch_channel: chan=%d bw=%d center_freq=%d csa_count=%d",
++                     chan, static_cast<int>(bw), vht_center_frequency, csa_beacon_count);
++
++    // Update m_radio_info with new channel parameters
++    m_radio_info.channel = chan;
++    m_radio_info.bandwidth = bw;
++    m_radio_info.vht_center_freq = vht_center_frequency;
++    m_radio_info.last_csa_sw_reason = ChanSwReason::Unknown;
++
++    // Update the data model with new channel configuration for CSA
++    if (m_data_model->get_num_radios() == 0) {
++        ONEWIFI_LOG_ERROR("No radio info available in data model");
++        return false;
++    }
++
++    em_radio_info_t *radio_info = m_data_model->get_radio_info(0);
++    if (!radio_info) {
++        ONEWIFI_LOG_ERROR("Failed to get radio info from data model");
++        return false;
++    }
++
++    // Get MAC address from interface name (matching OneWifi's mac_address_from_name logic)
++    mac_address_t iface_mac_csa;
++    std::string mac_str_csa;
++    if (!beerocks::net::network_utils::linux_iface_get_mac(get_iface_name(), mac_str_csa)) {
++        ONEWIFI_LOG_ERROR("CSA: Failed to get MAC from interface %s", get_iface_name().c_str());
++        return false;
++    }
++    
++    // Convert MAC string to mac_address_t for comparison
++    tlvf::mac_from_string(iface_mac_csa, mac_str_csa);
++    
++    // Debug: Log interface MAC for comparison (CSA)
++    ONEWIFI_LOG_INFO("CSA Interface %s MAC: %02x:%02x:%02x:%02x:%02x:%02x",
++                     get_iface_name().c_str(),
++                     iface_mac_csa[0], iface_mac_csa[1], iface_mac_csa[2],
++                     iface_mac_csa[3], iface_mac_csa[4], iface_mac_csa[5]);
++    
++    // Find and update ALL current operating classes with new channel and bandwidth for CSA
++    // CRITICAL FIX: There may be multiple current operating classes (type=1) for the same radio
++    // We must update ALL of them, not just the first one, because the encoder may read from any of them
++    int updated_count = 0;
++    for (unsigned int i = 0; i < m_data_model->get_num_op_class(); i++) {
++        em_op_class_info_t *op_class = m_data_model->get_op_class_info(i);
++        if (op_class && op_class->id.type == em_op_class_type_current) {
++            // Debug: Log operating class RUID for comparison (CSA)
++            ONEWIFI_LOG_INFO("CSA OpClass[%u] RUID: %02x:%02x:%02x:%02x:%02x:%02x (type=%d)",
++                             i,
++                             op_class->id.ruid[0], op_class->id.ruid[1], op_class->id.ruid[2],
++                             op_class->id.ruid[3], op_class->id.ruid[4], op_class->id.ruid[5],
++                             op_class->id.type);
++        }
++        
++        if (op_class && op_class->id.type == em_op_class_type_current &&
++            memcmp(op_class->id.ruid, iface_mac_csa, sizeof(mac_address_t)) == 0) {
++            // Update channel in current operating class for CSA
++            op_class->channel = chan;
++            
++            // Update operating class number based on bandwidth (if needed)
++            unsigned int new_op_class = op_class->op_class;
++            
++            // Map bandwidth to appropriate operating class for the frequency band
++            if (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_24G) {
++                switch (bw) {
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_20:
++                        new_op_class = 81;
++                        break;
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_40:
++                        new_op_class = 83;
++                        break;
++                    default:
++                        new_op_class = 81;
++                        break;
++                }
++            } else if (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_5G) {
++                switch (bw) {
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_20:
++                        new_op_class = 115;
++                        break;
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_40:
++                        new_op_class = 116;
++                        break;
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_80:
++                        new_op_class = 128;
++                        break;
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_160:
++                        new_op_class = 129;
++                        break;
++                    default:
++                        break;
++                }
++            } else if (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_6G) {
++                switch (bw) {
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_20:
++                        new_op_class = 131;
++                        break;
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_40:
++                        new_op_class = 132;
++                        break;
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_80:
++                        new_op_class = 133;
++                        break;
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_160:
++                        new_op_class = 134;
++                        break;
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_320:
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_320_1:
++                    case beerocks::eWiFiBandwidth::BANDWIDTH_320_2:
++                        new_op_class = 137;
++                        break;
++                    default:
++                        break;
++                }
++            }
++            
++            if (new_op_class != op_class->op_class) {
++                op_class->op_class = new_op_class;
++                op_class->id.op_class = new_op_class;
++                ONEWIFI_LOG_INFO("Updated current op_class[%u] to %u for bandwidth %d (CSA)", 
++                                 i, new_op_class, static_cast<int>(bw));
++            }
++            
++            updated_count++;
++            ONEWIFI_LOG_INFO("Updated current op_class[%u] for CSA: class=%u channel=%d", 
++                             i, op_class->op_class, op_class->channel);
++            // DO NOT break - continue to update ALL current operating classes
++        }
++    }
++
++    if (updated_count == 0) {
++        ONEWIFI_LOG_WARN("No current operating class found, CSA may not take effect");
++    } else {
++        ONEWIFI_LOG_INFO("Updated %d current operating class entries with new channel for CSA", updated_count);
++    }
++
++    // Map frequency band to em_freq_band_t for subdoc type determination
++    em_freq_band_t freq_band;
++    if (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_24G) {
++        freq_band = em_freq_band_24;
++    } else if (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_5G) {
++        freq_band = em_freq_band_5;
++    } else if (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_6G) {
++        freq_band = em_freq_band_60;
++    } else {
++        ONEWIFI_LOG_ERROR("Unknown frequency band: %d", m_radio_info.frequency_band);
++        return false;
++    }
++
++    // Get subdoc type using helper function
++    webconfig_subdoc_type_t subdoc_type = get_subdoc_radio_type_for_freq(freq_band);
++
++    ONEWIFI_LOG_INFO("Sending Radio subdoc (type=%d) for CSA: channel=%d bw=%d csa_count=%d", 
++                     subdoc_type, chan, static_cast<int>(bw), csa_beacon_count);
++
++    // Send radio configuration to OneWifi via webconfig encoding
++    bool result = refresh_onewifi_subdoc("Radio", subdoc_type, nullptr, nullptr);
++
++    if (result) {
++        ONEWIFI_LOG_INFO("Successfully initiated CSA to channel %d on radio %s",
++                         chan, get_iface_name().c_str());
++        
++        event_queue_push(static_cast<int>(bwl::ap_wlan_hal::Event::CSA_Finished));
++    } else {
++        ONEWIFI_LOG_ERROR("Failed to initiate CSA to channel %d on radio %s",
++                          chan, get_iface_name().c_str());
++    }
++
++    return result;
+ }
+ 
+ bool ap_wlan_hal_onewifi::cancel_cac(int chan, beerocks::eWiFiBandwidth bw, int vht_center_frequency,
+@@ -150,6 +1315,19 @@ bool ap_wlan_hal_onewifi::restricted_channels_get(char *channel_list)
+ 
+ bool ap_wlan_hal_onewifi::read_acs_report()
+ {
++    // Provide default valid rankings so that Channel Preference Report is populated.
++    // In a real implementation this should fetch data from the driver/Rbus
++    for (auto &pair : m_radio_info.channels_list) {
++        sChannelInfo &info  = pair.second;
++
++        for (auto &bw : info.bw_info_list) {
++            if (bw.first > m_radio_info.max_bandwidth) {
++                continue;
++            }
++            // rank 1 is a valid good rank
++            bw.second = 1;
++        }
++    }
+     return true;
+ }
+ 
+@@ -166,14 +1344,57 @@ bool ap_wlan_hal_onewifi::set_vap_enable(const std::string &iface_name, const bo
+ 
+ bool ap_wlan_hal_onewifi::get_vap_enable(const std::string &iface_name, bool &enable)
+ {
+-    enable = true;
+-    return true;
++    ONEWIFI_LOG_TRACE("%s iface_name=%s", __func__, iface_name.c_str());
++    return false;
+ }
+ 
+ bool ap_wlan_hal_onewifi::generate_connected_clients_events(
+     bool &is_finished_all_clients,
+     const std::chrono::steady_clock::time_point max_iteration_timeout)
+ {
++    // Re-enumerate currently connected STAs from the shared data model.
++    ONEWIFI_LOG_DEBUG("AP: generate_connected_clients_events: enumerating connected STAs from data model");
++
++    em_sta_info_t *sta = m_data_model->get_first_sta_info(em_target_sta_map_assoc);
++    while (sta) {
++        if (sta->associated) {
++            em_bss_info_t *bss = m_data_model->get_bss_info_with_mac(sta->bssid);
++            int8_t vap_id = (bss) ? get_vap_id_with_bss(std::string(bss->bssid.name)) : -1;
++            if (vap_id >= 0) {
++                auto msg_buff =
++                    ALLOC_SMART_BUFFER(sizeof(sACTION_APMANAGER_CLIENT_ASSOCIATED_NOTIFICATION));
++                auto msg = reinterpret_cast<sACTION_APMANAGER_CLIENT_ASSOCIATED_NOTIFICATION *>(
++                    msg_buff.get());
++                LOG_IF(!msg, FATAL) << "Memory allocation failed!";
++                memset(msg_buff.get(), 0, sizeof(sACTION_APMANAGER_CLIENT_ASSOCIATED_NOTIFICATION));
++
++                memcpy(msg->params.mac.oct, sta->id, sizeof(mac_address_t));
++                memcpy(msg->params.bssid.oct, sta->bssid, sizeof(mac_address_t));
++                msg->params.vap_id = vap_id;
++
++                // Copy association frame if present
++                if (sta->frame_body_len > 0 &&
++                    sta->frame_body_len <= beerocks::message::ASSOCIATION_MAX_LENGTH) {
++                    memcpy(msg->params.association_frame, sta->frame_body, sta->frame_body_len);
++                    msg->params.association_frame_length = sta->frame_body_len;
++
++                    auto assoc_frame = assoc_frame::AssocReqFrame::parse(
++                        msg->params.association_frame, msg->params.association_frame_length,
++                        assoc_frame::AssocReqFrame::ASSOCIATION_REQUEST);
++                    if (assoc_frame) {
++                        son::assoc_frame_utils::get_station_capabilities_from_assoc_frame(
++                            assoc_frame, msg->params.capabilities);
++                    }
++                }
++
++                event_queue_push(static_cast<int>(Event::STA_Connected), msg_buff);
++                ONEWIFI_LOG_DEBUG("AP: generate_connected_clients_events: pushed STA_Connected vap_id=%d",
++                                  int(vap_id));
++            }
++        }
++        sta = m_data_model->get_next_sta_info(sta, em_target_sta_map_assoc);
++    }
++
+     is_finished_all_clients = true;
+     return true;
+ }
+@@ -224,4 +1445,4 @@ std::shared_ptr<ap_wlan_hal> ap_wlan_hal_create(std::string iface_name, bwl::hal
+     return std::make_shared<onewifi::ap_wlan_hal_onewifi>(iface_name, callback, iface_config, hal_conf);
+ }
+ 
+-} // namespace bwl
++} // namespace bwl
+\ No newline at end of file
+-- 
+2.34.1
+
