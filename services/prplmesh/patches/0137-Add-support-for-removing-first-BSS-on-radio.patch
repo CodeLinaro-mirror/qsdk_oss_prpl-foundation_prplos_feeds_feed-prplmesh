@@ -1,0 +1,898 @@
+From d1e89e8f5cd650a39b70a53f5c97f9395a01a5d1 Mon Sep 17 00:00:00 2001
+From: Nirmal Raj S <nirm@qti.qualcomm.com>
+Date: Tue, 21 Apr 2026 11:00:54 +0530
+Subject: [PATCH] Add support for removing first BSS on radio and promoting
+ next BSS to primary interface
+
+[NLHAL] added custom_alias option in uci config based on vap_type received in m2
+
+Signed-off-by: Nirmal Raj S <nirm@qti.qualcomm.com>
+---
+ .../slave/tasks/ap_autoconfiguration_task.cpp |   4 -
+ .../bcl/include/bcl/son/son_wireless_utils.h  |   8 +
+ .../bcl/source/son/son_wireless_utils.cpp     |  15 +
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 291 ++++++++++++++----
+ .../platform/bpl/cfg/dm/bpl_cfg_wifi.cpp      |   7 +
+ .../platform/bpl/cfg/linux/bpl_cfg_wifi.cpp   |   7 +
+ framework/platform/bpl/cfg/rdk/bpl_cfg.cpp    |   8 +
+ .../platform/bpl/cfg/rdk/bpl_cfg_helper.cpp   |  27 +-
+ .../platform/bpl/cfg/rdk/bpl_cfg_helper.h     |   2 +-
+ framework/platform/bpl/cfg/uci/bpl_cfg.cpp    |   4 +-
+ .../platform/bpl/cfg/uci/bpl_cfg_helper.cpp   |  34 +-
+ .../platform/bpl/cfg/uci/bpl_cfg_helper.h     |   2 +-
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     | 124 +++++++-
+ framework/platform/bpl/include/bpl/bpl_cfg.h  |  15 +-
+ 14 files changed, 442 insertions(+), 106 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 4ed396117..ba4e7c3e7 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -3198,10 +3198,6 @@ bool ApAutoConfigurationTask::handle_bss_reconfiguration(
+             // Controller does not send BSSID -> pin to existing local BSSID.
+             it->payload_config.bssid = local_bss.mac;
+ 
+-            // Controller can't reconfigure local VAP type/label -> keep local.
+-            it->m2_config.vap_type  = local_bss.vap_type;
+-            it->m2_config.vap_label = local_bss.vap_label;
+-
+             if (is_bss_reconfiguration_required(local_bss, *it)) {
+                 LOG(DEBUG) << "BSS " << local_bss.mac << " needs reconfiguration.";
+                 reconfig_bss_list.emplace_back(std::move(*it));
+diff --git a/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h b/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
+index 107c6a66c..d11d01454 100644
+--- a/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
++++ b/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
+@@ -505,6 +505,14 @@ public:
+      **/
+     static eVapType string_to_vap_type(const std::string &type);
+ 
++    /*
++     * @brief Converts vap_type to string
++     *
++     * @param vap_type - the eVapType enum value.
++     * @return string - the string representation (e.g., "home", "guest").
++     **/
++    static std::string vap_type_to_string(eVapType vap_type);
++
+     /**
+      * @brief Get the vht central frequency object
+      * 
+diff --git a/common/beerocks/bcl/source/son/son_wireless_utils.cpp b/common/beerocks/bcl/source/son/son_wireless_utils.cpp
+index 289da5306..5dfed2d32 100644
+--- a/common/beerocks/bcl/source/son/son_wireless_utils.cpp
++++ b/common/beerocks/bcl/source/son/son_wireless_utils.cpp
+@@ -1822,6 +1822,21 @@ eVapType wireless_utils::string_to_vap_type(const std::string &type)
+     }
+ }
+ 
++std::string wireless_utils::vap_type_to_string(eVapType vap_type)
++{
++    switch (vap_type) {
++    case eVapType::HOME:     return "home";
++    case eVapType::GUEST:    return "guest";
++    case eVapType::VIDEO:    return "video";
++    case eVapType::BACKHAUL: return "backhaul";
++    case eVapType::HOTSPOT:  return "hotspot";
++    case eVapType::STAFF:    return "staff";
++    case eVapType::ISOLATED: return "isolated";
++    case eVapType::OTHER:
++    default:                 return "";
++    }
++}
++
+ bool wireless_utils::is_channel_in_operating_class(uint8_t operating_class, uint8_t channel)
+ {
+     auto channel_set = operating_class_to_channel_set(operating_class);
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index e724301f1..72fbf371f 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -1533,7 +1533,6 @@ void set_wifi_credentials_from_vap(const std::string &vap_id,
+ 
+     // In the hostapd config file, the first VAP uses the key "interface", while additional VAPs use the key "bss"
+     const std::vector<std::string> bss_check = {"interface", "bss"};
+-
+     for (const auto &key : bss_check) {
+         std::string bss = conf.get_vap_value(vap_id, key);
+         if (!bss.empty()) {
+@@ -1617,7 +1616,6 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+     //Exacting radio name to get only the base interface
+     std::string base_radio_iface_name;
+     extractLinkBaseInterface(m_radio_info.iface_name, base_radio_iface_name);
+-    m_radio_info.wps_pushbutton_configured = false;
+     for (auto &bss_it : bss_info_conf_list) {
+         bss_iterator++;
+         LOG(DEBUG) << "BSS iterator :   " << bss_iterator;
+@@ -1635,7 +1633,8 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+         LOG(DEBUG) << "backhaul:        " << bss_it.backhaul;
+         LOG(DEBUG) << "teardown:        " << bss_it.teardown;
+         LOG(DEBUG) << "bSTA:            " << bss_it.bSTA;
+-        LOG(DEBUG) << "wps_pushbutton   " << bss_it.wps_pushbutton;
++	LOG(DEBUG) << "wps_pushbutton   " << bss_it.wps_pushbutton;
++        LOG(DEBUG) << "vap_type   " << bss_it.vap_type;
+         auto conf_bssid = tlvf::mac_to_string(bss_it.bssid);
+         bss_it.freq_band = m_radio_info.frequency_band;
+ 
+@@ -1652,8 +1651,39 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+         if (conf_bssid == beerocks::net::network_utils::WILD_MAC_STRING) {
+             LOG(INFO) << "create new vap for wildcard bssid ";
+ 
+-            std::string new_vap_name = base_interface + "_" + std::to_string(new_vap_index);
++            int new_vap_index = m_radio_info.available_vaps.size();
++
++            std::string new_vap_name;
++
++            constexpr int kMaxTries = 4096;
++            bool found = false;
++
++            for (int tries = 0; tries < kMaxTries; ++tries) {
++                new_vap_name = base_interface + "_" + std::to_string(new_vap_index);
++
++                int iface_index = if_nametoindex(new_vap_name.c_str());
++                if (iface_index == 0) {
++                    found = true;
++                    break;
++                }
++
++                LOG(WARNING) << "Interface " << new_vap_name
++                             << " already exists with ifindex " << iface_index
++                             << ", trying next index " << (new_vap_index + 1);
++
++                ++new_vap_index;
++            }
+             
++            if (found) {
++                LOG(INFO) << "Using VAP name: " << new_vap_name
++                          << " (index " << new_vap_index << ")";
++            } else {
++                LOG(ERROR) << "Failed to find a free VAP name after "
++                           << kMaxTries << " attempts (base: "
++                           << base_interface << ")";
++                continue;
++            }
++
+             sMacAddr new_bssid;
+ 
+             if (!ap_wlan_hal_nl80211::generate_new_bssid(new_bssid)) {
+@@ -1706,26 +1736,9 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                 }
+             }
+ 
+-            // Determine bridge based on vap_type using BPL configuration
+-            std::string bridge;
+-            if (bss_it.vap_type == eVapType::GUEST) {
+-                if (!beerocks::bpl::cfg_get_guest_bridge_iface(bridge)) {
+-                    LOG(WARNING) << "Failed to get guest bridge from config, using default";
+-                    bridge = beerocks::bpl::DEFAULT_GUEST_BRIDGE_IFACE;
+-                }
+-            } else {
+-                if (!beerocks::bpl::cfg_get_private_bridge_iface(bridge)) {
+-                    LOG(WARNING) << "Failed to get private bridge from config, using default";
+-                    bridge = beerocks::bpl::DEFAULT_PRIVATE_BRIDGE_IFACE;
+-                }
+-            }
+-
+-            LOG(DEBUG) << "BSS " << new_vap_name << " vap_type=" << static_cast<int>(bss_it.vap_type)
+-                       << " -> bridge=" << bridge;
+-
+             if ((mld_id_val >=0) && bss_name_changed) {
+                 std::string prev_iface = "";
+-                if (!add_mld_link(new_vap_name,prev_iface,bss_it,bridge)) {
++                if (!add_mld_link(new_vap_name,prev_iface,bss_it,bridge_ifname)) {
+                     LOG(ERROR) << " add_mld_link failed for " << new_vap_name ;
+                     // mark bssid usage as false
+                     m_radio_info.bssid_pool[bss_mac_string] = false;
+@@ -1733,7 +1746,8 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                 }
+                 LOG(INFO) << "add_mld_link success:  " << " bss: " << new_vap_name << " bssid: " <<new_bssid;
+             } else {
+-                if (!add_bss(new_vap_name,bss_it,bridge,false)) {
++                std::string bridge_ifname_copy = bridge_ifname;
++                if (!add_bss(new_vap_name,bss_it,bridge_ifname_copy,false)) {
+                     LOG(ERROR) << " Add bss failed for " << new_vap_name ;
+                     // mark bssid usage as false
+                     m_radio_info.bssid_pool[bss_mac_string] = false;
+@@ -1956,14 +1970,47 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                 if (bss_it.teardown) {
+                     // BSS is flagged for teardown
+                     LOG(DEBUG) << "Disabling VAP " << vap_id;
+-                    if (m_radio_info.iface_name == vap_info.bss) {
+-                        //CR 4331885 Removing bss[0] is bringing down all vaps in that radio
+-                        // After having above CR fixed, rename the bss[1] section as interface in hostapd.conf
+-                        LOG(ERROR) << "Can't remove management vap which is bss[0]";
+-                        continue;
++                    if ((m_radio_info.iface_name == vap_info.bss) && (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_6G)) {
++                        // skip disabling primary tx vap on 6g radio since it will disable all 6g vaps
++                            LOG(INFO) << "skip disabling first bss on 6G radio ";
++                            continue;
+                     }
+-
+                     conf.remove_bss_config(vap_id);
++                    if (m_radio_info.iface_name == vap_info.bss) {
++                        // Promote the next BSS to be the primary interface by changing bss= to interface=
++                        LOG(INFO) << "Removing first vap bss[0] in radio - promoting next BSS to interface=";
++                        auto remaining_vaps = conf.get_hostapd_bss_config();
++                        for (auto& vap_pair : remaining_vaps) {
++                            const std::string& next_vap_id = vap_pair.first;
++                            std::string bss_val = conf.get_vap_value(next_vap_id, "bss");
++                            if (!bss_val.empty()) {
++                                conf.set_create_vap_value(next_vap_id, "interface", bss_val);
++                                conf.set_create_vap_value(next_vap_id, "bss", "");
++                                LOG(INFO) << "Promoted BSS " << next_vap_id << " from bss= to interface=";
++                                std::string updated_iface_name = next_vap_id;
++                                int8_t link_id = -1;
++                                std::string bssid = conf.get_vap_value(next_vap_id, "bssid");
++
++                                if (!m_nl80211_client->get_bss_link_id(updated_iface_name,bssid,link_id)) {
++                                     LOG(ERROR) << " get_bss_link_id failed " ;
++                                }
++
++                                // update radio iface
++                                LOG(INFO) << " Updated radio iface name: " << updated_iface_name;
++                                m_radio_info.iface_name = updated_iface_name;
++
++                                set_iface_name(m_radio_info.iface_name);
++
++                                //update prplmesh config file for persistance
++                                const std::string package_name = "prplmesh";
++                                const std::string section_type = "wifi-device";
++                                const std::string option_name  = "hostap_iface";
++
++                                beerocks::bpl::cfg_update_prplmesh_option(package_name, section_type, option_name, m_radio_info.radio_id, next_vap_id); 
++                                break;
++                            }
++                        }
++                    }
+                 } else {
+ 
+                     vap_info.fronthaul = bss_it.fronthaul;
+@@ -1996,53 +2043,91 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                     if (bss_name_changed == true) {
+                         add_mld_link(bss,vap_info.bss,bss_it,bridge_ifname);
+                     } else {
+-                        parsed_obj_map_t result;
+-
+-                        if (!wpa_ctrl_send_msg("STATUS", result, vap_info.bss)) {
+-                            LOG(ERROR) << __func__ << " failed";
+-                            LOG(ERROR) << "wpa_ctrl_send_msg returned false for STATUS command";
+-                            continue;
+-                        }
+-                        int links_present = 0;
+-                        
+-                        auto it = result.find("num_links");
+-                        if (it != result.end() && !it->second.empty()) {
+-                            const std::string &num_links_str = it->second;
+-                            bool valid = std::all_of(num_links_str.begin(), num_links_str.end(), ::isdigit);
+-
+-                            if (valid) {
+-                                LOG(INFO) << "num_links found";
+-                                links_present = beerocks::string_utils::stoi(num_links_str);
+-                            } else {
+-                                LOG(WARNING) << "num_links value is not a valid number: '" << num_links_str << "'";
+-                            }
+-                        } else {
+-                            LOG(WARNING) << "num_links not found or empty in result";
+-                        }
+-
+                         if (bss_it.teardown) {
++                            // Hostapd can only process one LINK_REMOVE at a time.
++                            // Serialize concurrent calls from multiple radio processes
++                            // using a file lock so each radio waits its turn.
++                            int lr_lock_fd = open("/var/lock/prplmesh-link-remove.lock", O_CREAT | O_RDWR, 0644);
++                            if (lr_lock_fd >= 0) {
++                                struct flock lr_lk{};
++                                lr_lk.l_type   = F_WRLCK;
++                                lr_lk.l_whence = SEEK_SET;
++                                lr_lk.l_start  = 0;
++                                lr_lk.l_len    = 0;
++                                if (fcntl(lr_lock_fd, F_SETLKW, &lr_lk) < 0) {
++                                    LOG(WARNING) << "LINK_REMOVE lock acquire failed: " << strerror(errno);
++                                } else {
++                                    LOG(INFO) << "LINK_REMOVE lock acquired for " << vap_info.bss;
++                                }
++                            }
+                             LOG(DEBUG) << "m_radio_info.iface_name : " << m_radio_info.iface_name << " vap_info.bss: " << vap_info.bss;
+-                            if (m_radio_info.iface_name == vap_info.bss) {
+-                                //CR 4331885 Removing bss[0] is bringing down all vaps in that radio
+-                                LOG(ERROR) << "Can't remove management vap which is bss[0]";
++                            parsed_obj_map_t result;
++
++                            if (!wpa_ctrl_send_msg("STATUS", result, vap_info.bss)) {
++                                LOG(ERROR) << __func__ << " failed";
++                                LOG(ERROR) << "wpa_ctrl_send_msg returned false for STATUS command";
++                                // Release lock before continuing
++                                if (lr_lock_fd >= 0) {
++                                    struct flock lr_ulk{};
++                                    lr_ulk.l_type = F_UNLCK;
++                                    lr_ulk.l_whence = SEEK_SET;
++                                    fcntl(lr_lock_fd, F_SETLK, &lr_ulk);
++                                    close(lr_lock_fd);
++                                    lr_lock_fd = -1;
++                                }
+                                 continue;
+                             }
++                            int links_present = 0;
++                            
++                            auto it = result.find("num_links");
++                            if (it != result.end() && !it->second.empty()) {
++                                const std::string &num_links_str = it->second;
++                                bool valid = std::all_of(num_links_str.begin(), num_links_str.end(), ::isdigit);
++
++                                if (valid) {
++                                    LOG(INFO) << "num_links found";
++                                    links_present = beerocks::string_utils::stoi(num_links_str);
++                                } else {
++                                    LOG(WARNING) << "num_links value is not a valid number: '" << num_links_str << "'";
++                                }
++                            } else {
++                                LOG(WARNING) << "num_links not found or empty in result";
++                            }
+                             if (links_present > 1) {
+                                 LOG(ERROR) << "Hit remove link " << bss_it.bssid;
+                                 // Check if mld link to be removed is not management vap link
+                                 remove_mld_link(vap_info.bss, bss_it.bssid);
++                                // disable the vap in wireless config
++                                if(beerocks::bpl::cfg_is_master()==0) {
++                                    beerocks::bpl::bpl_cfg_set_wifi_iface_teardown(vap_id, m_radio_info.radio_id, false);
++                                }
+                             } else {
+                                 // To check if bss to be removed is not bss[0] or base vap of that radio
+                                 std::string base_iface;
+                                 extractLinkBaseInterface(vap_info.bss, base_iface);
+                                 LOG(ERROR) << "Hit remove bss. BSSID: " << bss_it.bssid << " BSS name: " << base_iface;
+-                                if (remove_bss(base_iface)) {
++                                if (remove_bss(base_iface, bss_it.bssid)) {
+                                     LOG(DEBUG) << "BSS: " << base_iface << " is removed";
+-                                    // mark bssid usage as false
+-                                    std::string bss_mac_string = tlvf::mac_to_string(bss_it.bssid);
+-                                    m_radio_info.bssid_pool[bss_mac_string] = false;    
++                                }
++                                base_wlan_hal_nl80211::remove_interface(vap_info.bss);
++                                // disable the vap in wireless config
++                                if(beerocks::bpl::cfg_is_master()==0) {
++                                    beerocks::bpl::bpl_cfg_set_wifi_iface_teardown(vap_id, m_radio_info.radio_id, true);
+                                 }
+                             }
++                            if (lr_lock_fd >= 0) {
++                                struct flock lr_ulk{};
++                                lr_ulk.l_type   = F_UNLCK;
++                                lr_ulk.l_whence = SEEK_SET;
++                                lr_ulk.l_start  = 0;
++                                lr_ulk.l_len    = 0;
++                                if (fcntl(lr_lock_fd, F_SETLK, &lr_ulk) < 0) {
++                                    LOG(WARNING) << "LINK_REMOVE lock release failed: " << strerror(errno);
++                                } else {
++                                    LOG(INFO) << "LINK_REMOVE lock released for " << vap_info.bss;
++                                }
++                                close(lr_lock_fd);
++                            }
+                         } else {
+                             const std::string cmd("RELOAD_CONFIG");
+                             if (!wpa_ctrl_send_msg(cmd,vap_info.bss)) {
+@@ -2072,7 +2157,16 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+ 	    const std::string section_type = "wifi-device";
+ 	    const std::string option_name  = "hostap_iface";
+ 
+-	    beerocks::bpl::cfg_update_prplmesh_option(package_name, section_type, option_name, base_radio_iface_name, new_radio_iface_name);
++	    LOG(DEBUG) << "update_vap_credentials: calling cfg_update_prplmesh_option"
++	               << " package=" << package_name
++	               << " section_type=" << section_type
++	               << " option=" << option_name
++	               << " radio_id=" << m_radio_info.radio_id
++	               << " new_value=" << new_radio_iface_name;
++	    bool cfg_ret = beerocks::bpl::cfg_update_prplmesh_option(package_name, section_type, option_name, m_radio_info.radio_id, new_radio_iface_name);
++	    LOG(DEBUG) << "update_vap_credentials: cfg_update_prplmesh_option returned " << (cfg_ret ? "true" : "false")
++	               << " for radio_id=" << m_radio_info.radio_id
++	               << " new_hostap_iface=" << new_radio_iface_name;
+ 
+             // Delete previous interface
+             if (!m_nl80211_client->remove_vap_interface(base_interface)) {
+@@ -3082,6 +3176,31 @@ bool ap_wlan_hal_nl80211::remove_bss(std::string &ifname)
+     return base_wlan_hal_nl80211::remove_interface(ifname);
+ }
+ 
++bool ap_wlan_hal_nl80211::remove_bss(std::string &iface_name, sMacAddr &iface_mac)
++{
++    LOG(DEBUG) << "Removing BSS with ifname: '" << iface_name << "' bssid: '" << iface_mac << "'.";
++    std::stringstream cmd;
++    cmd << "REMOVE " << iface_name;
++    if (!wpa_ctrl_send_msg(cmd.str(), global_iface)) {
++        LOG(ERROR) << "Failed to remove the BSS!";
++        return false;
++    }
++
++    // mark bssid usage as false
++    std::string bss_mac_string = tlvf::mac_to_string(iface_mac);
++    m_radio_info.bssid_pool[bss_mac_string] = false;
++    LOG(DEBUG) << "BSSID " << bss_mac_string << " marked as unused in pool";
++
++    LOG(DEBUG) << "Removing the interface from the list";
++
++    // Delete interface
++    if (!m_nl80211_client->remove_vap_interface(iface_name)) {
++        LOG(ERROR) << "Failed to remove vap iface: " << iface_name;
++    } 
++
++    return base_wlan_hal_nl80211::remove_interface(iface_name);
++}
++
+ bool ap_wlan_hal_nl80211::add_key(const std::string &ifname, const sKeyInfo &key_info)
+ {
+     return m_nl80211_client->add_key(ifname, key_info);
+@@ -3645,12 +3764,12 @@ bool ap_wlan_hal_nl80211::handle_mld_reconfig(std::string target_ssid, int8_t ml
+         if (vap_iter != m_radio_info.available_vaps.end()) {
+             auto &vap_info     = vap_iter->second;
+             LOG(INFO) << "REMOVE " << vap_info.bss << "MAC ADDR: "<< vap_info.mac << "AP_MLD_MAC: " << vap_info.ap_mld_mac;
+-            
+-            if (m_radio_info.iface_name == vap_info.bss) {
+-                LOG(ERROR) << "Can't remove management vap which is bss[0]";
+-                return false;
++            if ((m_radio_info.iface_name == vap_info.bss) && (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_6G)) {
++                // skip disabling primary tx vap on 6g radio since it will disable all 6g vaps
++                    LOG(INFO) << "skip disabling first bss on 6G radio ";
++                    return false;
+             }
+-
++            
+             std::stringstream remove_cmd;
+             remove_cmd << "LINK_REMOVE " << HOST_MIN_ML_RECONF_COUNT;
+ 
+@@ -3677,6 +3796,46 @@ bool ap_wlan_hal_nl80211::handle_mld_reconfig(std::string target_ssid, int8_t ml
+ 
+             base_conf.remove_bss_config(vap_id);
+ 
++            if (m_radio_info.iface_name == vap_info.bss) {
++                //CR 4331885 Removing bss[0] is bringing down all vaps in that radio
++                // Promote the next BSS to be the primary interface by changing bss= to interface=
++                LOG(INFO) << "Removing first vap bss[0] in radio - promoting next BSS to interface=";
++                auto remaining_vaps = base_conf.get_hostapd_bss_config();
++                for (auto& vap_pair : remaining_vaps) {
++                    const std::string& next_vap_id = vap_pair.first;
++                    std::string bss_val = base_conf.get_vap_value(next_vap_id, "bss");
++                    if (!bss_val.empty()) {
++                        base_conf.set_create_vap_value(next_vap_id, "interface", bss_val);
++                        base_conf.set_create_vap_value(next_vap_id, "bss", "");
++                        LOG(INFO) << "Promoted BSS " << next_vap_id << " from bss= to interface=";
++
++                        std::string updated_iface_name = next_vap_id;
++                        int8_t link_id = -1;
++                        std::string bssid = base_conf.get_vap_value(next_vap_id, "bssid");
++
++                        if (!m_nl80211_client->get_bss_link_id(updated_iface_name,bssid,link_id)) {
++                             LOG(ERROR) << " get_bss_link_id failed " ;
++                        }
++
++                        // update radio iface
++                        LOG(INFO) << " Updated radio iface name: " << updated_iface_name;
++                        m_radio_info.iface_name = updated_iface_name;
++
++                        set_iface_name(m_radio_info.iface_name);
++
++                        //update prplmesh config file for persistance
++                        const std::string package_name = "prplmesh";
++                        const std::string section_type = "wifi-device";
++                        const std::string option_name  = "hostap_iface";
++
++                        beerocks::bpl::cfg_update_prplmesh_option(package_name, section_type, option_name, m_radio_info.radio_id, next_vap_id);
++
++
++                        break;
++                    }
++                }
++            }
++
+             if (!base_conf.store(vap_id)) {
+                 LOG(ERROR) << "Failed to update default config file";
+                 return false;
+diff --git a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+index 29df67834..d429c8751 100644
+--- a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+@@ -524,6 +524,13 @@ bool bpl_cfg_set_sta_vap_bh_credentials(const std::string &iface,
+ 
+ */
+ 
++bool bpl_cfg_set_wifi_iface_teardown(const std::string &iface, const std::string &radio_id, bool is_mlo)
++{
++    LOG(DEBUG) << "bpl_cfg_set_wifi_iface_teardown: not implemented for DM platform"
++               << " (iface=" << iface << ", radio_id=" << radio_id << ", is_mlo=" << is_mlo << ")";
++    return true;
++}
++
+ bool cfg_set_wireless_channel(const std::string &radio_id, int channel)
+ {
+     LOG(DEBUG) << "cfg_set_wireless_channel: not implemented for DM platform"
+diff --git a/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
+index 44fd0d94f..0e0dee8fb 100644
+--- a/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
+@@ -259,5 +259,12 @@ bool cfg_set_wifi_iface_network(const std::string & /*iface_name*/,
+ 
+ bool cfg_commit_wireless_config() { return true; }
+ 
++bool bpl_cfg_set_wifi_iface_teardown(const std::string &iface, const std::string &radio_id, bool is_mlo)
++{
++    LOG(DEBUG) << "bpl_cfg_set_wifi_iface_teardown: not implemented for linux platform"
++               << " (iface=" << iface << ", radio_id=" << radio_id << ", is_mlo=" << is_mlo << ")";
++    return true;
++}
++
+ } // namespace bpl
+ } // namespace beerocks
+diff --git a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+index 45e1f422c..a5a825d07 100644
+--- a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+@@ -755,5 +755,13 @@ bool cfg_commit_wireless_config()
+     return true;
+ }
+ 
++bool bpl_cfg_set_wifi_iface_teardown(const std::string &iface, const std::string &radio_id, bool is_mlo)
++{
++    (void)iface;
++    (void)radio_id;
++    (void)is_mlo;
++    return true;
++}
++
+ } // namespace bpl
+ } // namespace beerocks
+diff --git a/framework/platform/bpl/cfg/rdk/bpl_cfg_helper.cpp b/framework/platform/bpl/cfg/rdk/bpl_cfg_helper.cpp
+index 515b8e1fb..959907b3c 100644
+--- a/framework/platform/bpl/cfg/rdk/bpl_cfg_helper.cpp
++++ b/framework/platform/bpl/cfg/rdk/bpl_cfg_helper.cpp
+@@ -290,39 +290,30 @@ int cfg_set_prplmesh_config_no_commit(const std::string &option, const std::stri
+ bool cfg_update_prplmesh_option_commit(const std::string &package_name,
+                             const std::string &section_type,
+                             const std::string &option_name,
+-                            const std::string &old_value,
++                            const std::string &radio_id,
+                             const std::string &new_value)
+ {
+-    // Not directly applicable to JSON without a matching schema mapping,
+-    // but we can try to update under the specified section type if it's an array/object
++    // Update the option_name under the radio section identified by radio_id (e.g. "radio0").
+     cJSON *json = load_json_config();
+     if (!json) return false;
+ 
+-    // Simplified: Just update under 'config' if section_type is empty or "config"
+-    // Since this is a generic update, we'll try to find the old value and replace it
+-    cJSON *section = nullptr;
+-
+-    if (section_type == "config" || section_type.empty()) {
+-        section = cJSON_GetObjectItemCaseSensitive(json, "config");
+-    } else {
+-        section = cJSON_GetObjectItemCaseSensitive(json, section_type.c_str());
+-    }
+-
++    cJSON *section = cJSON_GetObjectItemCaseSensitive(json, radio_id.c_str());
+     if (!section) {
++        MAPF_ERR("cfg_update_prplmesh_option_commit: section not found for radio_id=" << radio_id);
+         cJSON_Delete(json);
+         return false;
+     }
+ 
+     cJSON *item = cJSON_GetObjectItemCaseSensitive(section, option_name.c_str());
+-    if (item && cJSON_IsString(item) && std::string(item->valuestring) == old_value) {
++    if (item) {
+         cJSON_ReplaceItemInObject(section, option_name.c_str(), cJSON_CreateString(new_value.c_str()));
+-        bool success = save_json_config(json);
+-        cJSON_Delete(json);
+-        return success;
++    } else {
++        cJSON_AddStringToObject(section, option_name.c_str(), new_value.c_str());
+     }
+ 
++    bool success = save_json_config(json);
+     cJSON_Delete(json);
+-    return false;
++    return success;
+ }
+ 
+ 
+diff --git a/framework/platform/bpl/cfg/rdk/bpl_cfg_helper.h b/framework/platform/bpl/cfg/rdk/bpl_cfg_helper.h
+index dd44ef156..0e9c15d5e 100644
+--- a/framework/platform/bpl/cfg/rdk/bpl_cfg_helper.h
++++ b/framework/platform/bpl/cfg/rdk/bpl_cfg_helper.h
+@@ -122,7 +122,7 @@ int cfg_set_prplmesh_config_no_commit(const std::string &option, const std::stri
+ bool cfg_update_prplmesh_option_commit(const std::string &package_name,
+                             const std::string &section_type,
+                             const std::string &option_name,
+-                            const std::string &old_value,
++                            const std::string &radio_id,
+                             const std::string &new_value);
+ 
+ } // namespace bpl
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
+index acbe7ed51..8f0824568 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
+@@ -1351,10 +1351,10 @@ bool cfg_get_network_name_for_bridge(const std::string &bridge_name, std::string
+ bool cfg_commit_changes() { return uci_commit_changes("prplmesh"); }
+ 
+ bool cfg_update_prplmesh_option(const std::string &package_name, const std::string &section_type,
+-                                const std::string &option_name, const std::string &old_value,
++                                const std::string &option_name, const std::string &radio_id,
+                                 const std::string &new_value)
+ {
+-    return cfg_update_prplmesh_option_commit(package_name, section_type, option_name, old_value,
++    return cfg_update_prplmesh_option_commit(package_name, section_type, option_name, radio_id,
+                                              new_value);
+ }
+ 
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_helper.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_helper.cpp
+index ec32d0424..bb308d8c8 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_helper.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_helper.cpp
+@@ -148,30 +148,50 @@ int cfg_set_prplmesh_config_no_commit(const std::string &option, const std::stri
+ bool cfg_update_prplmesh_option_commit(const std::string &package_name,
+                             const std::string &section_type,
+                             const std::string &option_name,
+-                            const std::string &old_value,
++                            const std::string &radio_id,
+                             const std::string &new_value)
+ {
++    MAPF_DBG("cfg_update_prplmesh_option_commit: entered"
++             << " package=" << package_name
++             << " section_type=" << section_type
++             << " option=" << option_name
++             << " radio_id=" << radio_id
++             << " new_value=" << new_value);
++
++    // Find the section name by looking up the section with radio_id option
+     std::string section_name;
+-
+-    if (!uci_find_section_by_option(package_name, section_type, option_name, old_value, section_name)) {
+-        LOG(ERROR) << "Failed to find configuration section for option " << option_name
+-                   << " with value " << old_value;
++    if (!uci_find_section_by_option(package_name, section_type, "radio_id", radio_id, section_name)) {
++        MAPF_ERR("cfg_update_prplmesh_option_commit: failed to find section for radio_id=" << radio_id);
++        LOG(ERROR) << "Failed to find configuration section for radio_id " << radio_id;
+         return false;
+     }
+-
++    
+     if (section_name.empty()) {
+-        LOG(ERROR) << "Section not found for " << option_name << " = " << old_value;
++        MAPF_ERR("cfg_update_prplmesh_option_commit: section not found for radio_id=" << radio_id);
++        LOG(ERROR) << "Configuration section not found for radio_id " << radio_id;
+         return false;
+     }
+ 
+     OptionsUnorderedMap options{{option_name, new_value}};
+ 
++    MAPF_DBG("cfg_update_prplmesh_option_commit: calling uci_set_section"
++             << " package=" << package_name
++             << " section=" << section_name);
++
+     if (!uci_set_section(package_name, section_type, section_name, options, true)) {
++        MAPF_ERR("cfg_update_prplmesh_option_commit: uci_set_section FAILED"
++                 << " option=" << option_name
++                 << " new_value=" << new_value
++                 << " section=" << section_name);
+         LOG(ERROR) << "Failed to set configuration for option " << option_name
+                    << " to " << new_value << " at section " << section_name;
+         return false;
+     }
+ 
++    MAPF_DBG("cfg_update_prplmesh_option_commit: uci_set_section SUCCESS"
++             << " option=" << option_name
++             << " new_value=" << new_value
++             << " section=" << section_name);
+     LOG(INFO) << "Successfully updated " << option_name << " to " << new_value
+               << " in section " << section_name;
+     return true;
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_helper.h b/framework/platform/bpl/cfg/uci/bpl_cfg_helper.h
+index 7e1ede382..24f664840 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_helper.h
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_helper.h
+@@ -132,7 +132,7 @@ int cfg_set_prplmesh_config_no_commit(const std::string &option, const std::stri
+ bool cfg_update_prplmesh_option_commit(const std::string &package_name,
+                             const std::string &section_type,
+                             const std::string &option_name,
+-                            const std::string &old_value,
++                            const std::string &radio_id,
+                             const std::string &new_value);
+ 
+ } // namespace bpl
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index 7c56a81f5..306c4bee8 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -567,19 +567,27 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+ 		    options["multi_ap_backhaul_ssid"] = configuration.backhaul_wps_ssid;
+     		    options["multi_ap_backhaul_key"]  = configuration.backhaul_wps_passphrase;
+ 	    }
+-            options["bss_transition"] = "1";
++	    options["bss_transition"] = "1";
+             options["ieee80211k"] = "1";
+ 
++	    // Set custom_alias based on vap_type (skip for OTHER/unknown)
++	    {
++		    std::string vap_type_str = son::wireless_utils::vap_type_to_string(configuration.vap_type);
++		    if (!vap_type_str.empty()) {
++			    options["custom_alias"] = vap_type_str;
++		    }
++	    }
++
+ 	    options["device"] = device_section;
+ 	    // Check if credential-relevant fields have actually changed to avoid unnecessary
+ 	    // UCI commits that would trigger netifd to restart hostapd on every autoconfiguration
+-	    // cycle.  Only ssid/encryption/key/multi_ap and backhaul credentials are compared;
+-	    // non-credential fields (bss_transition, ieee80211k, sae_pwe, device, etc.) may
+-	    // legitimately differ from the existing UCI config without requiring a restart.
++	    // cycle.  Only ssid/encryption/key/multi_ap, backhaul credentials, and custom_alias
++	    // are compared; non-credential fields (bss_transition, ieee80211k, sae_pwe, device,
++	    // etc.) may legitimately differ from the existing UCI config without requiring a restart.
+ 	    {
+ 		    static const char * const cred_keys[] = {
+ 			    "ssid", "encryption", "key", "multi_ap",
+-			    "multi_ap_backhaul_ssid", "multi_ap_backhaul_key", nullptr
++			    "multi_ap_backhaul_ssid", "multi_ap_backhaul_key", "custom_alias", nullptr
+ 		    };
+ 		    bool changed = false;
+ 		    for (int i = 0; cred_keys[i] != nullptr; ++i) {
+@@ -697,6 +705,13 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+             options["bss_transition"] = "1";
+             options["ieee80211k"] = "1";
+ 
++            // Set custom_alias based on vap_type (skip for OTHER/unknown)
++            {
++                std::string vap_type_str = son::wireless_utils::vap_type_to_string(config.vap_type);
++                if (!vap_type_str.empty()) {
++                    options["custom_alias"] = vap_type_str;
++                }
++            }
+ 
+             return options;
+         };
+@@ -775,7 +790,7 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+         if (section_found && mld_section_exists) {
+             static const char * const cred_keys[] = {
+                 "ssid", "encryption", "key", "multi_ap",
+-                "multi_ap_backhaul_ssid", "multi_ap_backhaul_key", nullptr
++                "multi_ap_backhaul_ssid", "multi_ap_backhaul_key", "custom_alias", nullptr
+             };
+             bool changed = false;
+             for (int i = 0; cred_keys[i] != nullptr; ++i) {
+@@ -1278,6 +1293,103 @@ bool bpl_cfg_set_sta_vap_bh_credentials(const std::string &iface,
+ }
+ 
+ 
++bool bpl_cfg_set_wifi_iface_teardown(const std::string &iface, const std::string &radio_id, bool is_mlo)
++{
++    const std::string package_name = "wireless";
++    const std::string section_type = "wifi-iface";
++    std::string section_name;
++
++    // Find the wifi-device section for this radio
++    std::string device_section;
++    if (!radio_id.empty() &&
++        uci_find_section_by_option("wireless", "wifi-device", "radio", radio_id, device_section)) {
++        LOG(INFO) << "bpl_cfg_set_wifi_iface_teardown: found device section for radio "
++                  << radio_id << ": " << device_section;
++    } else {
++        LOG(ERROR) << "bpl_cfg_set_wifi_iface_teardown: no wifi-device section found for radio: "
++                   << radio_id;
++        return false;
++    }
++
++    // Search all wifi-iface sections for one whose ifname matches and belongs to this device
++    std::vector<std::string> all_iface_sections;
++    if (!uci_get_all_sections(package_name, section_type, all_iface_sections)) {
++        LOG(ERROR) << "bpl_cfg_set_wifi_iface_teardown: failed to get all wifi-iface sections";
++        return false;
++    }
++
++    for (const auto &sec : all_iface_sections) {
++        std::string device_val, ifname_val;
++        if (!uci_get_option(package_name, section_type, sec, "device", device_val)) {
++            continue;
++        }
++        if (device_val != device_section) {
++            continue;
++        }
++        if (!uci_get_option(package_name, section_type, sec, "ifname", ifname_val)) {
++            continue;
++        }
++        if (ifname_val == iface) {
++            section_name = sec;
++            LOG(INFO) << "bpl_cfg_set_wifi_iface_teardown: found section " << sec
++                      << " for interface " << iface;
++            break;
++        }
++    }
++
++    if (section_name.empty()) {
++        LOG(ERROR) << "bpl_cfg_set_wifi_iface_teardown: section not found for interface "
++                   << iface << " on radio " << radio_id;
++        return false;
++    }
++
++    // Set only disabled=1 — do not touch any other credential fields
++    OptionsUnorderedMap options;
++    options["disabled"] = "1";
++
++    if (!uci_set_section(package_name, section_type, section_name, options, true)) {
++        LOG(ERROR) << "bpl_cfg_set_wifi_iface_teardown: failed to set disabled=1 for interface "
++                   << iface << " at section " << section_name;
++        return false;
++    }
++
++    LOG(INFO) << "bpl_cfg_set_wifi_iface_teardown: set disabled=1 for interface "
++              << iface << " at section " << section_name;
++
++    // For MLO interfaces, also set disabled=1 in the corresponding wifi-mld section
++    if (is_mlo) {
++        const std::string mld_section_type = "wifi-mld";
++        std::vector<std::string> all_mld_sections;
++        if (uci_get_all_sections(package_name, mld_section_type, all_mld_sections)) {
++            for (const auto &mld_sec : all_mld_sections) {
++                std::string mld_ifname_val;
++                if (!uci_get_option(package_name, mld_section_type, mld_sec, "ifname", mld_ifname_val)) {
++                    continue;
++                }
++                if (mld_ifname_val == iface) {
++                    OptionsUnorderedMap mld_options;
++                    mld_options["disabled"] = "1";
++                    if (!uci_set_section(package_name, mld_section_type, mld_sec, mld_options, true)) {
++                        LOG(WARNING) << "bpl_cfg_set_wifi_iface_teardown: failed to set disabled=1"
++                                     << " in wifi-mld section " << mld_sec
++                                     << " for interface " << iface;
++                    } else {
++                        LOG(INFO) << "bpl_cfg_set_wifi_iface_teardown: set disabled=1"
++                                  << " in wifi-mld section " << mld_sec
++                                  << " for interface " << iface;
++                    }
++                    break;
++                }
++            }
++        } else {
++            LOG(DEBUG) << "bpl_cfg_set_wifi_iface_teardown: no wifi-mld sections found for interface "
++                       << iface;
++        }
++    }
++
++    return true;
++}
++
+ bool cfg_set_wireless_channel(const std::string &radio_id, int channel)
+ {
+     if (radio_id.empty()) {
+diff --git a/framework/platform/bpl/include/bpl/bpl_cfg.h b/framework/platform/bpl/include/bpl/bpl_cfg.h
+index aed557d30..9b0df399d 100644
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -1001,6 +1001,19 @@ bool cfg_set_unsuccessful_assoc_max_reporting_rate(int &max_reporting_rate);
+ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+                                   const son::wireless_utils::sBssInfoConf &configuration, std::string &radio_id);
+ 
++/**
++ * @brief Sets disabled=1 for the wifi-iface section corresponding to the given interface.
++ *
++ * This is a lightweight teardown helper that only marks the interface as disabled
++ * in the persistent wireless UCI config without touching any other credential fields.
++ * It is called during BSS teardown so that the interface stays disabled across reboots.
++ *
++ * @param [in] iface     Interface name (e.g. "wlan0_1").
++ * @param [in] radio_id  Radio identifier used to locate the correct wifi-device section.
++ * @return true on success and false otherwise.
++ */
++bool bpl_cfg_set_wifi_iface_teardown(const std::string &iface, const std::string &radio_id, bool is_mlo = false);
++
+ /**
+  * @brief Reads mandatory interfaces configuration.
+  *
+@@ -1528,7 +1541,7 @@ bool cfg_commit_changes();
+ bool cfg_update_prplmesh_option(const std::string &package_name,
+                             const std::string &section_type,
+                             const std::string &option_name,
+-                            const std::string &old_value,
++                            const std::string &radio_id,
+                             const std::string &new_value);
+ 
+ bool bpl_cfg_set_sta_vap_bh_credentials(const std::string &iface,
+-- 
+2.34.1
+
