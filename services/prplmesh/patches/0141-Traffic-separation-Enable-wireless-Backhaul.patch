@@ -1,0 +1,529 @@
+From 2a1265bb414dc4615df92f3a9bb7933e509552cf Mon Sep 17 00:00:00 2001
+From: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+Date: Fri, 17 Apr 2026 23:11:46 +0530
+Subject: [PATCH] Traffic separation: Enable wireless Backhaul
+
+Fix a set of bugs in the traffic separation (TS) subsystem covering
+VLAN plumbing lifecycle, MLO interface naming, Multi-AP profile
+propagation, and controller M2 TLV gating.
+
+--- Problem 1: VLAN subinterfaces not recreated after agent reconnect ---
+
+After an agent reconnect the WDS STA interface is torn down and
+recreated by the kernel, destroying its VLAN subinterfaces.  Three
+layers of the TS stack each had an early-exit that prevented
+re-applying TS policies:
+
+  * TrafficSeparationTask::handle_new_sta_iface() skipped WDS
+    interfaces already present in m_tracked_wds_ifaces.
+    Fix: remove the early-exit; always call add_trunk_port() for
+    every current WDS interface.
+
+  * TrafficSeparationManager::add_trunk_port() returned true
+    immediately for any trunk already in m_trunk_port_plumbing_map
+    without checking whether the VLAN subinterfaces were still alive.
+    Fix: when TS is applied (is_applied()), call apply() on the
+    existing plumbing object before returning so the subinterface
+    existence check is triggered.
+
+  * TrunkPortPlumbing8021q::apply() returned early when m_is_applied
+    was true and the config was unchanged, even if the VLAN
+    subinterfaces had been destroyed.
+    Fix: before returning early, verify that m_private_subiface and
+    m_guest_subiface still exist via network_utils::linux_iface_exists().
+    If either is missing, fall through to clear() + re-apply.
+    Also fix a secondary bug: the "Clearing and applying new policies"
+    log was printed even on the unchanged-config early-return path;
+    move it into the config-changed else branch.
+
+--- Problem 2: MLO link suffix not stripped before WDS STA lookup ---
+
+In an MLO deployment bss.iface_name may carry a per-link suffix
+(e.g. wlan0-1).  get_all_sta_ifaces_for_bss() scans sysfs for WDS
+STA interfaces whose parent matches the given name; with the suffix
+present the scan returns nothing and no trunk ports are registered.
+
+Fix: wrap bss.iface_name with net::strip_link_suffix() in both
+collect_current_wds_ifaces() and collect_ports_from_db().
+
+Same root cause in configuration_complete_wait_action(): the bridge
+membership check called linux_iface_get_host_bridge(bssid.iface_name)
+instead of linux_iface_get_host_bridge(base_iface_name), causing the
+secondary-BSS skip logic to fail for MLO BSSes.
+Fix: use base_iface_name.
+
+--- Problem 3: Multi-AP profile and primary VLAN ID not propagated
+               in nl80211 BWL ---
+
+The nl80211 BWL left multi_ap_profile and multi_ap_primary_vlan_id
+at zero in sACTION_BACKHAUL_CONNECTED_NOTIFICATION.  Two paths were
+affected:
+
+  * process_nl80211_event() (CTRL-EVENT-CONNECTED path): a comment
+    said "not implemented on this flavour of BWL, leave it empty".
+    Fix: parse multi_ap_profile and multi_ap_primary_vlanid from the
+    event's key-value map.  Fields are optional; the code is
+    backward-compatible with unpatched WPA supplicant builds.
+
+  * reassociate() already-connected path: the synthesised Connected
+    event was zero-initialised.
+    Fix: populate the fields from connection_status, which is filled
+    by read_status() before this code path is reached.
+
+Add multi_ap_profile (uint8_t) and multi_ap_primary_vlanid (uint16_t)
+to the private ConnectionStatus struct (sta_wlan_hal_nl80211.h) and
+extract them from the WPA supplicant STATUS reply in read_status().
+
+--- Problem 4: Guest VID hardcoded to compile-time default ---
+
+build_ts_config() used bpl::DEFAULT_GUEST_VLAN_ID unconditionally
+when no secondary VLAN IDs were present in the controller DB.
+Platforms with a different operator-configured guest VID would use
+the wrong VID for VLAN plumbing until the controller pushed a TS
+policy.
+
+Fix: read the platform-configured value via
+bpl::cfg_get_traffic_separation_guest_vid() with fallback to the
+compile-time default on failure.
+
+--- Problem 5: WiFi trunk VLAN subinterfaces incorrectly persisted
+               to /etc/config/network ---
+
+persist_bridge_assignments() and reset_persistence() wrote WiFi WDS
+trunk VLAN subinterfaces (e.g. wds0.<private_vid>) to
+/etc/config/network.  WDS interfaces are ephemeral; persisting them
+causes stale UCI entries after reboot and may cause the network
+daemon to log errors.
+
+Fix: exclude all WiFi trunk ports (!tp.is_ethernet) from both
+persist_bridge_assignments() and reset_persistence().  Only Ethernet
+trunk ports (persistent hardware interfaces) have their guest VLAN
+subinterfaces written to UCI config.
+
+--- Problem 6: TS TLVs added unconditionally to M2 message ---
+
+In Controller::handle_cmdu_1905_autoconfiguration_WSC() the else
+branch (agent not yet configured) unconditionally added
+tlvProfile2TrafficSeparationPolicy and tlvProfile2Default802dotQSettings
+to the M2 message even when is_custom_ts_enabled was false.  An agent
+receiving TS TLVs with VID=0 would attempt incorrect VLAN plumbing.
+
+Fix: guard both TLV additions with if (is_custom_ts_enabled).
+Also correct the call order: add_profile_2default_802q_settings_tlv
+is now called before add_traffic_separation_policy_tlv, matching the
+Multi-AP spec ordering (default 802.1Q settings precede the policy TLV).
+
+Signed-off-by: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+---
+ .../backhaul_manager/backhaul_manager.cpp     |  1 -
+ .../slave/tasks/ap_autoconfiguration_task.cpp | 13 +++--
+ .../slave/tasks/traffic_separation_task.cpp   | 28 ++++++---
+ .../traffic_separation_manager.cpp            | 54 ++++++-----------
+ .../trunk_port_plumbing_8021q.cpp             | 20 +++++--
+ .../bwl/nl80211/sta_wlan_hal_nl80211.cpp      | 58 +++++++++++++++++--
+ .../bwl/nl80211/sta_wlan_hal_nl80211.h        | 14 +++++
+ controller/src/beerocks/master/controller.cpp | 11 +++-
+ 8 files changed, 138 insertions(+), 61 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 4fba447cb..6f7ca217d 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -2431,7 +2431,6 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+             }
+             LOG(INFO) << "Multi-AP-Profile: " << msg->multi_ap_profile
+                       << ", Multi-AP Primary VLAN ID: " << msg->multi_ap_primary_vlan_id;
+-
+             if (db->bsta_mld_configuration) {
+                 LOG(INFO) << "Fill AP MLD MAC Address with " << msg->mac_address;
+                 db->bsta_mld_configuration->ap_mld_mac = msg->mac_address;
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 28916e39a..4ed396117 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -714,8 +714,9 @@ void ApAutoConfigurationTask::configuration_complete_wait_action(const std::stri
+ 
+         // Return if not all bssids are in the bridge, and print error.
+         if (found == ifaces_in_bridge.end()) {
+-            LOG(DEBUG) << " bss iface: " << bssid.iface_name << " is not found in " << db->bridge.iface_name;
+-            auto host_bridge = network_utils::linux_iface_get_host_bridge(bssid.iface_name);
++            LOG(DEBUG) << " bss iface: " << bssid.iface_name << " is not found in "
++                       << db->bridge.iface_name;
++            auto host_bridge = network_utils::linux_iface_get_host_bridge(base_iface_name);
+             if (!host_bridge.empty()) {
+                 // skip secondary bss, already belonging to different bridge
+                 continue;
+@@ -1539,9 +1540,11 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_wsc(ieee1905_1::CmduMe
+     // tlvProfile2TrafficSeparationPolicy is not mandatory.
+     if (!cmdu_rx.getClass<wfa_map::tlvProfile2TrafficSeparationPolicy>()) {
+         LOG(INFO) << "tlvProfile2TrafficSeparationPolicy not found";
+-    } else if (!handle_profile2_traffic_separation_policy_tlv(cmdu_rx, misconfigured_ssids)) {
+-        LOG(ERROR) << "handle_profile2_traffic_separation_policy_tlv has failed!";
+-        return;
++    } else {
++        if (!handle_profile2_traffic_separation_policy_tlv(cmdu_rx, misconfigured_ssids)) {
++            LOG(ERROR) << "handle_profile2_traffic_separation_policy_tlv has failed!";
++            return;
++        }
+     }
+ 
+     // Parse SMD Policy Config TLVs from M2 (already parsed by multi-vendor framework)
+diff --git a/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp b/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
+index 7cd69e345..dbe8418fb 100644
+--- a/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
++++ b/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
+@@ -211,7 +211,21 @@ bool TrafficSeparationTask::build_ts_config(net::sTrafficSeparationConfig &cfg)
+ 
+     cfg.private_vid = db->traffic_separation.primary_vlan_id;
+ 
+-    const auto default_guest_vid = static_cast<uint32_t>(bpl::DEFAULT_GUEST_VLAN_ID);
++    int configured_guest_vid = bpl::DEFAULT_GUEST_VLAN_ID;
++    if (!bpl::cfg_get_traffic_separation_guest_vid(configured_guest_vid)) {
++        LOG(WARNING) << "TS config: failed to read TrafficSeparation_GuestVID, using default="
++                     << bpl::DEFAULT_GUEST_VLAN_ID;
++        configured_guest_vid = bpl::DEFAULT_GUEST_VLAN_ID;
++    }
++    if (configured_guest_vid < static_cast<int>(net::MIN_VLAN_ID) ||
++        configured_guest_vid > static_cast<int>(net::MAX_VLAN_ID)) {
++        LOG(WARNING) << "TS config: TrafficSeparation_GuestVID out of range ["
++                     << net::MIN_VLAN_ID << "-" << net::MAX_VLAN_ID
++                     << "], got=" << configured_guest_vid
++                     << ", using default=" << bpl::DEFAULT_GUEST_VLAN_ID;
++        configured_guest_vid = bpl::DEFAULT_GUEST_VLAN_ID;
++    }
++    const auto default_guest_vid = static_cast<uint32_t>(configured_guest_vid);
+     if (!db->traffic_separation.secondary_vlans_ids.empty()) {
+         cfg.guest_vid = *db->traffic_separation.secondary_vlans_ids.begin();
+     } else {
+@@ -341,15 +355,15 @@ bool TrafficSeparationTask::handle_new_sta_iface()
+     bool success                  = true;
+ 
+     for (const auto &wds_iface : current_wds_ifaces) {
+-        if (m_tracked_wds_ifaces.count(wds_iface.first) != 0) {
+-            continue;
+-        }
+-
+         net::sTrunkPort trunk{};
+         trunk.iface_name       = wds_iface.first;
+         trunk.is_ethernet      = false;
+         trunk.is_untagged_mode = wds_iface.second;
+ 
++        // Call add_trunk_port() for all current WDS interfaces, including already-tracked
++        // ones. For already-tracked interfaces, add_trunk_port() will re-apply the TS
++        // policies if the VLAN subinterfaces were destroyed (e.g., after agent reconnect
++        // where the WDS STA interface was torn down and recreated while still tracked).
+         if (!m_mgr->add_trunk_port(trunk)) {
+             LOG(ERROR) << "add_trunk_port failed iface=" << trunk.iface_name;
+             success = false;
+@@ -472,7 +486,7 @@ std::unordered_map<std::string, bool> TrafficSeparationTask::collect_current_wds
+                 }
+             }
+ 
+-            const auto sta_ifaces = get_all_sta_ifaces_for_bss(bss.iface_name);
++            const auto sta_ifaces = get_all_sta_ifaces_for_bss(net::strip_link_suffix(bss.iface_name));
+             for (const auto &sta : sta_ifaces) {
+                 current_wds_ifaces.emplace(sta, untagged_mode);
+             }
+@@ -607,7 +621,7 @@ bool TrafficSeparationTask::collect_ports_from_db(std::vector<net::sTrunkPort> &
+                     }
+                 }
+ 
+-                const auto sta_ifaces = get_all_sta_ifaces_for_bss(bss.iface_name);
++                const auto sta_ifaces = get_all_sta_ifaces_for_bss(net::strip_link_suffix(bss.iface_name));
+                 for (const auto &sta : sta_ifaces) {
+                     net::sTrunkPort trunk{};
+                     trunk.iface_name       = sta;
+diff --git a/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.cpp b/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.cpp
+index 5324efd55..c3db69e56 100644
+--- a/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.cpp
++++ b/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.cpp
+@@ -47,6 +47,15 @@ bool TrafficSeparationManager::add_trunk_port(const sTrunkPort &trunk_port)
+ 
+     auto it = m_trunk_port_plumbing_map.find(trunk_port.iface_name);
+     if (it != m_trunk_port_plumbing_map.end()) {
++        // Trunk is already managed. If TS is applied, re-apply to check if
++        // VLAN subinterfaces need to be recreated (e.g., after agent reconnect
++        // where the parent interface was torn down and recreated).
++        if (is_applied() && it->second) {
++            if (!it->second->apply(m_config)) {
++                LOG(ERROR) << "trunk_port re-apply failed iface=" << trunk_port.iface_name;
++                return false;
++            }
++        }
+         LOG(DEBUG) << "trunk_port iface=" << trunk_port.iface_name << " is already managed";
+         return true;
+     }
+@@ -424,20 +433,17 @@ void TrafficSeparationManager::persist_bridge_assignments()
+         }
+     }
+ 
+-    // Persist VLAN subinterface bridge assignments for tagged trunk ports.
+-    // For each tagged trunk port, the VLAN subinterface(s) must also be listed
+-    // in the correct bridge's ports in /etc/config/network so they survive reboot.
++    // Persist VLAN subinterface bridge assignments for tagged Ethernet trunk ports only.
++    // Only Ethernet trunk ports are written to /etc/config/network so they survive reboot.
+     //   - Ethernet trunks: <iface>.<guest_vid> -> guest_bridge
+-    //   - WiFi trunks:     <iface>.<guest_vid> -> guest_bridge
+-    //                      <iface>.<private_vid> -> private_bridge
+-    // Untagged trunk ports are skipped (no VLAN subinterfaces are created for them).
++    // WiFi trunk ports and untagged trunk ports are skipped.
+     for (const auto &entry : m_trunk_ports) {
+         const sTrunkPort &tp = entry.second;
+-        if (tp.is_untagged_mode) {
++        if (tp.is_untagged_mode || !tp.is_ethernet) {
+             continue;
+         }
+ 
+-        // Guest VLAN subinterface -> guest_bridge
++        // Guest VLAN subinterface -> guest_bridge (Ethernet trunks only)
+         if (!m_config.guest_bridge.empty() && m_config.guest_vid != 0) {
+             const std::string guest_vlan_iface =
+                 tp.iface_name + "." + std::to_string(m_config.guest_vid);
+@@ -445,17 +451,6 @@ void TrafficSeparationManager::persist_bridge_assignments()
+                 network_written = true;
+             }
+         }
+-
+-        // Private VLAN subinterface -> private_bridge (WiFi trunks only;
+-        // for Ethernet trunks the private traffic is untagged on the native VLAN).
+-        if (!tp.is_ethernet && !m_config.private_bridge.empty() && m_config.private_vid != 0) {
+-            const std::string private_vlan_iface =
+-                tp.iface_name + "." + std::to_string(m_config.private_vid);
+-            if (bpl::cfg_persist_iface_bridge_assignment(m_config.private_bridge,
+-                                                         private_vlan_iface)) {
+-                network_written = true;
+-            }
+-        }
+     }
+ 
+     if (wireless_written) {
+@@ -519,16 +514,15 @@ void TrafficSeparationManager::reset_persistence()
+     }
+ 
+     // Remove VLAN subinterface entries from /etc/config/network that were added by
+-    // persist_bridge_assignments() for tagged trunk ports.
+-    //   - All tagged trunk ports: remove <iface>.<guest_vid> from guest_bridge
+-    //   - WiFi trunks only:       remove <iface>.<private_vid> from private_bridge
++    // persist_bridge_assignments() for tagged Ethernet trunk ports only.
++    //   - Ethernet trunks only: remove <iface>.<guest_vid> from guest_bridge
+     for (const auto &entry : m_trunk_ports) {
+         const sTrunkPort &tp = entry.second;
+-        if (tp.is_untagged_mode) {
++        if (tp.is_untagged_mode || !tp.is_ethernet) {
+             continue;
+         }
+ 
+-        // Remove guest VLAN subinterface from guest_bridge
++        // Remove guest VLAN subinterface from guest_bridge (Ethernet trunks only)
+         if (!m_config.guest_bridge.empty() && m_config.guest_vid != 0) {
+             const std::string guest_vlan_iface =
+                 tp.iface_name + "." + std::to_string(m_config.guest_vid);
+@@ -539,18 +533,6 @@ void TrafficSeparationManager::reset_persistence()
+                 network_written = true;
+             }
+         }
+-
+-        // Remove private VLAN subinterface from private_bridge (WiFi trunks only)
+-        if (!tp.is_ethernet && !m_config.private_bridge.empty() && m_config.private_vid != 0) {
+-            const std::string private_vlan_iface =
+-                tp.iface_name + "." + std::to_string(m_config.private_vid);
+-            if (bpl::cfg_remove_iface_from_bridge_config(m_config.private_bridge,
+-                                                         private_vlan_iface)) {
+-                LOG(DEBUG) << "reset_persistence: removed " << private_vlan_iface
+-                           << " from bridge=" << m_config.private_bridge;
+-                network_written = true;
+-            }
+-        }
+     }
+ 
+     if (wireless_written) {
+diff --git a/agent/src/beerocks/slave/traffic_separation/trunk_port_plumbing_8021q.cpp b/agent/src/beerocks/slave/traffic_separation/trunk_port_plumbing_8021q.cpp
+index ade445bb1..2a1dd739e 100644
+--- a/agent/src/beerocks/slave/traffic_separation/trunk_port_plumbing_8021q.cpp
++++ b/agent/src/beerocks/slave/traffic_separation/trunk_port_plumbing_8021q.cpp
+@@ -37,14 +37,26 @@ bool TrunkPortPlumbing8021q::apply(const sTrafficSeparationConfig &cfg)
+         return false;
+     }
+ 
+-    // If TS is applied and config is unchanged -> do nothing.
++    // If TS is applied and config is unchanged -> do nothing (unless subinterfaces are gone).
+     // If config changed -> clear old plumbing first.
+     if (m_is_applied) {
+         if (m_last_cfg == cfg) {
+-            LOG(DEBUG) << "trunk=" << m_trunk.iface_name << " has already TS policies applied.";
+-            return true;
++            // Verify VLAN subinterfaces still exist. They may have been destroyed if the
++            // parent interface was torn down and recreated (e.g. on agent reconnect).
++            const bool subifaces_ok =
++                (m_private_subiface.empty() ||
++                 network_utils::linux_iface_exists(m_private_subiface)) &&
++                (m_guest_subiface.empty() ||
++                 network_utils::linux_iface_exists(m_guest_subiface));
++            if (subifaces_ok) {
++                LOG(DEBUG) << "trunk=" << m_trunk.iface_name << " has already TS policies applied.";
++                return true;
++            }
++            LOG(DEBUG) << "trunk=" << m_trunk.iface_name
++                       << " VLAN subinterfaces missing, re-applying TS policies.";
++        } else {
++            LOG(DEBUG) << "Clearing and applying new policies.";
+         }
+-        LOG(DEBUG) << "Clearing and applying new policies.";
+         if (!clear()) {
+             LOG(ERROR) << "failed to clear old plumbing";
+             return false;
+diff --git a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
+index cc7deab00..3a0a12301 100644
+--- a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
+@@ -332,8 +332,6 @@ bool sta_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+             return true;
+         }
+ 
+-        // Add sACTION_BACKHAUL_CONNECTED_NOTIFICATION which contain the Multi-AP profile, and the
+-        // Primary VLAN ID. Since this is not implemented on this flavour of BWL, leave it empty.
+         auto msg_buff = ALLOC_SMART_BUFFER(sizeof(sACTION_BACKHAUL_CONNECTED_NOTIFICATION));
+         auto msg      = reinterpret_cast<sACTION_BACKHAUL_CONNECTED_NOTIFICATION *>(msg_buff.get());
+         LOG_IF(!msg, FATAL) << "Memory allocation failed!";
+@@ -341,6 +339,29 @@ bool sta_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+         // Initialize the message
+         memset(msg_buff.get(), 0, sizeof(sACTION_BACKHAUL_CONNECTED_NOTIFICATION));
+ 
++        // Parse Multi-AP profile and primary VLAN ID from the CTRL-EVENT-CONNECTED event.
++        // Validate with endptr to reject empty, non-numeric, or partial strings (e.g. "123abc"),
++        // and range-check before narrowing cast to avoid silent wrap-around.
++        if (parsed_obj.count("multi_ap_profile")) {
++            const auto &val      = parsed_obj.at("multi_ap_profile");
++            char *endptr         = nullptr;
++            unsigned long parsed = std::strtoul(val.c_str(), &endptr, 10);
++            if (endptr != val.c_str() && *endptr == '\0' && parsed <= 0xFF) {
++                msg->multi_ap_profile = static_cast<uint8_t>(parsed);
++            } else {
++                LOG(WARNING) << "Invalid multi_ap_profile value: " << val;
++            }
++        }
++        if (parsed_obj.count("multi_ap_primary_vlanid")) {
++            const auto &val      = parsed_obj.at("multi_ap_primary_vlanid");
++            char *endptr         = nullptr;
++            unsigned long parsed = std::strtoul(val.c_str(), &endptr, 10);
++            if (endptr != val.c_str() && *endptr == '\0' && parsed <= 0xFFFF) {
++                msg->multi_ap_primary_vlan_id = static_cast<uint16_t>(parsed);
++            } else {
++                LOG(WARNING) << "Invalid multi_ap_primary_vlanid value: " << val;
++            }
++        }
+         update_status(connection_status);
+ 
+         // Forward the event
+@@ -410,7 +431,6 @@ bool sta_wlan_hal_nl80211::reassociate()
+         update_status(connection_status);
+         if (is_connected(connection_status.wpa_state)) {
+             LOG(TRACE) << "reassociate: - backhaul STA already connected";
+-
+             auto msg_buff = ALLOC_SMART_BUFFER(sizeof(sACTION_BACKHAUL_CONNECTED_NOTIFICATION));
+             auto msg = reinterpret_cast<sACTION_BACKHAUL_CONNECTED_NOTIFICATION *>(msg_buff.get());
+ 
+@@ -418,6 +438,12 @@ bool sta_wlan_hal_nl80211::reassociate()
+ 
+             memset(msg_buff.get(), 0, sizeof(sACTION_BACKHAUL_CONNECTED_NOTIFICATION));
+ 
++            // Populate Multi-AP profile and primary VLAN ID from STATUS reply.
++            // These fields are available when the WPA supplicant exposes them via STATUS
++            // (requires the WPA supplicant patch that adds multi_ap_profile and
++            // multi_ap_primary_vlanid to the STATUS command output).
++            msg->multi_ap_profile        = connection_status.multi_ap_profile;
++            msg->multi_ap_primary_vlan_id = connection_status.multi_ap_primary_vlanid;
+             event_queue_push(Event::Connected, msg_buff);
+ 
+             return true;
+@@ -546,16 +572,38 @@ bool sta_wlan_hal_nl80211::read_status(ConnectionStatus &connection_status)
+     connection_status.wpa_state       = reply["wpa_state"];
+     connection_status.address         = reply["address"];
+     connection_status.uuid            = reply["uuid"];
++    // Extract Multi-AP profile and primary VLAN ID if exposed by WPA supplicant STATUS command.
++    // Validate with endptr to reject empty, non-numeric, or partial strings (e.g. "123abc"),
++    // and range-check before narrowing cast to avoid silent wrap-around.
++    if (reply.count("multi_ap_profile")) {
++        const auto &val      = reply.at("multi_ap_profile");
++        char *endptr         = nullptr;
++        unsigned long parsed = std::strtoul(val.c_str(), &endptr, 10);
++        if (endptr != val.c_str() && *endptr == '\0' && parsed <= 0xFF) {
++            connection_status.multi_ap_profile = static_cast<uint8_t>(parsed);
++        } else {
++            LOG(WARNING) << "Invalid multi_ap_profile value: " << val;
++        }
++    }
++    if (reply.count("multi_ap_primary_vlanid")) {
++        const auto &val      = reply.at("multi_ap_primary_vlanid");
++        char *endptr         = nullptr;
++        unsigned long parsed = std::strtoul(val.c_str(), &endptr, 10);
++        if (endptr != val.c_str() && *endptr == '\0' && parsed <= 0xFFFF) {
++            connection_status.multi_ap_primary_vlanid = static_cast<uint16_t>(parsed);
++        } else {
++            LOG(WARNING) << "Invalid multi_ap_primary_vlanid value: " << val;
++        }
++    }
+ 
+     std::string reply_str;
+     for (const auto &entry : reply) {
+         if (!reply_str.empty()) {
+-            reply_str += "\n";
++            reply_str += " ";
+         }
+         reply_str += entry.first + "=" + entry.second;
+     }
+     LOG(TRACE) << "STATUS reply= \n" << reply_str;
+-
+     LOG(DEBUG) << "active network " << m_active_network_id;
+ 
+     return true;
+diff --git a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h
+index 50807a84d..e99de47fa 100644
+--- a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h
+@@ -154,6 +154,20 @@ private:
+          * Universally Unique Identifier of the device
+          */
+         std::string uuid;
++
++        /**
++         * Multi-AP profile advertised by the upstream AP in the association response.
++         * Populated from the STATUS command when available (requires WPA supplicant
++         * to expose multi_ap_profile in STATUS output).
++         */
++        uint8_t multi_ap_profile = 0;
++
++        /**
++         * Primary VLAN ID advertised by the upstream AP in the association response.
++         * Populated from the STATUS command when available (requires WPA supplicant
++         * to expose multi_ap_primary_vlanid in STATUS output).
++         */
++        uint16_t multi_ap_primary_vlanid = 0;
+     };
+ 
+     /**
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 5b9147a4f..32d76fbe7 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -1756,9 +1756,14 @@ bool Controller::handle_cmdu_1905_autoconfiguration_WSC(const sMacAddr &src_mac,
+             return false;
+         }
+     } else {
+-        agent_monitoring_task::add_traffic_separation_policy_tlv(database, cmdu_tx, m1->mac_addr());
+-        agent_monitoring_task::add_profile_2default_802q_settings_tlv(database, cmdu_tx,
+-                                                                      m1->mac_addr());
++        // Add Traffic Separation policy TLVs as part of WSC Autoconfiguration (M2) message.
++        // (Optional TLVs per Multi-AP profile-2; agent will apply before bringing up VLAN plumbing)
++        if (is_custom_ts_enabled) {
++            agent_monitoring_task::add_profile_2default_802q_settings_tlv(database, cmdu_tx,
++                                                                          m1->mac_addr());
++            agent_monitoring_task::add_traffic_separation_policy_tlv(database, cmdu_tx,
++                                                                     m1->mac_addr());
++        }
+     }
+ 
+     if (!has_configured_bss && is_custom_ts_enabled) {
+-- 
+2.34.1
+
