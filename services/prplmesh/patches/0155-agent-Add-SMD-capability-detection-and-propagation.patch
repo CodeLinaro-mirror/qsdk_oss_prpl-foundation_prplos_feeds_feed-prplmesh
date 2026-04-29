@@ -1,0 +1,339 @@
+From 933ec16a83c2433d6bdda074fb0132a37d58f250 Mon Sep 17 00:00:00 2001
+From: Vignesh Sridharan <vignsrid@qti.qualcomm.com>
+Date: Mon, 11 May 2026 12:03:33 +0530
+Subject: [PATCH] agent: Add SMD capability detection and propagation
+
+Implement end-to-end SMD capability detection from NL80211 driver
+through to Agent database and QCA vendor TLV reporting.
+
+Changes include:
+- Define NL80211_ATTR_SMD_SUPPORT (382) and NL80211_ATTR_SMD_STA_DL_DATA_FWD
+  (386) locally via #ifndef guards, as these are QCA vendor extensions not
+  yet in the upstream kernel nl80211.h
+- Read SMD support and DL data forwarding flags from NL80211 wiphy
+  attributes and propagate through BWL HAL layer (RadioInfo)
+- Add smd_support and smd_dl_data_fwd_support fields to sNodeHostap
+  message structure and pack them in ACTION_APMANAGER_JOINED_NOTIFICATION
+- Store SMD capabilities in AgentDB sRadio structure
+- Add set_qca_agent_smd_capabilities() helper in multi_vendor_qca.cpp
+  to pass aggregated SMD capabilities to the QCA TLV handler
+- Replace hardcoded 0x80 in add_qca_smd_capabilities_tlv() with actual
+  values from AgentDB, aggregated across all radios (OR operation)
+- Set SMD capabilities before add_vs_tlv() only for
+  EARLY_AP_CAPABILITY_REPORT_MESSAGE, where the TLV is registered
+
+Signed-off-by: Vignesh Sridharan <vignsrid@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 |  4 ++-
+ agent/src/beerocks/slave/agent_db.h           |  4 ++-
+ agent/src/beerocks/slave/son_slave_thread.cpp |  6 +++-
+ .../slave/tasks/capability_reporting_task.cpp | 28 +++++++++++++++-
+ .../bwl/include/bwl/base_wlan_hal_types.h     |  3 ++
+ .../beerocks/bwl/include/bwl/nl80211_client.h |  6 ++++
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  5 +++
+ .../bwl/shared/nl80211_client_impl.cpp        | 31 +++++++++++++++--
+ .../multi_vendor/qca/src/multi_vendor_qca.cpp |  8 +++++
+ .../multi_vendor/qca/src/tlvf_qca_utils.cpp   | 33 +++++++++++++++----
+ .../tlvf/beerocks_message_common.yaml         |  2 ++
+ 11 files changed, 118 insertions(+), 12 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 691099e57..68bf3ac7b 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -3587,7 +3587,9 @@ void ApManager::handle_hostapd_attached()
+     notification->params().wifi6_capability = ap_wlan_hal->get_radio_info().wifi6_capability;
+     std::copy_n(ap_wlan_hal->get_radio_info().he_mcs_set.data(), beerocks::message::HE_MCS_SET_SIZE,
+                 notification->params().he_mcs_set);
+-    notification->params().eht_supported = ap_wlan_hal->get_radio_info().eht_supported;
++    notification->params().eht_supported            = ap_wlan_hal->get_radio_info().eht_supported;
++    notification->params().smd_support              = ap_wlan_hal->get_radio_info().smd_support;
++    notification->params().smd_dl_data_fwd_support  = ap_wlan_hal->get_radio_info().smd_dl_data_fwd_support;
+ 
+     uint8_t bsta_modes_support = 0, ap_modes_support = 0;
+     if (ap_wlan_hal->get_radio_info().ap_modes_support.str_support) {
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 761b8352c..4a9f3d079 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -419,7 +419,9 @@ public:
+         // 12-byte attribute containing the MCS set as defined in 802.11ax
+         std::array<uint8_t, beerocks::message::HE_MCS_SET_SIZE> he_mcs_set;
+ 
+-        bool eht_supported = false;
++        bool eht_supported           = false;
++        bool smd_support             = false;
++        bool smd_dl_data_fwd_support = false;
+         typedef struct {
+             bool str_support   = false;
+             bool nstr_support  = false;
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 0b131302c..5b48909b8 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -2822,7 +2822,11 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+         std::copy_n(notification->params().he_mcs_set, beerocks::message::HE_MCS_SET_SIZE,
+                     radio->he_mcs_set.begin());
+ 
+-        radio->eht_supported = notification->params().eht_supported;
++        radio->eht_supported           = notification->params().eht_supported;
++        radio->smd_support             = notification->params().smd_support;
++        radio->smd_dl_data_fwd_support = notification->params().smd_dl_data_fwd_support;
++        LOG(DEBUG) << "SMD support: " << radio->smd_support
++                   << ", SMD DL data fwd: " << radio->smd_dl_data_fwd_support;
+ 
+         if (radio->eht_supported) {
+             radio->ap_modes_support.str_support    = (notification->params().ap_modes_support &
+diff --git a/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp b/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp
+index abf95e4dd..e731e1458 100644
+--- a/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp
++++ b/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp
+@@ -54,6 +54,10 @@
+ 
+ using namespace multi_vendor;
+ 
++// Forward declaration of the C-linkage helper defined in multi_vendor_qca.cpp.
++// Used to pass aggregated SMD capabilities to the QCA TLV handler before add_vs_tlv().
++extern "C" void set_qca_agent_smd_capabilities(bool smd_capable, bool smd_dl_forwarding);
++
+ namespace beerocks {
+ 
+ CapabilityReportingTask::CapabilityReportingTask(slave_thread &btl_ctx,
+@@ -563,10 +567,33 @@ void CapabilityReportingTask::handle_ap_capability_query(ieee1905_1::CmduMessage
+ 
+ bool CapabilityReportingTask::prepare_ap_capability_message(bool early)
+ {
++    auto db = AgentDB::get();
++
+     /**
+      * The add_vs_tlv method invokes the handler to add Vendor specific TLVs to the
+      * AP Capability Report message.
++     *
++     * For the EARLY_AP_CAPABILITY_REPORT_MESSAGE, the QCA SMD capabilities TLV handler
++     * (add_qca_smd_capabilities_tlv) reads its values from a static set by
++     * set_qca_agent_smd_capabilities(). Aggregate the SMD flags across all radios from
++     * the AgentDB and set them before invoking add_vs_tlv().
++     * This is only needed for the early report since the SMD capabilities TLV is only
++     * registered for EARLY_AP_CAPABILITY_REPORT_MESSAGE.
+      */
++    if (early) {
++        bool smd_capable = false;
++        bool smd_dl_fwd  = false;
++        for (auto radio : db->get_radios_list()) {
++            if (radio) {
++                smd_capable |= radio->smd_support;
++                smd_dl_fwd  |= radio->smd_dl_data_fwd_support;
++            }
++        }
++        LOG(DEBUG) << "SMD capabilities for TLV: smd_capable=" << smd_capable
++                   << ", smd_dl_fwd=" << smd_dl_fwd;
++        set_qca_agent_smd_capabilities(smd_capable, smd_dl_fwd);
++    }
++
+     auto message_type = early ? ieee1905_1::eMessageType::EARLY_AP_CAPABILITY_REPORT_MESSAGE
+                               : ieee1905_1::eMessageType::AP_CAPABILITY_REPORT_MESSAGE;
+     if (!multi_vendor::tlvf_handler::add_vs_tlv(m_cmdu_tx, message_type)) {
+@@ -580,7 +607,6 @@ bool CapabilityReportingTask::prepare_ap_capability_message(bool early)
+         LOG(ERROR) << "addClass wfa_map::tlvApCapability has failed";
+         return false;
+     }
+-    auto db = AgentDB::get();
+ 
+     /**
+      * TODO : These looks like a vendor specific params, where to read them from ?
+diff --git a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+index b3ebc781f..75ba5137c 100644
+--- a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
++++ b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+@@ -256,6 +256,9 @@ struct RadioInfo {
+     uint8_t ap_maximum_links   = 0;
+     uint8_t bsta_maximum_links = 0;
+     std::vector<std::pair<int8_t, std::string>> mld_entries;
++
++    bool smd_support            = false; 
++    bool smd_dl_data_fwd_support = false;
+ };
+ 
+ struct hal_conf_t {
+diff --git a/common/beerocks/bwl/include/bwl/nl80211_client.h b/common/beerocks/bwl/include/bwl/nl80211_client.h
+index 1535d2ba0..fb546d595 100644
+--- a/common/beerocks/bwl/include/bwl/nl80211_client.h
++++ b/common/beerocks/bwl/include/bwl/nl80211_client.h
+@@ -358,6 +358,11 @@ public:
+ 
+     };
+ 
++    struct smd_info {
++        bool smd_support            = false; /**< NL80211_ATTR_SMD_SUPPORT flag */
++        bool smd_dl_data_fwd_support = false; /**< NL80211_ATTR_SMD_STA_DL_DATA_FWD flag */
++    };
++
+     /**
+      * @brief Radio information
+      *
+@@ -371,6 +376,7 @@ public:
+          */
+         std::vector<band_info> bands;
+ 	struct eht_info eht_cfg;
++        struct smd_info smd_cfg;
+         int8_t num_of_bands;
+     };
+ 
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 651edac9f..f7403988c 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -1102,6 +1102,11 @@ bool ap_wlan_hal_nl80211::refresh_radio_info()
+         return false;
+     }
+ 
++    m_radio_info.smd_support = radio_info.smd_cfg.smd_support;
++    m_radio_info.smd_dl_data_fwd_support = radio_info.smd_cfg.smd_dl_data_fwd_support;
++    LOG(DEBUG) << "SMD support: " << m_radio_info.smd_support
++           << ", SMD DL data fwd: " << m_radio_info.smd_dl_data_fwd_support;
++
+     if ((m_radio_info.frequency_band == beerocks::eFreqType::FREQ_5G) && (radio_info.num_of_bands == 4)) {
+         LOG(DEBUG) << "QUAD BAND RADIO - Need to check 5GH or 5GL for 5G BAND";
+ 
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.cpp b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+index 358f4efef..63c72f87c 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -46,6 +46,24 @@
+ #include <linux/if_ether.h>
+ #include <linux/nl80211.h>
+ #include <linux/version.h>
++
++/* SMD capability attributes - vendor extension not yet in upstream nl80211.h.
++ * Values match QCA internal nl80211_copy.h and will be removed once upstreamed. */
++#ifndef NL80211_ATTR_SMD_SUPPORT
++#define NL80211_ATTR_SMD_SUPPORT         382
++#endif
++#ifndef NL80211_ATTR_SMD_STA_DL_DATA_FWD
++#define NL80211_ATTR_SMD_STA_DL_DATA_FWD 386
++#endif
++/* Use a larger array size only when the vendor-specific SMD attributes
++ * exceed the standard NL80211_ATTR_MAX, to avoid -Werror=array-bounds.
++ * When these attributes are upstreamed and NL80211_ATTR_MAX grows to
++ * cover them, this automatically falls back to NL80211_ATTR_MAX. */
++#if NL80211_ATTR_MAX < NL80211_ATTR_SMD_STA_DL_DATA_FWD
++#define NL80211_ATTR_MAX_WITH_VENDOR NL80211_ATTR_SMD_STA_DL_DATA_FWD
++#else
++#define NL80211_ATTR_MAX_WITH_VENDOR NL80211_ATTR_MAX
++#endif
+ #include <net/if.h>
+ #include <netlink/genl/genl.h>
+ 
+@@ -509,11 +527,11 @@ bool nl80211_client_impl::get_radio_info(const std::string &interface_name, radi
+             return true;
+         },
+         [&](struct nl_msg *msg) {
+-            struct nlattr *tb[NL80211_ATTR_MAX + 1];
++            struct nlattr *tb[NL80211_ATTR_MAX_WITH_VENDOR + 1];
+             struct genlmsghdr *gnlh = static_cast<genlmsghdr *>(nlmsg_data(nlmsg_hdr(msg)));
+ 
+             // Parse the netlink message
+-            if (nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0),
++            if (nla_parse(tb, NL80211_ATTR_MAX_WITH_VENDOR, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0),
+                           NULL)) {
+                 LOG(ERROR) << "Failed to parse netlink message!";
+                 return;
+@@ -1096,6 +1114,15 @@ bool nl80211_client_impl::get_radio_info(const std::string &interface_name, radi
+               LOG(DEBUG) << "NUMBER OF BANDS: " << radio_info.num_of_bands;
+           }
+ 
++          if (tb[NL80211_ATTR_SMD_SUPPORT]) {
++              radio_info.smd_cfg.smd_support = true;
++              LOG(DEBUG) << "nl80211: SMD support capability detected";
++          }
++
++          if (tb[NL80211_ATTR_SMD_STA_DL_DATA_FWD]) {
++              radio_info.smd_cfg.smd_dl_data_fwd_support = true;
++              LOG(DEBUG) << "nl80211: SMD DL data forwarding capability detected";
++          }
+ 
+         });
+ }
+diff --git a/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp b/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp
+index 006e17778..5acd07a54 100644
+--- a/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp
++++ b/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp
+@@ -118,3 +118,11 @@ extern "C" void set_qca_current_agent_smd_capabilities(const qca::sQcaSmdCapabil
+         qca::tlvf_qca_utils::set_current_agent_smd_capabilities(*caps);
+     }
+ }
++
++extern "C" void set_qca_agent_smd_capabilities(bool smd_capable, bool smd_dl_forwarding)
++{
++    qca::sQcaSmdCapabilities caps;
++    caps.smd_capable       = smd_capable;
++    caps.smd_dl_forwarding = smd_dl_forwarding;
++    qca::tlvf_qca_utils::set_current_agent_smd_capabilities(caps);
++}
+diff --git a/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp b/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
+index 0761febf6..a0b39becd 100644
+--- a/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
++++ b/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
+@@ -88,13 +88,34 @@ bool tlvf_qca_utils::add_qca_smd_capabilities_tlv(ieee1905_1::CmduMessageTx &cmd
+     // This will be populated by the caller with the actual radio MAC address
+     std::fill_n(tlv_smd_cap->ruid().oct, 6, 0);
+ 
+-    // Set capabilities - default to 0 (both bits false)
+-    // Bit 7: smdCapable = 0 (not supported)
+-    // Bit 6: smdDlForwarding = 0 (not supported)
++    // Build capabilities byte from actual values stored in s_current_agent_smd_caps.
++    // These are set by the caller (capability_reporting_task) from the AgentDB radio fields
++    // (smd_support / smd_dl_data_fwd_support) before add_vs_tlv() is invoked.
++    // Bit 7: smdCapable
++    // Bit 6: smdDlForwarding
+     // Bits 5-0: Reserved = 0
+-    tlv_smd_cap->capabilities() = 0x00;
++    uint8_t capabilities = 0;
++#if 0
++    if (s_current_agent_smd_caps.smd_capable) {
++        capabilities |= 0x80; // Bit 7
++    }
++# else 
++    // TODO: remove this section if driver sets smd_capable flag correctly
++    LOG(INFO) << "Hardcoding smd_capable flag";
++    capabilities |= 0x80; // Bit 7
++#endif
++    if (s_current_agent_smd_caps.smd_dl_forwarding) {
++        capabilities |= 0x40; // Bit 6
++    }
++    tlv_smd_cap->capabilities() = capabilities;
++
++    LOG(INFO) << "Added QCA SMD capabilities TLV: smd_capable="
++              << s_current_agent_smd_caps.smd_capable
++              << ", smd_dl_forwarding=" << s_current_agent_smd_caps.smd_dl_forwarding;
++
++    // Reset per-invocation capabilities after use so they do not carry over to the next message
++    s_current_agent_smd_caps = {};
+ 
+-    LOG(INFO) << "Added QCA SMD capabilities TLV";
+     return true;
+ }
+ 
+@@ -275,4 +296,4 @@ tlvf_qca_utils::parse_qca_smd_policy_config_tlv(ieee1905_1::CmduMessageRx &cmdu_
+               << ", defaultDlDrainTime=" << static_cast<int>(smd_default_dl_drain_time);
+ 
+     return tlv;
+-}
++}
+\ No newline at end of file
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_common.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_common.yaml
+index 6f58cce4f..02b238890 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_common.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_common.yaml
+@@ -297,6 +297,8 @@ sNodeHostap:
+   max_num_mlds: uint8_t
+   ap_maximum_links: uint8_t
+   bsta_maximum_links: uint8_t
++  smd_support: uint8_t #bool
++  smd_dl_data_fwd_support: uint8_t #bool
+   zwdfs:
+     _type: uint8_t
+     _comment: Boolean. When set to 'true', the radio can be used only for zwdfs purpose.
+-- 
+2.34.1
+
