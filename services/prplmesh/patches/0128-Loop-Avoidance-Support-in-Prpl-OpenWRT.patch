@@ -1,0 +1,392 @@
+From c15cca57043984a5ba6126172135e0ede2b19860 Mon Sep 17 00:00:00 2001
+From: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+Date: Wed, 15 Apr 2026 12:23:12 +0530
+Subject: [PATCH] Loop Avoidance Support in Prpl-OpenWRT
+
+Signed-off-by: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 | 31 +++++++-
+ .../fronthaul_manager/ap_manager/ap_manager.h |  1 +
+ .../backhaul_manager/backhaul_manager.cpp     | 25 ++++++
+ agent/src/beerocks/slave/son_slave_thread.cpp | 29 +++++++
+ common/beerocks/bwl/include/bwl/ap_wlan_hal.h | 13 +++
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 79 +++++++++++++++++++
+ .../bwl/nl80211/ap_wlan_hal_nl80211.h         |  1 +
+ .../tlvf/beerocks_message_action.yaml         |  6 +-
+ .../tlvf/beerocks_message_apmanager.yaml      |  5 ++
+ .../tlvf/beerocks_message_backhaul.yaml       |  4 +
+ 10 files changed, 191 insertions(+), 3 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index f80588d4f..3d07c1bcd 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -1153,6 +1153,34 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+     }
+ 
+     switch (beerocks_header->action_op()) {
++    case beerocks_message::ACTION_APMANAGER_BSTA_STATE_NOTIFICATION: {
++        // Handle bSTA connect/disconnect: update hop count BEFORE any other action
++        auto notification = beerocks_header->addClass<
++            beerocks_message::cACTION_APMANAGER_BSTA_STATE_NOTIFICATION>();
++        if (!notification) {
++            LOG(ERROR) << "addClass cACTION_APMANAGER_BSTA_STATE_NOTIFICATION failed";
++            return;
++        }
++        if (!ap_wlan_hal) {
++            LOG(WARNING) << "ap_wlan_hal not ready, skipping hop count update";
++            return;
++        }
++        uint8_t hop_count;
++        if (notification->connected()) {
++            // bSTA connected: 0 = local agent (gateway), 1 = standalone extender
++            hop_count = m_local_gw ? 0 : 1;
++            LOG(INFO) << "bSTA connected: setting hop_count=" << int(hop_count)
++                      << " on radio " << m_iface;
++        } else {
++            // bSTA disconnected: 255 = unreachable
++            hop_count = 255;
++            LOG(INFO) << "bSTA disconnected: setting hop_count=255 on radio " << m_iface;
++        }
++        if (!ap_wlan_hal->set_hop_count(hop_count)) {
++            LOG(ERROR) << "Setting hop count failed on interface" << m_iface;
++        };
++        return;
++    }
+     case beerocks_message::ACTION_APMANAGER_CONFIGURE: {
+         LOG(TRACE) << "ACTION_APMANAGER_CONFIGURE";
+ 
+@@ -1166,6 +1194,8 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+ 
+         certification_mode = config->certification_mode();
+         multi_ap_profile   = config->multi_ap_profile();
++        m_local_gw         = static_cast<bool>(config->local_gw());
++        LOG(DEBUG) << "ACTION_APMANAGER_CONFIGURE: local_gw=" << m_local_gw;
+ 
+         if (create_ap_wlan_hal()) {
+             LOG(DEBUG) << "Move to ATTACHING state";
+@@ -3717,7 +3747,6 @@ bool ApManager::handle_ap_enabled(int vap_id)
+     notification->vap_info().ap_mld_mac = tlvf::mac_from_string(vap_info.ap_mld_mac);
+ 
+     send_cmdu(cmdu_tx);
+-
+     return true;
+ }
+ 
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
+index 0831e50ea..c147fba8d 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
+@@ -211,6 +211,7 @@ private:
+     beerocks::logging &m_logger;
+     bool acs_enabled;
+     bool m_ap_support_zwdfs;
++    bool m_local_gw = false;
+     wfa_map::tlvProfile2MultiApProfile::eMultiApProfile m_multiap_controller_profile =
+         wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::PRPLMESH_PROFILE_UNKNOWN;
+ 
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 4fba447cb..d6c312ab3 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -2447,6 +2447,19 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+             send_cmdu(m_agent_fd, cmdu_tx);
+         }
+ 
++        // Notify fronthaul manager to restore hop count (bSTA connected)
++        {
++            auto bsta_notif = message_com::create_vs_message<
++                beerocks_message::cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION>(cmdu_tx);
++            if (bsta_notif) {
++                bsta_notif->connected() = 1;
++                LOG(DEBUG) << "Sending ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION (connected)";
++                send_cmdu(m_agent_fd, cmdu_tx);
++            } else {
++                LOG(ERROR) << "Failed sending ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION";
++            }
++        }
++
+         if (FSM_IS_IN_STATE(WAIT_WPS) || FSM_IS_IN_STATE(WIRELESS_CONFIG_4ADDR_MODE)) {
+             db->backhaul.selected_iface_name = iface;
+             auto radio = db->radio(iface);
+@@ -2552,6 +2565,18 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+             iface_hal->set_3addr_mcast(false);
+         }
+         if (iface == db->backhaul.selected_iface_name) {
++            // Notify fronthaul manager to set hop count = 255 (bSTA disconnected/unreachable)
++            {
++                auto bsta_notif = message_com::create_vs_message<
++                    beerocks_message::cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION>(cmdu_tx);
++                if (bsta_notif) {
++                    bsta_notif->connected() = 0;
++                    LOG(DEBUG) << "Sending ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION (disconnected)";
++                    send_cmdu(m_agent_fd, cmdu_tx);
++                } else {
++                    LOG(ERROR) << "Failed sending ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION";
++                }
++            }
+             if (FSM_IS_IN_STATE(OPERATIONAL) || FSM_IS_IN_STATE(CONNECTED)) {
+ 
+                 // If this event comes as a result of a steering request, then do not consider it
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 0fd192f40..f4f121de1 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -2403,6 +2403,34 @@ bool slave_thread::handle_cmdu_backhaul_manager_message(
+                                  TrafficSeparationTask::eEvent::TS_ENABLE);
+         break;
+     }
++    case beerocks_message::ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION: {
++        auto notification_in = beerocks_header->addClass<
++            beerocks_message::cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION>();
++        if (!notification_in) {
++            LOG(ERROR) << "addClass cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION failed";
++            return false;
++        }
++        LOG(DEBUG) << "Received ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION connected="
++                   << int(notification_in->connected());
++        // Forward to ALL ap_managers as ACTION_APMANAGER_BSTA_STATE_NOTIFICATION
++        m_radio_managers.do_on_each_radio_manager(
++            [&](const sManagedRadio &radio_manager, const std::string &) {
++                if (radio_manager.ap_manager_fd ==
++                    beerocks::net::FileDescriptor::invalid_descriptor) {
++                    return true;
++                }
++                auto notification_out = message_com::create_vs_message<
++                    beerocks_message::cACTION_APMANAGER_BSTA_STATE_NOTIFICATION>(cmdu_tx);
++                if (!notification_out) {
++                    LOG(ERROR) << "Failed building cACTION_APMANAGER_BSTA_STATE_NOTIFICATION";
++                    return true;
++                }
++                notification_out->connected() = notification_in->connected();
++                send_cmdu(radio_manager.ap_manager_fd, cmdu_tx);
++                return true;
++            });
++        break;
++    }
+     default: {
+         LOG(ERROR) << "Unknown BACKHAUL_MANAGER message, action_op: "
+                    << int(beerocks_header->action_op());
+@@ -2723,6 +2751,7 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+         config_msg->channel() = db->device_conf.front_radio.config.at(iface).configured_channel;
+         config_msg->certification_mode() = db->device_conf.certification_mode;
+         config_msg->multi_ap_profile()   = static_cast<uint8_t>(db->device_conf.multi_ap_profile);
++        config_msg->local_gw()           = static_cast<uint8_t>(db->device_conf.local_gw);
+         radio_manager.dm_instance        = db->dm_create_fronthaul_object(iface);
+ 
+         return send_cmdu(radio_manager.ap_manager_fd, cmdu_tx);
+diff --git a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+index 73e8b8f61..8a2de2b2a 100644
+--- a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+@@ -646,6 +646,19 @@ public:
+ #ifdef USE_PRPLMESH_NLHAL
+     virtual bool handle_mld_reconfig(std::string target_ssid, int8_t mld_unit) = 0;
+ #endif
++    /**
++     * @brief Dynamically update the Multi-AP hop count in the assocresp_elements
++     * vendor IE for all BSSes on this radio.
++     *
++     * Called when the backhaul STA connects or disconnects to update the hop count
++     * advertised in Association Response frames.
++     *
++     * @param hop_count  255 = bSTA disconnected (unreachable),
++     *                   1   = standalone extender (bSTA connected),
++     *                   0   = local agent (gateway).
++     * @return true on success, false otherwise.
++     */
++    virtual bool set_hop_count(uint8_t hop_count) { return true; }
+ 
+ private:
+     static const int frame_body_idx = (sizeof(s80211MgmtFrame::sHeader) * 2);
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 9a61851f8..e658e5164 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -57,6 +57,17 @@ bool ap_wlan_hal_nl80211::nl_event_handle(struct nl_msg *msg, void *arg)
+ 
+ #define NEIGHBOR_REPORT_SUBELEM_CANDIDATE_PREF_MAX_HEX "0301ff"
+ 
++// Multi-AP Vendor IE components for assocresp_elements
++// Wire format: <vendor_type(1)><length(1)><oui(3)><oui_type(1)><hop_count(1)>
++// Example (extender):   "dd050013741b01"
++// Example (local agent): "dd050013741b00"
++#define MULTIAP_VENDOR_IE_TYPE         0xDDU  // Vendor-specific IE type
++#define MULTIAP_VENDOR_IE_LENGTH       0x05U  // Length of the IE payload (5 bytes)
++#define QUALCOMM_VENDOR_OUI            "001374"  // Qualcomm OUI (3 bytes)
++#define MULTIAP_VENDOR_OUI_TYPE        0x1BU  // Multi-AP vendor OUI type
++#define MULTIAP_HOP_COUNT_EXTENDER     0x01U  // Hop count for standalone extenders
++#define MULTIAP_HOP_COUNT_LOCAL_AGENT  0x00U  // Hop count for local agents
++
+ 
+ // Temporary storage for station capabilities
+ struct SRadioCapabilitiesStrings {
+@@ -334,6 +345,31 @@ bool fetch_mld_iface_by_ssid(const std::string &target_ssid, std::string &mld_if
+ }
+ 
+ 
++// Builds the assocresp_elements hexdump for the Multi-AP backhaul vendor IE.
++// The IE is constructed from its individual components so that each field is
++// clearly identifiable and can be changed independently.
++//
++// @param hop_count  MULTIAP_HOP_COUNT_EXTENDER (0x01) for standalone extenders,
++//                   MULTIAP_HOP_COUNT_LOCAL_AGENT (0x00) for local agents.
++// @return  Lowercase hex string, e.g. "dd050013741b01".
++static std::string build_multiap_assocresp_ie(uint8_t hop_count)
++{
++    // Format: type(2) + len(2) + oui(6) + oui_type(2) + hop_count(2) + null(1) = 15 bytes
++    // Use a generously sized buffer to be safe against OUI string changes
++    char buf[32];
++    int written = snprintf(buf, sizeof(buf), "%02x%02x%s%02x%02x",
++             MULTIAP_VENDOR_IE_TYPE,
++             MULTIAP_VENDOR_IE_LENGTH,
++             QUALCOMM_VENDOR_OUI,
++             MULTIAP_VENDOR_OUI_TYPE,
++             hop_count);
++    if (written < 0 || static_cast<size_t>(written) >= sizeof(buf)) {
++        LOG(ERROR) << "build_multiap_assocresp_ie: buffer too small or encoding error";
++        return {};
++    }
++    return std::string(buf);
++}
++
+ static uint8_t wpa_bw_to_beerocks_bw(const std::string &chan_width)
+ {
+     // 20 MHz (no HT)
+@@ -1880,6 +1916,14 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                 conf.set_create_vap_value(vap_id, "rrm_neighbor_report", 1);
+                 conf.set_create_vap_value(vap_id, "rrm_beacon_report", 1);
+ 
++                if (bss_it.backhaul) {
++                    uint8_t hop_count = (beerocks::bpl::cfg_is_master() != 0)
++                                        ? MULTIAP_HOP_COUNT_LOCAL_AGENT
++                                        : MULTIAP_HOP_COUNT_EXTENDER;
++                    conf.set_create_vap_value(vap_id, "assocresp_elements",
++                        build_multiap_assocresp_ie(hop_count));
++                }
++
+                 //required to update uci wireless
+                 bss_it.multi_ap = multi_ap;
+                 // oddly enough, multi_ap_backhaul_wpa_passphrase has to be
+@@ -3216,6 +3260,34 @@ bool ap_wlan_hal_nl80211::configure_service_priority(const uint8_t *data)
+     return false;
+ }
+ 
++bool ap_wlan_hal_nl80211::set_hop_count(uint8_t hop_count)
++{
++    LOG(DEBUG) << "Setting hop_count=" << int(hop_count) << " on backhaul BSSes of radio "
++               << get_iface_name();
++
++    std::string vendor_ie = build_multiap_assocresp_ie(hop_count);
++    std::string cmd       = "SET assocresp_elements " + vendor_ie;
++    bool success          = true;
++
++    for (const auto &vap_entry : m_radio_info.available_vaps) {
++        const auto &vap = vap_entry.second;
++        if (vap.bss.empty()) {
++            continue;
++        }
++        if (!vap.backhaul) {  // Only update backhaul BSSes
++            continue;
++        }
++        if (!wpa_ctrl_send_msg(cmd, vap.bss)) {
++            LOG(ERROR) << "Failed to set hop_count=" << int(hop_count)
++                       << " on BSS " << vap.bss;
++            success = false;
++        } else {
++            LOG(DEBUG) << "Set hop_count=" << int(hop_count) << " on BSS " << vap.bss;
++        }
++    }
++    return success;
++}
++
+ bool ap_wlan_hal_nl80211::set_spatial_reuse_config(
+     son::wireless_utils::sSpatialReuseParams &spatial_reuse_params)
+ {
+@@ -3557,6 +3629,13 @@ bool ap_wlan_hal_nl80211::create_new_hostapd_conf_file(std::string &ifname, son:
+         conf.set_create_vap_value(vap_id, "multi_ap_backhaul_wpa_passphrase",
+                                   bss_conf.backhaul_wps_passphrase);
+     }
++    if (bss_conf.backhaul) {
++        uint8_t hop_count = (beerocks::bpl::cfg_is_master() != 0)
++                            ? MULTIAP_HOP_COUNT_LOCAL_AGENT
++                            : MULTIAP_HOP_COUNT_EXTENDER;
++        conf.set_create_vap_value(vap_id, "assocresp_elements",
++            build_multiap_assocresp_ie(hop_count));
++    }
+     auto ieee80211be_sprt = conf.get_head_value("ieee80211be");
+ 
+     LOG(INFO) << "ieee80211be_sprt: " << ieee80211be_sprt;
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+index 9e81060f0..395bdc280 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+@@ -141,6 +141,7 @@ public:
+     bool create_new_hostapd_conf_file(std::string &ifname, son::wireless_utils::sBssInfoConf &bss_conf,
+                                   std::string &bridge, std::string &conf_path,bool vbss);
+ 
++    bool set_hop_count(uint8_t hop_count) override;
+     bool remove_mld_link(std::string &link_iface_name, sMacAddr &link_mac);
+     bool remove_bss(std::string &iface_name, sMacAddr &iface_mac);
+ 
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
+index 138552a24..db516eab2 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
+@@ -152,8 +152,9 @@ eActionOp_BACKHAUL:
+   ACTION_BACKHAUL_WIFI_ENABLE_DISABLE_ENDPOINT: 84
+   ACTION_BACKHAUL_MLD_UPDATE_REQUEST: 85
+   ACTION_BACKHAUL_TOPOLOGY_NOTIFICATION_COMMAND: 86
++  ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION: 87
+ 
+-  ACTION_BACKHAUL_ENUM_END: 87
++  ACTION_BACKHAUL_ENUM_END: 88
+ 
+ ####################################################
+ ####################################################
+@@ -268,8 +269,9 @@ eActionOp_APMANAGER:
+   ACTION_APMANAGER_MULTI_CHAN_BEACON_11K_REQUEST: 76
+   ACTION_APMANAGER_MLD_UPDATE_REQUEST: 77
+   ACTION_APMANAGER_CHANGE_MODULE_LOGGING_LEVEL: 78
++  ACTION_APMANAGER_BSTA_STATE_NOTIFICATION: 79
+ 
+-  ACTION_APMANAGER_ENUM_END: 79
++  ACTION_APMANAGER_ENUM_END: 80
+ 
+ ####################################################
+ ####################################################
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+index 54744f409..0db45eb6d 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+@@ -37,6 +37,7 @@ cACTION_APMANAGER_CONFIGURE:
+   channel: uint8_t
+   certification_mode: uint8_t #bool
+   multi_ap_profile: uint8_t
++  local_gw: uint8_t #bool
+ 
+ cACTION_APMANAGER_JOINED_NOTIFICATION:
+   _type: class
+@@ -365,3 +366,7 @@ cACTION_APMANAGER_MLD_UPDATE_REQUEST:
+ cACTION_APMANAGER_CHANGE_MODULE_LOGGING_LEVEL:
+   _type: class
+   params: sLoggingLevelChange
++
++cACTION_APMANAGER_BSTA_STATE_NOTIFICATION:
++  _type: class
++  connected: uint8_t  # 1 = bSTA connected, 0 = bSTA disconnected
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
+index cfb9d272c..e73e6ec05 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
+@@ -241,3 +241,7 @@ cACTION_BACKHAUL_CHANNEL_SCAN_ABORTED_NOTIFICATION:
+ cACTION_BACKHAUL_CHANNEL_SCAN_FINISHED_NOTIFICATION:
+   _type: class
+   radio_mac: sMacAddr
++
++cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION:
++  _type: class
++  connected: uint8_t  # 1 = bSTA connected, 0 = bSTA disconnected
+-- 
+2.34.1
+
