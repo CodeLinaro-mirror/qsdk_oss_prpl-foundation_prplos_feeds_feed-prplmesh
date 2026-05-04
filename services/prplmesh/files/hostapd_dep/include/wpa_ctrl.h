@@ -118,10 +118,16 @@ extern "C" {
 #define WPA_EVENT_T2LM_UPDATE "CTRL-EVENT-T2LM-UPDATE "
 /** MLO link reconfiguration event */
 #define WPA_EVENT_LINK_RECONFIG "CTRL-EVENT-LINK-RECONFIG "
-/** MLO link sta removed */
+/** MLO link STA removed through link reconfiguration */
 #define WPA_EVENT_LINK_STA_REMOVED "CTRL-EVENT-LINK-STA-REMOVED "
-/** MLO link sta added */
+/** MLO link STA added through link reconfiguration */
 #define WPA_EVENT_LINK_STA_ADDED "CTRL-EVENT-LINK-STA-ADDED "
+
+#ifdef CONFIG_QCN_EXTN
+/** Ind Rep - WDS STA Pre-connect State */
+#define WPA_EVENT_PRE_CONNECTING "CTRL-EVENT-PRE-CONNECTING "
+#endif
+
 
 /** IP subnet status change notification
  *
@@ -182,6 +188,8 @@ extern "C" {
 #define WPS_EVENT_ENROLLEE_SEEN "WPS-ENROLLEE-SEEN "
 
 #define WPS_EVENT_OPEN_NETWORK "WPS-OPEN-NETWORK "
+/*Event to indictae do URI found on DPP_WPS*/
+#define WPS_EVENT_DPP_NO_URI "WPS-DPP-NO-URI "
 /** Result of SCS setup */
 #define WPA_EVENT_SCS_RESULT "CTRL-EVENT-SCS-RESULT "
 /* Event indicating DSCP policy */
@@ -396,6 +404,9 @@ extern "C" {
 #define DFS_EVENT_NOP_FINISHED "DFS-NOP-FINISHED "
 #define DFS_EVENT_PRE_CAC_EXPIRED "DFS-PRE-CAC-EXPIRED "
 
+/* AWGN events */
+#define INTERFERENCE_DETECTED "INTERFERENCE-DETECTED "
+
 #define AP_CSA_FINISHED "AP-CSA-FINISHED "
 
 #define P2P_EVENT_LISTEN_OFFLOAD_STOP "P2P-LISTEN-OFFLOAD-STOPPED "
@@ -471,6 +482,14 @@ extern "C" {
 
 /* PASN authentication status */
 #define PASN_AUTH_STATUS "PASN-AUTH-STATUS "
+
+/* Result of PASN performed for Proximity Ranging
+ * <result> role=<role> protocol=<protocol type> opclass=<op class> channel=<op channel> cc=<country>
+ */
+#define PR_PASN_RESULT "PR-PASN-RESULT "
+
+/* Proximity Ranging parameters to use in ranging */
+#define PR_RANGING_PARAMS "PR-RANGING-PARAMS "
 
 /* BSS command information masks */
 
