@@ -1,0 +1,660 @@
+From 670ebccbb080b703ecc2d0778ee264e53a378e8a Mon Sep 17 00:00:00 2001
+From: Sonali Naresh <sonanare@qti.qualcomm.com>
+Date: Fri, 1 May 2026 16:22:18 +0530
+Subject: [PATCH] MAP R6.1: Add Operating Channel Change Notification (OCCN) &
+ Query (OCQ) support
+
+This patch implements support for IEEE1905 Operating Channel Change Notification (OCCN)
+and Operating Channel Query (OCQ):
+- Integrates new IEEE1905 message types and events for OCCN/OCQ in Agent and Controller flows.
+- Adds TLV construction/parsing for operating channel query/notification.
+- Enables OCCN propagation between devices per Multi-AP requirements.
+
+Signed-off-by: Sonali Naresh <sonanare@qti.qualcomm.com>
+---
+ .../backhaul_manager/backhaul_manager.cpp     | 180 ++++++++++++
+ .../slave/backhaul_manager/backhaul_manager.h |   4 +
+ controller/src/beerocks/master/controller.cpp | 256 +++++++++++++++++-
+ controller/src/beerocks/master/controller.h   |   3 +
+ .../include/tlvf/ieee_1905_1/eMessageType.h   |   6 +
+ .../tlvf/wfa_map/tlvProfile2ErrorCode.h       |   2 +
+ .../yaml/tlvf/ieee_1905_1/eMessageType.yaml   |   2 +
+ .../tlvf/wfa_map/tlvProfile2ErrorCode.yaml    |   1 +
+ 8 files changed, 453 insertions(+), 1 deletion(-)
+
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 4fba447..fe786d2 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -34,9 +34,13 @@
+ #include <beerocks/tlvf/beerocks_message_control.h>
+ #include <beerocks/tlvf/beerocks_message_platform.h>
+ 
++#include <tlvf/ieee_1905_1/tlvAlMacAddress.h>
+ #include <tlvf/wfa_map/tlvBackhaulSteeringRequest.h>
+ #include <tlvf/wfa_map/tlvBackhaulSteeringResponse.h>
++#include <tlvf/wfa_map/tlvOperatingChannelReport.h>
+ #include <tlvf/wfa_map/tlvProfile2AssociationStatusNotification.h>
++#include <tlvf/wfa_map/tlvProfile2ErrorCode.h>
++#include "../tlvf_utils.h"
+ 
+ // BPL Error Codes
+ #include <bpl/bpl_cfg.h>
+@@ -302,6 +306,8 @@ bool BackhaulManager::thread_init()
+             ieee1905_1::eMessageType::TOPOLOGY_QUERY_MESSAGE,
+             ieee1905_1::eMessageType::VENDOR_SPECIFIC_MESSAGE,
+             ieee1905_1::eMessageType::UNASSOCIATED_STA_LINK_METRICS_QUERY_MESSAGE,
++            ieee1905_1::eMessageType::OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE,
++            ieee1905_1::eMessageType::OPERATING_CHANNEL_QUERY_MESSAGE,
+         })) {
+         LOG(ERROR) << "Failed subscribing to the Bus";
+         return false;
+@@ -2251,6 +2257,12 @@ bool BackhaulManager::handle_1905_1_message(ieee1905_1::CmduMessageRx &cmdu_rx,
+     case ieee1905_1::eMessageType::BACKHAUL_STEERING_REQUEST_MESSAGE: {
+         return handle_backhaul_steering_request(cmdu_rx, src_mac);
+     }
++    case ieee1905_1::eMessageType::OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE: {
++        return handle_operating_channel_change_notification(cmdu_rx, src_mac);
++    }
++    case ieee1905_1::eMessageType::OPERATING_CHANNEL_QUERY_MESSAGE: {
++        return handle_operating_channel_query(cmdu_rx, src_mac);
++    }
+     case ieee1905_1::eMessageType::VENDOR_SPECIFIC_MESSAGE: {
+         // We should not handle vendor specific messages here, return false so the message will
+         // be forwarded and will not be passed to the task_pool.
+@@ -3132,6 +3144,174 @@ bool BackhaulManager::handle_slave_failed_connection_message(ieee1905_1::CmduMes
+                                   db->bridge.iface_name);
+ }
+ 
++bool BackhaulManager::handle_operating_channel_change_notification(
++    ieee1905_1::CmduMessageRx &cmdu_rx, const sMacAddr &src_mac)
++{
++    auto mid = cmdu_rx.getMessageId();
++    LOG(INFO) << "Received OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE from " << src_mac
++              << ", mid=" << std::dec << int(mid);
++
++    // Parse the AL ID TLV to identify which agent's channel info is being reported
++    auto al_mac_tlv = cmdu_rx.getClass<ieee1905_1::tlvAlMacAddress>();
++    if (al_mac_tlv) {
++        LOG(DEBUG) << "OCCN: source agent AL MAC = " << al_mac_tlv->mac();
++    }
++
++    // Parse Operating Channel Report TLVs, log the channel info, and store in agent database
++    auto db = AgentDB::get();
++    for (auto op_chan_tlv : cmdu_rx.getClassList<wfa_map::tlvOperatingChannelReport>()) {
++        auto &ruid          = op_chan_tlv->radio_uid();
++        auto tx_power       = op_chan_tlv->current_transmit_power();
++        auto num_op_classes = op_chan_tlv->operating_classes_list_length();
++
++        uint8_t final_op_class = 0, final_chan_num = 0, beacon_channel = 0;
++        for (uint8_t oc = 0; oc < num_op_classes; oc++) {
++            auto op_class_tuple = op_chan_tlv->operating_classes_list(oc);
++            if (!std::get<0>(op_class_tuple)) {
++                LOG(ERROR) << "Failed to get operating class tuple";
++                break;
++            }
++            auto &op_class_struct = std::get<1>(op_class_tuple);
++            auto operating_class  = op_class_struct.operating_class;
++            auto channel          = op_class_struct.channel_number;
++
++            LOG(INFO) << "OCCN: ruid=" << ruid
++                      << " operating_class=" << int(operating_class)
++                      << " channel=" << int(channel)
++                      << " tx_power=" << int(tx_power);
++
++            if (operating_class > final_op_class) {
++                final_op_class = operating_class;
++                final_chan_num = channel;
++            }
++
++            // Track the 20MHz beacon channel for primary channel identification
++            if (son::wireless_utils::get_bandwidth_from_op_class(operating_class) ==
++                beerocks::eWiFiBandwidth::BANDWIDTH_20) {
++                beacon_channel = channel;
++            }
++        }
++
++        // Store channel info in agent database
++        if (num_op_classes != 0 && beacon_channel != 0) {
++            auto radio = db->get_radio_by_mac(ruid, AgentDB::eMacType::RADIO);
++            if (radio) {
++                auto tmp_bw = son::wireless_utils::get_bandwidth_from_channel_and_op_class(
++                    final_chan_num, final_op_class);
++                auto new_wifi_channel = beerocks::WifiChannel(
++                    beacon_channel,
++                    son::wireless_utils::which_freq_op_cls(final_op_class),
++                    tmp_bw, false);
++                radio->wifi_channel = new_wifi_channel;
++                LOG(INFO) << "OCCN: Stored channel info for ruid=" << ruid
++                          << " channel=" << int(beacon_channel)
++                          << " op_class=" << int(final_op_class)
++                          << " bandwidth=" << int(tmp_bw);
++            } else {
++                LOG(DEBUG) << "OCCN: Radio with RUID=" << ruid
++                           << " not found in local database, skipping storage";
++            }
++        }
++    }
++
++    // Send ACK back to the controller
++    return send_ack_to_controller(cmdu_tx, mid);
++}
++
++bool BackhaulManager::handle_operating_channel_query(ieee1905_1::CmduMessageRx &cmdu_rx,
++                                                     const sMacAddr &src_mac)
++{
++    auto mid = cmdu_rx.getMessageId();
++    LOG(INFO) << "Received OPERATING_CHANNEL_QUERY_MESSAGE from " << src_mac
++              << ", mid=" << std::dec << int(mid);
++
++    auto db = AgentDB::get();
++
++    // Helper lambda to send Error Response with reason code UNKNOWN_AGENT (0x0F)
++    auto send_error_response = [&]() -> bool {
++        if (!cmdu_tx.create(0, ieee1905_1::eMessageType::ERROR_RESPONSE_MESSAGE)) {
++            LOG(ERROR) << "Failed to create ERROR_RESPONSE_MESSAGE for OCQ";
++            return false;
++        }
++        auto error_tlv = cmdu_tx.addClass<wfa_map::tlvProfile2ErrorCode>();
++        if (!error_tlv) {
++            LOG(ERROR) << "Failed to add tlvProfile2ErrorCode to ERROR_RESPONSE_MESSAGE";
++            return false;
++        }
++        error_tlv->reason_code() = wfa_map::tlvProfile2ErrorCode::eReasonCode::UNKNOWN_AGENT;
++        if (!send_cmdu_to_broker(cmdu_tx, db->controller_info.bridge_mac, db->bridge.mac)) {
++            LOG(ERROR) << "Failed to send ERROR_RESPONSE_MESSAGE to controller";
++            return false;
++        }
++        return true;
++    };
++
++    // Parse the AL MAC TLV from the OCQ message
++    auto al_mac_tlv = cmdu_rx.getClass<ieee1905_1::tlvAlMacAddress>();
++    if (!al_mac_tlv) {
++        LOG(ERROR) << "Failed to get tlvAlMacAddress from OPERATING_CHANNEL_QUERY_MESSAGE";
++        return false;
++    }
++
++    const sMacAddr req_al_mac = al_mac_tlv->mac();
++    LOG(DEBUG) << "OCQ: requested AL MAC = " << req_al_mac;
++
++    // Check if the AL MAC matches this agent's own AL MAC (bridge MAC)
++    if (req_al_mac != db->bridge.mac) {
++        LOG(WARNING) << "OCQ: requested AL MAC " << req_al_mac
++                     << " does not match this agent's AL MAC " << db->bridge.mac
++                     << " - sending Error Response (0x0F)";
++        return send_error_response();
++    }
++
++    // Check if this agent has any radios in operation
++    const auto &radios = db->get_radios_list();
++    bool has_operational_radios = false;
++    for (const auto *radio : radios) {
++        if (radio && !radio->wifi_channel.is_empty()) {
++            has_operational_radios = true;
++            break;
++        }
++    }
++
++    if (!has_operational_radios) {
++        LOG(WARNING) << "OCQ: agent has no radios in operation"
++                     << " - sending Error Response (0x0F)";
++        return send_error_response();
++    }
++
++    // Build OPERATING_CHANNEL_REPORT_MESSAGE with current operating parameters for each radio
++    if (!cmdu_tx.create(0, ieee1905_1::eMessageType::OPERATING_CHANNEL_REPORT_MESSAGE)) {
++        LOG(ERROR) << "Failed to create OPERATING_CHANNEL_REPORT_MESSAGE for OCQ response";
++        return false;
++    }
++
++    for (const auto *radio : radios) {
++        if (!radio || radio->wifi_channel.is_empty()) {
++            LOG(DEBUG) << "OCQ: skipping radio with no channel info";
++            continue;
++        }
++
++        if (!tlvf_utils::create_operating_channel_report(cmdu_tx, radio->front.iface_mac)) {
++            LOG(ERROR) << "OCQ: Failed to add Operating Channel Report TLV for radio "
++                       << radio->front.iface_mac;
++            return false;
++        }
++
++        LOG(DEBUG) << "OCQ: Added OCR TLV for radio " << radio->front.iface_mac
++                   << " channel=" << int(radio->wifi_channel.get_channel());
++    }
++
++    // Send OCR back to the controller
++    if (!send_cmdu_to_broker(cmdu_tx, db->controller_info.bridge_mac, db->bridge.mac)) {
++        LOG(ERROR) << "OCQ: Failed to send OPERATING_CHANNEL_REPORT_MESSAGE to controller";
++        return false;
++    }
++
++    LOG(INFO) << "OCQ: Sent OPERATING_CHANNEL_REPORT_MESSAGE to controller";
++    return true;
++}
++
+ bool BackhaulManager::handle_backhaul_steering_request(ieee1905_1::CmduMessageRx &cmdu_rx,
+                                                        const sMacAddr &src_mac)
+ {
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+index 4df4c97..4523a15 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+@@ -277,6 +277,10 @@ private:
+     // 1905 messages handlers
+     bool handle_slave_failed_connection_message(ieee1905_1::CmduMessageRx &cmdu_rx,
+                                                 const sMacAddr &src_mac);
++    bool handle_operating_channel_change_notification(ieee1905_1::CmduMessageRx &cmdu_rx,
++                                                      const sMacAddr &src_mac);
++    bool handle_operating_channel_query(ieee1905_1::CmduMessageRx &cmdu_rx,
++                                        const sMacAddr &src_mac);
+     bool handle_backhaul_steering_request(ieee1905_1::CmduMessageRx &cmdu_rx,
+                                           const sMacAddr &src_mac);
+ 
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 8c5e6d4..9aa5b58 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -90,6 +90,7 @@
+ #include <tlvf/wfa_map/tlvProfile2CacCapabilities.h>
+ #include <tlvf/wfa_map/tlvProfile2CacStatusReport.h>
+ #include <tlvf/wfa_map/tlvProfile2ChannelScanResult.h>
++#include <tlvf/wfa_map/tlvProfile2ErrorCode.h>
+ #include <tlvf/wfa_map/tlvProfile2MultiApProfile.h>
+ #include <tlvf/wfa_map/tlvProfile2RadioMetrics.h>
+ #include <tlvf/wfa_map/tlvProfile2ReasonCode.h>
+@@ -326,6 +327,8 @@ bool Controller::start()
+             ieee1905_1::eMessageType::TRIGGER_CHANNEL_SWITCH_ANNOUNCEMENT_RESPONSE_MESSAGE,
+             ieee1905_1::eMessageType::EARLY_AP_CAPABILITY_REPORT_MESSAGE,
+             ieee1905_1::eMessageType::AVAILABLE_SPECTRUM_INQUIRY_MESSAGE,
++            ieee1905_1::eMessageType::OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE,
++            ieee1905_1::eMessageType::OPERATING_CHANNEL_QUERY_MESSAGE,
+         })) {
+         LOG(ERROR) << "Failed subscribing to the Bus";
+         return false;
+@@ -627,6 +630,8 @@ bool Controller::handle_cmdu_1905_1_message(const sMacAddr &src_mac,
+         return handle_cmdu_1905_early_ap_capability_report_message(src_mac, cmdu_rx);
+     case ieee1905_1::eMessageType::AVAILABLE_SPECTRUM_INQUIRY_MESSAGE:
+         return handle_cmdu_1905_available_spectrum_inquiry_message(src_mac, cmdu_rx);
++    case ieee1905_1::eMessageType::OPERATING_CHANNEL_QUERY_MESSAGE:
++        return handle_cmdu_1905_operating_channel_query(src_mac, cmdu_rx);
+ 
+     // Empty cases are used to prevent error logs. Below message types are processed within tasks.
+     case ieee1905_1::eMessageType::TOPOLOGY_RESPONSE_MESSAGE:
+@@ -2644,11 +2649,29 @@ bool Controller::handle_cmdu_1905_operating_channel_report(const sMacAddr &src_m
+     auto mid = cmdu_rx.getMessageId();
+     LOG(INFO) << "Received OPERATING_CHANNEL_REPORT_MESSAGE, mid=" << std::dec << int(mid);
+ 
++    // Save the OCR data from the received message so we can forward the exact TLVs in the OCCN.
++    // We cannot read from cmdu_rx after cmdu_tx is used (ACK), so we save the data now.
++    // Note: current_operating_class_profile is indexed by bandwidth (one slot per 20/40/80/160/320
++    // MHz), so it cannot represent multiple operating classes with the same bandwidth (e.g. op
++    // class 81 for 2.4GHz 20MHz and op class 115 for 5GHz 20MHz). Saving directly from the
++    // received TLVs preserves all operating classes faithfully.
++    struct sOcrEntry {
++        sMacAddr radio_uid;
++        uint8_t tx_power;
++        std::vector<std::pair<uint8_t, uint8_t>> op_classes; // (operating_class, channel_number)
++    };
++    std::vector<sOcrEntry> ocr_entries;
++
+     for (auto operating_channel_report_tlv :
+          cmdu_rx.getClassList<wfa_map::tlvOperatingChannelReport>()) {
+         auto &ruid    = operating_channel_report_tlv->radio_uid();
+         auto tx_power = operating_channel_report_tlv->current_transmit_power();
+ 
++        // Save OCR data for OCCN broadcast
++        sOcrEntry entry;
++        entry.radio_uid = ruid;
++        entry.tx_power  = tx_power;
++
+         /*
+             Here need to remove the CurrentOperatingClass data from the Controller Data Model which
+             was set in previous OPERATING_CHANNEL_REPORT_MESSAGE.
+@@ -2676,6 +2699,9 @@ bool Controller::handle_cmdu_1905_operating_channel_report(const sMacAddr &src_m
+             auto operating_class         = operating_class_struct.operating_class;
+             auto channel                 = operating_class_struct.channel_number;
+ 
++            // Save this operating class for the OCCN broadcast
++            entry.op_classes.emplace_back(operating_class, channel);
++
+             if (operating_class > final_op_class) {
+                 final_op_class = operating_class;
+                 final_chan_num = channel;
+@@ -2689,6 +2715,8 @@ bool Controller::handle_cmdu_1905_operating_channel_report(const sMacAddr &src_m
+             database.handle_current_op_class(ruid, operating_class, channel, tx_power);
+         }
+ 
++        ocr_entries.push_back(std::move(entry));
++
+         if (operating_classes_list_length != 0) {
+             if (beacon_channel != 0) {
+                 auto tmp_bw = wireless_utils::get_bandwidth_from_channel_and_op_class(
+@@ -2726,7 +2754,81 @@ bool Controller::handle_cmdu_1905_operating_channel_report(const sMacAddr &src_m
+         return false;
+     }
+ 
+-    return son_actions::send_cmdu_to_agent(src_mac, cmdu_tx, database);
++    if (!son_actions::send_cmdu_to_agent(src_mac, cmdu_tx, database)) {
++        LOG(ERROR) << "Failed to send ACK to agent " << src_mac;
++        return false;
++    }
++
++    // Broadcast OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE to all agents
++    // so they are informed about the channel change of the reporting agent.
++    auto reporting_agent = database.m_agents.get(src_mac);
++    if (reporting_agent) {
++        if (!cmdu_tx.create(0, ieee1905_1::eMessageType::OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE)) {
++            LOG(ERROR) << "Failed to create OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE for broadcast";
++            return true; // ACK was already sent successfully
++        }
++
++        // Add AL ID TLV identifying the agent whose channel info changed
++        auto al_mac_tx_tlv = cmdu_tx.addClass<ieee1905_1::tlvAlMacAddress>();
++        if (!al_mac_tx_tlv) {
++            LOG(ERROR) << "Failed to add tlvAlMacAddress to OCCN broadcast";
++            return true;
++        }
++        al_mac_tx_tlv->mac() = src_mac;
++
++        // Add Operating Channel Report TLVs using the data saved directly from the received OCR
++        // message. This preserves ALL operating classes faithfully, including multiple operating
++        // classes with the same bandwidth (e.g. 2.4GHz 20MHz and 5GHz 20MHz), which would be
++        // lost if we read from current_operating_class_profile (indexed by bandwidth).
++        for (const auto &entry : ocr_entries) {
++            if (entry.op_classes.empty()) {
++                LOG(DEBUG) << "OCCN broadcast: ruid=" << entry.radio_uid
++                           << " has no operating classes, skipping";
++                continue;
++            }
++
++            auto op_chan_tlv = cmdu_tx.addClass<wfa_map::tlvOperatingChannelReport>();
++            if (!op_chan_tlv) {
++                LOG(ERROR) << "Failed to add tlvOperatingChannelReport to OCCN broadcast";
++                continue;
++            }
++
++            op_chan_tlv->radio_uid()             = entry.radio_uid;
++            op_chan_tlv->current_transmit_power() = entry.tx_power;
++
++            if (!op_chan_tlv->alloc_operating_classes_list(
++                    static_cast<uint8_t>(entry.op_classes.size()))) {
++                LOG(ERROR) << "Failed to allocate operating_classes_list for OCCN broadcast";
++                continue;
++            }
++
++            for (size_t i = 0; i < entry.op_classes.size(); i++) {
++                auto op_class_tuple = op_chan_tlv->operating_classes_list(static_cast<uint8_t>(i));
++                if (!std::get<0>(op_class_tuple)) {
++                    LOG(ERROR) << "Failed to get operating_classes_list entry for OCCN broadcast";
++                    break;
++                }
++                auto &op_class_struct           = std::get<1>(op_class_tuple);
++                op_class_struct.operating_class = entry.op_classes[i].first;
++                op_class_struct.channel_number  = entry.op_classes[i].second;
++                LOG(DEBUG) << "OCCN broadcast: ruid=" << entry.radio_uid
++                           << " op_class=" << int(op_class_struct.operating_class)
++                           << " channel=" << int(op_class_struct.channel_number);
++            }
++        }
++
++        // Send OCCN to all connected agents except the one that sent the report
++        for (const auto &agent : database.get_all_connected_agents()) {
++            if (agent->al_mac == src_mac) {
++                continue; // Skip the reporting agent
++            }
++            LOG(DEBUG) << "Broadcasting OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE to agent "
++                       << agent->al_mac;
++            son_actions::send_cmdu_to_agent(agent->al_mac, cmdu_tx, database);
++        }
++    }
++
++    return true;
+ }
+ 
+ bool Controller::handle_cmdu_1905_higher_layer_data_message(const sMacAddr &src_mac,
+@@ -6027,4 +6129,156 @@ bool Controller::handle_cmdu_1905_ap_mld_configuration_response_message(
+     return true;
+ }
+ 
++bool Controller::handle_cmdu_1905_operating_channel_query(const sMacAddr &src_mac,
++                                                          ieee1905_1::CmduMessageRx &cmdu_rx)
++{
++    auto mid = cmdu_rx.getMessageId();
++    LOG(INFO) << "Received OPERATING_CHANNEL_QUERY_MESSAGE from " << src_mac
++              << ", mid=" << std::dec << int(mid);
++
++    // Parse the AL ID TLV to get the requested agent's AL MAC address
++    auto al_mac_tlv = cmdu_rx.getClass<ieee1905_1::tlvAlMacAddress>();
++    if (!al_mac_tlv) {
++        LOG(ERROR) << "Failed to get tlvAlMacAddress from OPERATING_CHANNEL_QUERY_MESSAGE";
++        return false;
++    }
++
++    const sMacAddr req_al_mac = al_mac_tlv->mac();
++    LOG(DEBUG) << "OCQ: requested agent AL MAC = " << req_al_mac;
++
++    // Look up the requested agent in the database
++    auto req_agent = database.m_agents.get(req_al_mac);
++    if (!req_agent) {
++        LOG(WARNING) << "OCQ: requested agent " << req_al_mac << " not found in database"
++                     << " - sending Error Response with reason code UNKNOWN_AGENT (0x0F)";
++
++        // Send Error Response with Reason Code 0x0F (UNKNOWN_AGENT)
++        if (!cmdu_tx.create(0, ieee1905_1::eMessageType::ERROR_RESPONSE_MESSAGE)) {
++            LOG(ERROR) << "Failed to create ERROR_RESPONSE_MESSAGE for OCQ";
++            return false;
++        }
++        auto error_tlv = cmdu_tx.addClass<wfa_map::tlvProfile2ErrorCode>();
++        if (!error_tlv) {
++            LOG(ERROR) << "Failed to add tlvProfile2ErrorCode to ERROR_RESPONSE_MESSAGE";
++            return false;
++        }
++        error_tlv->reason_code() = wfa_map::tlvProfile2ErrorCode::eReasonCode::UNKNOWN_AGENT;
++        if (!son_actions::send_cmdu_to_agent(src_mac, cmdu_tx, database)) {
++            LOG(ERROR) << "Failed to send ERROR_RESPONSE_MESSAGE to agent " << src_mac;
++            return false;
++        }
++        return true;
++    }
++
++    // Per spec: if the controller has not yet received an Operating Channel Report from the
++    // requested agent, respond with Error Response (Reason Code 0x0F).
++    bool has_ocr = false;
++    for (auto &radio_entry : req_agent->radios) {
++        auto &radio = radio_entry.second;
++        if (radio && !radio->wifi_channel.is_empty()) {
++            has_ocr = true;
++            break;
++        }
++    }
++    if (!has_ocr) {
++        LOG(WARNING) << "OCQ: no Operating Channel Report received yet from agent " << req_al_mac
++                     << " - sending Error Response with reason code UNKNOWN_AGENT (0x0F)";
++        if (!cmdu_tx.create(0, ieee1905_1::eMessageType::ERROR_RESPONSE_MESSAGE)) {
++            LOG(ERROR) << "Failed to create ERROR_RESPONSE_MESSAGE for OCQ (no OCR)";
++            return false;
++        }
++        auto error_tlv = cmdu_tx.addClass<wfa_map::tlvProfile2ErrorCode>();
++        if (!error_tlv) {
++            LOG(ERROR) << "Failed to add tlvProfile2ErrorCode to ERROR_RESPONSE_MESSAGE";
++            return false;
++        }
++        error_tlv->reason_code() = wfa_map::tlvProfile2ErrorCode::eReasonCode::UNKNOWN_AGENT;
++        if (!son_actions::send_cmdu_to_agent(src_mac, cmdu_tx, database)) {
++            LOG(ERROR) << "Failed to send ERROR_RESPONSE_MESSAGE to agent " << src_mac;
++            return false;
++        }
++        return true;
++    }
++
++    // Build OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE to send back to the requesting agent
++    if (!cmdu_tx.create(
++            0, ieee1905_1::eMessageType::OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE)) {
++        LOG(ERROR) << "Failed to create OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE";
++        return false;
++    }
++
++    // Add AL ID TLV identifying the agent whose channel info is being reported
++    auto al_mac_tx_tlv = cmdu_tx.addClass<ieee1905_1::tlvAlMacAddress>();
++    if (!al_mac_tx_tlv) {
++        LOG(ERROR) << "Failed to add tlvAlMacAddress to OCCN";
++        return false;
++    }
++    al_mac_tx_tlv->mac() = req_al_mac;
++
++    // Add Operating Channel Report TLVs for each radio of the requested agent.
++    // Use the stored current_operating_class_profile entries to include all operating
++    // classes as received in the latest Operating Channel Report message.
++    for (auto &radio_entry : req_agent->radios) {
++        auto &radio = radio_entry.second;
++        if (!radio || radio->wifi_channel.is_empty()) {
++            LOG(DEBUG) << "OCQ: radio " << radio_entry.first
++                       << " has no channel info, skipping";
++            continue;
++        }
++
++        // Count non-empty operating class profiles for this radio
++        uint8_t num_op_classes = 0;
++        for (int i = 0; i < Agent::operatingClassProfileIndex::OPERATING_CLASS_MAX_BW; i++) {
++            if (radio->current_operating_class_profile[i].op_class != 0) {
++                num_op_classes++;
++            }
++        }
++        if (num_op_classes == 0) {
++            LOG(DEBUG) << "OCQ: radio " << radio_entry.first
++                       << " has no stored operating class profiles, skipping";
++            continue;
++        }
++
++        auto op_chan_tlv = cmdu_tx.addClass<wfa_map::tlvOperatingChannelReport>();
++        if (!op_chan_tlv) {
++            LOG(ERROR) << "Failed to add tlvOperatingChannelReport";
++            return false;
++        }
++
++        op_chan_tlv->radio_uid()             = radio->radio_uid;
++        op_chan_tlv->current_transmit_power() = static_cast<uint8_t>(radio->tx_power);
++
++        if (!op_chan_tlv->alloc_operating_classes_list(num_op_classes)) {
++            LOG(ERROR) << "Failed to allocate operating_classes_list";
++            return false;
++        }
++
++        uint8_t oc_idx = 0;
++        for (int i = 0; i < Agent::operatingClassProfileIndex::OPERATING_CLASS_MAX_BW; i++) {
++            if (radio->current_operating_class_profile[i].op_class == 0) {
++                continue;
++            }
++            auto op_class_tuple = op_chan_tlv->operating_classes_list(oc_idx++);
++            if (!std::get<0>(op_class_tuple)) {
++                LOG(ERROR) << "Failed to get operating_classes_list entry";
++                break;
++            }
++            auto &op_class_struct           = std::get<1>(op_class_tuple);
++            op_class_struct.operating_class = radio->current_operating_class_profile[i].op_class;
++            op_class_struct.channel_number  = radio->current_operating_class_profile[i].channel;
++            LOG(DEBUG) << "OCQ: radio " << radio->radio_uid
++                       << " op_class=" << int(op_class_struct.operating_class)
++                       << " channel=" << int(op_class_struct.channel_number);
++        }
++    }
++
++    // Send OCCN back to the requesting agent
++    if (!son_actions::send_cmdu_to_agent(src_mac, cmdu_tx, database)) {
++        LOG(ERROR) << "Failed to send OCCN to agent " << src_mac;
++        return false;
++    }
++
++    return true;
++}
++
+ } // namespace son
+diff --git a/controller/src/beerocks/master/controller.h b/controller/src/beerocks/master/controller.h
+index 72dae69..b9ba78e 100644
+--- a/controller/src/beerocks/master/controller.h
++++ b/controller/src/beerocks/master/controller.h
+@@ -388,6 +388,9 @@ private:
+     bool handle_cmdu_1905_available_spectrum_inquiry_message(const sMacAddr &src_mac,
+                                                              ieee1905_1::CmduMessageRx &cmdu_rx);
+ 
++    bool handle_cmdu_1905_operating_channel_query(const sMacAddr &src_mac,
++                                                  ieee1905_1::CmduMessageRx &cmdu_rx);
++
+     void handle_cmdu_control_ieee1905_1_message(const std::string &src_mac,
+                                                 ieee1905_1::CmduMessageRx &cmdu_rx);
+     bool handle_intel_slave_join(const sMacAddr &src_mac,
+diff --git a/framework/tlvf/AutoGenerated/include/tlvf/ieee_1905_1/eMessageType.h b/framework/tlvf/AutoGenerated/include/tlvf/ieee_1905_1/eMessageType.h
+index 4c6ebd7..e8823a3 100644
+--- a/framework/tlvf/AutoGenerated/include/tlvf/ieee_1905_1/eMessageType.h
++++ b/framework/tlvf/AutoGenerated/include/tlvf/ieee_1905_1/eMessageType.h
+@@ -111,6 +111,8 @@ enum class eMessageType : uint16_t {
+     BSTA_MLD_CONFIGURATION_RESPONSE_MESSAGE = 0x8047,
+     VIRTUAL_BSS_MOVE_CANCEL_RESPONSE_MESSAGE = 0x8048,
+     AVAILABLE_SPECTRUM_INQUIRY_MESSAGE = 0x8049,
++    OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE = 0x804A,
++    OPERATING_CHANNEL_QUERY_MESSAGE = 0x804B,
+ };
+ // Enum AutoPrint generated code snippet begining- DON'T EDIT!
+ // clang-format off
+@@ -206,6 +208,8 @@ static const char *eMessageType_str(eMessageType enum_value) {
+     case eMessageType::BSTA_MLD_CONFIGURATION_RESPONSE_MESSAGE:              return "eMessageType::BSTA_MLD_CONFIGURATION_RESPONSE_MESSAGE";
+     case eMessageType::VIRTUAL_BSS_MOVE_CANCEL_RESPONSE_MESSAGE:             return "eMessageType::VIRTUAL_BSS_MOVE_CANCEL_RESPONSE_MESSAGE";
+     case eMessageType::AVAILABLE_SPECTRUM_INQUIRY_MESSAGE:                   return "eMessageType::AVAILABLE_SPECTRUM_INQUIRY_MESSAGE";
++    case eMessageType::OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE:        return "eMessageType::OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE";
++    case eMessageType::OPERATING_CHANNEL_QUERY_MESSAGE:                      return "eMessageType::OPERATING_CHANNEL_QUERY_MESSAGE";
+     }
+     static std::string out_str = std::to_string(int(enum_value));
+     return out_str.c_str();
+@@ -308,6 +312,8 @@ public:
+         case 0x8047:
+         case 0x8048:
+         case 0x8049:
++        case 0x804A:
++        case 0x804B:
+                 ret = true;
+                 break;
+             default:
+diff --git a/framework/tlvf/AutoGenerated/include/tlvf/wfa_map/tlvProfile2ErrorCode.h b/framework/tlvf/AutoGenerated/include/tlvf/wfa_map/tlvProfile2ErrorCode.h
+index ae3f33d..6cfbec4 100644
+--- a/framework/tlvf/AutoGenerated/include/tlvf/wfa_map/tlvProfile2ErrorCode.h
++++ b/framework/tlvf/AutoGenerated/include/tlvf/wfa_map/tlvProfile2ErrorCode.h
+@@ -42,6 +42,7 @@ class tlvProfile2ErrorCode : public BaseClass
+             TRAFFIC_SEPARATION_ON_COMBINED_FRONTHAUL_AND_PROFILE1_BACKHAUL_UNSUPPORTED = 0x7,
+             TRAFFIC_SEPARATION_ON_COMBINED_PROFILE1_BACKHAUL_AND_PROFILE2_BACKHAUL_UNSUPPORTED = 0x8,
+             SERVICE_PRIORITIZATION_RULE_NOT_SUPPORTED = 0x9,
++            UNKNOWN_AGENT = 0xF,
+         };
+         // Enum AutoPrint generated code snippet begining- DON'T EDIT!
+         // clang-format off
+@@ -54,6 +55,7 @@ class tlvProfile2ErrorCode : public BaseClass
+             case TRAFFIC_SEPARATION_ON_COMBINED_FRONTHAUL_AND_PROFILE1_BACKHAUL_UNSUPPORTED:         return "TRAFFIC_SEPARATION_ON_COMBINED_FRONTHAUL_AND_PROFILE1_BACKHAUL_UNSUPPORTED";
+             case TRAFFIC_SEPARATION_ON_COMBINED_PROFILE1_BACKHAUL_AND_PROFILE2_BACKHAUL_UNSUPPORTED: return "TRAFFIC_SEPARATION_ON_COMBINED_PROFILE1_BACKHAUL_AND_PROFILE2_BACKHAUL_UNSUPPORTED";
+             case SERVICE_PRIORITIZATION_RULE_NOT_SUPPORTED:                                          return "SERVICE_PRIORITIZATION_RULE_NOT_SUPPORTED";
++            case UNKNOWN_AGENT:                                                                      return "UNKNOWN_AGENT";
+             }
+             static std::string out_str = std::to_string(int(enum_value));
+             return out_str.c_str();
+diff --git a/framework/tlvf/yaml/tlvf/ieee_1905_1/eMessageType.yaml b/framework/tlvf/yaml/tlvf/ieee_1905_1/eMessageType.yaml
+index ad192bf..68fc1f9 100644
+--- a/framework/tlvf/yaml/tlvf/ieee_1905_1/eMessageType.yaml
++++ b/framework/tlvf/yaml/tlvf/ieee_1905_1/eMessageType.yaml
+@@ -96,3 +96,5 @@ eMessageType:
+   BSTA_MLD_CONFIGURATION_RESPONSE_MESSAGE: 0x8047
+   VIRTUAL_BSS_MOVE_CANCEL_RESPONSE_MESSAGE: 0x8048
+   AVAILABLE_SPECTRUM_INQUIRY_MESSAGE: 0x8049
++  OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE: 0x804A
++  OPERATING_CHANNEL_QUERY_MESSAGE: 0x804B
+diff --git a/framework/tlvf/yaml/tlvf/wfa_map/tlvProfile2ErrorCode.yaml b/framework/tlvf/yaml/tlvf/wfa_map/tlvProfile2ErrorCode.yaml
+index d1b5387..abfc682 100644
+--- a/framework/tlvf/yaml/tlvf/wfa_map/tlvProfile2ErrorCode.yaml
++++ b/framework/tlvf/yaml/tlvf/wfa_map/tlvProfile2ErrorCode.yaml
+@@ -41,3 +41,4 @@ eReasonCode:
+   TRAFFIC_SEPARATION_ON_COMBINED_FRONTHAUL_AND_PROFILE1_BACKHAUL_UNSUPPORTED: 0x07
+   TRAFFIC_SEPARATION_ON_COMBINED_PROFILE1_BACKHAUL_AND_PROFILE2_BACKHAUL_UNSUPPORTED: 0x08
+   SERVICE_PRIORITIZATION_RULE_NOT_SUPPORTED: 0x09
++  UNKNOWN_AGENT: 0x0F
+-- 
+2.34.1
+
