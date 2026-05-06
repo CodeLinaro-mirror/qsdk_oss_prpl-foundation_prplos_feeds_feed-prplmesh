@@ -1,0 +1,228 @@
+From a5a699ed928ffe6aa66666d6312717dd8fa6fd64 Mon Sep 17 00:00:00 2001
+From: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+Date: Tue, 5 May 2026 15:45:45 +0530
+Subject: [PATCH] Loop Avoidance in PrplMesh-OpenWRT - Phase 2 Changes
+
+Signed-off-by: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/son_slave_thread.cpp | 85 ++++++++++++++-----
+ agent/src/beerocks/slave/son_slave_thread.h   | 31 +++++++
+ .../tasks/controller_connectivity_task.cpp    | 14 ++-
+ 3 files changed, 107 insertions(+), 23 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index f4f121de1..6a66aa0f1 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -2410,25 +2410,18 @@ bool slave_thread::handle_cmdu_backhaul_manager_message(
+             LOG(ERROR) << "addClass cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION failed";
+             return false;
+         }
+-        LOG(DEBUG) << "Received ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION connected="
+-                   << int(notification_in->connected());
+-        // Forward to ALL ap_managers as ACTION_APMANAGER_BSTA_STATE_NOTIFICATION
+-        m_radio_managers.do_on_each_radio_manager(
+-            [&](const sManagedRadio &radio_manager, const std::string &) {
+-                if (radio_manager.ap_manager_fd ==
+-                    beerocks::net::FileDescriptor::invalid_descriptor) {
+-                    return true;
+-                }
+-                auto notification_out = message_com::create_vs_message<
+-                    beerocks_message::cACTION_APMANAGER_BSTA_STATE_NOTIFICATION>(cmdu_tx);
+-                if (!notification_out) {
+-                    LOG(ERROR) << "Failed building cACTION_APMANAGER_BSTA_STATE_NOTIFICATION";
+-                    return true;
+-                }
+-                notification_out->connected() = notification_in->connected();
+-                send_cmdu(radio_manager.ap_manager_fd, cmdu_tx);
+-                return true;
+-            });
++
++        m_backhaul_l2_connected = notification_in->connected() != 0;
++        LOG(ERROR) << "Received ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION connected="
++                   << int(m_backhaul_l2_connected) << ", current m_controller_reachable="
++                   << int(m_controller_reachable);
++
++        if (!m_backhaul_l2_connected) {
++            LOG(ERROR) << "L2 disconnected, forcing m_controller_reachable to false";
++            m_controller_reachable = false;
++        }
++
++        update_bsta_state_to_ap_managers();
+         break;
+     }
+     default: {
+@@ -5341,6 +5334,60 @@ bool slave_thread::link_to_controller()
+     return db->statuses.ap_autoconfiguration_completed;
+ }
+ 
++void slave_thread::notify_controller_reachability(bool reachable)
++{
++    LOG(ERROR) << "notify_controller_reachability called with reachable=" << int(reachable)
++               << ", current m_controller_reachable=" << int(m_controller_reachable)
++               << ", current m_backhaul_l2_connected=" << int(m_backhaul_l2_connected);
++
++    if (m_controller_reachable == reachable) {
++        LOG(ERROR) << "Reachability hasn't changed. Returning early.";
++        return;
++    }
++
++    m_controller_reachable = reachable;
++    LOG(ERROR) << "Controller reachability changed: "
++               << (m_controller_reachable ? "reachable" : "unreachable");
++
++    update_bsta_state_to_ap_managers();
++}
++
++void slave_thread::update_bsta_state_to_ap_managers()
++{
++    auto db = AgentDB::get();
++
++    const bool effective_bsta_connected =
++        db->device_conf.local_gw || (m_backhaul_l2_connected && m_controller_reachable);
++
++    LOG(ERROR) << "Updating AP managers with effective bSTA state: l2_connected="
++               << int(m_backhaul_l2_connected)
++               << ", controller_reachable=" << int(m_controller_reachable)
++               << ", local_gw=" << int(db->device_conf.local_gw)
++               << ", effective_connected=" << int(effective_bsta_connected);
++
++    m_radio_managers.do_on_each_radio_manager(
++        [&](sManagedRadio &radio_manager, const std::string &fronthaul_iface) {
++            if (radio_manager.ap_manager_fd == beerocks::net::FileDescriptor::invalid_descriptor) {
++                LOG(ERROR) << "Skipping bSTA state notification for " << fronthaul_iface
++                           << ": AP manager is not connected";
++                return true;
++            }
++
++            auto notification_out = message_com::create_vs_message<
++                beerocks_message::cACTION_APMANAGER_BSTA_STATE_NOTIFICATION>(cmdu_tx);
++            if (!notification_out) {
++                LOG(ERROR) << "Failed building cACTION_APMANAGER_BSTA_STATE_NOTIFICATION";
++                return true;
++            }
++
++            notification_out->connected() = effective_bsta_connected ? 1 : 0;
++            LOG(ERROR) << "Sending cACTION_APMANAGER_BSTA_STATE_NOTIFICATION with connected="
++                       << int(notification_out->connected()) << " to ap_manager for " << fronthaul_iface;
++            send_cmdu(radio_manager.ap_manager_fd, cmdu_tx);
++            return true;
++        });
++}
++
+ bool slave_thread::send_cmdu_to_controller(const std::string &fronthaul_iface,
+                                            ieee1905_1::CmduMessageTx &cmdu_tx)
+ {
+diff --git a/agent/src/beerocks/slave/son_slave_thread.h b/agent/src/beerocks/slave/son_slave_thread.h
+index a49a9c5bd..16fe74b10 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.h
++++ b/agent/src/beerocks/slave/son_slave_thread.h
+@@ -254,6 +254,18 @@ public:
+     bool send_cmdu_to_controller(const std::string &fronthaul_iface,
+                                  ieee1905_1::CmduMessageTx &cmdu_tx);
+ 
++    /**
++     * @brief Notify the Agent that logical controller reachability has changed.
++     *
++     * The AP Managers advertise a valid backhaul hop count only when both the physical backhaul
++     * link and the logical controller reachability are available. If controller reachability is
++     * lost while the backhaul link is still physically connected, this method forces the effective
++     * bSTA state to disconnected so backhaul BSSs advertise hop count 255.
++     *
++     * @param reachable true if the controller is reachable, false otherwise.
++     */
++    void notify_controller_reachability(bool reachable);
++
+     inline int get_ap_manager_fd(const std::string &fronthaul_iface)
+     {
+         return m_radio_managers[fronthaul_iface].ap_manager_fd;
+@@ -368,6 +380,16 @@ private:
+     bool m_is_backhaul_disconnected = false;
+     int m_agent_resets_counter      = 0;
+ 
++    /**
++     * @brief Physical L2 backhaul connection state as reported by the Backhaul Manager.
++     */
++    bool m_backhaul_l2_connected = false;
++
++    /**
++     * @brief Logical controller reachability state as reported by ControllerConnectivityTask.
++     */
++    bool m_controller_reachable = false;
++
+     TaskPool m_task_pool;
+ 
+     // Global FSM members:
+@@ -532,6 +554,15 @@ private:
+     bool handle_ack_message(int fd, ieee1905_1::CmduMessageRx &cmdu_rx);
+     bool handle_unassoc_sta_link_metric_query(int fd, ieee1905_1::CmduMessageRx &cmdu_rx);
+ 
++    /**
++     * @brief Recalculate the effective bSTA state and forward it to all AP Managers.
++     *
++     * The effective state is connected only when both the L2 backhaul state and logical controller
++     * reachability are connected. This prevents advertising a valid hop count when the agent has
++     * an L2 backhaul link but cannot reach the controller.
++     */
++    void update_bsta_state_to_ap_managers();
++
+     bool read_platform_configuration();
+ 
+     /**
+diff --git a/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp b/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp
+index 458702a4b..345a2b172 100644
+--- a/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp
++++ b/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp
+@@ -92,7 +92,8 @@ void ControllerConnectivityTask::work()
+     }
+     case eState::WAIT_FOR_CONTROLLER_DISCOVERY: {
+         if (check_controller_discovery_timeout()) {
+-            LOG(DEBUG) << "Backhaul link does not provide Controller connectivity";
++            LOG(ERROR) << "Backhaul link does not provide Controller connectivity";
++            m_btl_ctx.notify_controller_reachability(false);
+             FSM_MOVE_STATE(CONNECTION_TIMEOUT);
+         }
+         break;
+@@ -113,6 +114,8 @@ void ControllerConnectivityTask::work()
+             break;
+         }
+         if (check_controller_response_timeout()) {
++            LOG(ERROR) << "Controller response timeout! Forcing reachability to false.";
++            m_btl_ctx.notify_controller_reachability(false);
+             FSM_MOVE_STATE(CONNECTION_TIMEOUT);
+             break;
+         }
+@@ -199,7 +202,7 @@ void ControllerConnectivityTask::handle_event(uint8_t event_enum_value, const vo
+         break;
+     }
+     case BACKHAUL_MANAGER_CONNECTED: {
+-        LOG(DEBUG) << "BACKHAUL_MANAGER_CONNECTED is received";
++        LOG(ERROR) << "BACKHAUL_MANAGER_CONNECTED is received";
+ 
+         // Each time backhaul manager makes a new connection, assume that we do not have direct link to Controller.
+         // It will be updated after, we start listening to Discovery messages.
+@@ -207,16 +210,19 @@ void ControllerConnectivityTask::handle_event(uint8_t event_enum_value, const vo
+         m_direct_link_to_controller                   = false;
+         db->controller_info.direct_link_to_controller = false;
+         m_backhaul_connected_time                     = std::chrono::steady_clock::now();
++        m_btl_ctx.notify_controller_reachability(false);
+         FSM_MOVE_STATE(WAIT_FOR_CONTROLLER_DISCOVERY);
+         break;
+     }
+     case BACKHAUL_DISCONNECTED_NOTIFICATION: {
+-        LOG(DEBUG) << "BACKHAUL_DISCONNECTED_NOTIFICATION is received";
++        LOG(ERROR) << "BACKHAUL_DISCONNECTED_NOTIFICATION is received";
++        m_btl_ctx.notify_controller_reachability(false);
+         FSM_MOVE_STATE(BACKHAUL_LINK_DISCONNECTED);
+         break;
+     }
+     case CONTROLLER_DISCOVERED: {
+-        LOG(DEBUG) << "CONTROLLER_DISCOVERED is received";
++        LOG(ERROR) << "CONTROLLER_DISCOVERED is received";
++        m_btl_ctx.notify_controller_reachability(true);
+         FSM_MOVE_STATE(CONTROLLER_MONITORING);
+         break;
+     }
+-- 
+2.34.1
+
