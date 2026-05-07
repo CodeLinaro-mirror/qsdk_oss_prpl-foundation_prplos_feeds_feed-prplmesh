@@ -30,7 +30,7 @@ SUBTARGET="generic"
 
 # Determine architecture based on target
 case "$TARGET" in
-    ipq53xx|ipq54xx|ipq95xx)
+    ipq53xx|ipq54xx|ipq95xx|ipq96xx|ipq52xx)
         ARCH="64"
         ;;
     *)

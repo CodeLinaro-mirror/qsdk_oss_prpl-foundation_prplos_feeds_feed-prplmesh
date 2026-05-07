@@ -74,8 +74,8 @@ define Package/prplmesh
 		+!(TARGET_intel_x86||TARGET_intel_mips):kmod-sched-prio 
 #	non-intel_x86 neither non-intel_mips neither broadcom dependencies:
 	DEPENDS+= \
-		+!(TARGET_intel_x86||TARGET_intel_mips||TARGET_brcmbca||TARGET_ipq95xx||TARGET_ipq53xx||TARGET_ipq54xx):hostapd-openssl \
-		+!(TARGET_intel_x86||TARGET_intel_mips||TARGET_brcmbca||TARGET_ipq95xx||TARGET_ipq53xx||TARGET_ipq54xx):wpa-supplicant-openssl
+		+!(TARGET_intel_x86||TARGET_intel_mips||TARGET_brcmbca||TARGET_ipq95xx||TARGET_ipq53xx||TARGET_ipq54xx||TARGET_ipq96xx||TARGET_ipq52xx):hostapd-openssl \
+		+!(TARGET_intel_x86||TARGET_intel_mips||TARGET_brcmbca||TARGET_ipq95xx||TARGET_ipq53xx||TARGET_ipq54xx||TARGET_ipq96xx||TARGET_ipq52xx):wpa-supplicant-openssl
 	DEPENDS+= \
 		+(PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND&&USE_PRPLMESH_NLHAL):amx-libs-bundle \
 		+(PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND&&USE_PRPLMESH_NLHAL):net-services-bundle \
