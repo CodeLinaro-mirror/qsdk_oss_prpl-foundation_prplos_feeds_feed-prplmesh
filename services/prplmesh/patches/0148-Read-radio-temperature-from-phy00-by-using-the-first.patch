@@ -1,0 +1,178 @@
+From e6b1e809fae69bb045d1cd7656f2300c257e9111 Mon Sep 17 00:00:00 2001
+From: Aryan Khare <aryakhar@qti.qualcomm.com>
+Date: Thu, 7 May 2026 15:26:13 +0530
+Subject: [PATCH] Read radio temperature from phy00 by using the first
+ available hwmon entry. Extract temperature from temp1_input since all hwmon
+ entries map to the same PHY.
+
+Signed-off-by: Aryan Khare <aryakhar@qti.qualcomm.com>
+---
+ .../src/tlvf_airties_utils_nl80211.cpp        | 113 ++++++++++++++++--
+ 1 file changed, 106 insertions(+), 7 deletions(-)
+
+diff --git a/common/beerocks/multi_vendor/nl80211/src/tlvf_airties_utils_nl80211.cpp b/common/beerocks/multi_vendor/nl80211/src/tlvf_airties_utils_nl80211.cpp
+index 39bc74fd2..e6c0916df 100644
+--- a/common/beerocks/multi_vendor/nl80211/src/tlvf_airties_utils_nl80211.cpp
++++ b/common/beerocks/multi_vendor/nl80211/src/tlvf_airties_utils_nl80211.cpp
+@@ -18,6 +18,7 @@
+ #include <mapf/common/utils.h>
+ #include <net/if.h>
+ #include <sys/ioctl.h>
++#include <dirent.h>
+ #include <tlvf/airties/eAirtiesTLVId.h>
+ #include <tlvf/airties/supported_features.h>
+ #include <tlvf/airties/tlvAirtiesDeviceInfo.h>
+@@ -35,6 +36,9 @@
+ #include <bpl/cfg/uci/bpl_cfg_uci.h>
+ #endif
+ 
++#include <climits>
++#include <cstdlib>
++
+ using namespace airties;
+ using namespace beerocks;
+ 
+@@ -686,6 +690,70 @@ bool devicemetrics_get_uptime(struct timespec &ts)
+     return true;
+ }
+ 
++/**
++ * @brief Find the sysfs path of the first IEEE 802.11 phy that has a hwmon directory.
++ *
++ * Scans /sys/class/ieee80211/ for all phy entries and returns the resolved
++ * real path of the first one whose device directory contains a "hwmon"
++ * subdirectory.  This replaces the former hardcoded PHY_PATH macro and works
++ * across platforms regardless of the exact device-tree layout or interface
++ * naming convention.
++ *
++ * @return Resolved absolute phy device path (e.g.
++ *         "/sys/devices/platform/soc@0/c000000.wifi/ieee80211/phy00"),
++ *         or an empty string if no suitable phy is found.
++ */
++static std::string find_phy_path_with_hwmon()
++{
++    char resolved[PATH_MAX];
++
++    DIR *ieee80211_dir = opendir("/sys/class/ieee80211");
++    if (!ieee80211_dir) {
++        LOG(ERROR) << "Cannot open /sys/class/ieee80211";
++        return {};
++    }
++
++    std::string result;
++    struct dirent *phy_entry;
++    while ((phy_entry = readdir(ieee80211_dir)) != nullptr) {
++        if (phy_entry->d_name[0] == '.' || strncmp(phy_entry->d_name, "phy", 3) != 0) {
++            continue;
++        }
++
++        std::string phy_class_path =
++            std::string("/sys/class/ieee80211/") + phy_entry->d_name;
++        if (!realpath(phy_class_path.c_str(), resolved)) {
++            continue;
++        }
++
++        // Scan the phy device directory for a hwmon<N> subdirectory
++        // (the directory is named "hwmon8", "hwmon0", etc., not "hwmon")
++        DIR *phy_dir = opendir(resolved);
++        if (!phy_dir) {
++            continue;
++        }
++
++        bool has_hwmon = false;
++        struct dirent *sub_entry;
++        while ((sub_entry = readdir(phy_dir)) != nullptr) {
++            if (sub_entry->d_type == DT_DIR &&
++                strncmp(sub_entry->d_name, "hwmon", 5) == 0) {
++                has_hwmon = true;
++                break;
++            }
++        }
++        closedir(phy_dir);
++
++        if (has_hwmon) {
++            result = std::string(resolved);
++            break;
++        }
++    }
++    closedir(ieee80211_dir);
++
++    return result;
++}
++
+ uint8_t get_temp_degC(const char *path)
+ {
+     FILE *fd = fopen(path, "r");
+@@ -713,11 +781,23 @@ bool devicemetrics_get_radio_info(std::shared_ptr<airties::tlvAirtiesDeviceMetri
+ {
+     auto db = AgentDB::get();
+     const auto &radios = db->get_radios_list();
++    DIR *dir;
++    struct dirent *entry;
++    char temp_path[512];
++
++    // Resolve the phy path once; all radios on this platform share the same PHY
++    // thermal sensor (all hwmon entries map to the same chip).
++    const std::string phy_path = find_phy_path_with_hwmon();
++    if (phy_path.empty()) {
++        LOG(ERROR) << "Could not find any IEEE 802.11 phy with hwmon directory";
++    } else {
++        LOG(INFO) << "Using phy path for radio temperature: " << phy_path;
++    }
+ 
+     for (const auto &radio : radios) {
+         if (radio) {
+-            LOG(INFO) << "Radio MAC: " << radio->front.iface_mac << std::endl;
+-            LOG(INFO) << "Interface: " << radio->front.iface_name << std::endl;
++            LOG(INFO) << "Radio MAC: " << radio->front.iface_mac;
++            LOG(INFO) << "Interface: " << radio->front.iface_name;
+             auto rad_list = tlvDevMetrics->create_radio_list();
+             // When either condition is true the buffer is full; break immediately because no
+             // subsequent radio entry will fit either.
+@@ -728,15 +808,32 @@ bool devicemetrics_get_radio_info(std::shared_ptr<airties::tlvAirtiesDeviceMetri
+                 break;
+             }
+             rad_list->radio_id() = radio->front.iface_mac;
+-            // Reading a single temp1_input for phy00 since all hwmon entries map to same PHY.
+-            // Future: when hwmon→radio mapping becomes available, update to read per‑radio temps.
+-            rad_list->radio_temperature() = get_temp_degC("/sys/devices/platform/soc@0/c000000.wifi/ieee80211/phy00/hwmon4/temp1_input");
++
++            if (!phy_path.empty()) {
++                dir = opendir(phy_path.c_str());
++                if (!dir) {
++                    LOG(ERROR) << "opendir failed for " << phy_path;
++                } else {
++                    while ((entry = readdir(dir)) != NULL) {
++                        if (entry->d_type == DT_DIR &&
++                            strncmp(entry->d_name, "hwmon", 5) == 0) {
++                            snprintf(temp_path, sizeof(temp_path), "%s/%s/temp1_input",
++                                     phy_path.c_str(), entry->d_name);
++                            LOG(INFO) << "path " << temp_path;
++                            rad_list->radio_temperature() = get_temp_degC(temp_path);
++                            break;
++                        }
++                    }
++                    closedir(dir);
++                }
++            }
++
++            LOG(INFO) << "radio_temperature " << rad_list->radio_temperature();
+             tlvDevMetrics->add_radio_list(rad_list);
+         }
+     }
+-    LOG(INFO) <<  "No of radios : " << tlvDevMetrics->num_of_radios();
++    LOG(INFO) << "No of radios : " << tlvDevMetrics->num_of_radios();
+     return true;
+-
+ }
+ 
+ /*
+@@ -1103,3 +1200,5 @@ bool tlvf_airties_utils::add_airties_ethernet_non_1905_neighbor_device_list_tlv(
+     LOG(INFO) << "Added Ethernet non 1905 Neighbor Device List TLV";
+     return true;
+ }
++
++
+-- 
+2.34.1
+
