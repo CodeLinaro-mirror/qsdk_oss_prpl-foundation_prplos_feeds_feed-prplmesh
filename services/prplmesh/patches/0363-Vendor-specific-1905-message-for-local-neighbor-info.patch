@@ -1,0 +1,320 @@
+From 97ea7ed769baae0deda2a453acc5c09e505344f5 Mon Sep 17 00:00:00 2001
+From: Ameya Phadke <phadke@qti.qualcomm.com>
+Date: Wed, 29 Jul 2026 23:46:17 -0700
+Subject: [PATCH] Vendor Specific 1905 message for local neighbor information
+ msg
+
+Signed-off-by: Ameya Phadke <phadke@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/son_slave_thread.cpp | 23 +++----
+ .../slave/tasks/neighbor_db_agent_task.cpp    | 68 +++++++++++++------
+ .../slave/tasks/neighbor_db_agent_task.h      | 24 ++++---
+ .../master/tasks/neighbor_db_ctrl_task.cpp    | 59 +++++++++++-----
+ .../src/beerocks/master/tasks/task_pool.cpp   |  5 --
+ 5 files changed, 118 insertions(+), 61 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 5796a4a41..60ba2a3b3 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -6512,20 +6512,19 @@ bool slave_thread::send_cmdu_to_controller(const std::string &fronthaul_iface,
+ {
+     auto db = AgentDB::get();
+     if (cmdu_tx.getMessageType() == ieee1905_1::eMessageType::VENDOR_SPECIFIC_MESSAGE) {
+-        if (!db->controller_info.prplmesh_controller) {
+-            return true; // don't send VS messages to non prplmesh controllers
+-        }
+         auto beerocks_header = message_com::get_beerocks_header(cmdu_tx);
+-        if (!beerocks_header) {
+-            LOG(ERROR) << "Failed getting beerocks_header!";
+-            return false;
+-        }
+-
+-        auto radio = db->radio(fronthaul_iface);
+-        if (radio) {
+-            beerocks_header->actionhdr()->radio_mac() = radio->front.iface_mac;
++        if (beerocks_header) {
++            // Beerocks-style VS message: apply prplmesh-controller filter and set header fields.
++            if (!db->controller_info.prplmesh_controller) {
++                return true; // don't send beerocks VS messages to non-prplmesh controllers
++            }
++            auto radio = db->radio(fronthaul_iface);
++            if (radio) {
++                beerocks_header->actionhdr()->radio_mac() = radio->front.iface_mac;
++            }
++            beerocks_header->actionhdr()->direction() = beerocks::BEEROCKS_DIRECTION_CONTROLLER;
+         }
+-        beerocks_header->actionhdr()->direction() = beerocks::BEEROCKS_DIRECTION_CONTROLLER;
++        // Non-beerocks VS messages (e.g., QCA vendor-specific) fall through and are sent as-is.
+     }
+ 
+     const auto src_addr = db->bridge.mac;
+diff --git a/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.cpp b/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.cpp
+index 532103fd2..ae0686ca0 100644
+--- a/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.cpp
++++ b/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.cpp
+@@ -3,9 +3,11 @@
+  */
+ 
+ #include "neighbor_db_agent_task.h"
++#include "tlvf_qca_utils.h"
+ 
+ #include <bcl/network/network_utils.h>
+ #include <easylogging++.h>
++#include <tlvf/ieee_1905_1/eMessageType.h>
+ #include <tlvf/qca/eQcaMsgType.h>
+ #include <tlvf/qca/tlvQcaMsgType.h>
+ #include <tlvf/qca/tlvQcaNeighborInformation.h>
+@@ -115,32 +117,58 @@ std::vector<uint8_t> NeighborDbAgentTask::collect_local_neighbor_report()
+ void NeighborDbAgentTask::send_local_neighbor_info_to_controller(
+     const std::vector<uint8_t> &report_data)
+ {
+-    // [STUB] In the full implementation this function will:
+-    //  1. Build a 1905 Local Neighbor Information Message.
+-    //  2. Add Neighbor Information TLV (SMD TLV TBD) populated from report_data.
+-    //  3. Transmit to the controller via slave_thread::send_cmdu_to_controller().
+-    // The message is fire-and-forget; no response is expected.
+-
+     auto db                    = AgentDB::get();
+     const auto controller_alid = db->controller_info.bridge_mac;
++    const auto agent_alid      = db->bridge.mac;
+ 
+-    LOG(DEBUG) << "AP_DEBUG: [STUB] Sending Local Neighbor Information Message to controller "
++    LOG(DEBUG) << "AP_DEBUG: Sending Local Neighbor Information Message to controller "
+                << controller_alid << " (NRE bytes=" << report_data.size() << ")";
+ 
+     if (controller_alid == net::network_utils::ZERO_MAC) {
+-        LOG(WARNING) << "AP_DEBUG: [STUB] Controller ALID is unknown (ZERO_MAC)."
+-                     << " Message would be dropped in a real implementation.";
++        LOG(WARNING) << "AP_DEBUG: Controller ALID is unknown (ZERO_MAC). Dropping message.";
++        return;
+     }
+ 
+-    // TODO: Replace stub with actual 1905 message construction and transmission:
+-    //
+-    //   if (!m_cmdu_tx.create(0, ieee1905_1::eMessageType::LOCAL_NEIGHBOR_INFORMATION_MESSAGE)) {
+-    //       LOG(ERROR) << "Failed to create LOCAL_NEIGHBOR_INFORMATION_MESSAGE";
+-    //       return;
+-    //   }
+-    //   auto tlv = m_cmdu_tx.addClass<vendor_specific::tlvNeighborInformation>();
+-    //   // populate tlv from report_data...
+-    //   if (!m_btl_ctx.send_cmdu_to_controller({}, m_cmdu_tx)) {
+-    //       LOG(ERROR) << "Failed sending local neighbor info to controller";
+-    //   }
++    // Step 1: Create a VENDOR_SPECIFIC_MESSAGE CMDU.
++    if (!m_cmdu_tx.create(0, ieee1905_1::eMessageType::VENDOR_SPECIFIC_MESSAGE)) {
++        LOG(ERROR) << "AP_DEBUG: Failed to create VENDOR_SPECIFIC_MESSAGE";
++        return;
++    }
++
++    // Step 2: Add the QCA message type TLV (must be first).
++    //         Identifies this as a Local Neighbor Information message (Agent → Controller).
++    if (!qca::tlvf_qca_utils::add_qca_msg_type_tlv(
++            m_cmdu_tx,
++            static_cast<uint16_t>(qca::eQcaMsgType::QCA_MSG_LOCAL_NEIGHBOR_INFO))) {
++        LOG(ERROR) << "AP_DEBUG: Failed to add QCA message type TLV";
++        return;
++    }
++
++    // Step 3: Build the neighbor entry from the local NRE data.
++    //         The agent reports its own ALID as the source of the NRE.
++    std::vector<qca::sQcaNeighborEntry> entries;
++    if (!report_data.empty()) {
++        qca::sQcaNeighborEntry entry;
++        entry.agent_alid = agent_alid;
++        entry.nre_bytes  = report_data;
++        entries.push_back(std::move(entry));
++    }
++
++    // Step 4: Add the QCA Neighbor Information TLV.
++    //         Even if entries is empty, the TLV is added so the controller
++    //         knows the agent's neighbor DB is empty.
++    if (!qca::tlvf_qca_utils::add_qca_neighbor_info_tlv(m_cmdu_tx, entries)) {
++        LOG(ERROR) << "AP_DEBUG: Failed to add QCA Neighbor Information TLV";
++        return;
++    }
++
++    // Step 5: Transmit (fire-and-forget; no response expected).
++    if (!m_btl_ctx.send_cmdu_to_controller({}, m_cmdu_tx)) {
++        LOG(ERROR) << "AP_DEBUG: Failed to send Local Neighbor Information Message to controller "
++                   << controller_alid;
++        return;
++    }
++
++    LOG(INFO) << "AP_DEBUG: Sent Local Neighbor Information Message to controller "
++              << controller_alid << " (NRE bytes=" << report_data.size() << ")";
+ }
+diff --git a/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.h b/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.h
+index f1336f005..456b86d16 100644
+--- a/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.h
++++ b/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.h
+@@ -15,7 +15,7 @@
+ namespace beerocks {
+ 
+ /**
+- * @brief Agent Neighbor DB Task (SMD skeleton)
++ * @brief Agent Neighbor DB Task
+  *
+  * Agent-side task for the SMD Neighbor DB Update process.
+  *
+@@ -30,9 +30,13 @@ namespace beerocks {
+  *
+  * Current implementation status
+  * ------------------------------
+- * This is a skeleton implementation. All 1905 message transmissions and hostapd API calls are
+- * replaced by LOG(DEBUG) stubs so that the logic can be exercised without any external
+- * dependencies. The stubs are clearly marked with "[STUB]" in the log output.
++ * send_local_neighbor_info_to_controller() is fully implemented: it builds and transmits
++ * a QCA VENDOR_SPECIFIC_MESSAGE with tlvQcaMsgType + tlvQcaNeighborInformation to the
++ * controller.
++ *
++ * collect_local_neighbor_report() remains a stub that returns an empty NRE byte vector.
++ * The real implementation will query hostapd for the IEEE 802.11 Neighbor Report Element.
++ * The stub is clearly marked with "[STUB]" in the log output.
+  */
+ class NeighborDbAgentTask : public Task {
+ public:
+@@ -117,14 +121,18 @@ private:
+     std::vector<uint8_t> collect_local_neighbor_report();
+ 
+     /**
+-     * @brief [STUB] Send Local Neighbor Information Message to the controller.
++     * @brief Send Local Neighbor Information Message to the controller.
+      *
+-     * In the full implementation, this will build and transmit a 1905 Local Neighbor
+-     * Information Message with the Neighbor Information TLV.
++     * Builds and transmits a QCA VENDOR_SPECIFIC_MESSAGE containing:
++     *   1. tlvQcaMsgType  (QCA_MSG_LOCAL_NEIGHBOR_INFO = 0x0002)
++     *   2. tlvQcaNeighborInformation  (one entry with the agent's own ALID + NRE bytes)
+      *
+      * The message is sent fire-and-forget; no response is expected.
++     * Silently drops the message if the controller ALID is not yet known (ZERO_MAC).
+      *
+-     * @param report_data Raw NRE bytes (placeholder).
++     * @param report_data Raw NRE bytes from collect_local_neighbor_report().
++     *                    May be empty; the TLV is still sent with num_neighbor_reports=0
++     *                    so the controller knows the agent's neighbor DB is empty.
+      */
+     void send_local_neighbor_info_to_controller(const std::vector<uint8_t> &report_data);
+ 
+diff --git a/controller/src/beerocks/master/tasks/neighbor_db_ctrl_task.cpp b/controller/src/beerocks/master/tasks/neighbor_db_ctrl_task.cpp
+index 6ddbbd310..c4c41104f 100644
+--- a/controller/src/beerocks/master/tasks/neighbor_db_ctrl_task.cpp
++++ b/controller/src/beerocks/master/tasks/neighbor_db_ctrl_task.cpp
+@@ -13,6 +13,7 @@
+ #include <tlvf/ieee_1905_1/eMessageType.h>
+ #include <tlvf/qca/eQcaMsgType.h>
+ #include <tlvf/qca/tlvQcaMsgType.h>
++#include <tlvf/qca/tlvQcaNeighborInformation.h>
+ 
+ using namespace beerocks;
+ using namespace net;
+@@ -127,6 +128,9 @@ bool NeighborDbCtrlTask::handle_vendor_specific(ieee1905_1::CmduMessageRx &cmdu_
+         return false;
+     }
+ 
++    TASK_LOG(DEBUG) << "AP_DEBUG: Received QCA VENDOR_SPECIFIC_MESSAGE from " << src_mac
++                    << " message_type=0x" << std::hex << msg_type_tlv->message_type();
++
+     switch (static_cast<qca::eQcaMsgType>(msg_type_tlv->message_type())) {
+ 
+     case qca::eQcaMsgType::QCA_MSG_LOCAL_NEIGHBOR_INFO:
+@@ -165,26 +169,49 @@ bool NeighborDbCtrlTask::handle_local_neighbor_info_message(const sMacAddr &src_
+                    << ", mid=" << std::hex << mid;
+ 
+     // -----------------------------------------------------------------------
+-    // Step 1: Parse the Neighbor Information TLV and extract the NRE bytes.
+-    //
+-    // [STUB] In the full implementation:
+-    //   auto tlv = cmdu_rx.getClass<vendor_specific::tlvNeighborInformation>();
+-    //   if (!tlv) { TASK_LOG(ERROR) << "Missing Neighbor Information TLV"; return false; }
+-    //   std::vector<uint8_t> nre_bytes(tlv->frame_body(), tlv->frame_body() + tlv->length());
+-    //
+-    // For now we use an empty placeholder vector.
++    // Step 1: Retrieve the QCA Neighbor Information TLV.
++    //         Both TLVs were already parsed by CmduMessageRx::parse() via the
++    //         vendor TLV parser. Use getClass<>() to access the parsed TLV.
++    // -----------------------------------------------------------------------
++    auto neighbor_tlv = cmdu_rx.getClass<qca::tlvQcaNeighborInformation>();
++    if (!neighbor_tlv) {
++        TASK_LOG(ERROR) << "AP_DEBUG: Missing QCA Neighbor Information TLV from agent " << src_mac;
++        return false;
++    }
++
++    uint8_t count = neighbor_tlv->num_neighbor_reports();
++    TASK_LOG(DEBUG) << "AP_DEBUG: Neighbor Information TLV has " << int(count)
++                    << " NRE entry/entries from agent " << src_mac;
++
++    // -----------------------------------------------------------------------
++    // Step 2: Extract NRE bytes from the first (and only) neighbor report entry.
++    //         The agent sends exactly one entry containing its own NRE.
+     // -----------------------------------------------------------------------
+-    TASK_LOG(DEBUG) << "AP_DEBUG: [STUB] Parsing Neighbor Information TLV from agent " << src_mac
+-                    << " (TLV type TBD – using placeholder NRE data)";
+-    std::vector<uint8_t> nre_bytes; // placeholder
++    std::vector<uint8_t> nre_bytes;
++    if (count > 0) {
++        auto report_tuple = neighbor_tlv->neighbor_report_list(0);
++        if (std::get<0>(report_tuple)) {
++            auto &report     = std::get<1>(report_tuple);
++            uint16_t nre_len = report.neighbor_report_element_length();
++            if (nre_len > 0) {
++                const uint8_t *nre_data = report.neighbor_report_element();
++                nre_bytes.assign(nre_data, nre_data + nre_len);
++            }
++        } else {
++            TASK_LOG(WARNING) << "AP_DEBUG: Failed to access NRE[0] from agent " << src_mac;
++        }
++    }
++
++    TASK_LOG(DEBUG) << "AP_DEBUG: Extracted " << nre_bytes.size()
++                    << " NRE bytes from agent " << src_mac;
+ 
+     // -----------------------------------------------------------------------
+-    // Step 2: Update the local neighbor DB.
++    // Step 3: Update the local neighbor DB.
+     // -----------------------------------------------------------------------
+     update_local_neighbor_db(src_mac, nre_bytes);
+ 
+     // -----------------------------------------------------------------------
+-    // Step 3: Propagate the updated DB to all other agents (fire-and-forget).
++    // Step 4: Propagate the updated DB to all other agents (fire-and-forget).
+     // After propagation the task is back in idle state; no response is expected.
+     // -----------------------------------------------------------------------
+     propagate_neighbor_info_to_all_agents(src_mac);
+@@ -273,13 +300,13 @@ void NeighborDbCtrlTask::update_local_neighbor_db(const sMacAddr &agent_alid,
+ 
+ void NeighborDbCtrlTask::propagate_neighbor_info_to_all_agents(const sMacAddr &reporting_agent_alid)
+ {
+-    TASK_LOG(INFO) << "AP_DEBUG: Propagating updated neighbor DB to all agents except "
+-                   << reporting_agent_alid;
++    TASK_LOG(INFO) << "AP_DEBUG: Propagating updated neighbor DB to all agents"
++                   << " (triggered by " << reporting_agent_alid << ")";
+ 
+     int propagated_count  = 0;
+     auto connected_agents = database.get_all_connected_agents();
+     for (const auto &agent : connected_agents) {
+-        if (!agent || agent->al_mac == reporting_agent_alid) {
++        if (!agent) {
+             continue;
+         }
+         TASK_LOG(DEBUG) << "AP_DEBUG: Propagating aggregated neighbor info to agent "
+diff --git a/controller/src/beerocks/master/tasks/task_pool.cpp b/controller/src/beerocks/master/tasks/task_pool.cpp
+index 2addb18cc..5ac6cca8c 100644
+--- a/controller/src/beerocks/master/tasks/task_pool.cpp
++++ b/controller/src/beerocks/master/tasks/task_pool.cpp
+@@ -132,11 +132,6 @@ void task_pool::run_tasks(int max_exec_duration_ms)
+ 
+ void task_pool::handle_ieee1905_1_msg(const sMacAddr &src_mac, ieee1905_1::CmduMessageRx &cmdu_rx)
+ {
+-    if (cmdu_rx.getMessageType() == ieee1905_1::eMessageType::VENDOR_SPECIFIC_MESSAGE) {
+-        LOG(DEBUG) << "Message with mid: " << cmdu_rx.getMessageId()
+-                   << " is VENDOR_SPECIFIC message.";
+-        return;
+-    }
+     for (auto &task_element : m_scheduled_tasks) {
+         auto &task = task_element.second;
+         if (task->handle_ieee1905_1_msg(src_mac, cmdu_rx)) {
+-- 
+2.34.1
+
