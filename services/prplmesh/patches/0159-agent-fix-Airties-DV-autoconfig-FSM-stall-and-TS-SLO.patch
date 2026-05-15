@@ -1,0 +1,221 @@
+From abdcc2883ab8c33c119f1623eaf9238a65351204 Mon Sep 17 00:00:00 2001
+From: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+Date: Wed, 13 May 2026 11:45:19 +0530
+Subject: [PATCH] agent: fix Airties DV autoconfig FSM stall and TS SLO to MLO
+ transition bugs
+
+This patch addresses two Airties DV-specific autoconfiguration failures
+and two traffic-separation bugs triggered by SLO to MLO transitions.
+
+Airties DV — AP-Autoconfiguration FSM issues:
+
+Problem 1 — AP-Autoconfiguration Search FSM loops indefinitely:
+When the AP-Autoconfiguration Search times out, the FSM unconditionally
+moved back to CONTROLLER_DISCOVERY.  Airties sends an AP-Autoconfiguration
+Renew to trigger re-configuration but does not respond to subsequent
+Search messages, causing the FSM to loop indefinitely and never reach
+WSC M1.
+
+Fix: If the controller MAC is already known
+(db->controller_info.bridge_mac != ZERO_MAC), mark discovery as
+completed and transition directly to SEND_AP_AUTOCONFIGURATION_WSC_M1,
+bypassing re-discovery.  Fall back to CONTROLLER_DISCOVERY only when
+the controller MAC is unknown.
+
+Problem 2 — 5G FSM stuck in WAIT_AP_CONFIGURATION_COMPLETE:
+Backhaul-only BSSes (backhaul_bss=true, fronthaul_bss=false) are
+intentionally not added to the LAN bridge — they carry only
+controller↔agent traffic.  Including them in the bridge-membership
+check inside configuration_complete_wait_action() caused the 5G FSM
+to be permanently stuck in WAIT_AP_CONFIGURATION_COMPLETE because
+wlan2/SSID-BH-5G is never bridged.  This caused all subsequent AP
+Autoconfiguration Renew messages for the 5G radio to be silently
+dropped, preventing 5G SSID changes from ever reaching the agent.
+
+Fix: Skip backhaul-only BSSes (backhaul_bss && !fronthaul_bss) from
+the bridge-membership check.
+
+Traffic Separation — SLO→MLO transition issues:
+
+Problem 3 — BSS-type mismatch in is_bss_config_matching():
+A backhaul BSS (e.g. MAPBackhaulAP, vap_type=HOME) could be incorrectly
+matched to a fronthaul local BSSID that also has vap_type=HOME.  This
+swapped the fronthaul/backhaul roles and caused hostapd to reconfigure
+the wrong VAPs after an SLO→MLO transition where the autoconfiguration
+task runs before all radios have re-registered.
+
+Fix: Add a BSS-type guard using payload_config.bss_type (the bitmask)
+before the vap_type check.  When both sides have an unambiguous role
+(pure fronthaul or pure backhaul) and the roles differ, return false
+immediately.  payload_config.bss_type is used instead of
+m2_config.fronthaul_bss/backhaul_bss to remain compatible with all
+BssConfig instantiations.
+
+Problem 4 — ebtables VLAN filter clear failure aborts TS reconfiguration:
+After an SLO→MLO transition, hostapd recreates wlan2/wlan3 as MLO
+secondary links, which implicitly removes the ebtables VLAN-filter
+rules installed during the previous SLO-based TS configuration.  The
+TS manager's access-port list still holds the old SLO interface names
+and attempts to delete the already-gone rules on the next TS reset,
+causing AccessPortPlumbing8021q::clear() to return false and abort the
+entire TS reconfiguration.
+
+Fix: Since the desired state (no VLAN filter on the interface) is
+already achieved, treat the failure as a successful clear: log a
+WARNING and return true instead of returning false.
+
+Signed-off-by: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+---
+ .../slave/tasks/ap_autoconfiguration_task.cpp | 93 ++++++++++++++++++-
+ .../access_port_plumbing_8021q.cpp            | 10 ++
+ 2 files changed, 101 insertions(+), 2 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index ba4e7c3e7..d812d7c10 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -124,6 +124,29 @@ bool is_bss_config_matching(const beerocks::AgentDB::sRadio::sFront::sBssid &loc
+         return local_bss.vap_label == requested_bss.m2_config.vap_label;
+     }
+ 
++    // BSS-type guard: reject FH/BH role mismatches before the vap_type check.
++    // Without this, a BH BSS (e.g. MAPBackhaulAP, vap_type=HOME) can match a FH BSSID
++    // with the same vap_type, swapping roles (seen after SLO->MLO when autoconfig runs
++    // before all radios re-register).  Use payload_config.bss_type (not m2_config bool
++    // fields) to stay compatible with all BssConfig instantiations.
++    const bool local_is_fronthaul = local_bss.fronthaul_bss && !local_bss.backhaul_bss;
++    const bool local_is_backhaul  = local_bss.backhaul_bss && !local_bss.fronthaul_bss;
++
++    const auto req_bss_type = requested_bss.payload_config.bss_type;
++    const bool req_is_fronthaul =
++        static_cast<bool>(req_bss_type & WSC::eWscVendorExtSubelementBssType::FRONTHAUL_BSS) &&
++        !static_cast<bool>(req_bss_type & WSC::eWscVendorExtSubelementBssType::BACKHAUL_BSS);
++    const bool req_is_backhaul =
++        static_cast<bool>(req_bss_type & WSC::eWscVendorExtSubelementBssType::BACKHAUL_BSS) &&
++        !static_cast<bool>(req_bss_type & WSC::eWscVendorExtSubelementBssType::FRONTHAUL_BSS);
++
++    // Only apply the guard when both sides have an unambiguous role.
++    if ((local_is_fronthaul || local_is_backhaul) && (req_is_fronthaul || req_is_backhaul)) {
++        if (local_is_fronthaul != req_is_fronthaul || local_is_backhaul != req_is_backhaul) {
++            return false;
++        }
++    }
++
+     // Fall back to vap_type matching
+     const bool is_vap_type_applicable = (local_bss.vap_type != eVapType::OTHER) &&
+                                         (requested_bss.m2_config.vap_type != eVapType::OTHER);
+@@ -359,8 +382,19 @@ void ApAutoConfigurationTask::work()
+             }
+ 
+             if (std::chrono::steady_clock::now() > conf_params.timeout) {
+-                FSM_MOVE_STATE(radio_iface, eState::CONTROLLER_DISCOVERY);
+-                m_discovery_status[radio->wifi_channel.get_freq_type()].msg_sent = false;
++                // Controller MAC known (e.g. after a Renew): skip re-discovery -> WSC M1.
++                // Airties sends Renew but ignores subsequent Search, causing FSM loop.
++                if (db->controller_info.bridge_mac != network_utils::ZERO_MAC) {
++                    LOG(INFO) << "AP-Autoconfiguration Search timed out but controller MAC is "
++                                "known ("
++                            << db->controller_info.bridge_mac
++                            << "). Skipping re-discovery, proceeding to WSC M1.";
++                    m_discovery_status[radio->wifi_channel.get_freq_type()].completed = true;
++                    FSM_MOVE_STATE(radio_iface, eState::SEND_AP_AUTOCONFIGURATION_WSC_M1);
++                } else {
++                    FSM_MOVE_STATE(radio_iface, eState::CONTROLLER_DISCOVERY);
++                    m_discovery_status[radio->wifi_channel.get_freq_type()].msg_sent = false;
++                }
+             }
+             break;
+         }
+@@ -699,6 +733,15 @@ void ApAutoConfigurationTask::configuration_complete_wait_action(const std::stri
+             continue;
+         }
+ 
++        // Backhaul-only BSSes are not bridged (controller<->agent traffic only).
++        // Including them in the bridge check permanently stalls the 5G FSM in
++        // WAIT_AP_CONFIGURATION_COMPLETE, silently dropping all subsequent Renews.
++        if (bssid.backhaul_bss && !bssid.fronthaul_bss) {
++            LOG(DEBUG) << "skip backhaul-only bss " << bssid.iface_name
++                       << " from bridge membership check";
++            continue;
++        }
++
+         //TODO: [NLHAL] Currently removed _link from bss name and used base interface name to check iface is in bridge or not
+         std::string base_iface_name = "";
+         size_t pos = bssid.iface_name.find("_link");
+@@ -3284,6 +3327,52 @@ bool ApAutoConfigurationTask::handle_bss_reconfiguration(
+             }
+         }
+ 
++        // Airties sends the same M2 BSS list (including the BH BSS) to every radio.
++        // On a FH-only radio the BH BSS falls through Pass 1/2 unmatched; letting it
++        // through causes hostapd to create a spurious BH VAP, the 6 GHz MLD interfaces
++        // are then reported as 5 GHz BSSes, and the 5 GHz FSM reaches CONFIGURED without
++        // ever creating its own FH clones (wlan2_1/2/3).
++        //
++        // Check radio->front.bssids (all BSSIDs, including inactive) so that a torn-down
++        // BH radio (backhaul_bss=true in DB) still passes the guard and can re-create its
++        // BH VAP.  SLO/initial-onboarding cases are unaffected: the BH BSS is matched in
++        // Pass 2 and never reaches this point.
++        const bool is_backhaul_bss =
++            static_cast<bool>(remaining_bss.payload_config.bss_type &
++                              WSC::eWscVendorExtSubelementBssType::BACKHAUL_BSS);
++        if (is_backhaul_bss) {
++            // radio_has_backhaul_bss is true if:
++            //   (a) any BSSID has backhaul_bss=true (set by AP_ENABLED), OR
++            //   (b) any BSSID SSID matches the requested BH SSID (flag not yet set), OR
++            //   (c) tlvAgentApMldConfiguration assigns this BH SSID to this radio.
++            //       Without (c), the guard fires on the first M2 for a radio whose only
++            //       BSSID is still "OpenWrt" (fh=1 bh=0), even if the MLD TLV designates
++            //       it as a BH radio.
++            const std::string &backhaul_ssid = remaining_bss.payload_config.ssid;
++
++            // Check (c): MLD config assigns this backhaul SSID to this radio
++            bool mld_assigns_backhaul_to_radio = false;
++            auto mld_radio_it = m_ap_mld_requests_infos.find(radio_iface);
++            if (mld_radio_it != m_ap_mld_requests_infos.end()) {
++                mld_assigns_backhaul_to_radio =
++                    (mld_radio_it->second.find(backhaul_ssid) != mld_radio_it->second.end());
++            }
++
++            const bool radio_has_backhaul_bss =
++                mld_assigns_backhaul_to_radio ||
++                std::any_of(radio->front.bssids.begin(), radio->front.bssids.end(),
++                            [&backhaul_ssid](const sBssid &b) {
++                                return (b.backhaul_bss && !b.iface_name.empty()) ||
++                                       (!backhaul_ssid.empty() && b.ssid == backhaul_ssid);
++                            });
++            if (!radio_has_backhaul_bss) {
++                LOG(DEBUG) << "Skipping backhaul BSS " << remaining_bss.payload_config.ssid
++                           << " on fronthaul-only radio " << radio_iface
++                           << " (no backhaul BSSIDs on this radio)";
++                continue;
++            }
++        }
++
+         // Create new VAP (existing behavior)
+         if (reconfig_bss_list.size() <= radio->front.radio_max_bss) {
+ 
+diff --git a/agent/src/beerocks/slave/traffic_separation/access_port_plumbing_8021q.cpp b/agent/src/beerocks/slave/traffic_separation/access_port_plumbing_8021q.cpp
+index c4ea47941..7ecc4899d 100644
+--- a/agent/src/beerocks/slave/traffic_separation/access_port_plumbing_8021q.cpp
++++ b/agent/src/beerocks/slave/traffic_separation/access_port_plumbing_8021q.cpp
+@@ -62,6 +62,16 @@ bool AccessPortPlumbing8021q::clear()
+     }
+ 
+     if (!network_utils::set_vlan_packet_filter(false, m_access_port.iface_name)) {
++        // If the interface no longer exists, the VLAN filter is implicitly gone
++        // (expected after SLO->MLO: hostapd removes wlan2/wlan3 and recreates them
++        // as MLO links, taking the ebtables rules with it). Treat as success.
++        if (!network_utils::linux_iface_exists(m_access_port.iface_name)) {
++            LOG(WARNING) << "failed to clear VLAN filter iface=" << m_access_port.iface_name
++                         << " (interface no longer exists, likely removed during SLO->MLO"
++                         << " reconfiguration), treating as cleared";
++            m_is_applied = false;
++            return true;
++        }
+         LOG(ERROR) << "failed to clear VLAN filter iface=" << m_access_port.iface_name;
+         return false;
+     }
+-- 
+2.34.1
+
