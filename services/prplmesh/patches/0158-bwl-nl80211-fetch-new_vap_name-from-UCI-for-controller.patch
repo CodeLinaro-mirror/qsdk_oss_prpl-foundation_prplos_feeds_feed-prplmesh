@@ -1,0 +1,478 @@
+From 47ca05cc7bb800154e21770799890c45c75c13ac Mon Sep 17 00:00:00 2001
+From: Nirmal Raj S <nirm@qti.qualcomm.com>
+Date: Thu, 14 May 2026 10:58:55 +0530
+Subject: [PATCH] bwl/nl80211: fetch new_vap_name from UCI for controller in
+ update_vap_credentials
+
+Signed-off-by: Nirmal Raj S <nirm@qti.qualcomm.com>
+---
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  21 +++
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  89 ++++++---
+ .../platform/bpl/cfg/linux/bpl_cfg_wifi.cpp   |  14 ++
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     | 174 +++++++++++++++---
+ framework/platform/bpl/include/bpl/bpl_cfg.h  |  33 ++++
+ 5 files changed, 285 insertions(+), 46 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 5bb94e6f8..f5a8836f9 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -1752,6 +1752,27 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_wsc_renew(
+ 
+     db->statuses.controller_discovery_completed = false;
+ 
++    // Clear the MLD pair entrant file before starting the new autoconfiguration round.
++    // This file is used only by the NL80211 HAL to coordinate MLD group assignments
++    // across the radio processes; stale entries from the previous round must be removed
++    // so that the new round starts with a clean slate.  The clear is done here — once
++    // per AP_AUTOCONFIG_RENEW message, before the FSM is moved — rather than inside
++    // update_vap_credentials, to avoid the race that arises when all three radio
++    // processes call update_vap_credentials simultaneously.
++#ifdef USE_PRPLMESH_NLHAL
++    {
++        const char *mld_entrant_file = "/tmp/beerocks/mld_pair_entrant.txt";
++        FILE *f = fopen(mld_entrant_file, "w");
++        if (f) {
++            fclose(f);
++            LOG(INFO) << "handle_ap_autoconfiguration_wsc_renew: cleared " << mld_entrant_file;
++        } else {
++            LOG(WARNING) << "handle_ap_autoconfiguration_wsc_renew: failed to clear "
++                         << mld_entrant_file;
++        }
++    }
++#endif // USE_PRPLMESH_NLHAL
++
+     for (const auto radio : db->get_radios_list()) {
+         if (!radio) {
+             return;
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index f7403988c..4b09a8db0 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -1631,7 +1631,7 @@ bool ap_wlan_hal_nl80211::sta_bss_steer(const sBtmRequestParams &params)
+ }
+ 
+ void set_wifi_credentials_from_vap(const std::string &vap_id,
+-                                   const son::wireless_utils::sBssInfoConf &bss_conf,
++                                   son::wireless_utils::sBssInfoConf &bss_conf,
+                                    prplmesh::hostapd::Configuration &conf,std::string &radio_id)
+ {
+     int lock_fd = open("/var/lock/prplmesh-wireless.lock", O_CREAT | O_RDWR, 0644);
+@@ -1661,6 +1661,23 @@ void set_wifi_credentials_from_vap(const std::string &vap_id,
+         if (!bss.empty()) {
+             LOG(INFO) << "bss is: " << bss;
+             LOG(INFO) << key << " found, UCI is set";
++
++            // When bss_conf already carries an MLD ID, check whether the wifi-mld
++            // section already has this iface registered under a (possibly different)
++            // mld_id.  If so, reuse that existing mld_id so that
++            // bpl_cfg_set_wifi_credentials updates the correct section instead of
++            // creating a duplicate entry.
++            if (!bss_conf.mld_id.empty()) {
++                std::string existing_mld_id;
++                if (beerocks::bpl::bpl_cfg_get_mld_id_by_iface(bss, existing_mld_id)) {
++                    LOG(INFO) << "set_wifi_credentials_from_vap: iface=" << bss
++                              << " already present in wifi-mld section with mld_id="
++                              << existing_mld_id
++                              << ", overriding bss_conf.mld_id (was " << bss_conf.mld_id << ")";
++                    bss_conf.mld_id = existing_mld_id;
++                }
++            }
++
+             const bool ret_val = beerocks::bpl::bpl_cfg_set_wifi_credentials(bss, bss_conf,radio_id);
+             if (!ret_val) {
+                 LOG(ERROR) << "Failed to set UCI credential for vap_id: " << vap_id << " radio_id:" << radio_id;
+@@ -1779,34 +1796,56 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+ 
+             std::string new_vap_name;
+ 
+-            constexpr int kMaxTries = 4096;
+-            bool found = false;
++            // If controller (master), try to fetch new_vap_name from UCI wireless config
++            // using the SSID and radio_id as lookup keys.
++            if (beerocks::bpl::cfg_is_master() != 0) {
++                if (beerocks::bpl::bpl_cfg_get_vap_ifname_by_ssid_and_radio(
++                        bss_it.ssid, m_radio_info.radio_id, new_vap_name)) {
++                    LOG(INFO) << "Controller: fetched new_vap_name=" << new_vap_name
++                              << " for SSID=" << bss_it.ssid
++                              << " radio_id=" << m_radio_info.radio_id;
++                } else {
++                    LOG(INFO) << "Controller: no existing VAP found for SSID=" << bss_it.ssid
++                              << " radio_id=" << m_radio_info.radio_id
++                              << ", falling back to default naming logic";
++                    new_vap_name.clear();
++                }
++            }
+ 
+-            for (int tries = 0; tries < kMaxTries; ++tries) {
+-                new_vap_name = base_interface + "_" + std::to_string(new_vap_index);
++            // For agent (non-master), or when the controller lookup did not find a name,
++            // use the existing index-based naming logic.
++            if (new_vap_name.empty()) {
+ 
+-                int iface_index = if_nametoindex(new_vap_name.c_str());
+-                if (iface_index == 0) {
+-                    found = true;
+-                    break;
+-                }
++                constexpr int kMaxTries = 4096;
++                bool found = false;
+ 
+-                LOG(WARNING) << "Interface " << new_vap_name
+-                             << " already exists with ifindex " << iface_index
+-                             << ", trying next index " << (new_vap_index + 1);
++                for (int tries = 0; tries < kMaxTries; ++tries) {
++                    new_vap_name = base_interface + "_" + std::to_string(new_vap_index);
+ 
+-                ++new_vap_index;
+-            }
+-            
+-            if (found) {
+-                LOG(INFO) << "Using VAP name: " << new_vap_name
+-                          << " (index " << new_vap_index << ")";
+-            } else {
+-                LOG(ERROR) << "Failed to find a free VAP name after "
+-                           << kMaxTries << " attempts (base: "
+-                           << base_interface << ")";
+-                continue;
+-            }
++                    int iface_index = if_nametoindex(new_vap_name.c_str());
++                    if (iface_index == 0) {
++                        found = true;
++                        break;
++                    }
++
++                    LOG(WARNING) << "Interface " << new_vap_name
++                                 << " already exists with ifindex " << iface_index
++                                 << ", trying next index " << (new_vap_index + 1);
++
++                    ++new_vap_index;
++                }
++                
++                if (found) {
++                    LOG(INFO) << "Using VAP name: " << new_vap_name
++                              << " (index " << new_vap_index << ")";
++                } else {
++                    LOG(ERROR) << "Failed to find a free VAP name after "
++                               << kMaxTries << " attempts (base: "
++                               << base_interface << ")";
++                    continue;
++                }
++
++            } // end if (new_vap_name.empty())
+ 
+             sMacAddr new_bssid;
+ 
+diff --git a/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
+index 0e0dee8fb..f13135b7c 100644
+--- a/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
+@@ -266,5 +266,19 @@ bool bpl_cfg_set_wifi_iface_teardown(const std::string &iface, const std::string
+     return true;
+ }
+ 
++bool bpl_cfg_get_mld_id_by_iface(const std::string & /*iface*/, std::string & /*mld_id*/)
++{
++    LOG(DEBUG) << "bpl_cfg_get_mld_id_by_iface: not implemented for linux platform";
++    return false;
++}
++
++bool bpl_cfg_get_vap_ifname_by_ssid_and_radio(const std::string & /*ssid*/,
++                                               const std::string & /*radio_id*/,
++                                               std::string & /*new_vap_iface_name*/)
++{
++    LOG(DEBUG) << "bpl_cfg_get_vap_ifname_by_ssid_and_radio: not implemented for linux platform";
++    return false;
++}
++
+ } // namespace bpl
+ } // namespace beerocks
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index 030db95fd..eae29a967 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -569,6 +569,7 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+ 	    }
+ 	    options["bss_transition"] = "1";
+             options["ieee80211k"] = "1";
++            options["disabled"] = "0";
+ 
+ 	    // Set custom_alias based on vap_type (skip for OTHER/unknown)
+ 	    {
+@@ -587,7 +588,7 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+ 	    {
+ 		    static const char * const cred_keys[] = {
+ 			    "ssid", "encryption", "key", "multi_ap",
+-			    "multi_ap_backhaul_ssid", "multi_ap_backhaul_key", "custom_alias", nullptr
++			    "multi_ap_backhaul_ssid", "multi_ap_backhaul_key", "custom_alias", "disabled", nullptr
+ 		    };
+ 		    bool changed = false;
+ 		    for (int i = 0; cred_keys[i] != nullptr; ++i) {
+@@ -704,6 +705,7 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+             }
+             options["bss_transition"] = "1";
+             options["ieee80211k"] = "1";
++            options["disabled"] = "0";
+ 
+             // Set custom_alias based on vap_type (skip for OTHER/unknown)
+             {
+@@ -799,7 +801,7 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+         if (section_found && mld_section_exists) {
+             static const char * const cred_keys[] = {
+                 "ssid", "encryption", "key", "multi_ap",
+-                "multi_ap_backhaul_ssid", "multi_ap_backhaul_key", "custom_alias", nullptr
++                "multi_ap_backhaul_ssid", "multi_ap_backhaul_key", "custom_alias", "disabled", nullptr
+             };
+             bool changed = false;
+             for (int i = 0; cred_keys[i] != nullptr; ++i) {
+@@ -851,6 +853,7 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+         }
+ 	mldOptions["bss_transition"] = "1";
+ 	mldOptions["ieee80211k"] = "1";
++        mldOptions["disabled"] = "0";
+ 
+ 
+         if (!uci_set_section(package_name, mld_section_type, mld_section_name, mldOptions, true)) {
+@@ -1352,40 +1355,35 @@ bool bpl_cfg_set_wifi_iface_teardown(const std::string &iface, const std::string
+         return false;
+     }
+ 
+-    // Set only disabled=1 — do not touch any other credential fields
+-    OptionsUnorderedMap options;
+-    options["disabled"] = "1";
+-
+-    if (!uci_set_section(package_name, section_type, section_name, options, true)) {
+-        LOG(ERROR) << "bpl_cfg_set_wifi_iface_teardown: failed to set disabled=1 for interface "
+-                   << iface << " at section " << section_name;
++    // Remove the wifi-iface section entirely
++    if (!uci_delete_section(package_name, section_type, section_name, true)) {
++        LOG(ERROR) << "bpl_cfg_set_wifi_iface_teardown: failed to delete wifi-iface section "
++                   << section_name << " for interface " << iface;
+         return false;
+     }
+ 
+-    LOG(INFO) << "bpl_cfg_set_wifi_iface_teardown: set disabled=1 for interface "
+-              << iface << " at section " << section_name;
++    LOG(INFO) << "bpl_cfg_set_wifi_iface_teardown: deleted wifi-iface section "
++              << section_name << " for interface " << iface;
+ 
+-    // For MLO interfaces, also set disabled=1 in the corresponding wifi-mld section
++    // For MLO interfaces, also remove the corresponding wifi-mld section
+     if (is_mlo) {
+         const std::string mld_section_type = "wifi-mld";
+         std::vector<std::string> all_mld_sections;
+         if (uci_get_all_sections(package_name, mld_section_type, all_mld_sections)) {
+             for (const auto &mld_sec : all_mld_sections) {
+                 std::string mld_ifname_val;
+-                if (!uci_get_option(package_name, mld_section_type, mld_sec, "ifname", mld_ifname_val)) {
++                if (!uci_get_option(package_name, mld_section_type, mld_sec, "ifname",
++                                    mld_ifname_val)) {
+                     continue;
+                 }
+                 if (mld_ifname_val == iface) {
+-                    OptionsUnorderedMap mld_options;
+-                    mld_options["disabled"] = "1";
+-                    if (!uci_set_section(package_name, mld_section_type, mld_sec, mld_options, true)) {
+-                        LOG(WARNING) << "bpl_cfg_set_wifi_iface_teardown: failed to set disabled=1"
+-                                     << " in wifi-mld section " << mld_sec
++                    if (!uci_delete_section(package_name, mld_section_type, mld_sec, true)) {
++                        LOG(WARNING) << "bpl_cfg_set_wifi_iface_teardown: failed to delete"
++                                     << " wifi-mld section " << mld_sec
+                                      << " for interface " << iface;
+                     } else {
+-                        LOG(INFO) << "bpl_cfg_set_wifi_iface_teardown: set disabled=1"
+-                                  << " in wifi-mld section " << mld_sec
+-                                  << " for interface " << iface;
++                        LOG(INFO) << "bpl_cfg_set_wifi_iface_teardown: deleted wifi-mld section "
++                                  << mld_sec << " for interface " << iface;
+                     }
+                     break;
+                 }
+@@ -1399,6 +1397,140 @@ bool bpl_cfg_set_wifi_iface_teardown(const std::string &iface, const std::string
+     return true;
+ }
+ 
++bool bpl_cfg_get_mld_id_by_iface(const std::string &iface, std::string &mld_id)
++{
++    const std::string package_name     = "wireless";
++    const std::string mld_section_type = "wifi-mld";
++
++    // Get all wifi-mld sections
++    std::vector<std::string> all_mld_sections;
++    if (!uci_get_all_sections(package_name, mld_section_type, all_mld_sections)) {
++        LOG(DEBUG) << "bpl_cfg_get_mld_id_by_iface: no wifi-mld sections found";
++        return false;
++    }
++
++    for (const auto &mld_sec : all_mld_sections) {
++        std::string ifname_val;
++        if (!uci_get_option(package_name, mld_section_type, mld_sec, "ifname", ifname_val)) {
++            continue;
++        }
++
++        if (ifname_val != iface) {
++            continue;
++        }
++
++        // Found a wifi-mld section whose ifname matches.
++        // Extract the numeric suffix from the section name (e.g. "mld1" -> 1).
++        // bpl_cfg_set_wifi_credentials creates sections as "mld" + (mld_id_val + 1),
++        // so we subtract 1 to recover the original mld_id_val.
++        std::string mld_index_str;
++        for (char ch : mld_sec) {
++            if (isdigit(static_cast<unsigned char>(ch))) {
++                mld_index_str += ch;
++            }
++        }
++
++        if (mld_index_str.empty()) {
++            LOG(WARNING) << "bpl_cfg_get_mld_id_by_iface: section " << mld_sec
++                         << " has no numeric suffix, skipping";
++            continue;
++        }
++
++        int mld_index = beerocks::string_utils::stoi(mld_index_str);
++        mld_id        = std::to_string(mld_index - 1);
++        LOG(INFO) << "bpl_cfg_get_mld_id_by_iface: iface=" << iface
++                  << " found in wifi-mld section=" << mld_sec
++                  << " -> mld_id=" << mld_id;
++        return true;
++    }
++
++    LOG(DEBUG) << "bpl_cfg_get_mld_id_by_iface: no wifi-mld section found for iface=" << iface;
++    return false;
++}
++
++bool bpl_cfg_get_vap_ifname_by_ssid_and_radio(const std::string &ssid,
++                                               const std::string &radio_id,
++                                               std::string &new_vap_iface_name)
++{
++    const std::string package_name    = "wireless";
++    const std::string section_type    = "wifi-iface";
++    const std::string mld_section_type = "wifi-mld";
++
++    // Step 1: Find the wifi-device section that has the given radio_id
++    std::string device_section;
++    if (!uci_find_section_by_option(package_name, "wifi-device", "radio", radio_id,
++                                    device_section) ||
++        device_section.empty()) {
++        LOG(ERROR) << "bpl_cfg_get_vap_ifname_by_ssid_and_radio: no wifi-device section found"
++                   << " for radio_id=" << radio_id;
++        return false;
++    }
++
++    LOG(DEBUG) << "bpl_cfg_get_vap_ifname_by_ssid_and_radio: device_section=" << device_section
++               << " for radio_id=" << radio_id;
++
++    // Step 2: Get all wifi-iface sections
++    std::vector<std::string> all_iface_sections;
++    if (!uci_get_all_sections(package_name, section_type, all_iface_sections)) {
++        LOG(ERROR) << "bpl_cfg_get_vap_ifname_by_ssid_and_radio: failed to get all wifi-iface sections";
++        return false;
++    }
++
++    // Step 3: Iterate over wifi-iface sections belonging to the target wifi-device
++    for (const auto &sec : all_iface_sections) {
++        // Check if this section belongs to the target wifi-device
++        std::string device_val;
++        if (!uci_get_option(package_name, section_type, sec, "device", device_val) ||
++            device_val != device_section) {
++            continue;
++        }
++
++        // Check if SSID matches
++        std::string ssid_val;
++        if (!uci_get_option(package_name, section_type, sec, "ssid", ssid_val) ||
++            ssid_val != ssid) {
++            continue;
++        }
++
++        // SSID matched - check if ifname option is present
++        std::string ifname_val;
++        if (uci_get_option(package_name, section_type, sec, "ifname", ifname_val) &&
++            !ifname_val.empty()) {
++            new_vap_iface_name = ifname_val;
++            LOG(DEBUG) << "bpl_cfg_get_vap_ifname_by_ssid_and_radio: found ifname="
++                       << new_vap_iface_name << " in section=" << sec
++                       << " for ssid=" << ssid;
++            return true;
++        }
++
++        // ifname not present - check if mld option is present
++        std::string mld_val;
++        if (uci_get_option(package_name, section_type, sec, "mld", mld_val) &&
++            !mld_val.empty()) {
++            // Get ifname from the corresponding wifi-mld section
++            std::string mld_ifname_val;
++            if (uci_get_option(package_name, mld_section_type, mld_val, "ifname",
++                               mld_ifname_val) &&
++                !mld_ifname_val.empty()) {
++                new_vap_iface_name = mld_ifname_val;
++                LOG(DEBUG) << "bpl_cfg_get_vap_ifname_by_ssid_and_radio: found ifname="
++                           << new_vap_iface_name << " from wifi-mld section=" << mld_val
++                           << " for ssid=" << ssid;
++                return true;
++            }
++            LOG(WARNING) << "bpl_cfg_get_vap_ifname_by_ssid_and_radio: wifi-mld section="
++                         << mld_val << " has no ifname for ssid=" << ssid;
++        }
++
++        LOG(DEBUG) << "bpl_cfg_get_vap_ifname_by_ssid_and_radio: section=" << sec
++                   << " matched ssid=" << ssid << " but has no ifname or mld option";
++    }
++
++    LOG(DEBUG) << "bpl_cfg_get_vap_ifname_by_ssid_and_radio: no match found for ssid=" << ssid
++               << " radio_id=" << radio_id;
++    return false;
++}
++
+ bool cfg_set_wireless_channel(const std::string &radio_id, int channel)
+ {
+     if (radio_id.empty()) {
+diff --git a/framework/platform/bpl/include/bpl/bpl_cfg.h b/framework/platform/bpl/include/bpl/bpl_cfg.h
+index 2c7169f57..86b7d83c7 100644
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -1558,6 +1558,39 @@ bool cfg_update_prplmesh_option(const std::string &package_name,
+ bool bpl_cfg_set_sta_vap_bh_credentials(const std::string &iface,
+                                   const son::wireless_utils::sBssInfoConf &configuration);
+ 
++/**
++ * @brief Gets the MLD ID for a given interface from the wifi-mld UCI section.
++ *
++ * Searches all wifi-mld sections for one whose ifname option matches @p iface.
++ * If found, derives the mld_id value (section digit minus 1) that is consistent
++ * with bpl_cfg_set_wifi_credentials so the existing section is reused.
++ *
++ * @param [in]  iface   Interface name to look up (e.g. "wlan0_1").
++ * @param [out] mld_id  MLD ID string if found (e.g. "0" for wifi-mld section "mld1").
++ * @return true if a matching wifi-mld section was found, false otherwise.
++ */
++bool bpl_cfg_get_mld_id_by_iface(const std::string &iface, std::string &mld_id);
++
++/**
++ * @brief Fetches the VAP interface name for a given SSID and radio_id from UCI wireless config.
++ *
++ * Steps:
++ * 1. Find the wifi-device section that has the given radio_id.
++ * 2. Check all wifi-iface sections that belong to that wifi-device.
++ * 3. If the SSID matches, check if ifname option is present:
++ *    - If present: set new_vap_iface_name to ifname.
++ *    - If not present: check if mld option is present.
++ *      - If mld option present: get ifname from the corresponding wifi-mld section.
++ *
++ * @param [in]  ssid               SSID to search for.
++ * @param [in]  radio_id           Radio identifier (e.g. "radio0").
++ * @param [out] new_vap_iface_name The fetched VAP interface name.
++ * @return true on success (name found), false otherwise.
++ */
++bool bpl_cfg_get_vap_ifname_by_ssid_and_radio(const std::string &ssid,
++                                               const std::string &radio_id,
++                                               std::string &new_vap_iface_name);
++
+ } // namespace bpl
+ } // namespace beerocks
+ 
+-- 
+2.34.1
+
