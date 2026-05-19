@@ -1,0 +1,151 @@
+From d69ed845aee4d039c1796660c9d3006168b1bb56 Mon Sep 17 00:00:00 2001
+From: Suvidh Subodh Hegde <suvidhsu@qti.qualcomm.com>
+Date: Tue, 19 May 2026 19:18:05 +0530
+Subject: [PATCH] Static puncturing enablement for openwrt
+
+Signed-off-by: Suvidh Subodh Hegde <suvidhsu@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 | 15 ++++-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 62 +++++++++++++++++--
+ .../bwl/nl80211/ap_wlan_hal_nl80211.h         |  3 +
+ 3 files changed, 72 insertions(+), 8 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 6c173d2e8..58876be2d 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -1447,9 +1447,18 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+             }
+         }
+ 
+-        if ((!request->cs_params().channel) ||
+-            (ap_wlan_hal->get_radio_info().channel == request->cs_params().channel &&
+-             ap_wlan_hal->get_radio_info().bandwidth == request->cs_params().bandwidth)) {
++        // Per IEEE 802.11be / EasyMesh R6, puncturing changes require a CSA even when staying
++        // on the same channel so that clients can adapt to the new punct_bitmap.
++        bool punct_bitmap_requested = request->eht_operation_valid() &&
++                                      request->eo_params().disabled_subchannel_bitmap != 0 &&
++                                      ap_wlan_hal->get_radio_info().channel > 0 &&
++                                      ap_wlan_hal->get_radio_info().vht_center_freq > 0;
++
++        if (!punct_bitmap_requested &&
++            ((!request->cs_params().channel) ||
++             (ap_wlan_hal->get_radio_info().channel == request->cs_params().channel &&
++              ap_wlan_hal->get_radio_info().bandwidth == request->cs_params().bandwidth))) {
++
+             // No need to switch channels
+             LOG(INFO) << "No need to switch channels as current channel and requested channels are "
+                          "the same.";
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index b06b1ef69..d9d194a76 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -2375,7 +2375,6 @@ bool ap_wlan_hal_nl80211::switch_channel(int chan, beerocks::eWiFiBandwidth bw,
+     // Extension Channel
+     if (bw >= beerocks::BANDWIDTH_40) {
+         if (freq >= FREQ_5G_START && freq <= FREQ_5G_END) {
+-
+             /*
+             Valid 40 MHz primary channels follow a pattern:
+             channel % 8 == 0 → secondary channel above → offset = -1
+@@ -2393,11 +2392,49 @@ bool ap_wlan_hal_nl80211::switch_channel(int chan, beerocks::eWiFiBandwidth bw,
+                     cmd += " sec_channel_offset=-1";
+                 }
+             }
+-        } else if (freq < vht_center_frequency) {
+-            cmd += " sec_channel_offset=1";
+         } else {
+-            cmd += " sec_channel_offset=-1";
++            // For 6GHz (and other non-5GHz bands):
++            // For 80MHz: comparing freq vs vht_center_frequency (80MHz center) is correct.
++            // For 160MHz: vht_center_frequency is the 160MHz block center, but
++            //   sec_channel_offset must reflect the primary's position within its 40MHz block.
++            //   The 40MHz block center is ±20 MHz from the 80MHz segment center,
++            //   which is ±40 MHz from the 160MHz block center.
++            //
++            // Example: 6GHz 160MHz, primary=6195 MHz, 160MHz center=6185 MHz
++            //   Primary is in upper 80MHz (6185-6265), upper 80MHz center=6225
++            //   Primary (6195) < upper 80MHz center (6225) → lower 40MHz of upper 80MHz
++            //   40MHz center = 6185 + 20 = 6205 MHz
++            //   6195 < 6205 → sec_channel_offset=1 (secondary above primary) ✓
++            int center_for_offset = vht_center_frequency;
++            if (bw == beerocks::BANDWIDTH_160) {
++                int offset = freq - vht_center_frequency;
++                if (offset > 0) {
++                    // Primary is in upper 80MHz segment
++                    center_for_offset = (offset < 40) ? vht_center_frequency + 20
++                                                        : vht_center_frequency + 60;
++                } else {
++                    // Primary is in lower 80MHz segment
++                    center_for_offset = (offset > -40) ? vht_center_frequency - 20
++                                                        : vht_center_frequency - 60;
++                }
++                LOG(DEBUG) << "switch_channel: 160MHz sec_channel_offset calc:"
++                            << " freq=" << freq
++                            << " 160MHz_center=" << vht_center_frequency
++                            << " offset=" << (freq - vht_center_frequency)
++                            << " 40MHz_center=" << center_for_offset;
++            }
++            int sec_off = (freq < center_for_offset) ? 1 : -1;
++            LOG(DEBUG) << "switch_channel: sec_channel_offset=" << sec_off
++                        << " (freq=" << freq
++                        << (freq < center_for_offset ? " < " : " >= ")
++                        << "center_for_offset=" << center_for_offset << ")";
++            if (sec_off == 1) {
++                cmd += " sec_channel_offset=1";
++            } else {
++                cmd += " sec_channel_offset=-1";
++            }
+         }
++
+     }
+ 
+     /*
+@@ -2485,6 +2522,16 @@ bool ap_wlan_hal_nl80211::switch_channel(int chan, beerocks::eWiFiBandwidth bw,
+     }
+     cmd += " " + phy;
+ 
++    /// Static puncturing: include punct_bitmap if set.
++    // hostapd CHAN_SWITCH supports: punct_bitmap=<16-bit decimal>
++    if (m_punct_bitmap != 0) {
++        cmd += " punct_bitmap=" + std::to_string(m_punct_bitmap);
++        LOG(DEBUG) << "switch_channel: appending punct_bitmap="
++                << std::hex << m_punct_bitmap << std::dec;
++    }
++
++    LOG(INFO) << "switch_channel: sending CHAN_SWITCH cmd: " << cmd;
++
+     // Send command
+     if (!wpa_ctrl_send_msg(cmd)) {
+         LOG(ERROR) << "wpa_ctrl_send_msg() failed!";
+@@ -2616,7 +2663,12 @@ bool ap_wlan_hal_nl80211::set_primary_vlan_id(uint16_t primary_vlan_id)
+ 
+ bool ap_wlan_hal_nl80211::set_disabled_subchannels(uint16_t bitmap)
+ {
+-    LOG(DEBUG) << "ap_wlan_hal_nl80211: set_disabled_subchannels, bitmap=" << bitmap;
++    LOG(DEBUG) << "ap_wlan_hal_nl80211: set_disabled_subchannels, bitmap="
++               << std::hex << std::showbase << bitmap << std::dec << std::noshowbase;
++
++    // Store the bitmap so switch_channel() picks it up.
++    // switch_channel() appends "punct_bitmap=<value>" to the CHAN_SWITCH command.
++    m_punct_bitmap = bitmap;
+     return true;
+ }
+ 
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+index 50f609c70..4383c2d74 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+@@ -181,6 +181,9 @@ private:
+     std::unordered_map<std::string, std::shared_ptr<sMGMT_FRAME_NOTIFICATION>>
+         m_latest_assoc_frame = {};
+     uint16_t m_aid           = 2007; // AIDs must be in the range 1-2007
++    // Pending puncturing bitmap to be applied on next CHAN_SWITCH.
++    // Bit N = 1 means the Nth 20 MHz subchannel (LSB = lowest) is punctured.
++    uint16_t m_punct_bitmap = 0;
+ };
+    /**
+    * Set to true when CAC fails (success == 0). In this case, the next
+-- 
+2.34.1
+
