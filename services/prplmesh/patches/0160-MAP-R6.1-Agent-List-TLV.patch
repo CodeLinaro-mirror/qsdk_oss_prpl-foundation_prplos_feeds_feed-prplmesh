@@ -1,0 +1,220 @@
+From a3c5dcf1c1d513fe1e1efad1cdced902ee332696 Mon Sep 17 00:00:00 2001
+From: Sonali Naresh <sonanare@qti.qualcomm.com>
+Date: Tue, 19 May 2026 18:40:10 +0530
+Subject: [PATCH] MAP R6.1: Agent List TLV Implementation
+
+After successful onboarding of a new Multi-AP Agent
+using 1905 PBC method, the Multi-AP Controller shall
+send to the newly onboarded Enrollee Multi-AP Agent
+and all the other existing Multi-AP Agents an
+Agent List message including the Agent List TLV with
+the list of all the Multi-AP Agents that are part of
+the Multi-AP network (including the newly enrolled
+Multi-AP Agent itself).
+
+Signed-off-by: Sonali Naresh <sonanare@qti.qualcomm.com>
+---
+ controller/src/beerocks/master/controller.cpp | 12 +++
+ .../src/beerocks/master/son_actions.cpp       | 84 +++++++++++++++++++
+ controller/src/beerocks/master/son_actions.h  | 19 +++++
+ .../beerocks/master/tasks/topology_task.cpp   | 21 +++++
+ 4 files changed, 136 insertions(+)
+
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 4a87bcd..b0f840d 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -63,6 +63,7 @@ extern "C" void set_qca_current_agent_smd_capabilities(const qca::sQcaSmdCapabil
+ #include <tlvf/wfa_map/tlvAffiliatedApMetrics.h>
+ #include <tlvf/wfa_map/tlvAffiliatedStaMetrics.h>
+ #include <tlvf/wfa_map/tlvAgentApMldConfiguration.h>
++#include <tlvf/wfa_map/tlvAgentList.h>
+ #include <tlvf/wfa_map/tlvAkmSuiteCapabilities.h>
+ #include <tlvf/wfa_map/tlvApCapability.h>
+ #include <tlvf/wfa_map/tlvApExtendedMetrics.h>
+@@ -1874,6 +1875,17 @@ bool Controller::handle_cmdu_1905_autoconfiguration_WSC(const sMacAddr &src_mac,
+     agent->device_info.serial_number      = m1->serial_number();
+     database.dm_set_profile1_device_info(*agent);
+ 
++    // Per EasyMesh R6.1 §17.2.77: after successful onboarding via 1905 PBC (WSC), the
++    // Controller shall send an Agent List message (0x8035) with the Agent List TLV (0xD5)
++    // to the newly enrolled agent and to all other existing agents.
++    // The entry for the newly onboarded agent carries:
++    //   - Multi-AP Profile: value from the Multi-AP Profile TLV received (or Profile-1 default)
++    //   - Security: 1905 Security not enabled
++    if (!son_actions::send_agent_list_to_all_agents(database, cmdu_tx, al_mac)) {
++        LOG(WARNING) << "Failed to send Agent List message after onboarding agent " << al_mac;
++        // Non-fatal: onboarding itself succeeded; continue.
++    }
++
+     return true;
+ }
+ 
+diff --git a/controller/src/beerocks/master/son_actions.cpp b/controller/src/beerocks/master/son_actions.cpp
+index bb50e50..a44bc1d 100644
+--- a/controller/src/beerocks/master/son_actions.cpp
++++ b/controller/src/beerocks/master/son_actions.cpp
+@@ -24,7 +24,9 @@
+ #include <tlvf/ieee_1905_1/tlvAlMacAddress.h>
+ #include <tlvf/ieee_1905_1/tlvSupportedFreqBand.h>
+ #include <tlvf/ieee_1905_1/tlvSupportedRole.h>
++#include <tlvf/ieee_1905_1/eMessageType.h>
+ #include <tlvf/wfa_map/tlvAgentApMldConfiguration.h>
++#include <tlvf/wfa_map/tlvAgentList.h>
+ #include <tlvf/wfa_map/tlvClientAssociationControlRequest.h>
+ #include <tlvf/wfa_map/tlvProfile2MultiApProfile.h>
+ 
+@@ -606,6 +608,88 @@ bool son_actions::send_client_association_control(
+     return son_actions::send_cmdu_to_agent(agent_mac, cmdu_tx, database);
+ }
+ 
++bool son_actions::send_agent_list_to_all_agents(db &database, ieee1905_1::CmduMessageTx &cmdu_tx,
++                                                const sMacAddr &new_agent_mac)
++{
++    auto all_agents = database.get_all_connected_agents();
++    if (all_agents.empty()) {
++        LOG(DEBUG) << "No connected agents, skipping Agent List message";
++        return true;
++    }
++
++    LOG(INFO) << "Sending AGENT_LIST_MESSAGE to all agents after new agent " << new_agent_mac
++              << " onboarded/disconnected. Total agents: " << all_agents.size();
++
++    // Build AGENT_LIST_MESSAGE (type 0x8035) with Agent List TLV (type 0xD5)
++    if (!cmdu_tx.create(0, ieee1905_1::eMessageType::AGENT_LIST_MESSAGE)) {
++        LOG(ERROR) << "Failed to create AGENT_LIST_MESSAGE";
++        return false;
++    }
++
++    auto agent_list_tlv = cmdu_tx.addClass<wfa_map::tlvAgentList>();
++    if (!agent_list_tlv) {
++        LOG(ERROR) << "Failed to addClass tlvAgentList";
++        return false;
++    }
++
++    // Allocate one entry per connected agent
++    if (!agent_list_tlv->alloc_agents(all_agents.size())) {
++        LOG(ERROR) << "Failed to alloc_agents(" << all_agents.size() << ") in tlvAgentList";
++        return false;
++    }
++
++    size_t idx = 0;
++    for (const auto &agent : all_agents) {
++        auto agent_tuple = agent_list_tlv->agents(idx);
++        if (!std::get<0>(agent_tuple)) {
++            LOG(ERROR) << "Failed to access agent entry at index " << idx;
++            return false;
++        }
++        auto &entry    = std::get<1>(agent_tuple);
++        entry.al_mac   = agent->al_mac;
++
++        // Map stored profile to tlvAgentList::eMultiApProfile.
++        // The spec requires the newly onboarded agent's entry to reflect the profile
++        // received in its Multi-AP Profile TLV (or Profile-1 if not received).
++        // For all other agents we use their stored profile value.
++        // Both enums share the same numeric values (1/2/3), so a direct cast is safe.
++        switch (agent->profile) {
++        case wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_2:
++            entry.multi_ap_profile = wfa_map::tlvAgentList::eMultiApProfile::MULTIAP_PROFILE_2;
++            break;
++        case wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_3:
++            entry.multi_ap_profile = wfa_map::tlvAgentList::eMultiApProfile::MULTIAP_PROFILE_3;
++            break;
++        default:
++            // Profile-1 is the default (covers PRPLMESH_PROFILE_UNKNOWN and MULTIAP_PROFILE_1)
++            entry.multi_ap_profile = wfa_map::tlvAgentList::eMultiApProfile::MULTIAP_PROFILE_1;
++            break;
++        }
++
++        // Per spec: Security field shall be set to "1905 Security not enabled"
++        entry.security = wfa_map::tlvAgentList::eSecurity::IEEE1905_NOT_ENABLED;
++
++        LOG(DEBUG) << "Agent List entry[" << idx << "]: al_mac=" << agent->al_mac
++                   << " profile="
++                   << wfa_map::tlvAgentList::eMultiApProfile_str(entry.multi_ap_profile)
++                   << " security="
++                   << wfa_map::tlvAgentList::eSecurity_str(entry.security);
++        ++idx;
++    }
++
++    // Send the same CMDU to every connected agent (including the newly onboarded one)
++    bool ret = true;
++    for (const auto &agent : all_agents) {
++        LOG(DEBUG) << "Sending AGENT_LIST_MESSAGE to agent " << agent->al_mac;
++        if (!send_cmdu_to_agent(agent->al_mac, cmdu_tx, database)) {
++            LOG(ERROR) << "Failed to send AGENT_LIST_MESSAGE to agent " << agent->al_mac;
++            ret = false;
++        }
++    }
++
++    return ret;
++}
++
+ bool son_actions::handle_agent_ap_mld_configuration_tlv(db &database, const sMacAddr &al_mac,
+                                                         ieee1905_1::CmduMessageRx &cmdu_rx)
+ {
+diff --git a/controller/src/beerocks/master/son_actions.h b/controller/src/beerocks/master/son_actions.h
+index 767d661..0fee6eb 100644
+--- a/controller/src/beerocks/master/son_actions.h
++++ b/controller/src/beerocks/master/son_actions.h
+@@ -78,6 +78,25 @@ public:
+     static bool handle_agent_ap_mld_configuration_tlv(db &database, const sMacAddr &al_mac,
+                                                       ieee1905_1::CmduMessageRx &cmdu_rx);
+ 
++    /**
++     * @brief Build and send an Agent List message (0x8035) containing the Agent List TLV
++     *        (type 0xD5) to all currently connected Multi-AP Agents.
++     *
++     * Per EasyMesh R6.1 §17.2.77, after a new agent successfully onboards via the 1905 PBC
++     * (WSC) method the Controller shall send this message to the newly enrolled agent and to
++     * every other existing agent.  Each entry carries:
++     *   - AL MAC address of the agent
++     *   - Multi-AP Profile (from the agent's stored profile; defaults to Profile-1)
++     *   - Security field set to "1905 Security not enabled"
++     *
++     * @param database   Controller database reference.
++     * @param cmdu_tx    Transmit CMDU buffer (will be overwritten with the new message).
++     * @param new_agent_mac  AL-MAC of the newly onboarded agent (used for logging only).
++     * @return true on success, false if any step fails.
++     */
++    static bool send_agent_list_to_all_agents(db &database, ieee1905_1::CmduMessageTx &cmdu_tx,
++                                              const sMacAddr &new_agent_mac);
++
+ private:
+     static bool
+     check_hostap_activability(db &database,
+diff --git a/controller/src/beerocks/master/tasks/topology_task.cpp b/controller/src/beerocks/master/tasks/topology_task.cpp
+index e332519..bed20da 100644
+--- a/controller/src/beerocks/master/tasks/topology_task.cpp
++++ b/controller/src/beerocks/master/tasks/topology_task.cpp
+@@ -1140,6 +1140,27 @@ bool topology_task::handle_topology_notification(const sMacAddr &src_mac,
+ 
+         // TODO: Validate usages of reported_by_parent flag usages (PPM-1948)
+         son_actions::handle_dead_station(client_mac_str, reported_by_parent, database, tasks);
++
++        // Per EasyMesh R6.1 §17.2.77: when an agent's disconnection event is received,
++        // find the agent whose backhaul STA is the disconnected client, remove it from
++        // the Agent List maintained by the controller, and notify all remaining connected
++        // agents with an updated Agent List message.
++        auto disconnecting_agent = database.get_agent_by_parent(client_mac);
++        if (disconnecting_agent) {
++            LOG(INFO) << "Agent " << disconnecting_agent->al_mac
++                      << " (backhaul STA: " << client_mac_str
++                      << ") disconnected, removing from Agent List";
++            database.set_agent_state(tlvf::mac_to_string(disconnecting_agent->al_mac),
++                                     beerocks::STATE_DISCONNECTED);
++            if (!son_actions::send_agent_list_to_all_agents(database, cmdu_tx,
++                                                            disconnecting_agent->al_mac)) {
++                LOG(WARNING) << "Failed to send Agent List after agent "
++                             << disconnecting_agent->al_mac << " disconnected";
++            }
++        } else {
++            LOG(DEBUG) << "No agent found with backhaul STA " << client_mac_str
++                       << ", skipping Agent List update";
++        }
+     }
+ 
+     return true;
+-- 
+2.34.1
+
