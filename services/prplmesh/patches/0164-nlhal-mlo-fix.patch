@@ -1,0 +1,471 @@
+From 2349ec2ada9e0144b2565c2f376a9af0f3ca2dec Mon Sep 17 00:00:00 2001
+From: Nirmal Raj S <nirm@qti.qualcomm.com>
+Date: Fri, 22 May 2026 11:49:53 +0530
+Subject: [PATCH] fix MLD group locking and add UCI wifi-mld ifname lookup
+
+Consolidate per-function file locking in MLD group helpers into a
+single exclusive lock on /var/lock/prplmesh-mld-grp.lock held for
+the entire read-check-write sequence in get_ifname_wrt_mld_grp(),
+making it safe for concurrent radio processes.
+
+Add bpl_cfg_get_mld_ifname_by_ssid() (UCI impl + Linux stub) to
+look up the ifname from a wifi-mld section by SSID, skipping STA
+interfaces. Use it in get_ifname_wrt_mld_grp() to prefer the
+UCI-configured ifname over the auto-generated one when registering
+a new MLD group entry.
+
+In update_vap_credentials(), introduce a prpl_config_update flag
+to skip the redundant prplmesh config file update when UCI has
+already set the hostap_iface option.
+
+In add_mld_link(), always derive conf_path with the new_iface
+suffix, move create_new_hostapd_conf_file() before add_interface(),
+drop the DISABLE command before REMOVE, and call
+remove_vap_interface() for non-primary interfaces.
+
+Increase WPA_CTRL_READ_RETRY_MAX from 3 to 10
+
+Signed-off-by: Nirmal Raj S <nirm@qti.qualcomm.com>
+---
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 151 ++++++++++--------
+ .../beerocks/bwl/nl80211/wpa_ctrl_client.cpp  |   4 +
+ common/beerocks/bwl/nl80211/wpa_ctrl_client.h |   2 +-
+ .../platform/bpl/cfg/linux/bpl_cfg_wifi.cpp   |   6 +
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     |  77 +++++++++
+ framework/platform/bpl/include/bpl/bpl_cfg.h  |  12 ++
+ 6 files changed, 180 insertions(+), 72 deletions(-)
+
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index b3ce65a98..bb118cd20 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -149,15 +149,6 @@ int fetch_mld_id_pair(int mld_id, std::string &mld_grp_primary_ifname, std::stri
+ 
+        std::string filename = MLD_PAIR_ENTRANT_FILE;
+ 
+-       int fd = open(filename.c_str(), O_RDONLY);
+-       if (fd == -1) {
+-               perror("open");
+-               return -1;
+-       }
+-
+-       struct flock lock = { F_RDLCK, SEEK_SET, 0, 0, 0 };
+-       fcntl(fd, F_SETLKW, &lock); // acquire read lock
+-
+        std::ifstream file(filename);
+        std::string line;
+        std::string name;
+@@ -165,49 +156,30 @@ int fetch_mld_id_pair(int mld_id, std::string &mld_grp_primary_ifname, std::stri
+        while (getline(file, line)) {
+                std::istringstream iss(line);
+                std::string id_str, name_str, ssid_str;
+-               if (getline(iss, id_str, ',') && getline(iss, name_str, ',') && getline(iss, ssid_str) ) {
++               if (getline(iss, id_str, ',') && getline(iss, name_str, ',') && getline(iss, ssid_str)) {
+                        if (beerocks::string_utils::stoi(id_str) == mld_id) {
+                                name = name_str;
+                                ssid = ssid_str;
+                                break;
+                        }
+-
+-
+-
+                }
+        }
+ 
+-       lock.l_type = F_UNLCK;
+-       fcntl(fd, F_SETLK, &lock); // release lock
+-       close(fd);
+        mld_grp_primary_ifname = name;
+        mld_grp_ssid = ssid;
+        return 0;
+ 
+ }
+ 
+-int update_mld_grp_primary_ifname(int mld_id, std::string cur_ifname,std::string ssid) {
++int update_mld_grp_primary_ifname(int mld_id, std::string cur_ifname, std::string ssid) {
+        std::string filename = MLD_PAIR_ENTRANT_FILE;
+ 
+-       int fd = open(filename.c_str(), O_WRONLY | O_APPEND | O_CREAT, 0666);
+-       if (fd == -1) {
+-               perror("open");
+-               return -1;
+-       }
+-
+-       struct flock lock = { F_WRLCK, SEEK_SET, 0, 0, 0 };
+-       lock.l_type = F_WRLCK; // write lock
+-
+-       fcntl(fd, F_SETLKW, &lock); // wait until lock is acquired
+        std::ofstream file(filename, std::ios::app);
+        if (file.is_open()) {
+                file << mld_id << "," << cur_ifname << "," << ssid << "\n";
+                file.close();
+        }
+ 
+-       lock.l_type = F_UNLCK;
+-       fcntl(fd, F_SETLK, &lock); // release lock
+-       close(fd);
+        return 0;
+ 
+ }
+@@ -216,19 +188,6 @@ int update_mld_grp_primary_ifname(int mld_id, std::string cur_ifname,std::string
+ int modify_mld_grp(int mld_id, std::string new_ifname, std::string new_ssid) {
+     std::string filename = MLD_PAIR_ENTRANT_FILE;
+ 
+-    int fd = open(filename.c_str(), O_RDWR | O_CREAT, 0666);
+-    if (fd == -1) {
+-        perror("open");
+-        return -1;
+-    }
+-
+-    struct flock lock = { F_WRLCK, SEEK_SET, 0, 0, 0 };
+-    if (fcntl(fd, F_SETLKW, &lock) == -1) {
+-        perror("fcntl - lock");
+-        close(fd);
+-        return -1;
+-    }
+-
+     std::ifstream infile(filename);
+     std::vector<std::string> lines;
+     std::string line;
+@@ -241,13 +200,12 @@ int modify_mld_grp(int mld_id, std::string new_ifname, std::string new_ssid) {
+         if (std::getline(iss, id_str, ',') &&
+             std::getline(iss, ifname_str, ',') &&
+             std::getline(iss, ssid_str)) {
+-            
++
+             if (std::stoi(id_str) == mld_id) {
+                 lines.push_back(std::to_string(mld_id) + "," + new_ifname + "," + new_ssid);
+                 modified = true;
+                 continue;
+             }
+-            
+         }
+         lines.push_back(line);
+     }
+@@ -259,31 +217,69 @@ int modify_mld_grp(int mld_id, std::string new_ifname, std::string new_ssid) {
+     }
+     outfile.close();
+ 
+-    lock.l_type = F_UNLCK;
+-    fcntl(fd, F_SETLK, &lock);
+-    close(fd);
+-
+     return modified ? 0 : -1;
+ }
+ 
+ 
+-std::string get_ifname_wrt_mld_grp(int mld_id, std::string cur_ifname,std::string ssid) {
++std::string get_ifname_wrt_mld_grp(int mld_id, std::string cur_ifname, std::string ssid) {
++       // Acquire an exclusive lock on a dedicated lock file so that the
++       // read-check-write sequence (fetch → update/modify) is atomic with
++       // respect to concurrent callers from other radio processes.
++       int lock_fd = open("/var/lock/prplmesh-mld-grp.lock", O_CREAT | O_RDWR, 0644);
++       if (lock_fd < 0) {
++               LOG(ERROR) << "get_ifname_wrt_mld_grp: open lock failed: " << strerror(errno);
++       }
++
++       struct flock lk{};
++       lk.l_type   = F_WRLCK;
++       lk.l_whence = SEEK_SET;
++       lk.l_start  = 0;
++       lk.l_len    = 0;
++
++       if (lock_fd >= 0 && fcntl(lock_fd, F_SETLKW, &lk) < 0) {
++               LOG(ERROR) << "get_ifname_wrt_mld_grp: fcntl(F_SETLKW) failed: " << strerror(errno);
++               close(lock_fd);
++               lock_fd = -1;
++       }
++
+        std::string mld_grp_primary_ifname;
+        std::string mld_grp_ssid;
+-       fetch_mld_id_pair(mld_id, mld_grp_primary_ifname,mld_grp_ssid);
++       fetch_mld_id_pair(mld_id, mld_grp_primary_ifname, mld_grp_ssid);
++
++       std::string result;
+        if (mld_grp_primary_ifname.empty()) {
+-               update_mld_grp_primary_ifname(mld_id, cur_ifname,ssid);
+-               return cur_ifname;
++               // Before registering cur_ifname, check if a wifi-mld section already has
++               // an ifname for this SSID and use it instead of the generated cur_ifname.
++               std::string mld_ifname_from_uci;
++               if (beerocks::bpl::bpl_cfg_get_mld_ifname_by_ssid(ssid, mld_ifname_from_uci) &&
++                   !mld_ifname_from_uci.empty()) {
++                   LOG(INFO) << "get_ifname_wrt_mld_grp: found ifname=" << mld_ifname_from_uci
++                             << " in wifi-mld section for ssid=" << ssid
++                             << ", updating cur_ifname from " << cur_ifname;
++                   cur_ifname = mld_ifname_from_uci;
++               }
++               update_mld_grp_primary_ifname(mld_id, cur_ifname, ssid);
++               result = cur_ifname;
+        } else {
+                // First check SSID match for MLO link pair
+                if (ssid == mld_grp_ssid) {
+-                   return mld_grp_primary_ifname;
++                   result = mld_grp_primary_ifname;
+                } else {
+-                   modify_mld_grp(mld_id, cur_ifname,ssid);
+-                   return cur_ifname;
++                   modify_mld_grp(mld_id, cur_ifname, ssid);
++                   result = cur_ifname;
+                }
+        }
+ 
++       // Release the lock
++       if (lock_fd >= 0) {
++               lk.l_type = F_UNLCK;
++               if (fcntl(lock_fd, F_SETLK, &lk) < 0) {
++                       LOG(WARNING) << "get_ifname_wrt_mld_grp: fcntl(F_UNLCK) failed: " << strerror(errno);
++               }
++               close(lock_fd);
++       }
++
++       return result;
+ }
+ 
+ 
+@@ -1752,6 +1748,7 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+     std::string new_radio_iface_name;
+     std::string base_radio_bssid;
+     bool new_radio_iface_name_updated = false;
++    bool prpl_config_update = false;
+ 
+     //Exacting radio name to get only the base interface
+     std::string base_radio_iface_name;
+@@ -2217,7 +2214,8 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                                 const std::string section_type = "wifi-device";
+                                 const std::string option_name  = "hostap_iface";
+ 
+-                                beerocks::bpl::cfg_update_prplmesh_option(package_name, section_type, option_name, m_radio_info.radio_id, next_vap_id); 
++                                beerocks::bpl::cfg_update_prplmesh_option(package_name, section_type, option_name, m_radio_info.radio_id, next_vap_id);
++                                prpl_config_update = true;
+                                 break;
+                             }
+                         }
+@@ -2366,7 +2364,7 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+ 
+     }
+ 
+-    if (new_radio_iface_name_update_req != 0 && !new_radio_iface_name.empty()) {
++    if (new_radio_iface_name_update_req != 0 && !new_radio_iface_name.empty() && (prpl_config_update != true)) {
+ 	    // Extract the suffix from the original iface name
+ 
+ 	    //update prplmesh config file for persistance
+@@ -3357,10 +3355,27 @@ bool ap_wlan_hal_nl80211::remove_mld_link(std::string &link_iface_name, sMacAddr
+ bool ap_wlan_hal_nl80211::add_mld_link(std::string &new_iface,std::string &prev_iface,son::wireless_utils::sBssInfoConf &bss_conf,
+                                        std::string bridge)
+ {
+-    std::string conf_path =
+-        std::string(bwl::nl80211::base_ctrl_path) + "hostapd-" + m_radio_info.phy_name + ".conf";
+     std::stringstream cmd;
+ 
++    int number_of_vaps = static_cast<int>(m_radio_info.available_vaps.size());
++
++    std::string conf_path;
++    if (!prev_iface.empty() && number_of_vaps == 1) {
++        // When there is only one VAP and a previous interface exists, reuse the
++        // existing default hostapd config file instead of creating a new one.
++        conf_path = std::string(bwl::nl80211::base_ctrl_path) + "hostapd-" + m_radio_info.phy_name + ".conf";
++        LOG(INFO) << "add_mld_link: prev_iface=" << prev_iface
++                  << " and number_of_vaps=" << number_of_vaps
++                  << ", no need to create new config file, using existing: " << conf_path;
++    } else {
++        conf_path = std::string(bwl::nl80211::base_ctrl_path) + "hostapd-" + m_radio_info.phy_name + "." + new_iface + ".conf";
++        if (!create_new_hostapd_conf_file(new_iface,bss_conf,bridge,conf_path,false)) {
++            LOG(ERROR) << "Failed to store the hostapd configuration in " << conf_path;
++            m_radio_info.hostapd_new_bss_config.clear();
++            return false;
++        }
++    }
++
+     // Create a WPA control socket for the existing interface where a new link is being added
+     int fd = base_wlan_hal_nl80211::add_interface(new_iface);
+     if (fd < 0) {
+@@ -3374,24 +3389,18 @@ bool ap_wlan_hal_nl80211::add_mld_link(std::string &new_iface,std::string &prev_
+         std::stringstream remove_cmd;
+         extractLinkBaseInterface(prev_iface, base_iface);
+ 
+-        if (!wpa_ctrl_send_msg("DISABLE",prev_iface)) {
+-            LOG(ERROR) << __func__ << " DISABLE failed for " << prev_iface;
+-        }
+-
+         remove_cmd << "REMOVE " << base_iface;
+ 
+         if (!wpa_ctrl_send_msg(remove_cmd.str(), global_iface)) {
+             LOG(ERROR) << "Failed to remove iface: " << base_iface;
+             return false;
+         }
+-    } else {
+-        conf_path =
+-            std::string(bwl::nl80211::base_ctrl_path) + "hostapd-" + m_radio_info.phy_name + "." + new_iface + ".conf";
++        m_radio_info.hostapd_new_bss_config.clear();
+ 
+-        if (!create_new_hostapd_conf_file(new_iface,bss_conf,bridge,conf_path,false)) {
+-            LOG(ERROR) << "Failed to store the hostapd configuration in " << conf_path;
+-            m_radio_info.hostapd_new_bss_config.clear();
+-            return false;
++        if (prev_iface != m_radio_info.iface_name) {
++            if (!m_nl80211_client->remove_vap_interface(base_iface)) {
++                LOG(ERROR) << "Failed to remove vap iface: " << base_iface;
++            } 
+         }
+     } 
+ 
+diff --git a/common/beerocks/bwl/nl80211/wpa_ctrl_client.cpp b/common/beerocks/bwl/nl80211/wpa_ctrl_client.cpp
+index d6e8a7ff7..3858dc165 100644
+--- a/common/beerocks/bwl/nl80211/wpa_ctrl_client.cpp
++++ b/common/beerocks/bwl/nl80211/wpa_ctrl_client.cpp
+@@ -78,6 +78,10 @@ bool wpa_ctrl_socket_cmd::request(const std::string &cmd, char *buffer, size_t b
+         result = wpa_ctrl_request(m_ctx, cmd.c_str(), cmd.size(), buffer, &buff_size_copy, NULL);
+     } while (result == -2 && ++try_cnt < WPA_CTRL_READ_RETRY_MAX);
+ 
++    if (try_cnt > 0) {
++        LOG(WARNING) << "wpa_ctrl_request cmd: " << cmd << " retried " << try_cnt << " time(s)";
++    }
++
+     if (result < 0) {
+         LOG(ERROR) << "can't send wpa_ctrl_request with cmd: " << cmd;
+         return false;
+diff --git a/common/beerocks/bwl/nl80211/wpa_ctrl_client.h b/common/beerocks/bwl/nl80211/wpa_ctrl_client.h
+index 406f220cf..4dc628c38 100644
+--- a/common/beerocks/bwl/nl80211/wpa_ctrl_client.h
++++ b/common/beerocks/bwl/nl80211/wpa_ctrl_client.h
+@@ -111,7 +111,7 @@ protected:
+     /**
+      * Const value: maximum retries of time-outed buffer reading
+      */
+-    static constexpr int WPA_CTRL_READ_RETRY_MAX = 3;
++    static constexpr int WPA_CTRL_READ_RETRY_MAX = 10;
+ 
+ private:
+     /**
+diff --git a/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
+index f13135b7c..39cc04e53 100644
+--- a/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
+@@ -272,6 +272,12 @@ bool bpl_cfg_get_mld_id_by_iface(const std::string & /*iface*/, std::string & /*
+     return false;
+ }
+ 
++bool bpl_cfg_get_mld_ifname_by_ssid(const std::string & /*ssid*/, std::string & /*ifname*/)
++{
++    LOG(DEBUG) << "bpl_cfg_get_mld_ifname_by_ssid: not implemented for linux platform";
++    return false;
++}
++
+ bool bpl_cfg_get_vap_ifname_by_ssid_and_radio(const std::string & /*ssid*/,
+                                                const std::string & /*radio_id*/,
+                                                std::string & /*new_vap_iface_name*/)
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index eae29a967..bb5ca2c08 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -1448,6 +1448,83 @@ bool bpl_cfg_get_mld_id_by_iface(const std::string &iface, std::string &mld_id)
+     return false;
+ }
+ 
++bool bpl_cfg_get_mld_ifname_by_ssid(const std::string &ssid, std::string &ifname)
++{
++    const std::string package_name     = "wireless";
++    const std::string mld_section_type = "wifi-mld";
++
++    // Get all wifi-mld sections
++    std::vector<std::string> all_mld_sections;
++    if (!uci_get_all_sections(package_name, mld_section_type, all_mld_sections)) {
++        LOG(DEBUG) << "bpl_cfg_get_mld_ifname_by_ssid: no wifi-mld sections found";
++        return false;
++    }
++
++    for (const auto &mld_sec : all_mld_sections) {
++        // Check if the ssid option of this section matches the target SSID
++        std::string ssid_val;
++        if (!uci_get_option(package_name, mld_section_type, mld_sec, "ssid", ssid_val)) {
++            continue;
++        }
++
++        if (ssid_val != ssid) {
++            continue;
++        }
++
++        // SSID matched - get the ifname option
++        std::string ifname_val;
++        if (!uci_get_option(package_name, mld_section_type, mld_sec, "ifname", ifname_val) ||
++            ifname_val.empty()) {
++            LOG(DEBUG) << "bpl_cfg_get_mld_ifname_by_ssid: wifi-mld section=" << mld_sec
++                       << " matched ssid=" << ssid << " but has no ifname";
++            continue;
++        }
++
++        // Check whether this ifname belongs to a "sta" or "ap" interface by looking
++        // at the wifi-iface section. If mode is "sta", skip this wifi-mld section.
++        {
++            const std::string iface_section_type = "wifi-iface";
++            std::vector<std::string> all_iface_sections;
++            if (uci_get_all_sections(package_name, iface_section_type, all_iface_sections)) {
++                bool is_sta = false;
++                for (const auto &iface_sec : all_iface_sections) {
++                    std::string iface_ifname_val;
++                    if (!uci_get_option(package_name, iface_section_type, iface_sec, "ifname",
++                                        iface_ifname_val)) {
++                        continue;
++                    }
++                    if (iface_ifname_val != ifname_val) {
++                        continue;
++                    }
++                    // Found the wifi-iface section for this ifname - check its mode
++                    std::string mode_val;
++                    if (uci_get_option(package_name, iface_section_type, iface_sec, "mode",
++                                       mode_val) &&
++                        mode_val == "sta") {
++                        LOG(DEBUG) << "bpl_cfg_get_mld_ifname_by_ssid: wifi-mld section="
++                                   << mld_sec << " ifname=" << ifname_val
++                                   << " belongs to a sta interface, skipping";
++                        is_sta = true;
++                    }
++                    break;
++                }
++                if (is_sta) {
++                    continue;
++                }
++            }
++        }
++
++        ifname = ifname_val;
++        LOG(INFO) << "bpl_cfg_get_mld_ifname_by_ssid: ssid=" << ssid
++                  << " found in wifi-mld section=" << mld_sec
++                  << " -> ifname=" << ifname;
++        return true;
++    }
++
++    LOG(DEBUG) << "bpl_cfg_get_mld_ifname_by_ssid: no wifi-mld section found for ssid=" << ssid;
++    return false;
++}
++
+ bool bpl_cfg_get_vap_ifname_by_ssid_and_radio(const std::string &ssid,
+                                                const std::string &radio_id,
+                                                std::string &new_vap_iface_name)
+diff --git a/framework/platform/bpl/include/bpl/bpl_cfg.h b/framework/platform/bpl/include/bpl/bpl_cfg.h
+index 86b7d83c7..5f693728a 100644
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -1571,6 +1571,18 @@ bool bpl_cfg_set_sta_vap_bh_credentials(const std::string &iface,
+  */
+ bool bpl_cfg_get_mld_id_by_iface(const std::string &iface, std::string &mld_id);
+ 
++/**
++ * @brief Gets the interface name from the wifi-mld UCI section that has the given SSID.
++ *
++ * Searches all wifi-mld sections for one whose ssid option matches @p ssid.
++ * If found, returns the ifname option of that section.
++ *
++ * @param [in]  ssid     SSID to search for in wifi-mld sections.
++ * @param [out] ifname   Interface name if a matching wifi-mld section is found.
++ * @return true if a matching wifi-mld section was found, false otherwise.
++ */
++bool bpl_cfg_get_mld_ifname_by_ssid(const std::string &ssid, std::string &ifname);
++
+ /**
+  * @brief Fetches the VAP interface name for a given SSID and radio_id from UCI wireless config.
+  *
+-- 
+2.34.1
+
