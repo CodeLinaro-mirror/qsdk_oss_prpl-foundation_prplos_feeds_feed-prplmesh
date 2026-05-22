@@ -1,0 +1,527 @@
+From 14766db68f87564f4ba7f2e49be2c7d65d7c634f Mon Sep 17 00:00:00 2001
+From: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+Date: Thu, 21 May 2026 19:59:22 +0530
+Subject: [PATCH] agent/bwl/bpl: set multi_ap_vlanid on backhaul AP for traffic
+ separation
+
+In a daisy-chain topology with traffic separation enabled, Agent1 must
+include the primary VLAN ID in its backhaul AP association responses so
+that Agent2 can learn the VLAN ID when it connects wirelessly.
+
+This patch implements the full pipeline to propagate the primary VLAN ID
+received from the controller (via tlvProfile2Default802dotQSettings in
+M2) into the running hostapd configuration of the backhaul AP.
+
+Problem 1 — Timing: set_primary_vlan_id() is called during M2 processing
+before the backhaul AP is created (the AP is created later in the same
+M2 handler). The loop over available_vaps finds no backhaul VAP and
+returns without setting multi_ap_vlanid.
+
+Fix: Store the primary VLAN ID in m_primary_vlan_id when
+set_primary_vlan_id() is called. create_new_hostapd_conf_file() now
+embeds multi_ap_vlanid directly in the backhaul AP conf file at creation
+time, so hostapd advertises the VLAN ID in association responses from
+the moment the AP comes up — without requiring a subsequent
+RELOAD_CONFIG.
+
+Problem 2 — RELOAD_CONFIG target: The backhaul AP conf file is created
+as hostapd-<phy>.<base_iface>.conf with "interface=<base_iface>".
+Sending RELOAD_CONFIG to the link-specific name (e.g. wlan1_3_link0)
+does not reload this per-interface conf file. RELOAD_CONFIG must target
+the base interface (e.g. wlan1_3).
+
+Fix: Send RELOAD_CONFIG to base_iface, not vap.second.bss.
+
+Problem 3 — VAP section fallback: When the BSSID lookup in the conf
+file fails (link-specific BSSID differs from the conf BSSID), the
+fallback used vap.second.bss (link-specific name) which does not match
+any VAP section in the conf file. The correct fallback is base_iface.
+
+Fix: Use base_iface as the fallback target_vap.
+
+Problem 4 — Cross-radio MLO: Sending RELOAD_CONFIG to a peer-radio
+interface (e.g. wlan0_1 from wlan2's ap_manager) causes hostapd to
+reconfigure the entire MLD and removes the control socket for wlan2,
+triggering an ap_manager restart loop.
+
+Fix: Detect cross-radio MLO links by checking whether the backhaul BSS
+name contains the base name of the current radio. Skip RELOAD_CONFIG for
+cross-radio links; the UCI update persists the value for the next reload.
+
+Problem 5 — M1 ordering: When traffic separation is active, M1 must not
+be sent until the VLAN subinterface has been created on the backhaul
+trunk. Sending M1 too early causes the controller to include MLO
+configuration in M2 before the agent is ready.
+
+Fix: Gate M1 on ts_applied (set by TrafficSeparationTask after a
+successful full reset). Add ts_applied flag to AgentDB.
+
+Problem 6 — MLD re-autoconfiguration: A radio that received M2 before
+the AP MLD configuration request arrived gets mld_id=-1 for all its
+BSSes. When the MLD config later arrives, the radio must re-run M1/M2
+to obtain the correct MLD IDs.
+
+Fix: In handle_agent_ap_mld_configuration_tlv(), trigger
+re-autoconfiguration for radios newly added to MLD configuration while
+already in CONFIGURED state.
+
+New BPL API: cfg_set_wifi_iface_multi_ap_vlanid() persists
+multi_ap_vlanid in both wifi-iface and wifi-mld UCI sections for the
+given interface name. Implemented for UCI; stub for linux/dm/rdk.
+
+Signed-off-by: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/agent_db.h           |   2 +
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  37 +++++++
+ .../slave/tasks/traffic_separation_task.cpp   |   8 ++
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  94 +++++++++++++++-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.h         |   3 +
+ framework/platform/bpl/cfg/dm/bpl_cfg.cpp     |   5 +
+ framework/platform/bpl/cfg/linux/bpl_cfg.cpp  |   5 +
+ framework/platform/bpl/cfg/rdk/bpl_cfg.cpp    |   5 +
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     | 104 +++++++++++++++++-
+ framework/platform/bpl/include/bpl/bpl_cfg.h  |  14 +++
+ 10 files changed, 271 insertions(+), 6 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 4a9f3d079..f38777597 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -447,6 +447,8 @@ public:
+         uint16_t primary_vlan_id;
+         uint8_t default_pcp;
+         std::unordered_set<uint16_t> secondary_vlans_ids;
++        /// True after TrafficSeparationTask completes a full reset; false on TS_CLEAR.
++        bool ts_applied = false;
+     } traffic_separation;
+ 
+     struct {
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 4b878b9ef..2bf457342 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -399,6 +399,23 @@ void ApAutoConfigurationTask::work()
+             break;
+         }
+         case eState::SEND_AP_AUTOCONFIGURATION_WSC_M1: {
++            auto db = AgentDB::get();
++            // If TS is active but the initial VLAN interface has not yet been created,
++            // hold M1 here. The early AP capability report must reach the controller
++            // before M1 so it can include MLO configuration in M2; gating M1 on
++            // ts_applied guarantees the order: VLAN creation → early AP cap → M1.
++            if (db->traffic_separation.primary_vlan_id != 0 && !db->traffic_separation.ts_applied) {
++                LOG(DEBUG) << "Waiting for TS VLAN interface before sending M1 for " << radio_iface;
++                break;
++            }
++            // Send early AP capability immediately before M1 (if not already sent).
++            // Must precede M1 so the controller knows about MLO support when processing M1.
++            if (db->controller_info.early_ap_capability &&
++                !db->controller_info.early_ap_capability_report_sent) {
++                LOG(INFO) << "Sending EARLY_AP_CAPABILITY Before M1 for " << radio_iface;
++                db->controller_info.early_ap_capability_report_sent = true;
++                m_btl_ctx.send_event(slave_thread::eEvent::CONTROLLER_EARLY_AP_CAPABILITY);
++            }
+             send_ap_autoconfiguration_wsc_m1_message(radio_iface);
+             conf_params.timeout =
+                 std::chrono::steady_clock::now() +
+@@ -2522,6 +2539,26 @@ bool ApAutoConfigurationTask::handle_agent_ap_mld_configuration_tlv(
+         process_missing_mld_links(radio->front.iface_name);
+     }
+ 
++    // Trigger re-autoconfiguration for radios newly added to MLD configuration.
++    // This handles the timing issue where a radio (e.g. 6GHz) received its M2 before
++    // the AP MLD configuration request arrived, resulting in mld_id=-1 for all its BSSes.
++    // Now that the MLD config is known, force a new M1/M2 exchange so the controller
++    // can send the correct MLD IDs for this radio.
++    for (const auto &new_iface_kv : m_ap_mld_requests_infos) {
++        const auto &iface_name = new_iface_kv.first;
++        if (prev_ap_mld_requests.find(iface_name) == prev_ap_mld_requests.end()) {
++            // This radio is newly added to MLD configuration
++            auto conf_it = m_radios_conf_params.find(iface_name);
++            if (conf_it != m_radios_conf_params.end() &&
++                conf_it->second.state == eState::CONFIGURED) {
++                LOG(INFO) << "Radio " << iface_name
++                          << " newly added to MLD config while already CONFIGURED"
++                          << " — triggering re-autoconfiguration to obtain MLD IDs";
++                FSM_MOVE_STATE(iface_name, eState::SEND_AP_AUTOCONFIGURATION_WSC_M1);
++            }
++        }
++    }
++
+     return true;
+ }
+ 
+diff --git a/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp b/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
+index dbe8418fb..3c9d2bf27 100644
+--- a/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
++++ b/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
+@@ -69,6 +69,11 @@ void TrafficSeparationTask::handle_event(uint8_t event_enum_value, const void *
+             LOG(ERROR) << "cleanup_ts_runtime_state failed";
+         }
+ 
++        {
++            auto db                           = AgentDB::get();
++            db->traffic_separation.ts_applied = false;
++        }
++
+         clear_pending_apply();
+         break;
+     }
+@@ -123,6 +128,9 @@ void TrafficSeparationTask::work()
+     case eApplyMode::Full: {
+         if (!reset()) {
+             LOG(WARNING) << "full reset failed";
++        } else {
++            auto db                           = AgentDB::get();
++            db->traffic_separation.ts_applied = true;
+         }
+         break;
+     }
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 4d911fbfa..52924cd36 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -13,6 +13,7 @@
+ #include <bcl/network/network_utils.h>
+ #include <bcl/son/son_assoc_frame_utils.h>
+ #include <bcl/son/son_wireless_utils.h>
++#include <bpl/bpl_cfg.h>
+ #include <bwl/key_value_parser.h>
+ #include <cmath>
+ #include <easylogging++.h>
+@@ -1978,8 +1979,14 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+             m_radio_info.bssid_pool[used_bssid] = true;
+             prplmesh::hostapd::Configuration conf = load_hostapd_config("",tlvf::mac_to_string(bss_it.bssid));
+             if (!conf) {
+-                LOG(ERROR) << "Autoconfiguration: no hostapd config to apply configuration!";
+-                return false;
++                // The BSSID may be a STA link MAC that was marked as "in use" in the BSSID pool
++                // but is not present in any hostapd AP conf file (e.g. MLO STA link address).
++                // Release it and skip this BSS entry so the remaining VAPs can still be configured.
++                LOG(WARNING) << "Autoconfiguration: no hostapd config found for bssid="
++                             << tlvf::mac_to_string(bss_it.bssid)
++                             << " (may be a STA link MAC) - skipping this BSS entry";
++                m_radio_info.bssid_pool[tlvf::mac_to_string(bss_it.bssid)] = false;
++                continue;
+             }
+             auto &vap_id = conf.get_vap_by_bssid(tlvf::mac_to_string(bss_it.bssid));
+                 LOG(INFO) << "vap_id: " << vap_id;
+@@ -2753,7 +2760,77 @@ bool ap_wlan_hal_nl80211::set_radio_mbo_assoc_disallow(bool enable)
+ 
+ bool ap_wlan_hal_nl80211::set_primary_vlan_id(uint16_t primary_vlan_id)
+ {
+-    LOG(TRACE) << __func__ << " - NOT IMPLEMENTED!";
++    LOG(INFO) << "set_primary_vlan_id " << primary_vlan_id
++              << " radio=" << m_radio_info.iface_name;
++
++    // Store vlanid so create_new_hostapd_conf_file() can embed multi_ap_vlanid when the
++    // backhaul AP is created after this call (timing: set_primary_vlan_id runs
++    // before the backhaul AP is added to available_vaps).
++    m_primary_vlan_id = primary_vlan_id;
++
++    // Base interface name of this radio (e.g. "wlan2" from "wlan2_link0").
++    std::string radio_base_iface;
++    extractLinkBaseInterface(m_radio_info.iface_name, radio_base_iface);
++
++    for (const auto &vap : m_radio_info.available_vaps) {
++        if (!vap.second.backhaul) {
++            continue;
++        }
++        std::string base_iface;
++        extractLinkBaseInterface(vap.second.bss, base_iface);
++
++        // Cross-radio MLO: the backhaul AP link belongs to a different radio's interface.
++        // Sending RELOAD_CONFIG to it reconfigures the entire MLD and removes this radio's
++        // control socket, causing an ap_manager restart loop.
++        bool is_cross_radio_mlo = (!radio_base_iface.empty() &&
++                                   vap.second.bss.find(radio_base_iface) == std::string::npos);
++
++        LOG(DEBUG) << "set_primary_vlan_id: bss=" << vap.second.bss
++                   << " base_iface=" << base_iface
++                   << " cross_radio_mlo=" << (is_cross_radio_mlo ? "yes" : "no");
++
++        // Persist to UCI (survives reboots).
++        if (!beerocks::bpl::cfg_set_wifi_iface_multi_ap_vlanid(base_iface, primary_vlan_id)) {
++            LOG(ERROR) << "Failed to set multi_ap_vlanid in UCI for iface=" << base_iface;
++        }
++
++        // Update the running hostapd conf and reload.
++        // Skip RELOAD_CONFIG for cross-radio MLO links — sending it to a peer-radio
++        // interface removes this radio's control socket and triggers a restart loop.
++        prplmesh::hostapd::Configuration conf = load_hostapd_config(vap.second.bss, "");
++        if (conf) {
++            // Conf file uses "interface=<base_iface>"; fall back to base_iface if BSSID
++            // lookup fails (e.g. link-specific BSSID differs from conf BSSID).
++            const auto &vap_id = conf.get_vap_by_bssid(vap.second.mac);
++            const std::string &target_vap = vap_id.empty() ? base_iface : vap_id;
++            conf.set_create_vap_value(target_vap, "multi_ap_vlanid",
++                                      std::to_string(primary_vlan_id));
++            if (!conf.store(target_vap)) {
++                LOG(ERROR) << "set_primary_vlan_id: failed to save hostapd conf for bss="
++                           << vap.second.bss;
++            } else {
++                if (is_cross_radio_mlo) {
++                    LOG(DEBUG) << "set_primary_vlan_id: skipping RELOAD_CONFIG for cross-radio"
++                               << " MLO bss=" << vap.second.bss;
++                } else {
++                    // Send RELOAD_CONFIG to base_iface (e.g. "wlan1_3"), not the link-specific
++                    // name, because the conf file has "interface=<base_iface>".
++                    LOG(DEBUG) << "set_primary_vlan_id: RELOAD_CONFIG base_iface=" << base_iface
++                               << " vlanid=" << primary_vlan_id;
++                    if (!wpa_ctrl_send_msg("RELOAD_CONFIG", base_iface)) {
++                        LOG(WARNING) << "set_primary_vlan_id: RELOAD_CONFIG failed for"
++                                     << " base_iface=" << base_iface;
++                    } else {
++                        LOG(INFO) << "set_primary_vlan_id: multi_ap_vlanid=" << primary_vlan_id
++                                  << " applied to base_iface=" << base_iface;
++                    }
++                }
++            }
++        } else {
++            LOG(WARNING) << "set_primary_vlan_id: could not load hostapd conf for bss="
++                         << vap.second.bss;
++        }
++    }
+     return true;
+ }
+ 
+@@ -4004,6 +4081,17 @@ bool ap_wlan_hal_nl80211::create_new_hostapd_conf_file(std::string &ifname, son:
+                             : MULTIAP_HOP_COUNT_EXTENDER;
+         conf.set_create_vap_value(vap_id, "assocresp_elements",
+             build_multiap_assocresp_ie(hop_count));
++
++        // If a primary VLAN ID was already received (set_primary_vlan_id was called
++        // before this backhaul AP was created), embed multi_ap_vlanid directly in the
++        // conf file so hostapd advertises the VLAN ID in association responses
++        // immediately — without needing a subsequent RELOAD_CONFIG.
++        if (m_primary_vlan_id != 0) {
++            LOG(DEBUG) << "create_new_hostapd_conf_file: multi_ap_vlanid=" << m_primary_vlan_id
++                       << " ifname=" << ifname;
++            conf.set_create_vap_value(vap_id, "multi_ap_vlanid",
++                                      std::to_string(m_primary_vlan_id));
++        }
+     }
+     auto ieee80211be_sprt = conf.get_head_value("ieee80211be");
+ 
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+index 0fb79e6f1..42dd1f931 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+@@ -181,6 +181,9 @@ private:
+     std::unordered_map<std::string, std::shared_ptr<sMGMT_FRAME_NOTIFICATION>>
+         m_latest_assoc_frame = {};
+     uint16_t m_aid           = 2007; // AIDs must be in the range 1-2007
++    // Primary VLAN ID for the backhaul AP; set by set_primary_vlan_id() and
++    // embedded in the hostapd conf by create_new_hostapd_conf_file().
++    uint16_t m_primary_vlan_id = 0;
+     // Pending puncturing bitmap to be applied on next CHAN_SWITCH.
+     // Bit N = 1 means the Nth 20 MHz subchannel (LSB = lowest) is punctured.
+     uint16_t m_punct_bitmap = 0;
+diff --git a/framework/platform/bpl/cfg/dm/bpl_cfg.cpp b/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
+index ba7334712..a28cba6a4 100644
+--- a/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
+@@ -712,5 +712,10 @@ int cfg_get_load_steer_on_vaps(int num_of_interfaces,
+ 
+ bool cfg_commit_changes() { return true; }
+ 
++bool cfg_set_wifi_iface_multi_ap_vlanid(const std::string &iface_name, uint16_t vlanid)
++{
++    return true;
++}
++
+ } // namespace bpl
+ } // namespace beerocks
+diff --git a/framework/platform/bpl/cfg/linux/bpl_cfg.cpp b/framework/platform/bpl/cfg/linux/bpl_cfg.cpp
+index ddcf049df..5978a286f 100644
+--- a/framework/platform/bpl/cfg/linux/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/linux/bpl_cfg.cpp
+@@ -1042,5 +1042,10 @@ bool cfg_get_network_name_for_bridge(const std::string & /*bridge_name*/,
+ 
+ bool cfg_commit_changes() { return true; };
+ 
++bool cfg_set_wifi_iface_multi_ap_vlanid(const std::string &iface_name, uint16_t vlanid)
++{
++    return true;
++}
++
+ } // namespace bpl
+ } // namespace beerocks
+diff --git a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+index c850ab4f1..611dc1b7e 100644
+--- a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+@@ -1365,5 +1365,10 @@ bool bpl_cfg_set_wifi_iface_teardown(const std::string &iface, const std::string
+     return true;
+ }
+ 
++bool cfg_set_wifi_iface_multi_ap_vlanid(const std::string &iface_name, uint16_t vlanid)
++{
++    return true;
++}
++
+ } // namespace bpl
+ } // namespace beerocks
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index b0590d49b..a9b125312 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -1450,8 +1450,9 @@ bool bpl_cfg_get_mld_id_by_iface(const std::string &iface, std::string &mld_id)
+ 
+ bool bpl_cfg_get_mld_ifname_by_ssid(const std::string &ssid, std::string &ifname)
+ {
+-    const std::string package_name     = "wireless";
+-    const std::string mld_section_type = "wifi-mld";
++    const std::string package_name      = "wireless";
++    const std::string mld_section_type  = "wifi-mld";
++    const std::string iface_section_type = "wifi-iface";
+ 
+     // Get all wifi-mld sections
+     std::vector<std::string> all_mld_sections;
+@@ -1460,6 +1461,10 @@ bool bpl_cfg_get_mld_ifname_by_ssid(const std::string &ssid, std::string &ifname
+         return false;
+     }
+ 
++    // Pre-fetch all wifi-iface sections once for STA-mode check
++    std::vector<std::string> all_iface_sections;
++    uci_get_all_sections(package_name, iface_section_type, all_iface_sections);
++
+     for (const auto &mld_sec : all_mld_sections) {
+         // Check if the ssid option of this section matches the target SSID
+         std::string ssid_val;
+@@ -1471,7 +1476,38 @@ bool bpl_cfg_get_mld_ifname_by_ssid(const std::string &ssid, std::string &ifname
+             continue;
+         }
+ 
+-        // SSID matched - get the ifname option
++        // SSID matched.  Before accepting this section, verify it is NOT a backhaul-STA
++        // MLD section.  On an agent the backhaul STA also has a wifi-mld section whose
++        // ssid matches the backhaul AP SSID (e.g. "MAPBackhaulAP-STEVE").  If we return
++        // the STA's ifname (wlan0) as the backhaul AP interface name the AP creation
++        // collides with the STA and the backhaul AP is never cloned.
++        //
++        // Detection: if any wifi-iface section references this mld section (via the
++        // "mld" option) and has mode=sta, this is a STA MLD section — skip it.
++        bool is_sta_mld = false;
++        for (const auto &iface_sec : all_iface_sections) {
++            std::string mld_val, mode_val;
++            if (!uci_get_option(package_name, iface_section_type, iface_sec, "mld", mld_val)) {
++                continue;
++            }
++            if (mld_val != mld_sec) {
++                continue;
++            }
++            if (uci_get_option(package_name, iface_section_type, iface_sec, "mode", mode_val) &&
++                mode_val == "sta") {
++                is_sta_mld = true;
++                break;
++            }
++        }
++
++        if (is_sta_mld) {
++            LOG(DEBUG) << "bpl_cfg_get_mld_ifname_by_ssid: wifi-mld section=" << mld_sec
++                       << " matched ssid=" << ssid
++                       << " but is referenced by a STA wifi-iface, skipping";
++            continue;
++        }
++
++        // SSID matched and section is AP-side — get the ifname option
+         std::string ifname_val;
+         if (!uci_get_option(package_name, mld_section_type, mld_sec, "ifname", ifname_val) ||
+             ifname_val.empty()) {
+@@ -1603,5 +1639,67 @@ bool cfg_set_wireless_channel(const std::string &radio_id, int channel)
+     return true;
+ }
+ 
++bool cfg_set_wifi_iface_multi_ap_vlanid(const std::string &iface_name, uint16_t vlanid)
++{
++    const std::string pkg = "wireless";
++    bool any_updated      = false;
++
++    OptionsUnorderedMap options;
++    options["multi_ap_vlanid"] = std::to_string(vlanid);
++
++    // Update ALL wifi-iface sections with matching ifname.
++    // For MLO backhaul APs, multiple sections (one per band) share the same ifname.
++    {
++        const std::string type = "wifi-iface";
++        std::vector<std::string> all_sections;
++        if (uci_get_all_sections(pkg, type, all_sections)) {
++            for (const auto &sec : all_sections) {
++                std::string ifname_val;
++                if (!uci_get_option(pkg, type, sec, "ifname", ifname_val) ||
++                    ifname_val != iface_name) {
++                    continue;
++                }
++                if (!uci_set_section(pkg, type, sec, options, false)) {
++                    LOG(ERROR) << "cfg_set_wifi_iface_multi_ap_vlanid: failed for section=" << sec;
++                } else {
++                    LOG(DEBUG) << "cfg_set_wifi_iface_multi_ap_vlanid: set multi_ap_vlanid="
++                               << vlanid << " section=" << sec << " iface=" << iface_name;
++                    any_updated = true;
++                }
++            }
++        }
++    }
++
++    // Also update wifi-mld sections with matching ifname (MLO backhaul AP MLD sections).
++    {
++        const std::string mld_type = "wifi-mld";
++        std::vector<std::string> mld_sections;
++        if (uci_get_all_sections(pkg, mld_type, mld_sections)) {
++            for (const auto &sec : mld_sections) {
++                std::string ifname_val;
++                if (!uci_get_option(pkg, mld_type, sec, "ifname", ifname_val) ||
++                    ifname_val != iface_name) {
++                    continue;
++                }
++                if (!uci_set_section(pkg, mld_type, sec, options, false)) {
++                    LOG(ERROR) << "cfg_set_wifi_iface_multi_ap_vlanid: failed for mld section=" << sec;
++                } else {
++                    LOG(DEBUG) << "cfg_set_wifi_iface_multi_ap_vlanid: set multi_ap_vlanid="
++                               << vlanid << " mld section=" << sec << " iface=" << iface_name;
++                    any_updated = true;
++                }
++            }
++        }
++    }
++
++    if (any_updated) {
++        uci_commit_changes(pkg);
++    } else {
++        LOG(DEBUG) << "cfg_set_wifi_iface_multi_ap_vlanid: no section found for iface=" << iface_name;
++    }
++
++    return any_updated;
++}
++
+ } // namespace bpl
+ } // namespace beerocks
+diff --git a/framework/platform/bpl/include/bpl/bpl_cfg.h b/framework/platform/bpl/include/bpl/bpl_cfg.h
+index 5f693728a..700598e35 100644
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -1603,6 +1603,20 @@ bool bpl_cfg_get_vap_ifname_by_ssid_and_radio(const std::string &ssid,
+                                                const std::string &radio_id,
+                                                std::string &new_vap_iface_name);
+ 
++/**
++ * @brief Set the multi_ap_vlanid option for a backhaul AP wireless interface.
++ *
++ * On OpenWrt, the multi_ap_vlanid option in the backhaul AP wifi-iface section
++ * causes the primary VLAN ID to be included in the Multi-AP IE of association
++ * responses. This is required for daisy-chained agents to learn the primary
++ * VLAN ID when traffic separation is enabled.
++ *
++ * @param[in] iface_name - the wireless interface name (e.g., "wlan0")
++ * @param[in] vlanid - the primary VLAN ID to set
++ * @return true on success, false on failure
++ */
++bool cfg_set_wifi_iface_multi_ap_vlanid(const std::string &iface_name, uint16_t vlanid);
++
+ } // namespace bpl
+ } // namespace beerocks
+ 
+-- 
+2.34.1
+
