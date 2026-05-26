@@ -1,0 +1,1411 @@
+From eaea99e891bdaec4c2890e83a7b9236f9640b8ce Mon Sep 17 00:00:00 2001
+From: Jain Roy <jambi@qti.qualcomm.com>
+Date: Wed, 27 May 2026 11:43:49 +0530
+Subject: [PATCH] Slave hal implementation using MQTT
+
+Signed-off-by: Jain Roy <jambi@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/son_slave_thread.cpp | 145 +++++++++++++++
+ agent/src/beerocks/slave/son_slave_thread.h   |   9 +
+ cmake/Findlibmosquitto.cmake                  |  24 +++
+ common/beerocks/bwl/CMakeLists.txt            |   1 +
+ .../bwl/dummy/slave_wlan_hal_dummy.cpp        | 125 +++++++++++++
+ .../beerocks/bwl/dummy/slave_wlan_hal_dummy.h |  47 +++++
+ .../bwl/include/bwl/base_wlan_hal_types.h     |   3 +-
+ .../beerocks/bwl/include/bwl/slave_wlan_hal.h |  42 +++++
+ .../bwl/nl80211/slave_wlan_hal_nl80211.cpp    | 170 ++++++++++++++++++
+ .../bwl/nl80211/slave_wlan_hal_nl80211.h      |  64 +++++++
+ .../bwl/onewifi/slave_wlan_hal_onewifi.cpp    | 125 +++++++++++++
+ .../bwl/onewifi/slave_wlan_hal_onewifi.h      |  47 +++++
+ .../beerocks/bwl/whm/slave_wlan_hal_whm.cpp   | 125 +++++++++++++
+ common/beerocks/bwl/whm/slave_wlan_hal_whm.h  |  47 +++++
+ framework/platform/CMakeLists.txt             |   2 +
+ framework/platform/mqttapi/CMakeLists.txt     |  31 ++++
+ .../platform/mqttapi/include/mqtt_client.h    |  48 +++++
+ framework/platform/mqttapi/mqtt_client.cpp    | 154 ++++++++++++++++
+ 18 files changed, 1208 insertions(+), 1 deletion(-)
+ create mode 100644 cmake/Findlibmosquitto.cmake
+ create mode 100644 common/beerocks/bwl/dummy/slave_wlan_hal_dummy.cpp
+ create mode 100644 common/beerocks/bwl/dummy/slave_wlan_hal_dummy.h
+ create mode 100644 common/beerocks/bwl/include/bwl/slave_wlan_hal.h
+ create mode 100644 common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp
+ create mode 100644 common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h
+ create mode 100644 common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.cpp
+ create mode 100644 common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.h
+ create mode 100644 common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
+ create mode 100644 common/beerocks/bwl/whm/slave_wlan_hal_whm.h
+ create mode 100644 framework/platform/mqttapi/CMakeLists.txt
+ create mode 100644 framework/platform/mqttapi/include/mqtt_client.h
+ create mode 100644 framework/platform/mqttapi/mqtt_client.cpp
+
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 2a7823a1e..5dfc31800 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -412,10 +412,31 @@ bool slave_thread::thread_init()
+ 
+ void slave_thread::stop_slave_thread()
+ {
++    clear_event_handlers();
+     agent_reset();
+     should_stop = true;
+ }
+ 
++void slave_thread::clear_event_handlers()
++{
++    // Unregister external event handlers
++    for (auto fd : slave_hal_ext_events) {
++        if (fd != beerocks::net::FileDescriptor::invalid_descriptor) {
++            LOG(DEBUG) << "Removing handlers for external events. Fd: " << fd;
++            m_event_loop->remove_handlers(fd);
++        }
++    }
++    slave_hal_ext_events.clear();
++
++    // Unregister internal event handlers
++    if (slave_hal_int_events != beerocks::net::FileDescriptor::invalid_descriptor) {
++        LOG(DEBUG) << "Removing handlers for internal events. Fd: "
++                   << slave_hal_int_events;
++        m_event_loop->remove_handlers(slave_hal_int_events);
++        slave_hal_int_events = beerocks::net::FileDescriptor::invalid_descriptor;
++    }
++}
++
+ void slave_thread::agent_reset()
+ {
+     // If already during reset, return.
+@@ -4788,6 +4809,22 @@ bool slave_thread::agent_fsm()
+                 return true;
+             });
+ 
++        // Initialize slave_wlan_hal HAL
++        if(!m_slave_wlan_hal) {
++            using namespace std::placeholders; // for `_1`
++            bwl::hal_conf_t hal_conf;
++            m_slave_wlan_hal = bwl::slave_wlan_hal_create(
++                "slave", 
++                std::bind(&slave_thread::hal_event_handler, this, _1),
++                hal_conf);
++            
++            LOG_IF(!m_slave_wlan_hal, FATAL) << "Failed creating HAL instance!";
++        }
++
++        if (!register_event_handlers()) {
++            return false;
++        }
++
+         m_agent_state = STATE_LOAD_PLATFORM_CONFIGURATION;
+         break;
+     }
+@@ -6660,3 +6697,111 @@ bool slave_thread::send_event(eEvent event)
+         return false;
+     }
+ }
++
++bool slave_thread::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
++{
++    if (!event_ptr) {
++        LOG(ERROR) << "Invalid event!";
++        return false;
++    }
++
++    typedef bwl::slave_wlan_hal::Event Event;
++    auto event = (Event)(event_ptr->first);
++    switch (event) {
++    case Event::SMD_Roaming_Completed: {
++        LOG(DEBUG) << "Received SMD Roaming topic Event " << event;
++        break;
++    }
++    default: {
++        LOG(ERROR) << "Unhandled event: " << int(event);
++        return false;
++    }
++    }
++
++    return true;
++}
++
++bool slave_thread::register_event_handlers()
++{
++    // register internal event handlers
++    slave_hal_int_events = m_slave_wlan_hal->get_int_events_fd();
++    if (slave_hal_int_events < 0) {
++        LOG(DEBUG) << "No slave_wlan_hal internal events fd to register";
++    } else {
++        beerocks::EventLoop::EventHandlers int_event_handlers{
++            .name = "slave_hal_int_events",
++            .on_read = [this](int fd, beerocks::EventLoop &loop) {
++                if (!m_slave_wlan_hal || !m_slave_wlan_hal->process_int_events()) {
++                    LOG(ERROR) << "on_read process_int_events(" << fd << ") failed!";
++                    return false;
++                }
++                return true;
++            },
++            .on_write = nullptr,
++            .on_disconnect = [this](int fd, beerocks::EventLoop &loop) {
++                LOG(ERROR) << "slave_wlan_hal events disconnected! on fd " << fd;
++                slave_hal_int_events = beerocks::net::FileDescriptor::invalid_descriptor;
++                return false;
++            },
++            .on_error = [this](int fd, beerocks::EventLoop &loop) {
++                LOG(ERROR) << "slave_wlan_hal events error! on fd " << fd;
++                slave_hal_int_events = beerocks::net::FileDescriptor::invalid_descriptor;
++                return false;
++            },
++        };
++        if (slave_hal_int_events > 0) {
++            if (!m_event_loop->register_handlers(slave_hal_int_events, int_event_handlers)) {
++                LOG(ERROR) << "Unable to register handlers for slave_wlan_hal int event fd " << slave_hal_int_events;
++                return false;
++            }
++            LOG(DEBUG) << "Registered slave_wlan_hal int event with fd = " << slave_hal_int_events;
++        }
++    }
++    
++    // register external event handlers
++    slave_hal_ext_events = m_slave_wlan_hal->get_ext_events_fds();
++    if (slave_hal_ext_events.empty()) {
++        LOG(DEBUG) << "No slave_wlan_hal external events fds to register";
++    } else {
++        beerocks::EventLoop::EventHandlers ext_event_handlers{
++            .name = "slave_hal_ext_events",
++            .on_read = [this](int fd, beerocks::EventLoop &loop) {
++                if (!m_slave_wlan_hal || !m_slave_wlan_hal->process_ext_events(fd)) {
++                    LOG(ERROR) << "on_read process_ext_events(" << fd << ") failed!";
++                    return false;
++                }
++                return true;
++            },
++            .on_write = nullptr,
++            .on_disconnect = [this](int fd, beerocks::EventLoop &loop) {
++                LOG(ERROR) << "slave_wlan_hal ext events disconnected! on fd " << fd;
++                auto it = std::find(slave_hal_ext_events.begin(), slave_hal_ext_events.end(), fd);
++                if (it != slave_hal_ext_events.end()) {
++                    *it = beerocks::net::FileDescriptor::invalid_descriptor;
++                }
++                return false;
++            },
++            .on_error = [this](int fd, beerocks::EventLoop &loop) {
++                LOG(ERROR) << "slave_wlan_hal ext events error! on fd " << fd;
++                auto it = std::find(slave_hal_ext_events.begin(), slave_hal_ext_events.end(), fd);
++                if (it != slave_hal_ext_events.end()) {
++                    *it = beerocks::net::FileDescriptor::invalid_descriptor;
++                }
++                return false;
++            },
++        };
++        for (auto &ext_event_fd : slave_hal_ext_events) {
++            if (ext_event_fd > 0) {
++                if (!m_event_loop->register_handlers(ext_event_fd, ext_event_handlers)) {
++                    LOG(ERROR) << "Unable to register handlers for slave_wlan_hal ext event fd " << ext_event_fd;
++                    return false;
++                }
++                LOG(DEBUG) << "Registered slave_wlan_hal ext event with fd = " << ext_event_fd;
++            } else if (ext_event_fd < 0) {
++                ext_event_fd = beerocks::net::FileDescriptor::invalid_descriptor;
++            }
++        }
++    }
++
++    return true;
++}
+diff --git a/agent/src/beerocks/slave/son_slave_thread.h b/agent/src/beerocks/slave/son_slave_thread.h
+index 16fe74b10..4a28882a1 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.h
++++ b/agent/src/beerocks/slave/son_slave_thread.h
+@@ -26,6 +26,7 @@
+ 
+ #include <beerocks/tlvf/beerocks_header.h>
+ #include <tlvf/wfa_map/tlvChannelPreference.h>
++#include <bwl/slave_wlan_hal.h>
+ 
+ // Forward decleration
+ namespace beerocks_message {
+@@ -243,6 +244,10 @@ private:
+     void platform_notify_error(bpl::eErrorCode code, const std::string &error_data);
+     bool monitor_heartbeat_check(const std::string &fronthaul_iface);
+     bool ap_manager_heartbeat_check(const std::string &fronthaul_iface);
++    
++    bool hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr);
++    bool register_event_handlers();
++    void clear_event_handlers();
+ 
+ public:
+     /**
+@@ -515,6 +520,10 @@ public:
+     std::shared_ptr<btl::BrokerClient> m_broker_client;
+ 
+     std::shared_ptr<ServicePrioritizationTask> m_service_prioritization_task_configurator;
++    
++    std::shared_ptr<bwl::slave_wlan_hal> m_slave_wlan_hal;
++    std::vector<int> slave_hal_ext_events = {beerocks::net::FileDescriptor::invalid_descriptor};
++    int slave_hal_int_events = beerocks::net::FileDescriptor::invalid_descriptor;
+ 
+ private:
+     /**
+diff --git a/cmake/Findlibmosquitto.cmake b/cmake/Findlibmosquitto.cmake
+new file mode 100644
+index 000000000..d8fe9bbaa
+--- /dev/null
++++ b/cmake/Findlibmosquitto.cmake
+@@ -0,0 +1,24 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: ISC
++
++find_path(LIBMOSQUITTO_INCLUDE_DIR
++    NAMES mosquitto.h
++    PATH_SUFFIXES mosquitto
++)
++
++find_library(LIBMOSQUITTO_LIBRARY
++    NAMES mosquitto
++)
++
++include(FindPackageHandleStandardArgs)
++find_package_handle_standard_args(libmosquitto DEFAULT_MSG
++    LIBMOSQUITTO_LIBRARY
++    LIBMOSQUITTO_INCLUDE_DIR
++)
++
++if(LIBMOSQUITTO_FOUND)
++    set(LIBMOSQUITTO_LIBRARIES ${LIBMOSQUITTO_LIBRARY})
++    set(LIBMOSQUITTO_INCLUDE_DIRS ${LIBMOSQUITTO_INCLUDE_DIR})
++endif()
++
++mark_as_advanced(LIBMOSQUITTO_INCLUDE_DIR LIBMOSQUITTO_LIBRARY)
+diff --git a/common/beerocks/bwl/CMakeLists.txt b/common/beerocks/bwl/CMakeLists.txt
+index abefcca31..103f65aac 100644
+--- a/common/beerocks/bwl/CMakeLists.txt
++++ b/common/beerocks/bwl/CMakeLists.txt
+@@ -136,6 +136,7 @@ elseif(BWL_TYPE STREQUAL "NL80211")
+ 
+     find_package(nl-genl-3 REQUIRED)
+     list(APPEND BWL_LIBS nl-genl-3)
++    list(APPEND BWL_LIBS mqttapi)
+ 
+     if(NOT EXISTS ${PRPLMESH_INCLUDE_DIR})
+         message(FATAL_ERROR "prplmesh inlcude directory not found: ${PRPLMESH_INCLUDE_DIR}")
+diff --git a/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.cpp b/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.cpp
+new file mode 100644
+index 000000000..6108483ea
+--- /dev/null
++++ b/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.cpp
+@@ -0,0 +1,125 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#include "slave_wlan_hal_dummy.h"
++
++#include <bcl/beerocks_utils.h>
++#include <bcl/network/network_utils.h>
++#include <easylogging++.h>
++
++using namespace beerocks;
++
++namespace bwl {
++namespace dummy {
++
++slave_wlan_hal_dummy::slave_wlan_hal_dummy(const std::string &iface_name, hal_event_cb_t callback,
++                                   const bwl::hal_conf_t &hal_conf)
++    : base_wlan_hal(bwl::HALType::Slave, iface_name, IfaceType::Intel, callback, hal_conf)
++{
++    m_filtered_events.insert({});
++}
++
++slave_wlan_hal_dummy::~slave_wlan_hal_dummy()
++{
++    detach();
++}
++
++int slave_wlan_hal_dummy::smd_set_neighbor(const void* payload, int payload_len)
++{
++    return 0;
++}
++
++bool slave_wlan_hal_dummy::process_ext_events(int fd)
++{
++    return true;
++}
++
++bwl::HALState slave_wlan_hal_dummy::attach(bool)
++{
++    return bwl::HALState::Operational;
++}
++
++bool slave_wlan_hal_dummy::detach()
++{
++    return true;
++}
++
++bool slave_wlan_hal_dummy::refresh_radio_info()
++{
++    return true;
++}
++
++bool slave_wlan_hal_dummy::ping()
++{
++    return true;
++}
++
++bool slave_wlan_hal_dummy::reassociate()
++{
++    return true;
++}
++
++bool slave_wlan_hal_dummy::refresh_vaps_info(int id)
++{
++    return true;
++}
++
++bool slave_wlan_hal_dummy::get_vap_status(
++    const std::__cxx11::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list)
++{
++    return true;
++}
++
++bool slave_wlan_hal_dummy::update_mld_status(
++    const std::__cxx11::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list)
++{
++    return true;
++}
++
++bool slave_wlan_hal_dummy::process_nl_events()
++{
++    return true;
++}
++
++bool slave_wlan_hal_dummy::get_channel_utilization(uint8_t& channel_utilization)
++{
++    channel_utilization = 0;
++    return true;
++}
++
++const std::string slave_wlan_hal_dummy::get_iface_from_fd(int fd)
++{
++    return "";
++}
++
++std::string slave_wlan_hal_dummy::get_radio_mac()
++{
++    return "";
++}
++
++sMacAddr slave_wlan_hal_dummy::get_bsta_mld_mac()
++{
++    return sMacAddr();
++}
++
++sMacAddr slave_wlan_hal_dummy::get_ap_mld_mac()
++{
++    return sMacAddr();
++}
++
++bool slave_wlan_hal_dummy::set(const std::string& param, const std::string& value, int vap_id)
++{
++    return true;
++}
++
++} // namespace dummy
++
++std::shared_ptr<slave_wlan_hal> slave_wlan_hal_create(const std::string &iface_name,
++                                                  base_wlan_hal::hal_event_cb_t callback,
++                                                  const bwl::hal_conf_t &hal_conf)
++{
++    return std::make_shared<dummy::slave_wlan_hal_dummy>(iface_name, callback, hal_conf);
++}
++
++} // namespace bwl
+diff --git a/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.h b/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.h
+new file mode 100644
+index 000000000..6bc911c7e
+--- /dev/null
++++ b/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.h
+@@ -0,0 +1,47 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#ifndef _BWL_SLAVE_WLAN_HAL_DUMMY_H_
++#define _BWL_SLAVE_WLAN_HAL_DUMMY_H_
++
++#include <bwl/slave_wlan_hal.h>
++#include <vector>
++
++namespace bwl {
++namespace dummy {
++
++class slave_wlan_hal_dummy : public virtual slave_wlan_hal {
++public:
++    virtual int smd_set_neighbor(const void* payload, int payload_len) override;
++
++    explicit slave_wlan_hal_dummy(const std::string& iface_name,
++                               base_wlan_hal::hal_event_cb_t callback,
++                               const hal_conf_t& hal_conf);
++    virtual ~slave_wlan_hal_dummy();
++
++    // Inherited from base_wlan_hal
++    virtual bool process_ext_events(int fd = 0) override;
++
++    // Required virtual function implementations
++    virtual bwl::HALState attach(bool block) override;
++    virtual bool detach() override;
++    virtual bool refresh_radio_info() override;
++    virtual bool ping() override;
++    virtual bool reassociate() override;
++    virtual bool refresh_vaps_info(int id = beerocks::IFACE_RADIO_ID) override;
++    virtual bool get_vap_status(const std::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list) override;
++    virtual bool update_mld_status(const std::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list) override;
++    virtual bool process_nl_events() override;
++    virtual bool get_channel_utilization(uint8_t& channel_utilization) override;
++    virtual const std::string get_iface_from_fd(int fd) override;
++    virtual std::string get_radio_mac() override;
++    virtual sMacAddr get_bsta_mld_mac() override;
++    virtual sMacAddr get_ap_mld_mac() override;
++    virtual bool set(const std::string& param, const std::string& value, int vap_id) override;
++};
++
++} // namespace dummy
++} // namespace bwl
++
++#endif // _BWL_SLAVE_WLAN_HAL_DUMMY_H_
+diff --git a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+index 75ba5137c..101da65db 100644
+--- a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
++++ b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+@@ -32,7 +32,8 @@ enum class HALType {
+ 
+     AccessPoint,
+     Monitor,
+-    Station
++    Station,
++    Slave
+ };
+ 
+ enum class IfaceType {
+diff --git a/common/beerocks/bwl/include/bwl/slave_wlan_hal.h b/common/beerocks/bwl/include/bwl/slave_wlan_hal.h
+new file mode 100644
+index 000000000..31389e1f3
+--- /dev/null
++++ b/common/beerocks/bwl/include/bwl/slave_wlan_hal.h
+@@ -0,0 +1,42 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#ifndef _BWL_SLAVE_WLAN_HAL_H_
++#define _BWL_SLAVE_WLAN_HAL_H_
++
++#include "base_wlan_hal.h"
++
++namespace bwl {
++
++/*!
++ * Hardware abstraction layer for Slave
++ * Read more about virtual inheritance: https://en.wikipedia.org/wiki/Virtual_inheritance
++ */
++class slave_wlan_hal : public virtual base_wlan_hal {
++
++    // Public definitions
++public:
++    // Slave Events
++    enum class Event {
++        Invalid = 0,
++
++        // SMD Events
++        SMD_Roaming_Completed
++    };
++
++    // Public methods:
++public:
++    virtual ~slave_wlan_hal() = default;
++
++    virtual int smd_set_neighbor(const void* payload, int payload_len) = 0;
++};
++
++// Slave HAL factory types
++std::shared_ptr<slave_wlan_hal> slave_wlan_hal_create(const std::string &iface_name,
++                                                  base_wlan_hal::hal_event_cb_t cb,
++                                                  const bwl::hal_conf_t &hal_conf);
++
++} // namespace bwl
++
++#endif // _BWL_SLAVE_WLAN_HAL_H_
+diff --git a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp
+new file mode 100644
+index 000000000..16cefcc75
+--- /dev/null
++++ b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp
+@@ -0,0 +1,170 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#include "slave_wlan_hal_nl80211.h"
++
++#include <bcl/beerocks_utils.h>
++#include <bcl/network/network_utils.h>
++#include <easylogging++.h>
++
++using namespace beerocks;
++using namespace mqttapi;
++
++namespace bwl {
++namespace nl80211 {
++
++slave_wlan_hal_nl80211::slave_wlan_hal_nl80211(const std::string &iface_name, hal_event_cb_t callback,
++                                   const bwl::hal_conf_t &hal_conf)
++    : base_wlan_hal(bwl::HALType::Slave, iface_name, IfaceType::Intel, callback, hal_conf)
++{
++    int fd = mqtt_client.init(iface_name, "localhost", 1883,
++        [this](const char* topic, const void* payload, int payload_len) {
++            on_mqtt_message(topic, payload, payload_len);
++        });
++    if (fd < 0) {
++        LOG(ERROR) << "Failed to initialize MQTT client";
++        return;
++    }
++    
++    m_fds_ext_events = {fd};
++    subscribe_to_smd_events();
++}
++
++const std::vector<int> &slave_wlan_hal_nl80211::get_ext_events_fds() const
++{
++    return (m_fds_ext_events);
++}
++
++slave_wlan_hal_nl80211::~slave_wlan_hal_nl80211()
++{
++    detach();
++}
++
++void slave_wlan_hal_nl80211::subscribe_to_smd_events()
++{
++    if (mqtt_client.get_fd() >= 0) {
++        mqtt_client.subscribe("hostapd/transmit/SMD", 1);
++    } else {
++        LOG(ERROR) << "MQTT client is not valid for subscription";
++    }
++}
++
++void slave_wlan_hal_nl80211::on_mqtt_message(const char* topic, const void* payload, int payload_len)
++{
++    LOG(DEBUG) << " Processing message on topic " << topic;
++    // Process message
++    (void)payload;
++    (void)payload_len;
++
++    event_queue_push(Event::SMD_Roaming_Completed);
++}
++
++int slave_wlan_hal_nl80211::smd_set_neighbor(const void* payload, int payload_len)
++{
++    if (mqtt_client.get_fd() < 0) {
++        LOG(ERROR) << "MQTT client is not valid for publishing";
++        return -1;
++    }
++
++    return mqtt_client.publish("hostapd/receive", payload, payload_len, 1, false);
++}
++
++bool slave_wlan_hal_nl80211::process_ext_events(int fd)
++{
++    if (fd == mqtt_client.get_fd()) {
++        mqtt_client.process();
++        return true;
++    }
++    return false;
++}
++
++// Dummy implementations for pure virtual functions
++bwl::HALState slave_wlan_hal_nl80211::attach(bool)
++{
++    return bwl::HALState::Operational;
++}
++
++bool slave_wlan_hal_nl80211::detach()
++{
++    return true;
++}
++
++bool slave_wlan_hal_nl80211::refresh_radio_info()
++{
++    return true;
++}
++
++bool slave_wlan_hal_nl80211::ping()
++{
++    return true;
++}
++
++bool slave_wlan_hal_nl80211::reassociate()
++{
++    return true;
++}
++
++bool slave_wlan_hal_nl80211::refresh_vaps_info(int id)
++{
++    return true;
++}
++
++bool slave_wlan_hal_nl80211::get_vap_status(
++    const std::__cxx11::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list)
++{
++    return true;
++}
++
++bool slave_wlan_hal_nl80211::update_mld_status(
++    const std::__cxx11::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list)
++{
++    return true;
++}
++
++bool slave_wlan_hal_nl80211::process_nl_events()
++{
++    return true;
++}
++
++bool slave_wlan_hal_nl80211::get_channel_utilization(uint8_t& channel_utilization)
++{
++    channel_utilization = 0;
++    return true;
++}
++
++const std::string slave_wlan_hal_nl80211::get_iface_from_fd(int fd)
++{
++    return "";
++}
++
++std::string slave_wlan_hal_nl80211::get_radio_mac()
++{
++    return "";
++}
++
++sMacAddr slave_wlan_hal_nl80211::get_bsta_mld_mac()
++{
++    return sMacAddr();
++}
++
++sMacAddr slave_wlan_hal_nl80211::get_ap_mld_mac()
++{
++    return sMacAddr();
++}
++
++bool slave_wlan_hal_nl80211::set(const std::string& param, const std::string& value, int vap_id)
++{
++    return true;
++}
++
++} // namespace nl80211
++
++std::shared_ptr<slave_wlan_hal> slave_wlan_hal_create(const std::string &iface_name,
++                                                  base_wlan_hal::hal_event_cb_t callback,
++                                                  const bwl::hal_conf_t &hal_conf)
++{
++    return std::make_shared<nl80211::slave_wlan_hal_nl80211>(iface_name, callback, hal_conf);
++}
++
++} // namespace bwl
+diff --git a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h
+new file mode 100644
+index 000000000..7b246e4fe
+--- /dev/null
++++ b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h
+@@ -0,0 +1,64 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#ifndef _BWL_SLAVE_WLAN_HAL_NL80211_H_
++#define _BWL_SLAVE_WLAN_HAL_NL80211_H_
++
++#include <bwl/slave_wlan_hal.h>
++#include <mqtt_client.h>
++#include <vector>
++
++namespace bwl {
++namespace nl80211 {
++
++class slave_wlan_hal_nl80211 : public virtual slave_wlan_hal {
++public:
++    virtual int smd_set_neighbor(const void* payload, int payload_len) override;
++
++    explicit slave_wlan_hal_nl80211(const std::string& iface_name,
++                               base_wlan_hal::hal_event_cb_t callback,
++                               const hal_conf_t& hal_conf);
++    virtual ~slave_wlan_hal_nl80211();
++
++    const std::vector<int> &get_ext_events_fds() const;
++
++    // Inherited from base_wlan_hal
++    virtual bool process_ext_events(int fd = 0) override;
++    void subscribe_to_smd_events();
++
++    // Required virtual function implementations
++    virtual bwl::HALState attach(bool block) override;
++    virtual bool detach() override;
++    virtual bool refresh_radio_info() override;
++    virtual bool ping() override;
++    virtual bool reassociate() override;
++    virtual bool refresh_vaps_info(int id = beerocks::IFACE_RADIO_ID) override;
++    virtual bool get_vap_status(const std::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list) override;
++    virtual bool update_mld_status(const std::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list) override;
++    virtual bool process_nl_events() override;
++    virtual bool get_channel_utilization(uint8_t& channel_utilization) override;
++    virtual const std::string get_iface_from_fd(int fd) override;
++    virtual std::string get_radio_mac() override;
++    virtual sMacAddr get_bsta_mld_mac() override;
++    virtual sMacAddr get_ap_mld_mac() override;
++    virtual bool set(const std::string& param, const std::string& value, int vap_id) override;
++
++protected:
++    // Overload for Monitor events
++    bool event_queue_push(slave_wlan_hal::Event event, std::shared_ptr<void> data = {})
++    {
++        return base_wlan_hal::event_queue_push(int(event), data);
++    }
++
++private:
++    void on_mqtt_message(const char* topic, const void* payload, int payload_len);
++
++    beerocks::mqttapi::MQTTClient mqtt_client;
++    std::vector<int> m_fds_ext_events = {-1};
++};
++
++} // namespace nl80211
++} // namespace bwl
++
++#endif // _BWL_SLAVE_WLAN_HAL_NL80211_H_
+diff --git a/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.cpp b/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.cpp
+new file mode 100644
+index 000000000..9674c46b3
+--- /dev/null
++++ b/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.cpp
+@@ -0,0 +1,125 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#include "slave_wlan_hal_onewifi.h"
++
++#include <bcl/beerocks_utils.h>
++#include <bcl/network/network_utils.h>
++#include <easylogging++.h>
++
++using namespace beerocks;
++
++namespace bwl {
++namespace onewifi {
++
++slave_wlan_hal_onewifi::slave_wlan_hal_onewifi(const std::string &iface_name, hal_event_cb_t callback,
++                                   const bwl::hal_conf_t &hal_conf)
++    : base_wlan_hal(bwl::HALType::Slave, iface_name, IfaceType::Intel, callback, hal_conf)
++{
++    m_filtered_events.insert({});
++}
++
++slave_wlan_hal_onewifi::~slave_wlan_hal_onewifi()
++{
++    detach();
++}
++
++int slave_wlan_hal_onewifi::smd_set_neighbor(const void* payload, int payload_len)
++{
++    return 0;
++}
++
++bool slave_wlan_hal_onewifi::process_ext_events(int fd)
++{
++    return true;
++}
++
++bwl::HALState slave_wlan_hal_onewifi::attach(bool)
++{
++    return bwl::HALState::Operational;
++}
++
++bool slave_wlan_hal_onewifi::detach()
++{
++    return true;
++}
++
++bool slave_wlan_hal_onewifi::refresh_radio_info()
++{
++    return true;
++}
++
++bool slave_wlan_hal_onewifi::ping()
++{
++    return true;
++}
++
++bool slave_wlan_hal_onewifi::reassociate()
++{
++    return true;
++}
++
++bool slave_wlan_hal_onewifi::refresh_vaps_info(int id)
++{
++    return true;
++}
++
++bool slave_wlan_hal_onewifi::get_vap_status(
++    const std::__cxx11::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list)
++{
++    return true;
++}
++
++bool slave_wlan_hal_onewifi::update_mld_status(
++    const std::__cxx11::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list)
++{
++    return true;
++}
++
++bool slave_wlan_hal_onewifi::process_nl_events()
++{
++    return true;
++}
++
++bool slave_wlan_hal_onewifi::get_channel_utilization(uint8_t& channel_utilization)
++{
++    channel_utilization = 0;
++    return true;
++}
++
++const std::string slave_wlan_hal_onewifi::get_iface_from_fd(int fd)
++{
++    return "";
++}
++
++std::string slave_wlan_hal_onewifi::get_radio_mac()
++{
++    return "";
++}
++
++sMacAddr slave_wlan_hal_onewifi::get_bsta_mld_mac()
++{
++    return sMacAddr();
++}
++
++sMacAddr slave_wlan_hal_onewifi::get_ap_mld_mac()
++{
++    return sMacAddr();
++}
++
++bool slave_wlan_hal_onewifi::set(const std::string& param, const std::string& value, int vap_id)
++{
++    return true;
++}
++
++} // namespace onewifi
++
++std::shared_ptr<slave_wlan_hal> slave_wlan_hal_create(const std::string &iface_name,
++                                                  base_wlan_hal::hal_event_cb_t callback,
++                                                  const bwl::hal_conf_t &hal_conf)
++{
++    return std::make_shared<onewifi::slave_wlan_hal_onewifi>(iface_name, callback, hal_conf);
++}
++
++} // namespace bwl
+diff --git a/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.h b/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.h
+new file mode 100644
+index 000000000..eef2efd13
+--- /dev/null
++++ b/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.h
+@@ -0,0 +1,47 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#ifndef _BWL_SLAVE_WLAN_HAL_ONEWIFI_H_
++#define _BWL_SLAVE_WLAN_HAL_ONEWIFI_H_
++
++#include <bwl/slave_wlan_hal.h>
++#include <vector>
++
++namespace bwl {
++namespace onewifi {
++
++class slave_wlan_hal_onewifi : public virtual slave_wlan_hal {
++public:
++    virtual int smd_set_neighbor(const void* payload, int payload_len) override;
++
++    explicit slave_wlan_hal_onewifi(const std::string& iface_name,
++                               base_wlan_hal::hal_event_cb_t callback,
++                               const hal_conf_t& hal_conf);
++    virtual ~slave_wlan_hal_onewifi();
++
++    // Inherited from base_wlan_hal
++    virtual bool process_ext_events(int fd = 0) override;
++
++    // Required virtual function implementations
++    virtual bwl::HALState attach(bool block) override;
++    virtual bool detach() override;
++    virtual bool refresh_radio_info() override;
++    virtual bool ping() override;
++    virtual bool reassociate() override;
++    virtual bool refresh_vaps_info(int id = beerocks::IFACE_RADIO_ID) override;
++    virtual bool get_vap_status(const std::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list) override;
++    virtual bool update_mld_status(const std::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list) override;
++    virtual bool process_nl_events() override;
++    virtual bool get_channel_utilization(uint8_t& channel_utilization) override;
++    virtual const std::string get_iface_from_fd(int fd) override;
++    virtual std::string get_radio_mac() override;
++    virtual sMacAddr get_bsta_mld_mac() override;
++    virtual sMacAddr get_ap_mld_mac() override;
++    virtual bool set(const std::string& param, const std::string& value, int vap_id) override;
++};
++
++} // namespace onewifi
++} // namespace bwl
++
++#endif // _BWL_SLAVE_WLAN_HAL_ONEWIFI_H_
+diff --git a/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
+new file mode 100644
+index 000000000..46b766b2a
+--- /dev/null
++++ b/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
+@@ -0,0 +1,125 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#include "slave_wlan_hal_whm.h"
++
++#include <bcl/beerocks_utils.h>
++#include <bcl/network/network_utils.h>
++#include <easylogging++.h>
++
++using namespace beerocks;
++
++namespace bwl {
++namespace whm {
++
++slave_wlan_hal_whm::slave_wlan_hal_whm(const std::string &iface_name, hal_event_cb_t callback,
++                                   const bwl::hal_conf_t &hal_conf)
++    : base_wlan_hal(bwl::HALType::Slave, iface_name, IfaceType::Intel, callback, hal_conf)
++{
++    m_filtered_events.insert({});
++}
++
++slave_wlan_hal_whm::~slave_wlan_hal_whm()
++{
++    detach();
++}
++
++int slave_wlan_hal_whm::smd_set_neighbor(const void* payload, int payload_len)
++{
++    return 0;
++}
++
++bool slave_wlan_hal_whm::process_ext_events(int fd)
++{
++    return true;
++}
++
++bwl::HALState slave_wlan_hal_whm::attach(bool)
++{
++    return bwl::HALState::Operational;
++}
++
++bool slave_wlan_hal_whm::detach()
++{
++    return true;
++}
++
++bool slave_wlan_hal_whm::refresh_radio_info()
++{
++    return true;
++}
++
++bool slave_wlan_hal_whm::ping()
++{
++    return true;
++}
++
++bool slave_wlan_hal_whm::reassociate()
++{
++    return true;
++}
++
++bool slave_wlan_hal_whm::refresh_vaps_info(int id)
++{
++    return true;
++}
++
++bool slave_wlan_hal_whm::get_vap_status(
++    const std::__cxx11::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list)
++{
++    return true;
++}
++
++bool slave_wlan_hal_whm::update_mld_status(
++    const std::__cxx11::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list)
++{
++    return true;
++}
++
++bool slave_wlan_hal_whm::process_nl_events()
++{
++    return true;
++}
++
++bool slave_wlan_hal_whm::get_channel_utilization(uint8_t& channel_utilization)
++{
++    channel_utilization = 0;
++    return true;
++}
++
++const std::string slave_wlan_hal_whm::get_iface_from_fd(int fd)
++{
++    return "";
++}
++
++std::string slave_wlan_hal_whm::get_radio_mac()
++{
++    return "";
++}
++
++sMacAddr slave_wlan_hal_whm::get_bsta_mld_mac()
++{
++    return sMacAddr();
++}
++
++sMacAddr slave_wlan_hal_whm::get_ap_mld_mac()
++{
++    return sMacAddr();
++}
++
++bool slave_wlan_hal_whm::set(const std::string& param, const std::string& value, int vap_id)
++{
++    return true;
++}
++
++} // namespace whm
++
++std::shared_ptr<slave_wlan_hal> slave_wlan_hal_create(const std::string &iface_name,
++                                                  base_wlan_hal::hal_event_cb_t callback,
++                                                  const bwl::hal_conf_t &hal_conf)
++{
++    return std::make_shared<whm::slave_wlan_hal_whm>(iface_name, callback, hal_conf);
++}
++
++} // namespace bwl
+diff --git a/common/beerocks/bwl/whm/slave_wlan_hal_whm.h b/common/beerocks/bwl/whm/slave_wlan_hal_whm.h
+new file mode 100644
+index 000000000..45ef6a972
+--- /dev/null
++++ b/common/beerocks/bwl/whm/slave_wlan_hal_whm.h
+@@ -0,0 +1,47 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#ifndef _BWL_SLAVE_WLAN_HAL_WHM_H_
++#define _BWL_SLAVE_WLAN_HAL_WHM_H_
++
++#include <bwl/slave_wlan_hal.h>
++#include <vector>
++
++namespace bwl {
++namespace whm {
++
++class slave_wlan_hal_whm : public virtual slave_wlan_hal {
++public:
++    virtual int smd_set_neighbor(const void* payload, int payload_len) override;
++
++    explicit slave_wlan_hal_whm(const std::string& iface_name,
++                               base_wlan_hal::hal_event_cb_t callback,
++                               const hal_conf_t& hal_conf);
++    virtual ~slave_wlan_hal_whm();
++
++    // Inherited from base_wlan_hal
++    virtual bool process_ext_events(int fd = 0) override;
++
++    // Required virtual function implementations
++    virtual bwl::HALState attach(bool block) override;
++    virtual bool detach() override;
++    virtual bool refresh_radio_info() override;
++    virtual bool ping() override;
++    virtual bool reassociate() override;
++    virtual bool refresh_vaps_info(int id = beerocks::IFACE_RADIO_ID) override;
++    virtual bool get_vap_status(const std::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list) override;
++    virtual bool update_mld_status(const std::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list) override;
++    virtual bool process_nl_events() override;
++    virtual bool get_channel_utilization(uint8_t& channel_utilization) override;
++    virtual const std::string get_iface_from_fd(int fd) override;
++    virtual std::string get_radio_mac() override;
++    virtual sMacAddr get_bsta_mld_mac() override;
++    virtual sMacAddr get_ap_mld_mac() override;
++    virtual bool set(const std::string& param, const std::string& value, int vap_id) override;
++};
++
++} // namespace whm
++} // namespace bwl
++
++#endif // _BWL_SLAVE_WLAN_HAL_WHM_H_
+diff --git a/framework/platform/CMakeLists.txt b/framework/platform/CMakeLists.txt
+index 1fae29dbc..9ab6d4ac4 100644
+--- a/framework/platform/CMakeLists.txt
++++ b/framework/platform/CMakeLists.txt
+@@ -9,3 +9,5 @@ else()
+ 	# set_ambiorix_impl_ptr are available for linking
+ 	add_subdirectory(nbapi)
+ endif()
++
++add_subdirectory(mqttapi)
+diff --git a/framework/platform/mqttapi/CMakeLists.txt b/framework/platform/mqttapi/CMakeLists.txt
+new file mode 100644
+index 000000000..780575a47
+--- /dev/null
++++ b/framework/platform/mqttapi/CMakeLists.txt
+@@ -0,0 +1,31 @@
++project(mqttapi VERSION ${prplmesh_VERSION})
++
++message("${BoldWhite}Preparing ${BoldGreen}${PROJECT_NAME}${BoldWhite} for the ${BoldGreen}${TARGET_PLATFORM}${BoldWhite} platform${ColourReset}")
++
++# Set the base path for the current module
++set(MODULE_PATH ${CMAKE_CURRENT_LIST_DIR})
++
++list(APPEND mqttapi_sources ${MODULE_PATH}/mqtt_client.cpp)
++
++find_package(libmosquitto REQUIRED)
++list(APPEND MQTTAPI_LIBS ${LIBMOSQUITTO_LIBRARIES})
++
++# Build the library
++add_library(${PROJECT_NAME} ${mqttapi_sources})
++
++set_target_properties(${PROJECT_NAME} PROPERTIES VERSION ${prplmesh_VERSION} SOVERSION ${prplmesh_VERSION_MAJOR})
++set_target_properties(${PROJECT_NAME} PROPERTIES LINK_FLAGS "-Wl,-z,defs")
++
++target_link_libraries(${PROJECT_NAME} PRIVATE ${MQTTAPI_LIBS} bcl)
++
++# Install
++target_include_directories(${PROJECT_NAME}
++    PUBLIC
++        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
++    )
++
++install(TARGETS ${PROJECT_NAME}
++    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
++    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
++    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
++    )
+diff --git a/framework/platform/mqttapi/include/mqtt_client.h b/framework/platform/mqttapi/include/mqtt_client.h
+new file mode 100644
+index 000000000..7c4316d42
+--- /dev/null
++++ b/framework/platform/mqttapi/include/mqtt_client.h
+@@ -0,0 +1,48 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#ifndef MQTT_CLIENT_H
++#define MQTT_CLIENT_H
++
++#include <string>
++#include <map>
++#include <functional>
++#include <mosquitto.h>
++
++namespace beerocks {
++namespace mqttapi {
++
++class MQTTClient {
++public:
++    using MessageCallback = std::function<void(const char*, const void*, int)>;
++    
++    MQTTClient();
++    ~MQTTClient();
++
++    int init(const std::string& id, const std::string& host, int port, MessageCallback callback);
++    int get_fd() const;
++    void process();
++    void cleanup();
++
++    int publish(const std::string& topic, const void* payload, int payload_len, int qos, bool retain);
++    int subscribe(const std::string& topic, int qos);
++    void unsubscribe(const std::string& topic);
++
++private:
++    static void on_connect_static(struct mosquitto* mosq, void* obj, int rc);
++    static void on_message_static(struct mosquitto* mosq, void* obj, const struct mosquitto_message* msg);
++
++    void on_connect(int rc);
++    void on_message(const struct mosquitto_message* msg);
++
++    struct mosquitto* mosq;
++    int mqtt_fd;
++    MessageCallback mqtt_callback;
++};
++
++} // namespace mqttapi
++} // namespace beerocks
++
++
++#endif // MQTT_CLIENT_H
+diff --git a/framework/platform/mqttapi/mqtt_client.cpp b/framework/platform/mqttapi/mqtt_client.cpp
+new file mode 100644
+index 000000000..fea283941
+--- /dev/null
++++ b/framework/platform/mqttapi/mqtt_client.cpp
+@@ -0,0 +1,154 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#include "mqtt_client.h"
++#include <mosquitto.h>
++#include <errno.h>
++#include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <atomic>
++#include <easylogging++.h>
++
++namespace beerocks {
++namespace mqttapi {
++
++static std::atomic<int> g_init_count{0};
++
++MQTTClient::MQTTClient() : mosq(nullptr), mqtt_fd(-1)
++{
++    if (g_init_count.fetch_add(1) == 0) {
++        mosquitto_lib_init();
++    }
++}
++
++MQTTClient::~MQTTClient()
++{
++    cleanup();
++
++    if (g_init_count.fetch_sub(1) == 1) {
++        mosquitto_lib_cleanup();
++    }
++}
++
++int MQTTClient::init(const std::string& id, const std::string& host, int port, MessageCallback callback)
++{
++    cleanup();
++
++    mosq = mosquitto_new(id.c_str(), true, this);
++    if (!mosq) {
++        LOG(ERROR) << "Error: Out of memory.";
++        return -1;
++    }
++
++    mosquitto_connect_callback_set(mosq, on_connect_static);
++    mosquitto_message_callback_set(mosq, on_message_static);
++
++    if (mosquitto_connect(mosq, host.c_str(), port, 60) != MOSQ_ERR_SUCCESS) {
++        LOG(ERROR) << "Unable to connect to MQTT broker";
++        cleanup();
++        return -1;
++    }
++
++    mqtt_fd = mosquitto_socket(mosq);
++    if (mqtt_fd == -1) {
++        perror("mosquitto_socket");
++        cleanup();
++        return -1;
++    }
++
++    int flags = fcntl(mqtt_fd, F_GETFL, 0);
++    if (flags == -1) {
++        perror("fcntl F_GETFL");
++        cleanup();
++        return -1;
++    }
++    if (fcntl(mqtt_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
++        perror("fcntl F_SETFL");
++        cleanup();
++        return -1;
++    }
++
++    mqtt_callback = callback;
++
++    return mqtt_fd;
++}
++
++int MQTTClient::get_fd() const
++{
++    return mqtt_fd;
++}
++
++void MQTTClient::process()
++{
++    if (!mosq || mqtt_fd == -1) {
++        return;
++    }
++
++    int rc = mosquitto_loop_read(mosq, 1);
++    if (rc == MOSQ_ERR_CONN_LOST) {
++        LOG(ERROR) << "MQTT connection lost";
++    }
++    
++    if (mosquitto_want_write(mosq)) {
++        rc = mosquitto_loop_write(mosq, 1);
++        if (rc == MOSQ_ERR_CONN_LOST) {
++            LOG(ERROR) << "MQTT connection lost during write";
++        }
++    }
++}
++
++void MQTTClient::cleanup()
++{
++    if (mosq) {
++        mosquitto_disconnect(mosq);
++        mosquitto_destroy(mosq);
++        mosq = nullptr;
++    }
++    mqtt_fd = -1;
++}
++
++int MQTTClient::publish(const std::string& topic, const void* payload, int payload_len, int qos, bool retain)
++{
++    if (!mosq) return MOSQ_ERR_NO_CONN;
++    return mosquitto_publish(mosq, nullptr, topic.c_str(), payload_len, payload, qos, retain);
++}
++
++int MQTTClient::subscribe(const std::string& topic, int qos)
++{
++    if (!mosq) {
++        return MOSQ_ERR_NO_CONN;
++    }
++    return mosquitto_subscribe(mosq, nullptr, topic.c_str(), qos);
++}
++
++void MQTTClient::on_connect_static(struct mosquitto* mosq, void* obj, int rc)
++{
++    MQTTClient* client = static_cast<MQTTClient*>(obj);
++    client->on_connect(rc);
++}
++
++void MQTTClient::on_message_static(struct mosquitto* mosq, void* obj, const struct mosquitto_message* msg)
++{
++    MQTTClient* client = static_cast<MQTTClient*>(obj);
++    client->on_message(msg);
++}
++
++void MQTTClient::on_connect(int rc)
++{
++    if (rc != MOSQ_ERR_SUCCESS) {
++        LOG(ERROR) << "MQTT connection failed: " << mosquitto_strerror(rc);
++    }
++}
++
++void MQTTClient::on_message(const struct mosquitto_message* msg)
++{
++    if (mqtt_callback && msg && msg->topic) {
++        mqtt_callback(msg->topic, msg->payload, msg->payloadlen);
++    }
++}
++
++} // namespace mqttapi
++} // namespace beerocks
++
+-- 
+2.34.1
+
