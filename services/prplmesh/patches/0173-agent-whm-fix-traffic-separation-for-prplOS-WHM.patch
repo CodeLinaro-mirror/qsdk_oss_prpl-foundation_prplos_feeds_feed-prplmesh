@@ -1,0 +1,159 @@
+From f25e9e783063e6b1851942dc738f3a0d12bf50ed Mon Sep 17 00:00:00 2001
+From: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+Date: Mon, 25 May 2026 23:44:01 +0530
+Subject: [PATCH] agent/whm: fix traffic separation for prplOS WHM platform
+
+Two issues prevented traffic separation from working correctly on
+prplOS with the WHM (Wireless Hardware Manager) backend:
+
+1. Guest VAP created with wrong CustomAlias and BridgeInterface
+   (ap_wlan_hal_whm.cpp)
+
+   When the controller sends a wildcard-BSSID M2 for a guest BSS,
+   update_vap_credentials() called addVAPIntf to create a new VAP.
+   The generated CustomAlias was always "vap<band><index>" (e.g.
+   "vap6g2"), which WHM does not recognise as a guest VAP, and the
+   BridgeInterface was always set to the private bridge (br-lan)
+   instead of the guest bridge (br-guest).
+
+   Fix: derive the CustomAlias suffix from the BSS vap_type
+   (home/backhaul/guest) so WHM assigns the correct role, and set
+   BridgeInterface to DEFAULT_GUEST_BRIDGE_IFACE ("br-guest") when
+   the vap_type is GUEST.
+
+2. Redundant TS clear/apply cycles on Multi-AP Policy Request
+   (ap_autoconfiguration_task.cpp)
+
+   The WSC M2 message already carries the Traffic Separation TLVs
+   (Default 802.1Q Settings + Traffic Separation Policy). After all
+   radios complete autoconfiguration the "all radios configured"
+   trigger applies TS with the correct policy. When the controller
+   subsequently sends a Multi-AP Policy Request carrying the same
+   TS policy, the old code unconditionally triggered another full
+   TS reset (clear all trunk/access ports + re-apply), causing
+   unnecessary churn that delayed stabilisation.
+
+   Additionally, the old code iterated over all configured radios
+   and sent one TS_ENABLE event per radio, causing N redundant TS
+   resets for N radios.
+
+   Fix:
+   - Send only one TS_ENABLE event per Multi-AP Policy Request
+     (use std::any_of instead of a per-radio loop).
+   - Guard the TS trigger: only fire TS_ENABLE if the TS policy
+     actually changed (primary VLAN ID or SSID-VID mapping differs
+     from the last applied state) or if TS has not been applied yet.
+     BH-switch and new-VAP scenarios are handled by dedicated events
+     (TS_NEW_BH_STA_IFACE, TS_CLEAR_BH_STA_IFACE) and are not
+     affected by this guard.
+
+Signed-off-by: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+---
+ .../slave/tasks/ap_autoconfiguration_task.cpp | 35 ++++++++++++++-----
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   | 16 +++++++--
+ 2 files changed, 40 insertions(+), 11 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 2bf457342..111e2be43 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -1898,13 +1898,18 @@ void ApAutoConfigurationTask::handle_multi_ap_policy_config_request(
+     m_btl_ctx.send_cmdu_to_controller({}, m_cmdu_tx);
+ 
+     /** Traffic Separation Policy **/
++    // Snapshot the current TS policy before updating, so we can detect changes below.
++    auto db = AgentDB::get();
++    const uint16_t prev_primary_vlan_id = db->traffic_separation.primary_vlan_id;
++    const auto prev_ssid_vid_mapping    = db->traffic_separation.ssid_vid_mapping;
++    const bool ts_already_applied       = db->traffic_separation.ts_applied;
++
+     if (!handle_profile2_default_802dotq_settings_tlv(cmdu_rx)) {
+         LOG(ERROR) << "handle_profile2_default_802dotq_settings_tlv has failed!";
+         return;
+     }
+ 
+     std::unordered_set<std::string> misconfigured_ssids;
+-    auto db            = AgentDB::get();
+     auto ts_policy_tlv = cmdu_rx.getClass<wfa_map::tlvProfile2TrafficSeparationPolicy>();
+     // tlvProfile2TrafficSeparationPolicy is not mandatory. Preserve the current TS policy when
+     // this TLV is absent, because Multi-AP Policy messages may be received per-radio.
+@@ -2040,15 +2045,27 @@ void ApAutoConfigurationTask::handle_multi_ap_policy_config_request(
+                    << db->link_metrics_policy.failed_associations_maximum_reporting_rate;
+     }
+ 
+-    for (const auto &radios_conf_param_kv : m_radios_conf_params) {
+-        const auto &conf_params = radios_conf_param_kv.second;
++    // Trigger TrafficSeparationTask only if the TS policy changed or has not been applied yet.
++    // The "all radios configured" trigger already applies TS after M2 processing (which also
++    // carries the TS TLV). Re-triggering here when the policy is unchanged causes a redundant
++    // full clear/apply cycle. BH-switch and new-VAP scenarios are handled by dedicated events
++    // (TS_NEW_BH_STA_IFACE, TS_CLEAR_BH_STA_IFACE) and are not affected by this guard.
++    const bool ts_policy_changed =
++        (db->traffic_separation.primary_vlan_id != prev_primary_vlan_id) ||
++        (db->traffic_separation.ssid_vid_mapping != prev_ssid_vid_mapping);
+ 
+-        if (conf_params.state == eState::CONFIGURED) {
+-            // Trigger TrafficSeparationTask on Multi-AP Policy Request received
+-            LOG(DEBUG) << "Trigger traffic separation on Multi-AP Policy Request";
+-            m_btl_ctx.task_pool_try_send_event(eTaskType::TRAFFIC_SEPARATION,
+-                                               TrafficSeparationTask::eEvent::TS_ENABLE);
+-        }
++    const bool any_radio_configured =
++        std::any_of(m_radios_conf_params.begin(), m_radios_conf_params.end(),
++                    [](const auto &kv) { return kv.second.state == eState::CONFIGURED; });
++
++    if (any_radio_configured && (!ts_already_applied || ts_policy_changed)) {
++        LOG(DEBUG) << "Trigger traffic separation on Multi-AP Policy Request"
++                   << (ts_policy_changed ? " (policy changed)" : " (first apply)");
++        m_btl_ctx.task_pool_try_send_event(eTaskType::TRAFFIC_SEPARATION,
++                                           TrafficSeparationTask::eEvent::TS_ENABLE);
++    } else if (any_radio_configured) {
++        LOG(DEBUG) << "Skipping TS trigger on Multi-AP Policy Request: "
++                      "policy unchanged and already applied";
+     }
+ 
+     return;
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index f45627bf4..ff4e130b9 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include "ap_wlan_hal_whm.h"
+ 
++#include <bpl/bpl_cfg.h>
+ #include <algorithm>
+ #include <bcl/beerocks_defines.h>
+ #include <bcl/beerocks_os_utils.h>
+@@ -505,7 +506,14 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+ 
+             auto freq_name = wbapi_utils::band_short_name(m_radio_info.frequency_band);
+ 
+-            std::string new_vap_name = "vap" + freq_name + std::to_string(new_vap_index++);
++            const std::string type_suffix =
++                son::wireless_utils::vap_type_to_string(bss_info_conf.vap_type);
++            std::string new_vap_name;
++            if (!type_suffix.empty() && type_suffix != "other") {
++                new_vap_name = "vap" + freq_name + type_suffix;
++            } else {
++                new_vap_name = "vap" + freq_name + std::to_string(new_vap_index++);
++            }
+ 
+             std::string radio_name;
+             if (!m_ambiorix_cl.get_param(radio_name, m_radio_path, "Alias")) {
+@@ -541,7 +549,11 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+             LOG(INFO) << "added new instances " << wifi_ssid_path << " " << wifi_vap_path;
+ 
+             args.set_type(AMXC_VAR_ID_HTABLE);
+-            args.add_child("BridgeInterface", bridge_ifname);
++            const std::string effective_bridge =
++                (bss_info_conf.vap_type == eVapType::GUEST)
++                    ? bpl::DEFAULT_GUEST_BRIDGE_IFACE
++                    : bridge_ifname;
++            args.add_child("BridgeInterface", effective_bridge);
+             args.add_child("IEEE80211kEnabled", 1);
+             args.add_child("WDSEnable", 1);
+             if (!m_ambiorix_cl.update_object(wifi_vap_path, args)) {
+-- 
+2.34.1
+
