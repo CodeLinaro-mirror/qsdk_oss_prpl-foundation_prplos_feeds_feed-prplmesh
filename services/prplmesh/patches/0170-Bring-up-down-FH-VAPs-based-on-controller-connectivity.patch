@@ -1,0 +1,501 @@
+From 826704b06bd34b123f43221f57142428f9f8ddde Mon Sep 17 00:00:00 2001
+From: Nirmal Raj S <nirm@qti.qualcomm.com>
+Date: Mon, 25 May 2026 10:39:03 +0530
+Subject: [PATCH] Bring up/down FH VAPs based on controller connectivity
+
+Signed-off-by: Nirmal Raj S <nirm@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 |  28 ++++
+ .../backhaul_manager/backhaul_manager.cpp     |  45 +++++-
+ agent/src/beerocks/slave/son_slave_thread.cpp |  65 ++++++++-
+ agent/src/beerocks/slave/son_slave_thread.h   |   8 ++
+ common/beerocks/bwl/include/bwl/ap_wlan_hal.h |  20 +++
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 130 ++++++++++++++++++
+ .../bwl/nl80211/ap_wlan_hal_nl80211.h         |   4 +
+ .../tlvf/beerocks_message_action.yaml         |   6 +-
+ .../tlvf/beerocks_message_apmanager.yaml      |   4 +
+ .../tlvf/beerocks_message_backhaul.yaml       |   5 +
+ 10 files changed, 303 insertions(+), 12 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index f0d592e95..5b7cf24e6 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -2482,6 +2482,34 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+         }
+         break;
+     }
++#ifdef USE_PRPLMESH_NLHAL
++    case beerocks_message::ACTION_APMANAGER_SET_FH_VAPS_STATE: {
++        LOG(DEBUG) << "Got ACTION_APMANAGER_SET_FH_VAPS_STATE";
++
++        auto request =
++            beerocks_header->addClass<beerocks_message::cACTION_APMANAGER_SET_FH_VAPS_STATE>();
++        if (!request) {
++            LOG(ERROR) << "addClass cACTION_APMANAGER_SET_FH_VAPS_STATE failed";
++            return;
++        }
++
++        bool enable = request->enable() != 0;
++        LOG(DEBUG) << "SET_FH_VAPS_STATE: " << (enable ? "enabling" : "disabling") << " FH VAPs";
++
++        if (enable) {
++            // Re-enable all FH VAPs via hostapd ENABLE command
++            if (!ap_wlan_hal->enable_all_fh_vaps()) {
++                LOG(ERROR) << "SET_FH_VAPS_STATE: enable_all_fh_vaps() failed";
++            }
++        } else {
++            // Disable all FH VAPs via hostapd DISABLE command
++            if (!ap_wlan_hal->disable_all_fh_vaps()) {
++                LOG(ERROR) << "SET_FH_VAPS_STATE: disable_all_fh_vaps() failed";
++            }
++        }
++        break;
++    }
++#endif // USE_PRPLMESH_NLHAL
+     case beerocks_message::ACTION_APMANAGER_MLD_UPDATE_REQUEST: {
+         auto request =
+             beerocks_header->addClass<beerocks_message::cACTION_APMANAGER_MLD_UPDATE_REQUEST>();
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 12eb55471..3778b1321 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -675,7 +675,7 @@ bool BackhaulManager::handle_backhaul_connect()
+         }
+     }
+ 
+-    // Send the message
++    // Send the connected notification
+     send_cmdu(m_agent_fd, cmdu_tx);
+ 
+     return true;
+@@ -1041,9 +1041,22 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+                             // Set flag indicating disconnection due to ethernet detection
+                             radio_info->sta_hal_disconnected_for_eth = true;
+                             LOG(DEBUG) << "Set sta_hal_disconnected_for_eth flag for " << radio_info->sta_iface;
++                        }
++                    }
++
++                    send_slaves_enable();
+ 
+-                            // Enable all AP VAPS in the radio
+-                            send_slaves_enable();
++                    // Wireless to wired switching - enable all FH VAPs after triggering STA disconnection
++                    if (m_agent_fd != beerocks::net::FileDescriptor::invalid_descriptor) {
++                        auto fh_vaps_notif_wireless_to_wired = message_com::create_vs_message<
++                            beerocks_message::cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION>(cmdu_tx);
++                        if (fh_vaps_notif_wireless_to_wired) {
++                            fh_vaps_notif_wireless_to_wired->connected() = 1;
++                            LOG(DEBUG) << "Sending ACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION"
++                                          " (connected=1) during wireless->wired switch";
++                            send_cmdu(m_agent_fd, cmdu_tx);
++                        } else {
++                            LOG(ERROR) << "Failed building cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION";
+                         }
+                     }
+                 } else {
+@@ -1107,6 +1120,20 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+                                 }
+                             }
+                         }
++                        // Wired to wireless switching - disable all FH VAPs after triggering STA reconnection
++                        if (m_agent_fd != beerocks::net::FileDescriptor::invalid_descriptor) {
++                            auto fh_vaps_notif_wired_to_wireless = message_com::create_vs_message<
++                                beerocks_message::cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION>(cmdu_tx);
++                            if (fh_vaps_notif_wired_to_wireless) {
++                                fh_vaps_notif_wired_to_wireless->connected() = 0;
++                                LOG(DEBUG) << "Sending ACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION"
++                                              " (connected=0) during wired->wireless switch";
++                                send_cmdu(m_agent_fd, cmdu_tx);
++                            } else {
++                                LOG(ERROR) << "Failed building cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION";
++                            }
++                        }
++
+                         // Don't restart FSM, stay in current state to allow reconnection
+                         break;
+                     }
+@@ -2718,8 +2745,10 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+             auto bsta_notif = message_com::create_vs_message<
+                 beerocks_message::cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION>(cmdu_tx);
+             if (bsta_notif) {
+-                bsta_notif->connected() = 1;
+-                LOG(DEBUG) << "Sending ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION (connected)";
++                bsta_notif->connected()       = 1;
++                bsta_notif->backhaul_switch() = m_backhaul_switch ? 1 : 0;
++                LOG(DEBUG) << "Sending ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION (connected)"
++                           << ", backhaul_switch=" << int(bsta_notif->backhaul_switch());
+                 send_cmdu(m_agent_fd, cmdu_tx);
+             } else {
+                 LOG(ERROR) << "Failed sending ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION";
+@@ -2836,8 +2865,10 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+                 auto bsta_notif = message_com::create_vs_message<
+                     beerocks_message::cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION>(cmdu_tx);
+                 if (bsta_notif) {
+-                    bsta_notif->connected() = 0;
+-                    LOG(DEBUG) << "Sending ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION (disconnected)";
++                    bsta_notif->connected()       = 0;
++                    bsta_notif->backhaul_switch() = m_backhaul_switch ? 1 : 0;
++                    LOG(DEBUG) << "Sending ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION (disconnected)"
++                               << ", backhaul_switch=" << int(bsta_notif->backhaul_switch());
+                     send_cmdu(m_agent_fd, cmdu_tx);
+                 } else {
+                     LOG(ERROR) << "Failed sending ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION";
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 2a7823a1e..4a094c41e 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -2413,10 +2413,11 @@ bool slave_thread::handle_cmdu_backhaul_manager_message(
+             return false;
+         }
+ 
+-        m_backhaul_l2_connected = notification_in->connected() != 0;
++        m_backhaul_l2_connected  = notification_in->connected() != 0;
++        bool backhaul_switch     = notification_in->backhaul_switch() != 0;
+         LOG(ERROR) << "Received ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION connected="
+-                   << int(m_backhaul_l2_connected) << ", current m_controller_reachable="
+-                   << int(m_controller_reachable);
++                   << int(m_backhaul_l2_connected) << ", backhaul_switch=" << int(backhaul_switch)
++                   << ", current m_controller_reachable=" << int(m_controller_reachable);
+ 
+         if (!m_backhaul_l2_connected) {
+             LOG(ERROR) << "L2 disconnected, forcing m_controller_reachable to false";
+@@ -2424,6 +2425,27 @@ bool slave_thread::handle_cmdu_backhaul_manager_message(
+         }
+ 
+         update_bsta_state_to_ap_managers();
++
++        // During a backhaul switch (wired<->wireless), FH VAP toggling is handled separately
++        // via ACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION. Only call send_fh_vap_state_to_ap_managers
++        // for normal (non-switch) bSTA connect/disconnect events.
++        if (!backhaul_switch) {
++            send_fh_vap_state_to_ap_managers(m_backhaul_l2_connected);
++        }
++        break;
++    }
++    case beerocks_message::ACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION: {
++        auto notification_in = beerocks_header->addClass<
++            beerocks_message::cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION>();
++        if (!notification_in) {
++            LOG(ERROR) << "addClass cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION failed";
++            return false;
++        }
++
++        bool connected = notification_in->connected() != 0;
++        LOG(DEBUG) << "Received ACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION connected="
++                   << int(connected);
++        send_fh_vap_state_to_ap_managers(connected);
+         break;
+     }
+     default: {
+@@ -5364,6 +5386,12 @@ void slave_thread::notify_controller_reachability(bool reachable)
+                << ", current m_controller_reachable=" << int(m_controller_reachable)
+                << ", current m_backhaul_l2_connected=" << int(m_backhaul_l2_connected);
+ 
++    // Send FH VAP state to all AP managers based on controller reachability.
++    // Disable when controller is not reachable, enable when it becomes reachable.
++    LOG(DEBUG) << "Controller reachability changed - sending FH VAP "
++               << (reachable ? "enable" : "disable") << " to all AP managers";
++    send_fh_vap_state_to_ap_managers(reachable);
++
+     if (m_controller_reachable == reachable) {
+         LOG(ERROR) << "Reachability hasn't changed. Returning early.";
+         return;
+@@ -5412,6 +5440,37 @@ void slave_thread::update_bsta_state_to_ap_managers()
+         });
+ }
+ 
++void slave_thread::send_fh_vap_state_to_ap_managers(bool enable)
++{
++#ifdef USE_PRPLMESH_NLHAL
++    LOG(DEBUG) << "send_fh_vap_state_to_ap_managers: "
++               << (enable ? "enabling" : "disabling") << " FH VAPs on all radios";
++
++    m_radio_managers.do_on_each_radio_manager(
++        [&](sManagedRadio &radio_manager, const std::string &fronthaul_iface) {
++            if (radio_manager.ap_manager_fd == beerocks::net::FileDescriptor::invalid_descriptor) {
++                LOG(DEBUG) << "send_fh_vap_state_to_ap_managers: skipping " << fronthaul_iface
++                           << " - AP manager not connected";
++                return true;
++            }
++
++            auto request_out = message_com::create_vs_message<
++                beerocks_message::cACTION_APMANAGER_SET_FH_VAPS_STATE>(cmdu_tx);
++            if (!request_out) {
++                LOG(ERROR) << "Failed building cACTION_APMANAGER_SET_FH_VAPS_STATE for "
++                           << fronthaul_iface;
++                return true;
++            }
++
++            request_out->enable() = enable ? 1 : 0;
++            LOG(DEBUG) << "send_fh_vap_state_to_ap_managers: sending SET_FH_VAPS_STATE("
++                       << (enable ? "enable" : "disable") << ") to " << fronthaul_iface;
++            send_cmdu(radio_manager.ap_manager_fd, cmdu_tx);
++            return true;
++        });
++#endif
++}
++
+ bool slave_thread::send_cmdu_to_controller(const std::string &fronthaul_iface,
+                                            ieee1905_1::CmduMessageTx &cmdu_tx)
+ {
+diff --git a/agent/src/beerocks/slave/son_slave_thread.h b/agent/src/beerocks/slave/son_slave_thread.h
+index 16fe74b10..dc0eefe52 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.h
++++ b/agent/src/beerocks/slave/son_slave_thread.h
+@@ -563,6 +563,14 @@ private:
+      */
+     void update_bsta_state_to_ap_managers();
+ 
++    /**
++     * @brief Sends a SET_FH_VAPS_STATE request to all AP managers to enable or disable FH VAPs.
++     * Called when controller reachability changes or when the backhaul L2 link is lost.
++     *
++     * @param enable true to enable FH VAPs, false to disable them.
++     */
++    void send_fh_vap_state_to_ap_managers(bool enable);
++
+     bool read_platform_configuration();
+ 
+     /**
+diff --git a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+index 8a2de2b2a..e82d4b880 100644
+--- a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+@@ -660,6 +660,26 @@ public:
+      */
+     virtual bool set_hop_count(uint8_t hop_count) { return true; }
+ 
++    /**
++     * @brief Enable all fronthaul VAPs on this radio.
++     *
++     * Sends the hostapd ENABLE command to each fronthaul BSS so that
++     * clients can associate again after a backhaul/controller outage.
++     *
++     * @return true on success, false otherwise.
++     */
++    virtual bool enable_all_fh_vaps() { return true; }
++
++    /**
++     * @brief Disable all fronthaul VAPs on this radio.
++     *
++     * Sends the hostapd DISABLE command to each fronthaul BSS to prevent
++     * clients from associating when the backhaul/controller is not reachable.
++     *
++     * @return true on success, false otherwise.
++     */
++    virtual bool disable_all_fh_vaps() { return true; }
++
+ private:
+     static const int frame_body_idx = (sizeof(s80211MgmtFrame::sHeader) * 2);
+ 
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 43bc6afe9..c0ec4e38b 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -4073,6 +4073,136 @@ void ap_wlan_hal_nl80211::set_sta_enable(bool enable)
+     m_radio_info.sta_enabled = enable;
+ }
+ 
++bool ap_wlan_hal_nl80211::enable_all_fh_vaps()
++{
++    LOG(DEBUG) << "enable_all_fh_vaps: enabling all fronthaul VAPs on radio " << get_iface_name();
++
++    bool success = true;
++    bool is_6g   = (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_6G);
++
++    for (const auto &vap_entry : m_radio_info.available_vaps) {
++        const auto &vap = vap_entry.second;
++        if (vap.bss.empty()) {
++            continue;
++        }
++        if (!vap.fronthaul) {
++            continue;
++        }
++
++        // Extract link_id from the VAP interface name to determine if this is an MLO link
++        int link_id = -1;
++        extractLinkId(vap.bss, link_id);
++
++        LOG(DEBUG) << "enable_all_fh_vaps: FH VAP " << vap.bss << " link_id=" << link_id
++                   << " is_6g=" << is_6g;
++
++        if (link_id >= 0) {
++            // MLO link: check operational status before sending commands
++            bool link_operational = m_nl80211_client->check_link_id_operational(vap.bss, link_id);
++            LOG(DEBUG) << "enable_all_fh_vaps: Link " << link_id
++                       << " operational status: " << (link_operational ? "true" : "false");
++
++            if (link_operational) {
++                // Link is already operational, no need to reload
++                LOG(DEBUG) << "enable_all_fh_vaps: link " << link_id
++                           << " already operational on " << vap.bss << ", skipping";
++            } else {
++                // For 6G radio: send STOP_AP before RELOAD
++                if (is_6g) {
++                    LOG(DEBUG) << "enable_all_fh_vaps: 6G radio - sending STOP_AP to FH VAP "
++                               << vap.bss;
++                    if (!wpa_ctrl_send_msg("STOP_AP", vap.bss)) {
++                        LOG(ERROR) << "enable_all_fh_vaps: STOP_AP command failed for FH VAP "
++                                   << vap.bss;
++                        success = false;
++                        continue;
++                    }
++                }
++                LOG(DEBUG) << "enable_all_fh_vaps: sending RELOAD to FH VAP " << vap.bss;
++                if (!wpa_ctrl_send_msg("RELOAD", vap.bss)) {
++                    LOG(ERROR) << "enable_all_fh_vaps: RELOAD command failed for FH VAP "
++                               << vap.bss;
++                    success = false;
++                }
++            }
++        } else {
++
++            if (beerocks::net::network_utils::linux_iface_is_up_and_running(vap.bss)) {
++                // interface is already operational, no need to reload
++                LOG(DEBUG) << "enable_all_fh_vaps: link " << " already operational on " << vap.bss << ", skipping";
++            } else {
++                // Non-MLO VAP: for 6G radio send STOP_AP before RELOAD
++                if (is_6g) {
++                    LOG(DEBUG) << "enable_all_fh_vaps: 6G radio - sending STOP_AP to FH VAP "
++                               << vap.bss;
++                    if (!wpa_ctrl_send_msg("STOP_AP", vap.bss)) {
++                        LOG(ERROR) << "enable_all_fh_vaps: STOP_AP command failed for FH VAP "
++                                   << vap.bss;
++                        success = false;
++                        continue;
++                    }
++                }
++                LOG(DEBUG) << "enable_all_fh_vaps: sending RELOAD to FH VAP " << vap.bss;
++                if (!wpa_ctrl_send_msg("RELOAD", vap.bss)) {
++                    LOG(ERROR) << "enable_all_fh_vaps: RELOAD command failed for FH VAP " << vap.bss;
++                    success = false;
++                }
++            }
++        }
++    }
++    return success;
++}
++
++bool ap_wlan_hal_nl80211::disable_all_fh_vaps()
++{
++    LOG(DEBUG) << "disable_all_fh_vaps: disabling all fronthaul VAPs on radio " << get_iface_name();
++
++    bool success = true;
++
++    for (const auto &vap_entry : m_radio_info.available_vaps) {
++        const auto &vap = vap_entry.second;
++        if (vap.bss.empty()) {
++            continue;
++        }
++        if (!vap.fronthaul) {
++            continue;
++        }
++
++        // Extract link_id from the VAP interface name to determine if this is an MLO link
++        int link_id = -1;
++        extractLinkId(vap.bss, link_id);
++
++        LOG(DEBUG) << "disable_all_fh_vaps: FH VAP " << vap.bss << " link_id=" << link_id;
++
++        if (link_id >= 0) {
++            // MLO link: check operational status before sending STOP_AP
++            bool link_operational = m_nl80211_client->check_link_id_operational(vap.bss, link_id);
++            LOG(DEBUG) << "disable_all_fh_vaps: Link " << link_id
++                       << " operational status: " << (link_operational ? "true" : "false");
++
++            if (link_operational) {
++                LOG(DEBUG) << "disable_all_fh_vaps: sending STOP_AP to FH VAP " << vap.bss;
++                if (!wpa_ctrl_send_msg("STOP_AP", vap.bss)) {
++                    LOG(ERROR) << "disable_all_fh_vaps: STOP_AP command failed for FH VAP "
++                               << vap.bss;
++                    success = false;
++                }
++            } else {
++                LOG(DEBUG) << "disable_all_fh_vaps: link " << link_id
++                           << " not operational on " << vap.bss << ", skipping STOP_AP";
++            }
++        } else {
++            // Non-MLO VAP: send STOP_AP
++            LOG(DEBUG) << "disable_all_fh_vaps: sending STOP_AP to FH VAP " << vap.bss;
++            if (!wpa_ctrl_send_msg("STOP_AP", vap.bss)) {
++                LOG(ERROR) << "disable_all_fh_vaps: STOP_AP command failed for FH VAP " << vap.bss;
++                success = false;
++            }
++        }
++    }
++    return success;
++}
++
+ bool ap_wlan_hal_nl80211::handle_mld_reconfig(std::string target_ssid, int8_t mld_unit)
+ {
+     std::string mld_iface;
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+index 0fb79e6f1..3cd303c8e 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+@@ -135,6 +135,10 @@ public:
+ 
+     virtual bool reload_all_ap_vaps() override;
+ 
++    virtual bool enable_all_fh_vaps() override;
++
++    virtual bool disable_all_fh_vaps() override;
++
+     bool add_mld_link(std::string &new_iface,std::string &prev_iface,son::wireless_utils::sBssInfoConf &bss_conf,
+                                        std::string bridge);
+ 
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
+index 1cf08d780..392de078f 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
+@@ -153,8 +153,9 @@ eActionOp_BACKHAUL:
+   ACTION_BACKHAUL_MLD_UPDATE_REQUEST: 85
+   ACTION_BACKHAUL_TOPOLOGY_NOTIFICATION_COMMAND: 86
+   ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION: 87
++  ACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION: 88
+ 
+-  ACTION_BACKHAUL_ENUM_END: 88
++  ACTION_BACKHAUL_ENUM_END: 89
+ 
+ ####################################################
+ ####################################################
+@@ -271,8 +272,9 @@ eActionOp_APMANAGER:
+   ACTION_APMANAGER_CHANGE_MODULE_LOGGING_LEVEL: 78
+   ACTION_APMANAGER_BSTA_STATE_NOTIFICATION: 79
+   ACTION_APMANAGER_VAP_DB_UPDATE_NOTIFICATION: 80
++  ACTION_APMANAGER_SET_FH_VAPS_STATE: 81
+ 
+-  ACTION_APMANAGER_ENUM_END: 81
++  ACTION_APMANAGER_ENUM_END: 82
+ 
+ ####################################################
+ ####################################################
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+index 9c7877776..bd72bb924 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+@@ -373,3 +373,7 @@ cACTION_APMANAGER_BSTA_STATE_NOTIFICATION:
+ 
+ cACTION_APMANAGER_VAP_DB_UPDATE_NOTIFICATION:
+   _type: class
++
++cACTION_APMANAGER_SET_FH_VAPS_STATE:
++  _type: class
++  enable: uint8_t  # 1 = enable FH VAPs, 0 = disable FH VAPs
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
+index e73e6ec05..91feadea2 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
+@@ -245,3 +245,8 @@ cACTION_BACKHAUL_CHANNEL_SCAN_FINISHED_NOTIFICATION:
+ cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION:
+   _type: class
+   connected: uint8_t  # 1 = bSTA connected, 0 = bSTA disconnected
++  backhaul_switch: uint8_t  # 1 = backhaul switch in progress, 0 = normal connection/disconnection
++
++cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION:
++  _type: class
++  connected: uint8_t  # 1 = backhaul connected (enable FH VAPs), 0 = backhaul disconnected (disable FH VAPs)
+-- 
+2.34.1
+
