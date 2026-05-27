@@ -53,7 +53,9 @@ define Package/prplmesh
 		+ubus \
 		+ubox \
 		+ebtables \
-        +libpcap
+        +libpcap \
+		+libmosquitto \
+		+mosquitto
 #	intel_mips and intel_x86 specific dependencies:
 	DEPENDS+= \
 		+TARGET_intel_mips:dwpal_6x-uci \
