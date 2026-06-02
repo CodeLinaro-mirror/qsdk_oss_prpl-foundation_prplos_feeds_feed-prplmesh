@@ -1,0 +1,878 @@
+From aa1d90b997c3b7b39035b3d28d0b60a0c10cc0ee Mon Sep 17 00:00:00 2001
+From: Aryan Khare <aryakhar@qti.qualcomm.com>
+Date: Tue, 2 Jun 2026 21:33:48 +0530
+Subject: [PATCH] Unassociated STA Link Metrics - WHM implementation
+
+RCPI Query and Response implementation for prplOS platform
+
+Signed-off-by: Aryan Khare <aryakhar@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/son_slave_thread.cpp |  33 +-
+ .../tasks/link_metrics_collection_task.cpp    |   8 +-
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   | 202 +++++++++-
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.h     |  18 +
+ common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp  | 363 ++++++++++++++----
+ common/beerocks/bwl/whm/mon_wlan_hal_whm.h    |   7 +
+ .../src/beerocks/cli/beerocks_cli_bml.cpp     |   2 +
+ .../master/tasks/link_metrics_task.cpp        |  64 ++-
+ 8 files changed, 618 insertions(+), 79 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index c2e43992a..f49bc0d83 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -4207,8 +4207,31 @@ bool slave_thread::handle_cmdu_monitor_message(const std::string &fronthaul_ifac
+ 
+             stations_stats one_station_stats;
+             one_station_stats.channel_number = station_in.channel;
+-            // signal_strength is already in RCPI format
+-            one_station_stats.uplink_rcpi_dbm_enc = station_in.signal_strength;
++            if (station_in.signal_strength == 0) {
++                // WHM NaStaMonitor reports SignalStrength=0 when measurement is still not ready
++                // or when the STA is not visible on the requested channel. Do not convert this
++                // value with convert_rcpi_from_rssi(), since that would produce a fake valid RCPI.
++                one_station_stats.uplink_rcpi_dbm_enc = 0;
++            } else {
++                // WHM returns SignalStrength in dBm (e.g. -24).
++                // Convert RSSI (dBm) → RCPI using the standard formula: RCPI = 2*(RSSI+110).
++                // Then verify the round-trip by decoding RCPI back to RSSI.
++                // The RCPI value is stored as uint8_t in the TLV field.
++                // Note: RCPI values > 127 (e.g. 172 for -24 dBm) will appear negative in
++                // Wireshark because its dissector reads the field as signed int8.
++                // This is a Wireshark display issue; the wire value is correct per spec.
++                int8_t rssi_dbm = static_cast<int8_t>(station_in.signal_strength);
++                uint8_t rcpi    = son::wireless_utils::convert_rcpi_from_rssi(rssi_dbm);
++                int8_t decoded_rssi = son::wireless_utils::convert_rssi_from_rcpi(rcpi);
++                one_station_stats.uplink_rcpi_dbm_enc = rcpi;
++
++                LOG(DEBUG) << "Unassoc STA metrics WHM encoding:"
++                           << " sta=" << station_in.sta_mac
++                           << " rssi_dBm=" << int(rssi_dbm)
++                           << " rcpi_uint8=" << int(rcpi)
++                           << " decoded_rssi_dBm=" << int(decoded_rssi)
++                           << " wireshark_signed_display=" << int(static_cast<int8_t>(rcpi));
++            }
+             one_station_stats.sta_mac = station_in.sta_mac;
+             one_station_stats.measurement_to_report_delta_msec =
+                 (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+@@ -4216,6 +4239,12 @@ bool slave_thread::handle_cmdu_monitor_message(const std::string &fronthaul_ifac
+                     std::chrono::milliseconds(station_in.time_stamp))
+                     .count();
+ 
++            LOG(DEBUG) << "Unassoc STA metrics summary: sta=" << station_in.sta_mac
++                       << " channel=" << int(station_in.channel)
++                       << " opclass=" << int(station_in.operating_class)
++                       << " raw_signal_strength_dBm=" << station_in.signal_strength
++                       << " uplink_rcpi_dbm_enc=" << int(one_station_stats.uplink_rcpi_dbm_enc);
++
+             map_stations_per_operating_class[station_in.operating_class].push_back(
+                 one_station_stats);
+         }
+diff --git a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+index b6b2dad82..e7fb0b585 100644
+--- a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+@@ -856,8 +856,14 @@ void LinkMetricsCollectionTask::handle_unassociated_sta_link_metrics_query(
+                             << " Station with mac_addr: " << tlvf::mac_to_string(un_station_mac)
+                             << " is already connected to the radio with mac_addr: "
+                             << tlvf::mac_to_string(radio->front.iface_mac)
+-                            << " --> it will not get monitored as non_associated station!";
++                            << " --> adding it to the WHM monitor request anyway";
+                     }
++
++                    // For the WHM NaStaMonitor flow, still forward the STA to the monitor request
++                    // even if the STA is associated on one of the BSSes of the same radio. In this
++                    // deployment the measurement is expected to be taken via the repeater-side AP
++                    // data model path, and filtering it here causes the request to be dropped
++                    // entirely, resulting in total_stations=0 and no response at all.
+                     map_stations_per_channel[channel].emplace_back(un_station_mac);
+                 }
+             }
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index ff4e130b9..ab647ebc1 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -2223,13 +2223,211 @@ bool ap_wlan_hal_whm::send_delba(const std::string &ifname, const sMacAddr &dst,
+ void ap_wlan_hal_whm::send_unassoc_sta_link_metric_query(
+     std::shared_ptr<wfa_map::tlvUnassociatedStaLinkMetricsQuery> &query)
+ {
++    if (!query) {
++        LOG(ERROR) << "send_unassoc_sta_link_metric_query: null query TLV";
++        return;
++    }
++
++    std::string nasta_monitor_path = m_radio_path + "NaStaMonitor";
++    uint8_t operating_class        = query->operating_class_of_channel_list();
++
++    LOG(DEBUG) << "send_unassoc_sta_link_metric_query: radio=" << m_radio_path
++               << " opclass=" << int(operating_class)
++               << " channels=" << int(query->channel_list_length());
++    LOG(DEBUG) << "UNASSOC_QUERY: nasta_monitor_path=" << nasta_monitor_path
++              << " radio_iface=" << m_radio_info.iface_name
++              << " opclass=" << int(operating_class)
++              << " num_channels=" << int(query->channel_list_length());
++
++    for (size_t i = 0; i < query->channel_list_length(); i++) {
++        auto ch_tuple = query->channel_list(i);
++        if (!std::get<0>(ch_tuple)) {
++            LOG(ERROR) << "channel_list(" << i << ") access failed";
++            continue;
++        }
++        auto &ch     = std::get<1>(ch_tuple);
++        uint8_t chan = ch.channel_number();
++
++        for (size_t j = 0; j < ch.sta_list_length(); j++) {
++            auto sta_tuple = ch.sta_list(j);
++            if (!std::get<0>(sta_tuple)) {
++                LOG(ERROR) << "sta_list(" << j << ") access failed";
++                continue;
++            }
++            std::string mac = tlvf::mac_to_string(std::get<1>(sta_tuple));
++
++            LOG(INFO) << "UNASSOC_QUERY: Adding STA=" << mac << " channel=" << int(chan)
++                      << " to NaStaMonitor path=" << nasta_monitor_path
++                      << " on radio_iface=" << m_radio_info.iface_name
++                      << " radio_path=" << m_radio_path;
++
++            AmbiorixVariant args(AMXC_VAR_ID_HTABLE), result;
++            args.add_child("macaddress", mac);
++            args.add_child("channel", chan);
++
++            if (!m_ambiorix_cl.call(nasta_monitor_path, "createNonAssociatedDevice", args,
++                                    result)) {
++                LOG(ERROR) << "createNonAssociatedDevice FAILED for STA=" << mac
++                           << " channel=" << int(chan)
++                           << " on radio=" << m_radio_info.iface_name;
++                continue;
++            }
++            LOG(INFO) << "createNonAssociatedDevice OK: STA=" << mac
++                      << " channel=" << int(chan)
++                      << " on radio=" << m_radio_info.iface_name
++                      << " radio_path=" << m_radio_path;
++
++            m_pending_unassoc_measurements[mac] = {chan, operating_class,
++                                                    std::chrono::steady_clock::now()};
++        }
++    }
++
++    if (!m_pending_unassoc_measurements.empty()) {
++        // Trigger the driver to update RSSI stats for all monitored STAs
++        AmbiorixVariant stats_args, stats_result;
++        LOG(INFO) << "UNASSOC_QUERY: calling getNaStationStats on " << nasta_monitor_path
++                  << " for " << m_pending_unassoc_measurements.size() << " pending STA(s)";
++        if (!m_ambiorix_cl.call(nasta_monitor_path, "getNaStationStats", stats_args,
++                                stats_result)) {
++            LOG(WARNING) << "getNaStationStats call FAILED (stats may be stale)";
++        } else {
++            LOG(INFO) << "getNaStationStats OK - driver will measure RSSI for "
++                      << m_pending_unassoc_measurements.size() << " STA(s)";
++        }
++    }
+ }
+ 
+ bool ap_wlan_hal_whm::prepare_unassoc_sta_link_metrics_response(
+     std::shared_ptr<wfa_map::tlvUnassociatedStaLinkMetricsResponse> &response)
+ {
+-    //LOG(TRACE) << __func__ << " - NOT IMPLEMENTED!";
+-    return false;
++    if (m_pending_unassoc_measurements.empty()) {
++        LOG(DEBUG) << "prepare_unassoc_sta_link_metrics_response: no pending measurements";
++        return false;
++    }
++
++    std::string nasta_monitor_path  = m_radio_path + "NaStaMonitor";
++    std::string non_assoc_dev_path  = m_radio_path + "NaStaMonitor.NonAssociatedDevice.";
++    auto now                        = std::chrono::steady_clock::now();
++
++    LOG(DEBUG) << "UNASSOC_RESPONSE: preparing response for "
++              << m_pending_unassoc_measurements.size() << " pending STA(s)"
++              << " nasta_path=" << nasta_monitor_path
++              << " non_assoc_dev_path=" << non_assoc_dev_path;
++
++    // Re-trigger stats refresh to get the latest RSSI measurements from the driver
++    // before reading the data model. This is critical because the driver may not have
++    // updated SignalStrength yet since the query was sent.
++    {
++        AmbiorixVariant refresh_args, refresh_result;
++        LOG(INFO) << "UNASSOC_RESPONSE: calling getNaStationStats to refresh RSSI data";
++        if (!m_ambiorix_cl.call(nasta_monitor_path, "getNaStationStats", refresh_args,
++                                refresh_result)) {
++            LOG(WARNING) << "UNASSOC_RESPONSE: getNaStationStats refresh FAILED"
++                         << " - SignalStrength values may be stale or zero";
++        } else {
++            LOG(INFO) << "UNASSOC_RESPONSE: getNaStationStats refresh OK";
++        }
++    }
++
++    // Set operating class from the first pending entry
++    response->operating_class_of_channel_list() =
++        m_pending_unassoc_measurements.begin()->second.operating_class;
++
++    // Read all NonAssociatedDevice instances from the data model
++    auto non_ass_devices =
++        m_ambiorix_cl.get_object_multi<AmbiorixVariantMapSmartPtr>(non_assoc_dev_path);
++
++    if (non_ass_devices) {
++        LOG(INFO) << "UNASSOC_RESPONSE: found " << non_ass_devices->size()
++                  << " NonAssociatedDevice entries in data model";
++        for (auto &dev : *non_ass_devices) {
++            std::string mac;
++            dev.second.read_child(mac, "MACAddress");
++            if (mac.empty()) {
++                LOG(WARNING) << "UNASSOC_RESPONSE: skipping device with empty MACAddress";
++                continue;
++            }
++
++            auto it = m_pending_unassoc_measurements.find(mac);
++            if (it == m_pending_unassoc_measurements.end()) {
++                LOG(DEBUG) << "UNASSOC_RESPONSE: STA=" << mac << " not in pending list, skipping";
++                continue;
++            }
++
++            int32_t signal_strength = 0;
++            bool ss_read_ok = dev.second.read_child(signal_strength, "SignalStrength");
++
++            LOG(INFO) << "UNASSOC_RSSI_RAW: STA=" << mac
++                      << " channel=" << int(it->second.channel)
++                      << " opclass=" << int(it->second.operating_class)
++                      << " SignalStrength_read_ok=" << ss_read_ok
++                      << " raw_signal_strength=" << signal_strength;
++
++            if (!ss_read_ok) {
++                LOG(WARNING) << "UNASSOC_RSSI_RAW: read_child(SignalStrength) FAILED for STA="
++                             << mac << " - value defaults to 0";
++            }
++            if (signal_strength == 0) {
++                LOG(WARNING) << "UNASSOC_RSSI_RAW: STA=" << mac
++                             << " SignalStrength=0 - driver may not have measured RSSI yet"
++                             << " (STA not visible on channel " << int(it->second.channel)
++                             << " or measurement pending)";
++            }
++
++            // SignalStrength is RSSI in dBm (negative value); convert to RCPI
++            // RCPI = 2 * (RSSI + 110), clamped to [0, 220]
++            // Note: signal_strength=0 means no measurement → rssi=0 → rcpi=220 (max)
++            //       which is incorrect; the driver should return a negative dBm value.
++            int8_t rssi  = static_cast<int8_t>(signal_strength);
++            uint8_t rcpi = (rssi >= 0) ? 220 : (rssi < -110) ? 0
++                                                               : static_cast<uint8_t>(2 * (rssi + 110));
++
++            uint32_t delta_ms = static_cast<uint32_t>(
++                std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.start_time)
++                    .count());
++
++            LOG(INFO) << "UNASSOC_RCPI_CALC: STA=" << mac
++                      << " channel=" << int(it->second.channel)
++                      << " opclass=" << int(it->second.operating_class)
++                      << " raw_signal_strength=" << signal_strength
++                      << " rssi_dBm=" << int(rssi)
++                      << " rcpi=" << int(rcpi)
++                      << " uplink_rcpi_dbm_enc=" << int(rcpi)
++                      << " delta_ms=" << delta_ms;
++
++            if (!response->alloc_sta_list(1)) {
++                LOG(ERROR) << "alloc_sta_list failed for STA " << mac;
++                continue;
++            }
++
++            uint8_t idx      = response->sta_list_length() - 1;
++            auto sta_tuple   = response->sta_list(idx);
++            if (!std::get<0>(sta_tuple)) {
++                LOG(ERROR) << "sta_list(" << int(idx) << ") access failed";
++                continue;
++            }
++            auto &sta                            = std::get<1>(sta_tuple);
++            sta.sta_mac                          = tlvf::mac_from_string(mac);
++            sta.channel_number                   = it->second.channel;
++            sta.uplink_rcpi_dbm_enc              = rcpi;
++            sta.measurement_to_report_delta_msec = delta_ms;
++        }
++    } else {
++        LOG(WARNING) << "Failed to read NonAssociatedDevice objects from " << non_assoc_dev_path;
++    }
++
++    // Cleanup: remove all pending STAs from NaStaMonitor
++    for (auto &entry : m_pending_unassoc_measurements) {
++        AmbiorixVariant del_args(AMXC_VAR_ID_HTABLE), del_result;
++        del_args.add_child("macaddress", entry.first);
++        if (!m_ambiorix_cl.call(nasta_monitor_path, "deleteNonAssociatedDevice", del_args,
++                                del_result)) {
++            LOG(WARNING) << "deleteNonAssociatedDevice failed for STA " << entry.first;
++        }
++    }
++    m_pending_unassoc_measurements.clear();
++
++    return true;
+ }
+ 
+ bool ap_wlan_hal_whm::set_beacon_da(const std::string &ifname, const sMacAddr &mac)
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
+index 0cd237429..b6728d89a 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
+@@ -12,6 +12,10 @@
+ #include "base_wlan_hal_whm.h"
+ #include <bwl/ap_wlan_hal.h>
+ 
++#include <chrono>
++#include <map>
++#include <string>
++
+ namespace bwl {
+ namespace whm {
+ 
+@@ -180,6 +184,20 @@ protected:
+     virtual bool set(const std::string &param, const std::string &value, int vap_id) override;
+ 
+ private:
++    /**
++     * @brief Pending unassociated STA measurement entry.
++     * Populated by send_unassoc_sta_link_metric_query(),
++     * consumed by prepare_unassoc_sta_link_metrics_response().
++     */
++    struct sPendingUnassocMeasurement {
++        uint8_t channel;
++        uint8_t operating_class;
++        std::chrono::steady_clock::time_point start_time;
++    };
++
++    /** MAC address → pending measurement parameters */
++    std::map<std::string, sPendingUnassocMeasurement> m_pending_unassoc_measurements;
++
+     /**
+      * @brief MLO client association information
+      */
+diff --git a/common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp
+index dcd825862..1f42ce3a8 100644
+--- a/common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp
+@@ -18,6 +18,8 @@
+ 
+ #include <cmath>
+ #include <iomanip>
++#include <unordered_set>
++#include <unistd.h>
+ using namespace beerocks;
+ using namespace wbapi;
+ 
+@@ -191,6 +193,13 @@ mon_wlan_hal_whm::mon_wlan_hal_whm(const std::string &iface_name, hal_event_cb_t
+     : base_wlan_hal(bwl::HALType::Monitor, iface_name, IfaceType::Intel, callback, hal_conf),
+       base_wlan_hal_whm(bwl::HALType::Monitor, iface_name, callback, hal_conf)
+ {
++    // Connect the ubus backend client for NaStaMonitor operations.
++    // The main m_ambiorix_cl uses the USP backend which only accesses Device.WiFi.* namespace.
++    // NaStaMonitor functions (createNonAssociatedDevice, getNaStationStats, etc.) and
++    // AssociatedDevice data are only accessible in the WiFi.* namespace via the ubus backend.
++    LOG_IF(!m_ubus_cl.connect(AMBIORIX_WBAPI_BACKEND_PATH, AMBIORIX_WBAPI_BUS_URI), ERROR)
++        << "Failed to connect ubus backend client for NaStaMonitor operations on " << iface_name;
++
+     subscribe_to_ap_events();
+     subscribe_to_sta_events();
+     subscribe_to_scan_complete_events();
+@@ -1009,104 +1018,312 @@ bool mon_wlan_hal_whm::sta_unassoc_rssi_measurement(
+ 
+     std::vector<sUnassociatedStationStats> stats;
+ 
++    // NaStaMonitor functions (createNonAssociatedDevice, getNaStationStats, etc.) and the
++    // SignalStrength data are only available in the "WiFi." namespace (without "Device." prefix).
++    // m_radio_path is in the "Device.WiFi." namespace (e.g., "Device.WiFi.Radio.2.").
++    // Strip the "Device." prefix to get the correct path (e.g., "WiFi.Radio.2.").
++    std::string wifi_radio_path = m_radio_path;
++    {
++        const std::string device_prefix = "Device.";
++        if (wifi_radio_path.rfind(device_prefix, 0) == 0) {
++            wifi_radio_path.erase(0, device_prefix.length());
++        }
++    }
++    LOG(DEBUG) << "MON_UNASSOC: using WiFi namespace path: " << wifi_radio_path;
++
++    std::string nasta_monitor_path = wifi_radio_path + "NaStaMonitor";
++    std::unordered_set<std::string> requested_station_macs;
+     std::list<std::string> amx_un_stations_to_be_removed;
+ 
+-    std::string non_associated_device_path = m_radio_path + "NaStaMonitor.NonAssociatedDevice.";
++    for (const auto &new_station : new_list) {
++        requested_station_macs.insert(new_station.first);
++    }
++
++    // Read currently monitored stations first so we can:
++    // 1. keep requested entries alive in the data model,
++    // 2. avoid recreating an existing entry,
++    // 3. remove stale entries that are no longer requested.
++    {
++        AmbiorixVariant args, result;
++        if (!m_ubus_cl.call(nasta_monitor_path, "getNaStationStats", args, result)) {
++            LOG(ERROR) << "MON_UNASSOC: initial getNaStationStats failed for object "
++                       << nasta_monitor_path;
++        } else {
++            auto outer_list = result.read_children<AmbiorixVariantListSmartPtr>();
++            if (outer_list && !outer_list->empty()) {
++                auto inner_list = outer_list->front().read_children<AmbiorixVariantListSmartPtr>();
++                if (inner_list) {
++                    for (auto &item : *inner_list) {
++                        auto data_map = item.read_children<AmbiorixVariantMapSmartPtr>();
++                        if (!data_map) {
++                            continue;
++                        }
++
++                        std::string mac_address_amx;
++                        if (data_map->find("MACAddress") != data_map->end()) {
++                            (*data_map)["MACAddress"].get(mac_address_amx);
++                        }
++                        if (mac_address_amx.empty()) {
++                            continue;
++                        }
++
++                        if (requested_station_macs.find(mac_address_amx) ==
++                            requested_station_macs.end()) {
++                            amx_un_stations_to_be_removed.push_back(mac_address_amx);
++                            LOG(INFO) << "MON_UNASSOC: scheduling stale NaStaMonitor entry removal for STA="
++                                      << mac_address_amx << " path=" << nasta_monitor_path;
++                        } else {
++                            LOG(INFO) << "MON_UNASSOC: keeping existing NaStaMonitor entry for STA="
++                                      << mac_address_amx << " path=" << nasta_monitor_path;
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    // Remove stations that are no longer requested on this radio.
++    for (auto &station_to_remove : amx_un_stations_to_be_removed) {
++        AmbiorixVariant result;
++        AmbiorixVariant args(AMXC_VAR_ID_HTABLE);
++        args.add_child("macaddress", station_to_remove);
++        if (!m_ubus_cl.call(nasta_monitor_path, "deleteNonAssociatedDevice", args, result)) {
++            LOG(ERROR) << "MON_UNASSOC: deleteNonAssociatedDevice failed for object "
++                       << nasta_monitor_path << " MACAddress=" << station_to_remove;
++        } else {
++            LOG(INFO) << "MON_UNASSOC: removed stale unassociated station with mac="
++                      << station_to_remove << " path=" << nasta_monitor_path;
++        }
++    }
+ 
+-    std::string nasta_monitor_path = m_radio_path + "NaStaMonitor";
+-    //Now add the new unassociated stations
++    // Add requested stations that are not already present in NaStaMonitor.
+     for (const auto &new_station : new_list) {
+         const std::string mac_address(new_station.first);
+         const uint8_t chan     = new_station.second.channel;
+         const uint8_t op_class = new_station.second.operating_class;
+ 
++        if (std::find(amx_un_stations_to_be_removed.begin(), amx_un_stations_to_be_removed.end(),
++                      mac_address) != amx_un_stations_to_be_removed.end()) {
++            // Entry was stale and removed above, recreate it below.
++        } else {
++            AmbiorixVariant args, result;
++            if (m_ubus_cl.call(nasta_monitor_path, "getNaStationStats", args, result)) {
++                auto outer_list = result.read_children<AmbiorixVariantListSmartPtr>();
++                bool already_exists = false;
++                if (outer_list && !outer_list->empty()) {
++                    auto inner_list =
++                        outer_list->front().read_children<AmbiorixVariantListSmartPtr>();
++                    if (inner_list) {
++                        for (auto &item : *inner_list) {
++                            auto data_map = item.read_children<AmbiorixVariantMapSmartPtr>();
++                            if (!data_map) {
++                                continue;
++                            }
++                            std::string mac_address_amx;
++                            if (data_map->find("MACAddress") != data_map->end()) {
++                                (*data_map)["MACAddress"].get(mac_address_amx);
++                            }
++                            if (mac_address_amx == mac_address) {
++                                already_exists = true;
++                                break;
++                            }
++                        }
++                    }
++                }
++                if (already_exists) {
++                    LOG(INFO) << "MON_UNASSOC: NaStaMonitor entry already exists for STA="
++                              << mac_address << " path=" << nasta_monitor_path;
++                    continue;
++                }
++            }
++        }
++
++        // Before creating the NaStaMonitor entry, check if the STA is already associated
++        // to any VAP on this radio. Use the ubus backend (WiFi.* namespace) since the
++        // Device.WiFi.* namespace is not accessible on the agent via ubus.
++        // Path: WiFi.AccessPoint.[RadioReference == 'WiFi.Radio.2'].AssociatedDevice.[MACAddress == '...']
++        {
++            std::string mac_lc(mac_address), mac_uc(mac_address);
++            std::transform(mac_lc.begin(), mac_lc.end(), mac_lc.begin(), ::tolower);
++            std::transform(mac_uc.begin(), mac_uc.end(), mac_uc.begin(), ::toupper);
++            std::string radio_ref = wifi_radio_path;
++            if (!radio_ref.empty() && radio_ref.back() == '.') {
++                radio_ref.pop_back();
++            }
++            const std::string assoc_check_path =
++                "WiFi.AccessPoint.[RadioReference == '" + radio_ref +
++                "'].AssociatedDevice.[MACAddress == '" + mac_lc + "' || MACAddress == '" +
++                mac_uc + "'].";
++            LOG(DEBUG) << "MON_UNASSOC: checking association for STA=" << mac_address
++                       << " path=" << assoc_check_path;
++            auto assoc_dev = m_ubus_cl.get_object(assoc_check_path);
++            if (assoc_dev) {
++                LOG(WARNING) << "MON_UNASSOC: STA=" << mac_address
++                             << " is already associated to radio " << get_iface_name()
++                             << " - skipping NaStaMonitor entry (driver would reject measurement)";
++                continue;
++            }
++        }
++
+         AmbiorixVariant result;
+         AmbiorixVariant args(AMXC_VAR_ID_HTABLE);
+         args.add_child("macaddress", mac_address);
+         args.add_child("channel", chan);
+         args.add_child("operatingClass", op_class);
+-        if (!m_ambiorix_cl.call(nasta_monitor_path, "createNonAssociatedDevice", args, result)) {
+-            LOG(ERROR) << " remote function call createNonAssociatedDevice for object "
+-                       << nasta_monitor_path << " Failed!";
++        LOG(INFO) << "MON_UNASSOC: createNonAssociatedDevice request for STA=" << mac_address
++                  << " channel=" << int(chan) << " opclass=" << int(op_class)
++                  << " path=" << nasta_monitor_path;
++        if (!m_ubus_cl.call(nasta_monitor_path, "createNonAssociatedDevice", args, result)) {
++            LOG(ERROR) << "MON_UNASSOC: createNonAssociatedDevice failed for object "
++                       << nasta_monitor_path << " STA=" << mac_address << " channel=" << int(chan)
++                       << " opclass=" << int(op_class);
+             continue;
+         }
+ 
+-        LOG(TRACE) << "Non Associated Station with MACAddress: " << mac_address << "added to "
+-                   << non_associated_device_path;
++        LOG(INFO) << "MON_UNASSOC: createNonAssociatedDevice OK for STA=" << mac_address
++                  << " channel=" << int(chan) << " opclass=" << int(op_class)
++                  << " path=" << nasta_monitor_path;
+     }
+ 
+     if (!new_list.empty()) {
+-        AmbiorixVariant args, result;
+-        if (!m_ambiorix_cl.call(nasta_monitor_path, "getNaStationStats", args, result)) {
+-            LOG(ERROR) << "remote function call getNaStationStats for object " << nasta_monitor_path
+-                       << " Failed!";
++        // Trigger measurement first.
++        {
++            AmbiorixVariant args, result;
++            LOG(INFO) << "MON_UNASSOC: calling getNaStationStats on " << nasta_monitor_path
++                      << " for " << new_list.size() << " STA(s) - triggering driver measurement";
++            if (!m_ubus_cl.call(nasta_monitor_path, "getNaStationStats", args, result)) {
++                LOG(ERROR) << "remote function call getNaStationStats for object "
++                           << nasta_monitor_path << " Failed!";
++            }
+         }
+-    }
+ 
+-    auto non_ass_devices =
+-        m_ambiorix_cl.get_object_multi<AmbiorixVariantMapSmartPtr>(non_associated_device_path);
+-    if (!non_ass_devices) {
+-        return false;
+-    }
++        // Poll for a bounded time until SignalStrength becomes non-zero.
++        // A zero value from WHM means the measurement is not ready yet, or the STA is not
++        // visible on the requested channel. Do not treat it as a valid measurement.
++        constexpr int poll_iterations       = 5;
++        constexpr useconds_t poll_interval_us = 1000000; // 1s
++        std::unordered_map<std::string, sUnassociatedStationStats> latest_stats_per_sta;
++
++        for (int poll_idx = 0; poll_idx < poll_iterations; poll_idx++) {
++            usleep(poll_interval_us);
++            LOG(INFO) << "MON_UNASSOC: poll #" << (poll_idx + 1) << "/" << poll_iterations
++                      << " reading stats from getNaStationStats on " << nasta_monitor_path;
++
++            AmbiorixVariant args2, result2;
++            if (!m_ubus_cl.call(nasta_monitor_path, "getNaStationStats", args2, result2)) {
++                LOG(ERROR) << "remote function call getNaStationStats (read) for object "
++                           << nasta_monitor_path << " Failed!";
++                continue;
++            }
+ 
+-    //Lets iterate through all instances
+-    for (auto &non_ass_device : *non_ass_devices) {
+-        int32_t signal_strength(0);
+-        uint8_t channel(0);
+-        uint8_t operating_class(0);
+-        std::string time_stamp_str;
+-        std::string mac_address_amx;
+-        non_ass_device.second.read_child(mac_address_amx, "MACAddress");
+-        if (mac_address_amx.empty()) {
+-            continue;
+-        }
+-        non_ass_device.second.read_child(signal_strength, "SignalStrength");
+-        non_ass_device.second.read_child(channel, "Channel");
+-        non_ass_device.second.read_child(operating_class, "OperatingClass");
+-        non_ass_device.second.read_child(time_stamp_str, "TimeStamp");
+-
+-        amxc_ts_t time;
+-        memset(&time, 0, sizeof(amxc_ts_t));
+-        amxc_ts_parse(&time, time_stamp_str.c_str(), time_stamp_str.size());
+-        uint64_t timestamp_ms = time.sec * 1000 + time.nsec / 1000000;
+-        // TimeStamp is datetime as per RFC3339 and maybe contains fractions of seconds information
+-
+-        if (new_list.find(mac_address_amx) != new_list.end()) {
+-            //NonAssociatedDevice exists -->get the result and update the data
+-            sUnassociatedStationStats new_stat = {
+-                tlvf::mac_from_string(mac_address_amx),
+-                signal_strength,
+-                channel,
+-                operating_class,
+-                timestamp_ms,
+-            };
+-            stats.push_back(new_stat);
+-            LOG(DEBUG) << " read unassociated station stats for mac_address: " << mac_address_amx
+-                       << " SignalStrength: " << signal_strength << " channel: " << channel
+-                       << " operating_class: " << operating_class
+-                       << " TimeStamp(string): " << time_stamp_str
+-                       << " and TimeStamp(seconds): " << time.sec
+-                       << " and TimeStamp(milliseconds): " << timestamp_ms;
+-            new_list.erase(mac_address_amx); // consumed!
++            auto outer_list = result2.read_children<AmbiorixVariantListSmartPtr>();
++            if (!(outer_list && !outer_list->empty())) {
++                continue;
++            }
++
++            auto inner_list = outer_list->front().read_children<AmbiorixVariantListSmartPtr>();
++            if (!inner_list) {
++                continue;
++            }
++
++            bool all_requested_sta_have_valid_signal = true;
++
++            for (auto &item : *inner_list) {
++                auto data_map = item.read_children<AmbiorixVariantMapSmartPtr>();
++                if (!data_map) {
++                    continue;
++                }
++
++                std::string mac_address_amx;
++                int32_t signal_strength = 0;
++                uint8_t channel         = 0;
++                uint8_t operating_class = 0;
++                std::string time_stamp_str;
++
++                if (data_map->find("MACAddress") != data_map->end()) {
++                    (*data_map)["MACAddress"].get(mac_address_amx);
++                }
++                if (mac_address_amx.empty()) {
++                    continue;
++                }
++                if (new_list.find(mac_address_amx) == new_list.end()) {
++                    continue;
++                }
++
++                if (data_map->find("SignalStrength") != data_map->end()) {
++                    (*data_map)["SignalStrength"].get(signal_strength);
++                }
++                if (data_map->find("Channel") != data_map->end()) {
++                    (*data_map)["Channel"].get(channel);
++                }
++                if (data_map->find("OperatingClass") != data_map->end()) {
++                    (*data_map)["OperatingClass"].get(operating_class);
++                }
++                if (data_map->find("TimeStamp") != data_map->end()) {
++                    (*data_map)["TimeStamp"].get(time_stamp_str);
++                }
++
++                LOG(INFO) << "MON_UNASSOC: getNaStationStats entry STA=" << mac_address_amx
++                          << " channel=" << int(channel) << " opclass=" << int(operating_class)
++                          << " SignalStrength=" << signal_strength
++                          << " TimeStamp=" << time_stamp_str;
++
++                amxc_ts_t time;
++                memset(&time, 0, sizeof(amxc_ts_t));
++                amxc_ts_parse(&time, time_stamp_str.c_str(), time_stamp_str.size());
++                uint64_t timestamp_ms = time.sec * 1000 + time.nsec / 1000000;
++
++                latest_stats_per_sta[mac_address_amx] = {tlvf::mac_from_string(mac_address_amx),
++                                                         signal_strength, channel, operating_class,
++                                                         timestamp_ms};
++
++                if (signal_strength == 0) {
++                    all_requested_sta_have_valid_signal = false;
++                }
++            }
++
++            for (const auto &requested_station : new_list) {
++                auto latest_it = latest_stats_per_sta.find(requested_station.first);
++                if (latest_it == latest_stats_per_sta.end() ||
++                    latest_it->second.signal_strength == 0) {
++                    all_requested_sta_have_valid_signal = false;
++                    break;
++                }
++            }
++
++            if (all_requested_sta_have_valid_signal) {
++                LOG(INFO) << "MON_UNASSOC: all requested STA measurements became non-zero on poll #"
++                          << (poll_idx + 1);
++                break;
++            }
+         }
+-        amx_un_stations_to_be_removed.push_back(mac_address_amx);
+-    }
+ 
+-    // Now lets remove all stations the controller do not want them anymore
+-    for (auto &station_to_remove : amx_un_stations_to_be_removed) {
+-        AmbiorixVariant result;
+-        AmbiorixVariant args(AMXC_VAR_ID_HTABLE);
+-        args.add_child("macaddress", station_to_remove);
+-        if (!m_ambiorix_cl.call(nasta_monitor_path, "deleteNonAssociatedDevice", args, result)) {
+-            LOG(ERROR) << " remote function call deleteNonAssociatedDevice"
+-                       << " for object " << nasta_monitor_path
+-                       << " and  MACAddress: " << station_to_remove << " Failed!!";
+-            continue;
+-        } else {
+-            LOG(TRACE) << "Successfully removed unassociated station with mac: "
+-                       << station_to_remove
+-                       << " and path: " << nasta_monitor_path + station_to_remove;
++        for (auto &requested_station : new_list) {
++            const auto &requested_mac = requested_station.first;
++            auto latest_it            = latest_stats_per_sta.find(requested_mac);
++            if (latest_it == latest_stats_per_sta.end()) {
++                LOG(WARNING) << "MON_UNASSOC_RSSI: no getNaStationStats entry found for STA="
++                             << requested_mac << " on path=" << nasta_monitor_path;
++                continue;
++            }
++
++            const auto &latest_stat = latest_it->second;
++            stats.push_back(latest_stat);
++
++            LOG(INFO) << "MON_UNASSOC_RSSI: STA=" << requested_mac
++                      << " channel=" << int(latest_stat.channel)
++                      << " opclass=" << int(latest_stat.operating_class)
++                      << " SignalStrength=" << latest_stat.signal_strength
++                      << " timestamp_ms=" << latest_stat.time_stamp;
++
++            if (latest_stat.signal_strength == 0) {
++                LOG(WARNING) << "MON_UNASSOC_RSSI: SignalStrength=0 for STA=" << requested_mac
++                             << " after polling - measurement still incomplete or STA not visible on channel "
++                             << int(latest_stat.channel);
++            }
+         }
++
++        new_list.clear();
+     }
+     sUnassociatedStationsStats stats_out{stats};
+     auto msg_buff = ALLOC_SMART_BUFFER(sizeof(stats_out));
+diff --git a/common/beerocks/bwl/whm/mon_wlan_hal_whm.h b/common/beerocks/bwl/whm/mon_wlan_hal_whm.h
+index ffef48e68..a44f872b3 100644
+--- a/common/beerocks/bwl/whm/mon_wlan_hal_whm.h
++++ b/common/beerocks/bwl/whm/mon_wlan_hal_whm.h
+@@ -121,6 +121,13 @@ private:
+     bool get_scan_results_from_pwhm();
+ 
+     bool m_scan_active = false;
++
++    // Separate AmbiorixClient connected to the ubus backend for NaStaMonitor operations.
++    // The main m_ambiorix_cl uses the USP backend (usp:/var/run/pwhm_usp.sock) which can
++    // only access the Device.WiFi.* namespace. The NaStaMonitor functions and AssociatedDevice
++    // data are only accessible in the WiFi.* namespace via the ubus backend
++    // (ubus:/var/run/ubus/ubus.sock).
++    beerocks::wbapi::AmbiorixClient m_ubus_cl;
+ };
+ 
+ } // namespace whm
+diff --git a/controller/src/beerocks/cli/beerocks_cli_bml.cpp b/controller/src/beerocks/cli/beerocks_cli_bml.cpp
+index 7aca26118..1e907b086 100644
+--- a/controller/src/beerocks/cli/beerocks_cli_bml.cpp
++++ b/controller/src/beerocks/cli/beerocks_cli_bml.cpp
+@@ -2276,10 +2276,12 @@ int cli_bml::get_unassoc_sta_rcpi_query_result(const std::string &sta_mac)
+     int ret = bml_get_unassoc_sta_rcpi_query_result(ctx, sta_mac.c_str(), &sta);
+ 
+     if (ret == BML_RET_OK) {
++        auto decoded_rssi_dbm = son::wireless_utils::convert_rssi_from_rcpi(sta.rcpi);
+         std::cout << "Unassoc sta link metric result for sta " << sta_mac << std::endl
+                   << "sta opclass=" << int(sta.opclass) << std::endl
+                   << "sta channel=" << int(sta.channel) << std::endl
+                   << "sta uplink rcpi=" << int(sta.rcpi) << std::endl
++                  << "sta uplink rssi dBm=" << int(decoded_rssi_dbm) << std::endl
+                   << "sta measurement delta=" << sta.measurement_delta << std::endl;
+     }
+ 
+diff --git a/controller/src/beerocks/master/tasks/link_metrics_task.cpp b/controller/src/beerocks/master/tasks/link_metrics_task.cpp
+index 1444db590..3b8856a6c 100644
+--- a/controller/src/beerocks/master/tasks/link_metrics_task.cpp
++++ b/controller/src/beerocks/master/tasks/link_metrics_task.cpp
+@@ -112,8 +112,43 @@ void LinkMetricsTask::handle_event(int event_enum_value, void *event_obj)
+             return;
+         }
+ 
++        // For MLO STAs, the NaStaMonitor driver needs the link-specific MAC for the queried
++        // channel, not the MLD MAC. Resolve the affiliated link MAC here so the repeater agent
++        // can create the NaStaMonitor entry with the correct MAC.
++        sMacAddr query_sta_mac = unassoc_sta_link_metric_event->unassoc_sta_mac;
++        {
++            auto station = database.get_station(unassoc_sta_link_metric_event->unassoc_sta_mac);
++            if (station && !station->sta_mld_configuration.affiliated_stas.empty()) {
++                uint8_t query_channel = unassoc_sta_link_metric_event->channel;
++                for (const auto &affiliated_sta :
++                     station->sta_mld_configuration.affiliated_stas) {
++                    auto radio = database.get_radio_by_bssid(affiliated_sta.bssid);
++                    if (radio) {
++                        auto wifi_channel =
++                            database.get_radio_wifi_channel(radio->radio_uid);
++                        if (wifi_channel.get_channel() == query_channel) {
++                            query_sta_mac = affiliated_sta.affiliated_sta_mac;
++                            LOG(DEBUG)
++                                << "MLO STA unassoc query: resolved link MAC "
++                                << query_sta_mac << " for channel " << int(query_channel)
++                                << " (MLD MAC: "
++                                << unassoc_sta_link_metric_event->unassoc_sta_mac << ")";
++                            break;
++                        }
++                    }
++                }
++                if (query_sta_mac == unassoc_sta_link_metric_event->unassoc_sta_mac) {
++                    LOG(WARNING)
++                        << "MLO STA unassoc query: no affiliated link MAC found for channel "
++                        << int(unassoc_sta_link_metric_event->channel)
++                        << " for MLD MAC " << unassoc_sta_link_metric_event->unassoc_sta_mac
++                        << " - using MLD MAC as fallback";
++                }
++            }
++        }
++
+         auto &unassoc_sta_list = std::get<1>(unassocChanList->sta_list(0));
+-        unassoc_sta_list       = unassoc_sta_link_metric_event->unassoc_sta_mac;
++        unassoc_sta_list       = query_sta_mac;
+ 
+         // Add channel_list object to TLV
+         if (!tlvUnassociatedStaLinkMetricsQuery->add_channel_list(unassocChanList)) {
+@@ -408,6 +443,33 @@ bool LinkMetricsTask::handle_cmdu_1905_unassociated_station_link_metric_response
+         sta_details.measurement_delta = sta_metrics.measurement_to_report_delta_msec;
+         unassoc_sta_metric[mac]       = sta_details;
+ 
++        // For MLO STAs: the response MAC is the affiliated link MAC. Also store the result
++        // under the MLD MAC so the user can query the result using the MLD MAC.
++        {
++            auto all_station_macs = database.get_stations();
++            for (const auto &station_mac_str : all_station_macs) {
++                auto station =
++                    database.get_station(tlvf::mac_from_string(station_mac_str));
++                if (!station || station->sta_mld_configuration.affiliated_stas.empty()) {
++                    continue;
++                }
++                for (const auto &affiliated_sta :
++                     station->sta_mld_configuration.affiliated_stas) {
++                    if (affiliated_sta.affiliated_sta_mac == sta_metrics.sta_mac) {
++                        std::string mld_mac = tlvf::mac_to_string(
++                            station->sta_mld_configuration.mld_config.sta_mld_mac);
++                        if (!mld_mac.empty() && mld_mac != mac) {
++                            unassoc_sta_metric[mld_mac] = sta_details;
++                            LOG(DEBUG)
++                                << "MLO STA unassoc response: stored result under MLD MAC "
++                                << mld_mac << " for link MAC " << mac;
++                        }
++                        break;
++                    }
++                }
++            }
++        }
++
+         // updating the DM and the database
+         auto agents = database.get_all_connected_agents();
+ 
+-- 
+2.34.1
+
