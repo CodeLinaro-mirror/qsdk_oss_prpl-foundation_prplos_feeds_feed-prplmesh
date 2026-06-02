@@ -1,0 +1,534 @@
+From d3895a872bedc54b8b642505950111d3d0827603 Mon Sep 17 00:00:00 2001
+From: Sureshkumar <suresure@qti.qualcomm.com>
+Date: Fri, 29 May 2026 11:34:23 +0530
+Subject: [PATCH] [PATCH]  [prplmesh] Band steering and MLO reporting fixes
+
+Add support for BTM-only steering mode by allowing steering without ACL-based blocking,
+avoiding delays and side effects during soft/idle steering scenarios.
+
+Ensure the serving BSS is always excluded from blocking to maintain client connectivity
+and prevent disruption of steering flows.
+
+Fix MLO client LEAVE reporting to use MLD-level identifiers instead of link-level values,
+as required by EasyMesh specification.
+
+Correct MLO client reporting in topology data to consistently use AP MLD identifiers,
+avoiding reliance on link-level assumptions.
+
+Signed-off-by: Sureshkumar <suresure@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 | 20 +++---
+ agent/src/beerocks/slave/son_slave_thread.cpp | 27 ++++++-
+ .../beerocks/slave/tasks/topology_task.cpp    |  8 ++-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 26 ++++++-
+ controller/nbapi/on_action.cpp                | 22 +++++-
+ controller/src/beerocks/master/controller.cpp | 23 ++++--
+ controller/src/beerocks/master/controller.h   |  4 +-
+ controller/src/beerocks/master/db/db.cpp      | 60 ++++++++++++++++
+ controller/src/beerocks/master/db/db.h        | 14 ++++
+ .../master/tasks/client_steering_task.cpp     | 70 ++++++++++++++++---
+ .../master/tasks/client_steering_task.h       |  7 ++
+ 11 files changed, 247 insertions(+), 34 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index e400a271c..5502b6005 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -2780,11 +2780,13 @@ bool ApManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+ 
+         LOG(DEBUG) << "BSSID: " << vap_node->second.mac << " AP_MLD_MAC: " << vap_node->second.ap_mld_mac;
+ 
+-        if (!vap_node->second.ap_mld_mac.empty()) {
+-            LOG(DEBUG) << "AP_MLD_MAC is not empty - use ap_mld_mac as parent bssid";
++        // Spec §17.2.6: BSSID = AP MLD MAC only for MLO clients.
++        // Legacy STAs on MLO-capable APs must use the link BSSID, not the AP MLD MAC.
++        if (msg->params.is_mlo && !vap_node->second.ap_mld_mac.empty()) {
++            LOG(DEBUG) << "MLO STA + AP_MLD_MAC is not empty - use ap_mld_mac as parent bssid";
+             notification->bssid()        = tlvf::mac_from_string(vap_node->second.ap_mld_mac);
+         } else {
+-            LOG(DEBUG) << "AP_MLD_MAC is empty - use ap_mac as parent bssid";
++            LOG(DEBUG) << "Legacy STA or AP_MLD_MAC is empty - use link mac as parent bssid";
+             notification->bssid()        = tlvf::mac_from_string(vap_node->second.mac);
+         }
+ 
+@@ -2860,13 +2862,11 @@ bool ApManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+             return false;
+         }
+ 
+-        if (!vap_node->second.ap_mld_mac.empty()) {
+-            LOG(DEBUG) << "AP_MLD_MAC is not empty - use ap_mld_mac as parent bssid";
+-            notification->params().bssid        = tlvf::mac_from_string(vap_node->second.ap_mld_mac);
+-        } else {
+-            LOG(DEBUG) << "AP_MLD_MAC is empty - use ap_mac as parent bssid";
+-            notification->params().bssid        = tlvf::mac_from_string(vap_node->second.mac);
+-        }
++        // Always use link BSSID in the disconnect notification.
++        // sClientDisconnectionParams does not carry is_mlo, so we cannot distinguish
++        // MLO from legacy here. The son_slave_thread LEAVE handler resolves the
++        // AP MLD MAC for MLO clients via the associated_sta_mlds DB lookup.
++        notification->params().bssid        = tlvf::mac_from_string(vap_node->second.mac);
+ 
+         notification->params().mac    = msg->params.mac;
+         notification->params().vap_id = msg->params.vap_id;
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index ff8f9785c..93a66166f 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -3248,8 +3248,31 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+             LOG(ERROR) << "addClass tlvClientAssociationEvent failed";
+             return false;
+         }
+-        client_association_event_tlv->client_mac() = notification_in->params().mac;
+-        client_association_event_tlv->bssid()      = notification_in->params().bssid;
++        // Spec §17.2.6: For MLD clients, STA_MAC = Client MLD MAC, BSSID = AP MLD MAC.
++        // The disconnect notification carries link-specific MACs (affiliated STA MAC + BSSID).
++        // Look up the STA MLD MAC and AP MLD MAC from associated_sta_mlds before using them.
++        sMacAddr tlv_disc_client_mac = notification_in->params().mac;
++        sMacAddr tlv_disc_bssid      = notification_in->params().bssid;
++        {
++            bool found_mld = false;
++            for (const auto &sta_mld_entry : db->associated_sta_mlds) {
++                if (found_mld) break;
++                for (const auto &affiliated : sta_mld_entry.second.affiliated_stas) {
++                    if (affiliated.affiliated_sta_mac == notification_in->params().mac) {
++                        tlv_disc_client_mac = sta_mld_entry.first;
++                        tlv_disc_bssid      = sta_mld_entry.second.mld_config.ap_mld_mac;
++                        LOG(DEBUG) << "MLO LEAVE: using STA MLD MAC=" << tlv_disc_client_mac
++                                   << " AP MLD MAC=" << tlv_disc_bssid
++                                   << " (link MAC=" << notification_in->params().mac
++                                   << " link BSSID=" << notification_in->params().bssid << ")";
++                        found_mld = true;
++                        break;
++                    }
++                }
++            }
++        }
++        client_association_event_tlv->client_mac() = tlv_disc_client_mac;
++        client_association_event_tlv->bssid()      = tlv_disc_bssid;
+         client_association_event_tlv->association_event() =
+             wfa_map::tlvClientAssociationEvent::CLIENT_HAS_LEFT_THE_BSS;
+ 
+diff --git a/agent/src/beerocks/slave/tasks/topology_task.cpp b/agent/src/beerocks/slave/tasks/topology_task.cpp
+index 1ccdb79c8..35f5331e3 100644
+--- a/agent/src/beerocks/slave/tasks/topology_task.cpp
++++ b/agent/src/beerocks/slave/tasks/topology_task.cpp
+@@ -1042,9 +1042,15 @@ bool TopologyTask::add_associated_clients_tlv()
+                     bss_list->add_clients_associated_list(client_info);
+                 }
+ 
+-                // Check if any MLD STA connected to same BSSID as their AP MLD MAC
++                // Check if any MLD STA connected to same BSSID as their AP MLD MAC.
++                // Spec (Table 27): AP_MAC = AP MLD MAC for MLD clients.
++                // Explicitly update bss_list->bssid() to the AP MLD MAC so the field
++                // is correct even if the assumption bssid.mac == ap_mld_mac ever breaks.
+                 for (const auto &sta_mld : db->associated_sta_mlds) {
+                     if (bssid.mac == sta_mld.second.mld_config.ap_mld_mac) {
++                        // Spec §17.2.5: AP_MAC = AP MLD MAC the Client MLD is Setup Linked to
++                        bss_list->bssid() = sta_mld.second.mld_config.ap_mld_mac;
++
+                         auto client_info = bss_list->create_clients_associated_list();
+ 
+                         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index e0da94507..e44eb6c52 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -2911,13 +2911,33 @@ bool ap_wlan_hal_nl80211::generate_connected_clients_events(
+ 
+             auto assoc_frame_type = assoc_frame::AssocReqFrame::UNKNOWN;
+ 
+-            if (m_latest_assoc_frame.find(client_mac) == m_latest_assoc_frame.end()) {
+-                LOG(WARNING) << "STA-CONNECTED without previously receiving a (re-)association frame!";
++            auto it = m_latest_assoc_frame.find(client_mac);
++
++            /* MLO fallback: STA-FIRST/STA-NEXT returns the MLD MAC for MLO clients,
++             * but m_latest_assoc_frame is keyed by the link MAC (affiliated STA MAC)
++             * from the AP_MGMT_FRAME_RECEIVED event.  When the direct lookup fails,
++             * scan for a frame whose BSSID matches the current VAP's BSS MAC — this
++             * uniquely identifies the link-specific assoc frame for this client. */
++            if (it == m_latest_assoc_frame.end()) {
++                for (auto &kv : m_latest_assoc_frame) {
++                    if (tlvf::mac_to_string(kv.second->bssid) == vap.second.bss) {
++                        it = m_latest_assoc_frame.find(kv.first);
++                        LOG(DEBUG) << "MLO assoc frame fallback: MLD_MAC=" << client_mac
++                                   << " → link_MAC=" << kv.first
++                                   << " (BSS=" << vap.second.bss << ")";
++                        break;
++                    }
++                }
++            }
++
++            if (it == m_latest_assoc_frame.end()) {
++                LOG(WARNING) << "STA-CONNECTED without previously receiving a (re-)association frame!"
++                             << " client_mac=" << client_mac;
+                 msg->params.association_frame_length = 0;
+             } else {
+                 // Add the latest association frame
+                 // PPM-1718: parse the association frame and make sure it belongs to the right MAC address.
+-                auto &frame_info  = m_latest_assoc_frame[client_mac];
++                auto &frame_info  = it->second;
+                 msg->params.bssid = frame_info->bssid;
+                 auto &frame_body  = frame_info->data;
+                 // Add the latest association frame
+diff --git a/controller/nbapi/on_action.cpp b/controller/nbapi/on_action.cpp
+index 1a287079b..4ddd3e588 100644
+--- a/controller/nbapi/on_action.cpp
++++ b/controller/nbapi/on_action.cpp
+@@ -458,11 +458,31 @@ amxd_status_t client_steering(amxd_object_t *object, amxd_function_t *func, amxc
+         return amxd_status_unknown_error;
+     }
+ 
++    /*
++     * Read optional parameters added by the qmesh-steering-app:
++     *   acl_allowed      — false = BTM-only (skip ACL BLOCK messages)
++     *   is_btm_supported — true  = STA supports 802.11v BTM (from assoc frame parse)
++     *                      false = use legacy disassociation
++     * Both default to true for backward compatibility with callers that do not
++     * set these fields (e.g. NBAPI CLI, certification tests).
++     */
++    bool acl_allowed      = GET_BOOL(args, "acl_allowed");
++    bool is_btm_supported = GET_BOOL(args, "is_btm_supported");
++
++    /* GET_BOOL returns false when the key is absent; default both to true */
++    {
++        amxc_var_t *acl_var = amxc_var_get_path(args, "acl_allowed", AMXC_VAR_FLAG_DEFAULT);
++        if (!acl_var) { acl_allowed = true; }
++        amxc_var_t *btm_var = amxc_var_get_path(args, "is_btm_supported", AMXC_VAR_FLAG_DEFAULT);
++        if (!btm_var) { is_btm_supported = true; }
++    }
++
+     if (!g_database->can_start_client_steering(sta_mac, target_bssid)) {
+         LOG(WARNING) << "Failed to initiate steering on the client: " << sta_mac
+                      << " with attempt connecting to an AP with BSSID: " << target_bssid;
+     } else {
+-        controller_ctx->start_client_steering(sta_mac, target_bssid);
++        controller_ctx->start_client_steering(sta_mac, target_bssid,
++                                              acl_allowed, is_btm_supported);
+     }
+     return amxd_status_ok;
+ }
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index c7f4d39f3..fc44ca8f7 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -4912,15 +4912,28 @@ bool Controller::handle_cmdu_control_message(
+     return true;
+ }
+ 
+-bool Controller::start_client_steering(const std::string &sta_mac, const std::string &target_bssid)
++bool Controller::start_client_steering(const std::string &sta_mac, const std::string &target_bssid,
++                                        bool acl_allowed, bool is_btm_supported)
+ {
+     std::string triggered_by{"NBAPI"};
+     bool disassoc_imminent = false;
+ 
+-    LOG(DEBUG) << "NBAPI client steer request for " << sta_mac << " to hostap: " << target_bssid;
+-    son_actions::steer_sta(database, cmdu_tx, m_task_pool, sta_mac, target_bssid, triggered_by,
+-                           std::string(), disassoc_imminent,
+-                           database.config.steering_disassoc_timer_msec.count());
++    LOG(DEBUG) << "NBAPI client steer request for " << sta_mac << " to hostap: " << target_bssid
++               << " acl_allowed=" << acl_allowed
++               << " is_btm_supported=" << is_btm_supported;
++
++    /* Create client_steering_task directly so we can pass acl_allowed and is_btm_supported.
++     * son_actions::steer_sta() does not have these parameters and is used by many other
++     * callers that always want ACL BLOCK enabled and assume BTM support.
++     * For NBAPI-triggered steers from the steering app we need BTM-only mode
++     * (acl_allowed=false) for idle band steering, and is_btm_supported reflects the
++     * actual BTM capability from the STA's assoc frame Extended Capabilities IE. */
++    auto new_task = std::make_shared<client_steering_task>(
++        database, cmdu_tx, m_task_pool, sta_mac, target_bssid, triggered_by,
++        std::string() /* steering_type */, disassoc_imminent,
++        static_cast<int>(database.config.steering_disassoc_timer_msec.count()),
++        false /* steer_restricted */, acl_allowed, is_btm_supported);
++    m_task_pool.add_task(new_task);
+     return true;
+ }
+ 
+diff --git a/controller/src/beerocks/master/controller.h b/controller/src/beerocks/master/controller.h
+index 879ab214a..5adf64ecd 100644
+--- a/controller/src/beerocks/master/controller.h
++++ b/controller/src/beerocks/master/controller.h
+@@ -98,7 +98,9 @@ public:
+      * @param target_bssid Target BSSID.
+      * @return True if client steering started successfully, false otherwise.
+      */
+-    bool start_client_steering(const std::string &sta_mac, const std::string &target_bssid);
++    bool start_client_steering(const std::string &sta_mac, const std::string &target_bssid,
++                                bool acl_allowed      = true,
++                                bool is_btm_supported = true);
+ 
+     /**
+      * @brief Send BTM Request on NBAPI RPC.
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 654fa002f..870fd85d7 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -6935,6 +6935,66 @@ void db::dm_increment_steer_summary_stats(const std::string &param_name)
+     dm_uint64_param_one_up(DATAELEMENTS_ROOT_DM ".Network.MultiAPSteeringSummaryStats", param_name);
+ }
+ 
++void db::dm_fire_steer_summary_stats_event(const Station &station)
++{
++    if (station.dm_path.empty()) {
++        return;
++    }
++
++    const auto &s = station.steering_summary_stats;
++
++    /*
++     * Fire QCOM_Vendor.SteeringSummaryStatsUpdated vendor event.
++     *
++     * External strategy applications (e.g. qmesh-steering-app) subscribe to this
++     * event and use the delta in BTMSuccesses / BTMFailures to determine the steer
++     * outcome without polling the DM:
++     *   - BTMSuccesses increased → steer accepted + STA roamed → cancel BTM timer
++     *   - BTMFailures  increased → steer rejected → reprogram BTM timer to eBTMAssociationTime
++     *
++     * Fields carried in the event:
++     *   MACAddress    — STA MAC (used as the primary key by the steering app)
++     *   BTMAttempts   — cumulative BTM requests sent to this STA
++     *   BTMSuccesses  — cumulative successful steers (STA roamed to target)
++     *   BTMFailures   — cumulative failed steers (STA rejected or timed out)
++     *   LastSteerTime — Unix timestamp of the last steering attempt
++     */
++    /*
++     * Fire QCOM_Vendor.SteeringSummaryStatsUpdated vendor event using
++     * trigger_event_with_data() — same mechanism as all other vendor events.
++     * The qmesh-lib subscribes to this event path and delivers
++     * QMESH_EVENT_STEERING_SUMMARY_STATS_UPDATED to the steering app.
++     */
++    const std::string vendor_event_obj =
++        DATAELEMENTS_ROOT_DM ".Network.QCOM_Vendor.SteeringSummaryStatsUpdated";
++
++    amxc_var_t event_data;
++    amxc_var_init(&event_data);
++    amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
++
++    const std::string mac_str = tlvf::mac_to_string(station.mac);
++    amxc_var_add_key(cstring_t, &event_data, "MACAddress",    mac_str.c_str());
++    amxc_var_add_key(cstring_t, &event_data, "DMPath",        station.dm_path.c_str());
++    amxc_var_add_key(uint64_t,  &event_data, "BTMAttempts",   s.btm_attempts);
++    amxc_var_add_key(uint64_t,  &event_data, "BTMSuccesses",  s.btm_successes);
++    amxc_var_add_key(uint64_t,  &event_data, "BTMFailures",   s.btm_failures);
++    amxc_var_add_key(uint32_t,  &event_data, "LastSteerTime", s.last_steer_time);
++
++    const bool ok =
++        m_ambiorix_datamodel->trigger_event_with_data(vendor_event_obj, "Event", &event_data);
++    amxc_var_clean(&event_data);
++
++    if (ok) {
++        LOG(DEBUG) << "dm_fire_steer_summary_stats_event: STA=" << station.mac
++                   << " attempts=" << s.btm_attempts
++                   << " successes=" << s.btm_successes
++                   << " failures=" << s.btm_failures;
++    } else {
++        LOG(WARNING) << "dm_fire_steer_summary_stats_event: trigger_event_with_data failed for STA="
++                     << station.mac;
++    }
++}
++
+ bool db::dm_add_failed_connection_event(const sMacAddr &bssid, const sMacAddr &sta_mac,
+                                         const uint16_t reason_code, const uint16_t status_code)
+ {
+diff --git a/controller/src/beerocks/master/db/db.h b/controller/src/beerocks/master/db/db.h
+index 234743b9c..5c4899a27 100644
+--- a/controller/src/beerocks/master/db/db.h
++++ b/controller/src/beerocks/master/db/db.h
+@@ -1035,6 +1035,20 @@ public:
+      */
+     void dm_increment_steer_summary_stats(const std::string &param_name);
+ 
++    /**
++     * @brief Fire QCOM_Vendor.SteeringSummaryStatsUpdated vendor event.
++     *
++     * Called after a steer outcome (success or failure) is determined so that
++     * external strategy applications (e.g. qmesh-steering-app) can react to
++     * the steer result without polling the DM.
++     *
++     * The event carries the STA MAC and the current per-STA BTM counters:
++     *   MACAddress, BTMAttempts, BTMSuccesses, BTMFailures, LastSteerTime.
++     *
++     * @param station  Station whose steering summary stats were just updated.
++     */
++    void dm_fire_steer_summary_stats_event(const Station &station);
++
+     /**
+      * @brief Adds or updates instance of Neighbor inside Interface object.
+      *
+diff --git a/controller/src/beerocks/master/tasks/client_steering_task.cpp b/controller/src/beerocks/master/tasks/client_steering_task.cpp
+index 648e946f6..7d070209d 100644
+--- a/controller/src/beerocks/master/tasks/client_steering_task.cpp
++++ b/controller/src/beerocks/master/tasks/client_steering_task.cpp
+@@ -30,12 +30,14 @@ client_steering_task::client_steering_task(db &database, ieee1905_1::CmduMessage
+                                            const std::string &triggered_by,
+                                            const std::string &steering_type, bool disassoc_imminent,
+                                            int disassoc_timer_ms, bool steer_restricted,
++                                           bool acl_allowed, bool is_btm_supported,
+                                            const std::string &task_name)
+     : task(task_name), m_database(database), m_cmdu_tx(cmdu_tx), m_tasks(tasks), m_sta_mac(sta_mac),
+       m_target_bssid(target_bssid), //Chosen VAP BSSID to steer the client to
+       m_triggered_by(triggered_by), m_steering_type(steering_type),
+       m_disassoc_imminent(disassoc_imminent), m_disassoc_timer_ms(disassoc_timer_ms),
+-      m_steer_restricted(steer_restricted)
++      m_steer_restricted(steer_restricted), m_acl_allowed(acl_allowed),
++      m_is_btm_supported(is_btm_supported)
+ {
+ }
+ 
+@@ -69,6 +71,10 @@ void client_steering_task::work()
+                 station->steering_summary_stats.blacklist_failures++;
+                 m_database.dm_increment_steer_summary_stats("BlacklistFailures");
+             }
++            /* Fire SteeringSummaryStatsUpdated vendor event so external strategy apps
++             * (e.g. qmesh-steering-app) can detect the steer failure and reprogram
++             * their BTM association timer from 16s to BTMAssociationTime. */
++            m_database.dm_fire_steer_summary_stats_event(*station);
+             finish();
+             break;
+         }
+@@ -115,13 +121,21 @@ void client_steering_task::work()
+         if (!m_steering_success && m_disassoc_imminent) {
+             TASK_LOG(DEBUG) << "steering failed for " << m_sta_mac << " from " << m_original_bssid
+                             << " to " << m_target_bssid;
+-            if (m_database.get_node_11v_capability(*client)) {
++            /*
++             * Use m_is_btm_supported (from the steering app's assoc frame parse) to
++             * decide whether to count BTM or blacklist failures.  This is more accurate
++             * than get_node_11v_capability() which reads from the prplMesh internal DB
++             * and may not reflect the actual BTM capability from the assoc frame.
++             */
++            if (m_is_btm_supported) {
+                 client->steering_summary_stats.btm_failures++;
+                 m_database.dm_increment_steer_summary_stats("BTMFailures");
+             } else {
+                 client->steering_summary_stats.blacklist_failures++;
+                 m_database.dm_increment_steer_summary_stats("BlacklistFailures");
+             }
++            /* Fire SteeringSummaryStatsUpdated vendor event — steer failed */
++            m_database.dm_fire_steer_summary_stats_event(*client);
+             /*
+                  * might need to split this logic to high and low bands of 5GHz
+                  * since some clients can support one but not the other
+@@ -159,13 +173,19 @@ void client_steering_task::work()
+             }
+ 
+         } else {
+-            if (m_database.get_node_11v_capability(*client)) {
++            /*
++             * Use m_is_btm_supported (from the steering app's assoc frame parse) to
++             * decide whether to count BTM or blacklist successes.
++             */
++            if (m_is_btm_supported) {
+                 client->steering_summary_stats.btm_successes++;
+                 m_database.dm_increment_steer_summary_stats("BTMSuccesses");
+             } else {
+                 client->steering_summary_stats.blacklist_successes++;
+                 m_database.dm_increment_steer_summary_stats("BlacklistSuccesses");
+             }
++            /* Fire SteeringSummaryStatsUpdated vendor event — steer succeeded */
++            m_database.dm_fire_steer_summary_stats_event(*client);
+         }
+ 
+         if (!dm_set_steer_event_params(m_database.dm_add_steer_event())) {
+@@ -204,6 +224,11 @@ bool client_steering_task::steer_sta()
+         return false;
+     }
+ 
++    LOG(DEBUG) << "steer_sta: sta=" << m_sta_mac
++               << " target=" << m_target_bssid
++               << " acl_allowed=" << m_acl_allowed
++               << " is_btm_supported=" << m_is_btm_supported;
++
+     if (!client->is_bSta()) {
+         if (!m_database.set_sta_handoff_flag(*client, true)) {
+             LOG(ERROR) << "can't set handoff flag for " << m_sta_mac;
+@@ -312,6 +337,17 @@ bool client_steering_task::steer_sta()
+         return true;
+     }
+ 
++    /* ACL BLOCK loop — skipped entirely when m_acl_allowed == false.
++     * When acl_allowed=false (BTM-only mode, e.g. idle band steering from the
++     * steering app), we skip all CLIENT_ASSOCIATION_CONTROL_REQUEST (BLOCK)
++     * messages and send only the BTM request below.  This avoids ACL
++     * side-effects on non-target BSSIDs when the steering app does not want
++     * them (e.g. idle band steering where the STA may roam back quickly). */
++    if (!m_acl_allowed) {
++        LOG(DEBUG) << "acl_allowed=false: skipping ACL BLOCK for STA " << m_sta_mac
++                   << " → target " << m_target_bssid << " (BTM-only mode)";
++    } else {
++
+     auto hostaps = m_database.get_active_radios();
+ 
+     hostaps.erase(target_radio_mac); // remove chosen hostap from the general list
+@@ -338,13 +374,21 @@ bool client_steering_task::steer_sta()
+             if (tlvf::mac_to_string(bss.first) == m_original_bssid) {
+ 
+                 /*
+-                 * consider BTM support in current station capabilities (when available)
+-                 * independently from updated 11v responsiveness
+-		         */
+-                auto cur_sta_cap = m_database.get_sta_current_capabilities(m_sta_mac);
+-                if (cur_sta_cap && cur_sta_cap->btm_supported) {
+-                    continue;
+-                }
++                 * Always skip ACL BLOCK on the serving (source) BSS.
++                 *
++                 * Blocking the serving BSS would prevent the STA from receiving
++                 * the BTM request frame (sent after the ACL BLOCK) and from
++                 * completing the transition.  The STA must remain associated to
++                 * its current BSS until it successfully roams to the target BSS.
++                 *
++                 * Previously this was conditional on BTM support, but that caused
++                 * non-BTM STAs to be blocked on their serving BSS, which broke
++                 * the steering flow for those clients.
++                 */
++                LOG(DEBUG) << "Skipping ACL BLOCK on serving BSS "
++                           << tlvf::mac_to_string(bss.first)
++                           << " for STA " << m_sta_mac;
++                continue;
+             }
+ 
+             // Send 17.1.27	Client Association Control Request : Block
+@@ -369,8 +413,12 @@ bool client_steering_task::steer_sta()
+         }
+     }
+ 
++    } // end if (m_acl_allowed)
++
+     //Send STEERING request after 3 seconds, as ACL takes time to set
+-    UTILS_SLEEP_MSEC(3000);
++    if (m_acl_allowed) {
++        UTILS_SLEEP_MSEC(3000);
++    }
+ 
+     if (!m_cmdu_tx.create(0, ieee1905_1::eMessageType::CLIENT_STEERING_REQUEST_MESSAGE)) {
+         LOG(ERROR) << "cmdu creation of type CLIENT_STEERING_REQUEST_MESSAGE, has failed";
+diff --git a/controller/src/beerocks/master/tasks/client_steering_task.h b/controller/src/beerocks/master/tasks/client_steering_task.h
+index 605780d4a..3cea6337f 100644
+--- a/controller/src/beerocks/master/tasks/client_steering_task.h
++++ b/controller/src/beerocks/master/tasks/client_steering_task.h
+@@ -30,6 +30,8 @@ public:
+                          bool disassoc_imminent,
+                          int disassoc_timer_ms        = beerocks::BSS_STEER_DISASSOC_TIMER_MS,
+                          bool steer_restricted        = false,
++                         bool acl_allowed             = true,
++                         bool is_btm_supported        = true,
+                          const std::string &task_name = std::string("client_steering_task"));
+     virtual ~client_steering_task() {}
+     bool handle_ieee1905_1_msg(const sMacAddr &src_mac,
+@@ -99,6 +101,11 @@ private:
+     const int m_disassoc_timer_ms;
+     bool m_btm_report_received = false;
+     bool m_steer_restricted    = false;
++    /** If false, skip all ACL BLOCK messages and send only the BTM request.
++     *  Set to false by the steering app for idle band steering via NBAPI.
++     *  Default: true (normal prplMesh flow). */
++    bool m_acl_allowed         = true;
++    bool m_is_btm_supported    = true; /**< true = send 802.11v BTM Request; false = legacy disassoc */
+ 
+     /**
+      * @brief The timestamp of steering event in data model of steering events.
+-- 
+2.34.1
+
