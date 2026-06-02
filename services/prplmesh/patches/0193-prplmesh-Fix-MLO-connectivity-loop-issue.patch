@@ -1,0 +1,452 @@
+From 5609230be4b2e06ba632312d5e675fb54cf62f4f Mon Sep 17 00:00:00 2001
+From: Sureshkumar <suresure@qti.qualcomm.com>
+Date: Tue, 2 Jun 2026 18:59:28 +0530
+Subject: [PATCH] [prplmesh] steering: fix MLO join/leave loop and BTM steering
+ for MLO clients
+
+- Introduce MLO-aware handling of disconnect events: track links
+  individually and only trigger LEAVE when all affiliated links are
+  disconnected. Avoid removing the MLD client entry on partial disconnects.
+
+- Use the AP MLD identifier in association notifications for MLO clients
+  to ensure correct interpretation and avoid false roam detection.
+
+- Add logic to distinguish multi-link joins from actual roaming, preventing
+  unnecessary disassociation when links belong to the same AP MLD.
+
+- Ensure steering requests are sent through the correct link-specific
+  interface to allow proper handling by the AP.
+
+- Avoid sending silent disassociation during steering, as ACL-based blocking
+  is sufficient and prevents confusion in multi-link scenarios.
+
+- Ensure non-BTM-capable clients are still steerable by enforcing ACL-based
+  blocking when needed.
+
+Signed-off-by: Sureshkumar <suresure@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 |   5 +
+ agent/src/beerocks/slave/son_slave_thread.cpp | 213 +++++++++++++-----
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  30 ++-
+ .../src/beerocks/master/son_actions.cpp       |  34 ++-
+ .../master/tasks/client_steering_task.cpp     |  27 ++-
+ 5 files changed, 231 insertions(+), 78 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 8a60dd735..266f5ebbe 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -1683,12 +1683,17 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+                        << " on BSSID " << tlvf::mac_to_string(request->bssid())
+                        << ", disassoc=" << (sta_info.disassoc ? "yes" : "no");
+ 
++            /* For BTM-capable STAs the BTM request (BSS_TM_REQ) handles the transition.
++             * For MLD STAs the silent disassoc on a specific link can confuse link management.
++             * The DENY_ACL (sta_deny below) is sufficient to prevent re-association.
++             * Re-enable if legacy (non-BTM) steering requires forced disassociation.
+             if (sta_info.disassoc) {
+                 if (!ap_wlan_hal->sta_disassoc(it->first, tlvf::mac_to_string(sta_info.mac),
+                                                wfa_map::tlvProfile2ReasonCode::AP_INITIATED)) {
+                     LOG(WARNING) << "Failed to disassociate STA " << tlvf::mac_to_string(sta_info.mac);
+                 }
+             }
++            */
+ 
+             if (!ap_wlan_hal->sta_deny(sta_info.mac, request->bssid())) {
+                 LOG(WARNING) << "Failed to deny STA " << tlvf::mac_to_string(sta_info.mac);
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 16d5a6504..c73840f83 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -3243,8 +3243,101 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+             }
+         }
+ 
+-        // If exists, remove client association information for disconnected client.
+-        db->erase_client(client_mac);
++        // Fix: MLD lookup MUST happen BEFORE erase_client().
++        // erase_client(mld_mac) also removes from associated_sta_mlds, so the
++        // lookup would fail if called after erase_client.
++        // The driver sends the MLD MAC in disconnect events (same MAC for all links).
++        //
++        // Spec 17.2.6:
++        //   MLD client  -> LEAVE must carry Client MLD MAC + AP MLD MAC.
++        //                  Only send when ALL affiliated links have disconnected.
++        //   Non-MLD client -> LEAVE carries the link MAC + link BSSID (unchanged).
++        sMacAddr tlv_disc_client_mac = notification_in->params().mac;
++        sMacAddr tlv_disc_bssid      = notification_in->params().bssid;
++        bool send_leave    = true;
++        bool is_mld_client = false;
++
++        // Case A: notification MAC is the MLD MAC itself
++        //         (driver sends MLD MAC in AP-STA-DISCONNECTED events).
++        {
++            auto mld_it = db->associated_sta_mlds.find(notification_in->params().mac);
++            if (mld_it != db->associated_sta_mlds.end()) {
++                is_mld_client = true;
++                auto &mld_entry       = mld_it->second;
++                auto &affiliated_stas = mld_entry.affiliated_stas;
++
++                // Remove the disconnecting link from affiliated_stas using the link BSSID.
++                affiliated_stas.erase(
++                    std::remove_if(affiliated_stas.begin(), affiliated_stas.end(),
++                                   [&](const auto &a) {
++                                       return a.bssid == notification_in->params().bssid;
++                                   }),
++                    affiliated_stas.end());
++
++                if (affiliated_stas.empty()) {
++                    // All links gone — send MLD-level LEAVE and erase the entry.
++                    tlv_disc_client_mac = mld_it->first;
++                    tlv_disc_bssid      = mld_entry.mld_config.ap_mld_mac;
++                    LOG(DEBUG) << "MLO LEAVE (MLD MAC): all links disconnected,"
++                               << " STA MLD MAC=" << tlv_disc_client_mac
++                               << " AP MLD MAC=" << tlv_disc_bssid
++                               << " (disconnecting BSSID=" << notification_in->params().bssid << ")";
++                    db->associated_sta_mlds.erase(mld_it);
++                } else {
++                    // Some links still up — skip LEAVE, do NOT erase the MLD entry.
++                    send_leave = false;
++                    LOG(DEBUG) << "MLO LEAVE (MLD MAC): " << affiliated_stas.size()
++                               << " links still connected — skipping TOPOLOGY_NOTIFICATION"
++                               << " for MLD MAC=" << notification_in->params().mac;
++                }
++                // Do NOT call erase_client(mld_mac) — that removes the entire MLD entry.
++            }
++        }
++
++        // Case B: notification MAC is a link MAC (search affiliated_stas).
++        if (!is_mld_client) {
++            for (auto &sta_mld_entry : db->associated_sta_mlds) {
++                bool found = false;
++                for (const auto &aff : sta_mld_entry.second.affiliated_stas) {
++                    if (aff.affiliated_sta_mac == notification_in->params().mac) {
++                        found = true;
++                        break;
++                    }
++                }
++                if (!found) continue;
++
++                is_mld_client = true;
++                auto &mld_entry       = sta_mld_entry.second;
++                auto &affiliated_stas = mld_entry.affiliated_stas;
++
++                affiliated_stas.erase(
++                    std::remove_if(affiliated_stas.begin(), affiliated_stas.end(),
++                                   [&](const auto &a) {
++                                       return a.affiliated_sta_mac == notification_in->params().mac;
++                                   }),
++                    affiliated_stas.end());
++
++                if (affiliated_stas.empty()) {
++                    tlv_disc_client_mac = sta_mld_entry.first;
++                    tlv_disc_bssid      = mld_entry.mld_config.ap_mld_mac;
++                    LOG(DEBUG) << "MLO LEAVE (link MAC): all links disconnected,"
++                               << " STA MLD MAC=" << tlv_disc_client_mac
++                               << " AP MLD MAC=" << tlv_disc_bssid;
++                    db->associated_sta_mlds.erase(sta_mld_entry.first);
++                } else {
++                    send_leave = false;
++                    LOG(DEBUG) << "MLO LEAVE (link MAC): " << affiliated_stas.size()
++                               << " links still connected — skipping TOPOLOGY_NOTIFICATION";
++                }
++                break;
++            }
++        }
++
++        // For non-MLD clients: call erase_client to remove from radio->associated_clients.
++        // For MLD clients: do NOT call erase_client(mld_mac) — it removes associated_sta_mlds.
++        if (!is_mld_client) {
++            db->erase_client(client_mac);
++        }
+ 
+         if (reconcile_ts_sta_ifaces) {
+             LOG(DEBUG) << "Trigger traffic separation WDS clear on backhaul-BSS disconnect";
+@@ -3258,74 +3351,54 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+             return true;
+         }
+ 
+-        // build 1905.1 message CMDU to send to the controller
+-        if (!cmdu_tx.create(0, ieee1905_1::eMessageType::TOPOLOGY_NOTIFICATION_MESSAGE)) {
+-            LOG(ERROR) << "cmdu creation of type TOPOLOGY_NOTIFICATION_MESSAGE, has failed";
+-            return false;
+-        }
++        if (send_leave) {
++            // build 1905.1 message CMDU to send to the controller
++            if (!cmdu_tx.create(0, ieee1905_1::eMessageType::TOPOLOGY_NOTIFICATION_MESSAGE)) {
++                LOG(ERROR) << "cmdu creation of type TOPOLOGY_NOTIFICATION_MESSAGE, has failed";
++                return false;
++            }
+ 
+-        auto tlvAlMacAddress = cmdu_tx.addClass<ieee1905_1::tlvAlMacAddress>();
+-        if (!tlvAlMacAddress) {
+-            LOG(ERROR) << "addClass ieee1905_1::tlvAlMacAddress failed";
+-            return false;
+-        }
+-        tlvAlMacAddress->mac() = db->bridge.mac;
++            auto tlvAlMacAddress = cmdu_tx.addClass<ieee1905_1::tlvAlMacAddress>();
++            if (!tlvAlMacAddress) {
++                LOG(ERROR) << "addClass ieee1905_1::tlvAlMacAddress failed";
++                return false;
++            }
++            tlvAlMacAddress->mac() = db->bridge.mac;
+ 
+-        auto client_association_event_tlv = cmdu_tx.addClass<wfa_map::tlvClientAssociationEvent>();
+-        if (!client_association_event_tlv) {
+-            LOG(ERROR) << "addClass tlvClientAssociationEvent failed";
+-            return false;
+-        }
+-        // Spec §17.2.6: For MLD clients, STA_MAC = Client MLD MAC, BSSID = AP MLD MAC.
+-        // The disconnect notification carries link-specific MACs (affiliated STA MAC + BSSID).
+-        // Look up the STA MLD MAC and AP MLD MAC from associated_sta_mlds before using them.
+-        sMacAddr tlv_disc_client_mac = notification_in->params().mac;
+-        sMacAddr tlv_disc_bssid      = notification_in->params().bssid;
+-        {
+-            bool found_mld = false;
+-            for (const auto &sta_mld_entry : db->associated_sta_mlds) {
+-                if (found_mld) break;
+-                for (const auto &affiliated : sta_mld_entry.second.affiliated_stas) {
+-                    if (affiliated.affiliated_sta_mac == notification_in->params().mac) {
+-                        tlv_disc_client_mac = sta_mld_entry.first;
+-                        tlv_disc_bssid      = sta_mld_entry.second.mld_config.ap_mld_mac;
+-                        LOG(DEBUG) << "MLO LEAVE: using STA MLD MAC=" << tlv_disc_client_mac
+-                                   << " AP MLD MAC=" << tlv_disc_bssid
+-                                   << " (link MAC=" << notification_in->params().mac
+-                                   << " link BSSID=" << notification_in->params().bssid << ")";
+-                        found_mld = true;
+-                        break;
+-                    }
+-                }
++            auto client_association_event_tlv = cmdu_tx.addClass<wfa_map::tlvClientAssociationEvent>();
++            if (!client_association_event_tlv) {
++                LOG(ERROR) << "addClass tlvClientAssociationEvent failed";
++                return false;
+             }
+-        }
+-        client_association_event_tlv->client_mac() = tlv_disc_client_mac;
+-        client_association_event_tlv->bssid()      = tlv_disc_bssid;
+-        client_association_event_tlv->association_event() =
+-            wfa_map::tlvClientAssociationEvent::CLIENT_HAS_LEFT_THE_BSS;
+ 
+-        if (!db->controller_info.prplmesh_controller) {
+-            LOG(DEBUG) << "non-prplMesh, not adding ClientAssociationEvent VS TLV";
+-        } else {
+-            // Add vendor specific tlv
+-            auto vs_tlv =
+-                message_com::add_vs_tlv<beerocks_message::tlvVsClientAssociationEvent>(cmdu_tx);
++            client_association_event_tlv->client_mac() = tlv_disc_client_mac;
++            client_association_event_tlv->bssid()      = tlv_disc_bssid;
++            client_association_event_tlv->association_event() =
++                wfa_map::tlvClientAssociationEvent::CLIENT_HAS_LEFT_THE_BSS;
+ 
+-            if (!vs_tlv) {
+-                LOG(ERROR) << "add_vs_tlv tlvVsClientAssociationEvent failed";
+-                return false;
++            if (!db->controller_info.prplmesh_controller) {
++                LOG(DEBUG) << "non-prplMesh, not adding ClientAssociationEvent VS TLV";
++            } else {
++                // Add vendor specific tlv
++                auto vs_tlv =
++                    message_com::add_vs_tlv<beerocks_message::tlvVsClientAssociationEvent>(cmdu_tx);
++
++                if (!vs_tlv) {
++                    LOG(ERROR) << "add_vs_tlv tlvVsClientAssociationEvent failed";
++                    return false;
++                }
++
++                vs_tlv->mac()               = notification_in->params().mac;
++                vs_tlv->bssid()             = notification_in->params().bssid;
++                vs_tlv->vap_id()            = notification_in->params().vap_id;
++                vs_tlv->disconnect_reason() = notification_in->params().reason;
++                vs_tlv->disconnect_source() = notification_in->params().source;
++                vs_tlv->disconnect_type()   = notification_in->params().type;
+             }
+ 
+-            vs_tlv->mac()               = notification_in->params().mac;
+-            vs_tlv->bssid()             = notification_in->params().bssid;
+-            vs_tlv->vap_id()            = notification_in->params().vap_id;
+-            vs_tlv->disconnect_reason() = notification_in->params().reason;
+-            vs_tlv->disconnect_source() = notification_in->params().source;
+-            vs_tlv->disconnect_type()   = notification_in->params().type;
++            send_cmdu_to_controller(fronthaul_iface, cmdu_tx);
+         }
+ 
+-        send_cmdu_to_controller(fronthaul_iface, cmdu_tx);
+-
+         // profile-2
+ 
+         // build 1905.1 0x8022 Client Disassociation Stats
+@@ -3669,8 +3742,24 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+             LOG(ERROR) << "addClass tlvClientAssociationEvent failed";
+             return false;
+         }
++        // Fix A: For MLO clients only, use the AP MLD MAC as the BSSID in the TLV.
++        // This prevents the controller from treating each per-link JOIN notification as a
++        // "roam" and sending spurious DISASSOCIATE requests for the previous link,
++        // which causes an infinite join/leave loop (IEEE 802.11be §17.2.6).
++        // Non-MLO (legacy) clients always use the link-level BSSID directly.
++        sMacAddr tlv_bssid = notification_in->bssid();
++        if (notification_in->is_mlo()) {
++            for (const auto &bss : radio->front.bssids) {
++                if (bss.mac == link_mac && bss.apmld_mac != net::network_utils::ZERO_MAC) {
++                    tlv_bssid = bss.apmld_mac;
++                    LOG(DEBUG) << "MLO JOIN: using AP MLD MAC " << tlv_bssid
++                               << " as BSSID in TLV for link " << link_mac;
++                    break;
++                }
++            }
++        }
+         client_association_event_tlv->client_mac() = notification_in->mac();
+-        client_association_event_tlv->bssid()      = notification_in->bssid();
++        client_association_event_tlv->bssid()      = tlv_bssid;
+         client_association_event_tlv->association_event() =
+             wfa_map::tlvClientAssociationEvent::CLIENT_HAS_JOINED_THE_BSS;
+         if (client_association_event_tlv->client_mac() != beerocks::net::network_utils::ZERO_MAC)
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 90c8bcbd5..22d6c549e 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -1496,13 +1496,13 @@ bool ap_wlan_hal_nl80211::sta_disassoc(int8_t vap_id, const std::string &mac, ui
+     }
+ 
+     std::string ifname = m_radio_info.available_vaps[vap_id].bss;
+-
+-    // For MLO support: Try to determine which link the STA is associated with
+     std::string sta_bssid = m_radio_info.available_vaps[vap_id].mac;
++    int8_t link_id = -1;
+ 
++    // For MLO support: Try to determine which link the STA is associated with
+     if (!sta_bssid.empty()) {
+         sMacAddr bssid = tlvf::mac_from_string(sta_bssid);
+-        int8_t link_id = get_link_id_from_bssid(ifname, bssid, m_nl80211_client.get());
++        link_id = get_link_id_from_bssid(ifname, bssid, m_nl80211_client.get());
+         std::string target_interface = get_interface_for_link(ifname, link_id);
+ 
+         LOG(DEBUG) << "Steering: sta_disassoc - sta_mac=" << mac
+@@ -1627,8 +1627,30 @@ bool ap_wlan_hal_nl80211::sta_bss_steer(const sBtmRequestParams &params)
+     // Target BSSID
+     cmd += std::string() + " neighbor=" + tlvf::mac_to_string(params.bssid) + "," + std::to_string(NEIGHBOR_REPORT_BSSID_INFO_EASYMESH) + "," + std::to_string(params.oper_class) + "," + std::to_string(params.chan) + ",0," + NEIGHBOR_REPORT_SUBELEM_CANDIDATE_PREF_MAX_HEX;
+ 
++    // For MLO support: resolve the correct link interface for this BSSID.
++    // sta_bss_steer() must send BSS_TM_REQ to the link-specific hostapd control
++    // socket where the STA is registered, exactly as sta_disassoc() does.
++    // Without this resolution the command is sent to the base VAP interface and
++    // hostapd returns FAIL because the STA is not in that link's station table.
++    std::string ifname = m_radio_info.available_vaps[params.vap_id].bss;
++    std::string sta_bssid = m_radio_info.available_vaps[params.vap_id].mac;
++    int8_t bss_steer_link_id = -1;
++
++    if (!sta_bssid.empty()) {
++        sMacAddr bssid_mac = tlvf::mac_from_string(sta_bssid);
++        bss_steer_link_id = get_link_id_from_bssid(ifname, bssid_mac, m_nl80211_client.get());
++        std::string target_interface = get_interface_for_link(ifname, bss_steer_link_id);
++
++        LOG(DEBUG) << "Steering: sta_bss_steer - sta_mac=" << tlvf::mac_to_string(params.mac)
++                   << ", bssid=" << sta_bssid
++                   << ", interface=" << target_interface
++                   << ", link_id=" << int(bss_steer_link_id);
++
++        ifname = target_interface;
++    }
++
+     // Send command
+-    if (!wpa_ctrl_send_msg(cmd, m_radio_info.available_vaps[params.vap_id].bss)) {
++    if (!wpa_ctrl_send_msg(cmd, ifname)) {
+         LOG(ERROR) << "sta_bss_steer() failed!";
+         return false;
+     }
+diff --git a/controller/src/beerocks/master/son_actions.cpp b/controller/src/beerocks/master/son_actions.cpp
+index a44bc1d54..43f2d8e2e 100644
+--- a/controller/src/beerocks/master/son_actions.cpp
++++ b/controller/src/beerocks/master/son_actions.cpp
+@@ -72,8 +72,38 @@ void son_actions::handle_completed_connection(db &database, ieee1905_1::CmduMess
+             (!new_hostap_mac.empty()) &&
+             (new_hostap_mac != network_utils::ZERO_MAC_STRING) &&
+             (previous_hostap_mac != new_hostap_mac)) {
+-            disconnect_client(database, cmdu_tx, client_mac, previous_hostap_mac,
+-                              eDisconnect_Type_Disassoc, 0);
++            // Fix B: MLO-aware DISASSOCIATE — skip if new and previous BSSIDs are affiliated
++            // APs of the same AP MLD on the same agent.
++            // Without this check, the controller treats each per-link JOIN notification as a
++            // "roam" and disassociates the previous link, causing an infinite join/leave loop
++            // for MLO clients (IEEE 802.11be §17.2.6).
++            bool is_mlo_partner_link = false;
++            auto new_agent_mac  = database.get_bss_parent_agent(tlvf::mac_from_string(new_hostap_mac));
++            auto prev_agent_mac = database.get_bss_parent_agent(tlvf::mac_from_string(previous_hostap_mac));
++            if (new_agent_mac == prev_agent_mac && new_agent_mac != network_utils::ZERO_MAC) {
++                auto agent = database.m_agents.get(new_agent_mac);
++                if (agent) {
++                    for (const auto &ap_mld_entry : agent->ap_mlds) {
++                        bool found_new = false, found_prev = false;
++                        for (const auto &affl_ap : ap_mld_entry.second.affiliated_aps) {
++                            auto bssid_str = tlvf::mac_to_string(affl_ap.second.bssid);
++                            if (bssid_str == new_hostap_mac)      found_new  = true;
++                            if (bssid_str == previous_hostap_mac) found_prev = true;
++                        }
++                        if (found_new && found_prev) {
++                            is_mlo_partner_link = true;
++                            LOG(DEBUG) << "MLO multi-link: skipping DISASSOCIATE for "
++                                       << previous_hostap_mac << " (MLO partner of "
++                                       << new_hostap_mac << ")";
++                            break;
++                        }
++                    }
++                }
++            }
++            if (!is_mlo_partner_link) {
++                disconnect_client(database, cmdu_tx, client_mac, previous_hostap_mac,
++                                  eDisconnect_Type_Disassoc, 0);
++            }
+         }
+ 
+         /*
+diff --git a/controller/src/beerocks/master/tasks/client_steering_task.cpp b/controller/src/beerocks/master/tasks/client_steering_task.cpp
+index 7d070209d..66e9283a7 100644
+--- a/controller/src/beerocks/master/tasks/client_steering_task.cpp
++++ b/controller/src/beerocks/master/tasks/client_steering_task.cpp
+@@ -337,14 +337,21 @@ bool client_steering_task::steer_sta()
+         return true;
+     }
+ 
+-    /* ACL BLOCK loop — skipped entirely when m_acl_allowed == false.
+-     * When acl_allowed=false (BTM-only mode, e.g. idle band steering from the
+-     * steering app), we skip all CLIENT_ASSOCIATION_CONTROL_REQUEST (BLOCK)
+-     * messages and send only the BTM request below.  This avoids ACL
+-     * side-effects on non-target BSSIDs when the steering app does not want
+-     * them (e.g. idle band steering where the STA may roam back quickly). */
+-    if (!m_acl_allowed) {
+-        LOG(DEBUG) << "acl_allowed=false: skipping ACL BLOCK for STA " << m_sta_mac
++    /* Effective ACL decision:
++     * Use ACL BLOCK if explicitly requested (acl_allowed=true) OR if the STA
++     * does not support BTM (is_btm_supported=false).  When BTM is not available,
++     * ACL is the only steering mechanism regardless of the acl_allowed flag.
++     *
++     * Truth table:
++     *   acl_allowed=true,  is_btm=true  → ACL BLOCK + BTM request (normal path)
++     *   acl_allowed=false, is_btm=true  → BTM-only, no ACL (idle band steer)
++     *   acl_allowed=true,  is_btm=false → ACL BLOCK + legacy disassoc
++     *   acl_allowed=false, is_btm=false → ACL BLOCK anyway (BTM unavailable)
++     */
++    const bool effective_acl = m_acl_allowed || !m_is_btm_supported;
++
++    if (!effective_acl) {
++        LOG(DEBUG) << "effective_acl=false: skipping ACL BLOCK for STA " << m_sta_mac
+                    << " → target " << m_target_bssid << " (BTM-only mode)";
+     } else {
+ 
+@@ -413,10 +420,10 @@ bool client_steering_task::steer_sta()
+         }
+     }
+ 
+-    } // end if (m_acl_allowed)
++    } // end if (effective_acl)
+ 
+     //Send STEERING request after 3 seconds, as ACL takes time to set
+-    if (m_acl_allowed) {
++    if (effective_acl) {
+         UTILS_SLEEP_MSEC(3000);
+     }
+ 
+-- 
+2.34.1
+
