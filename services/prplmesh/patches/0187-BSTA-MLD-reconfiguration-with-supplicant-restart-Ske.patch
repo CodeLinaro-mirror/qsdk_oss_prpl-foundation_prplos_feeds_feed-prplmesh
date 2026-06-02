@@ -1,0 +1,709 @@
+From 2c32240802bf5cec1b19ffd3e8456f33c18779b1 Mon Sep 17 00:00:00 2001
+From: Girija P <gpandiya@qti.qualcomm.com>
+Date: Tue, 2 Jun 2026 12:45:12 +0530
+Subject: [PATCH] BSTA MLD reconfiguration with supplicant restart - Skeleton
+ UCI option bsta_reconfigure_with_supplicant_restart from the prplmesh config
+ to enable/disable support runtime Add a new
+ ACTION_BACKHAUL_SUPPLICANT_RESTART message and its handler to trigger
+ wpa_supplicant restart after all radios are updated with BSTA MLD info.
+
+Signed-off-by: Girija P <gpandiya@qti.qualcomm.com>
+---
+ .../backhaul_manager/backhaul_manager.cpp     |  54 +++--
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  55 ++++-
+ .../slave/tasks/ap_autoconfiguration_task.h   |  10 +
+ .../beerocks/tlvf/beerocks_message_action.h   |  24 ++-
+ .../beerocks/tlvf/beerocks_message_backhaul.h |  63 ++++++
+ .../tlvf/beerocks_message_backhaul.cpp        | 204 ++++++++++++++++++
+ .../tlvf/beerocks_message_action.yaml         |   3 +-
+ .../tlvf/beerocks_message_backhaul.yaml       |   5 +
+ framework/platform/bpl/cfg/linux/bpl_cfg.cpp  |   6 +
+ framework/platform/bpl/cfg/uci/bpl_cfg.cpp    |  14 ++
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     |  19 +-
+ framework/platform/bpl/include/bpl/bpl_cfg.h  |  12 ++
+ 12 files changed, 442 insertions(+), 27 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index a8fe0f0ae..934d59648 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -2479,6 +2479,43 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+         }
+         break;
+     }
++
++    case beerocks_message::ACTION_BACKHAUL_SUPPLICANT_RESTART: {
++        LOG(INFO) << "Received ACTION_BACKHAUL_SUPPLICANT_RESTART";
++#ifdef USE_PRPLMESH_NLHAL
++        {
++            auto db = AgentDB::get();
++            if (db->supplicant_restart_required) {
++                LOG(INFO) << "Supplicant restart required after all radios updated with MLD info"
++                          << " — triggering FSM restart to reload wpa_supplicant configuration";
++                db->supplicant_restart_required = false;
++                // Trigger FSM restart so wpa_supplicant picks up the new MLD group configuration.
++                // This ensures the updated UCI/wireless config (written by bpl_cfg_update_bsta_mld_grp)
++                // is applied by restarting the supplicant through the normal backhaul restart sequence.
++                // Read bsta_reconfigure_with_supplicant_restart from prplmesh UCI config runtime.
++                // Only perform the FSM RESTART when the flag is enabled.
++                bool bsta_reconfigure_with_supplicant_restart = false;
++                beerocks::bpl::cfg_get_bsta_reconfigure_with_supplicant_restart(
++                    bsta_reconfigure_with_supplicant_restart);
++                LOG(INFO) << "bsta_reconfigure_with_supplicant_restart="
++                          << bsta_reconfigure_with_supplicant_restart;
++                if (bsta_reconfigure_with_supplicant_restart) {
++//                    call API for wpa_supplicant restart sequence   - TBD
++//                    stop_on_failure_attempts = configuration_stop_on_failure_attempts;
++//                    FSM_MOVE_STATE(RESTART);
++                } else {
++                    LOG(DEBUG) << "bsta_reconfigure_with_supplicant_restart is not set"
++                               << " — skipping FSM RESTART";
++                }
++            } else {
++                LOG(DEBUG) << "ACTION_BACKHAUL_SUPPLICANT_RESTART received but"
++                           << " supplicant_restart_required is not set — skipping restart";
++            }
++        }
++#endif // USE_PRPLMESH_NLHAL
++        break;
++    }
++
+     case beerocks_message::ACTION_BACKHAUL_MLD_UPDATE_REQUEST: {
+         auto request =
+             beerocks_header->addClass<beerocks_message::cACTION_BACKHAUL_MLD_UPDATE_REQUEST>();
+@@ -2521,20 +2558,9 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+             return false;
+         }
+ 
+-/* if sta_wlan_hal is in attached state or if connect is tried somewhere later, check if supp_rst flag is present
+- * in sta_wlan_hal, if so, restart the supplicant, wait for a timeout and 
+- * then try attach or connect anywhere from backhaul manager 
+- * This makes sure config is saved during ethernet backhaul too and when eth to wifi switching happens,
+- * new mld config will be effective and can be used */
+-#ifdef USE_PRPLMESH_NLHAL
+-        auto db                        = AgentDB::get();
+-        if (db->supplicant_restart_required) {
+-            LOG(DEBUG) << " Supplicant restart will be triggered by STA WLAN HAL this time\n";
+-            db->supplicant_restart_required = false;
+-        } else {
+-            LOG(DEBUG) << " Supplicant restart will not be triggered by STA WLAN HAL this time\n";
+-        }
+-#endif
++        // Note: db->supplicant_restart_required is intentionally NOT reset here.
++        // It will be checked and reset by the ACTION_BACKHAUL_SUPPLICANT_RESTART handler
++        // which is sent by ap_autoconfiguration_task after all radios are updated with MLD info.
+         sta_wlan_hal->update_mld_mode(request->mld_mode());
+         sta_wlan_hal->update_mld_unit(request->mld_unit());
+         break;
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 9f8cc1a54..b938a7737 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -1904,10 +1904,21 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_wsc(ieee1905_1::CmduMe
+         }
+     }
+ 
+-    // Send bSTA MLD requests after sending BSS configuration
+-    for (auto &bsta_mld_request : bsta_mld_requests_infos) {
+-        send_bsta_mld_configuration(bsta_mld_request.first, bsta_mld_request.second.first,
+-                                    bsta_mld_request.second.second);
++    // Send bSTA MLD requests after sending BSS configuration.
++    // Once all radios are updated with mld_info, send SUPPLICANT_RESTART to backhaul manager.
++    if (!bsta_mld_requests_infos.empty()) {
++        LOG(DEBUG) << "Sending bSTA MLD configuration for "
++                   << bsta_mld_requests_infos.size() << " radio(s)";
++        for (auto &bsta_mld_request : bsta_mld_requests_infos) {
++            send_bsta_mld_configuration(bsta_mld_request.first, bsta_mld_request.second.first,
++                                        bsta_mld_request.second.second);
++        }
++        // All radios have been updated with MLD info — trigger supplicant restart if needed.
++        // The backhaul manager checks db->supplicant_restart_required and only restarts
++        // wpa_supplicant if it was set during ACTION_BACKHAUL_MLD_UPDATE_REQUEST processing.
++        if (!send_backhaul_supplicant_restart()) {
++            LOG(ERROR) << "send_backhaul_supplicant_restart failed";
++        }
+     }
+     bsta_mld_requests_infos.clear();
+ 
+@@ -2044,6 +2055,23 @@ void ApAutoConfigurationTask::handle_bsta_mld_configuration_request(
+         return;
+     }
+ 
++    // Send bSTA MLD configuration for all affiliated radios that were stored in
++    // bsta_mld_requests_infos by handle_bsta_mld_configuration_tlv.
++    // Once all radios are updated with MLD info, trigger supplicant restart if needed.
++    if (!bsta_mld_requests_infos.empty()) {
++        LOG(DEBUG) << "Sending bSTA MLD configuration for "
++                   << bsta_mld_requests_infos.size() << " radio(s) from BSTA_MLD_CONFIGURATION_REQUEST";
++        for (auto &bsta_mld_request : bsta_mld_requests_infos) {
++            send_bsta_mld_configuration(bsta_mld_request.first, bsta_mld_request.second.first,
++                                        bsta_mld_request.second.second);
++        }
++        // All radios have been updated with MLD info — trigger supplicant restart if needed.
++        if (!send_backhaul_supplicant_restart()) {
++            LOG(ERROR) << "send_backhaul_supplicant_restart failed";
++        }
++    }
++    bsta_mld_requests_infos.clear();
++
+     // Send BSTA_MLD_CONFIGURATION_RESPONSE_MESSAGE
+     send_bsta_mld_configuration_response_message();
+     return;
+@@ -2812,6 +2840,25 @@ bool ApAutoConfigurationTask::send_bsta_configuration(const sMacAddr &radio_mac,
+     return backhaul_manager_cmdu_client->send_cmdu(m_cmdu_tx);
+ }
+ 
++bool ApAutoConfigurationTask::send_backhaul_supplicant_restart()
++{
++    auto request =
++        message_com::create_vs_message<beerocks_message::cACTION_BACKHAUL_SUPPLICANT_RESTART>(
++            m_cmdu_tx);
++    if (!request) {
++        LOG(ERROR) << "Failed building message cACTION_BACKHAUL_SUPPLICANT_RESTART!";
++        return false;
++    }
++    auto backhaul_manager_cmdu_client = m_btl_ctx.get_backhaul_manager_cmdu_client();
++    if (!backhaul_manager_cmdu_client) {
++        LOG(ERROR) << "Failed to get backhaul manager cmdu client";
++        return false;
++    }
++    LOG(INFO) << "Sending ACTION_BACKHAUL_SUPPLICANT_RESTART to BH manager"
++              << " (all radios updated with MLD info)";
++    return backhaul_manager_cmdu_client->send_cmdu(m_cmdu_tx);
++}
++
+ bool ApAutoConfigurationTask::send_bsta_mld_configuration(const sMacAddr &ruid, int8_t mld_unit,
+                                                           uint8_t mld_mode, bool initialization)
+ {
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+index ba82b4f76..b3e6e347a 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+@@ -388,6 +388,16 @@ private:
+      */
+     bool handle_bss_reconfiguration(const std::string &radio_iface, std::vector<sBssConfig> &infos);
+ 
++    /**
++     * @brief Send ACTION_BACKHAUL_SUPPLICANT_RESTART to the backhaul manager.
++     *
++     * Called after all radios have been updated with MLD info to trigger
++     * wpa_supplicant restart if required.
++     *
++     * @return true on success, otherwise false.
++     */
++    bool send_backhaul_supplicant_restart();
++
+     bool send_ap_bss_info_update_request(const std::string &radio_iface);
+ 
+     bool send_ap_connected_sta_notifications_request(const std::string &radio_iface);
+diff --git a/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_action.h b/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_action.h
+index 0116fad9d..a2147e934 100644
+--- a/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_action.h
++++ b/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_action.h
+@@ -149,7 +149,10 @@ enum eActionOp_BACKHAUL: uint8_t {
+     ACTION_BACKHAUL_WIFI_ENABLE_DISABLE_ENDPOINT = 0x54,
+     ACTION_BACKHAUL_MLD_UPDATE_REQUEST = 0x55,
+     ACTION_BACKHAUL_TOPOLOGY_NOTIFICATION_COMMAND = 0x56,
+-    ACTION_BACKHAUL_ENUM_END = 0x57,
++    ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION = 0x57,
++    ACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION = 0x58,
++    ACTION_BACKHAUL_SUPPLICANT_RESTART = 0x59,
++    ACTION_BACKHAUL_ENUM_END = 0x5a,
+ };
+ 
+ enum eActionOp_PLATFORM: uint8_t {
+@@ -240,7 +243,12 @@ enum eActionOp_APMANAGER: uint8_t {
+     ACTION_APMANAGER_STATE_NOTIFICATION = 0x4b,
+     ACTION_APMANAGER_MULTI_CHAN_BEACON_11K_REQUEST = 0x4c,
+     ACTION_APMANAGER_MLD_UPDATE_REQUEST = 0x4d,
+-    ACTION_APMANAGER_ENUM_END = 0x4e,
++    ACTION_APMANAGER_CHANGE_MODULE_LOGGING_LEVEL = 0x4e,
++    ACTION_APMANAGER_BSTA_STATE_NOTIFICATION = 0x4f,
++    ACTION_APMANAGER_VAP_DB_UPDATE_NOTIFICATION = 0x50,
++    ACTION_APMANAGER_SET_FH_VAPS_STATE = 0x51,
++    ACTION_APMANAGER_UPDATE_HIDDEN_SSID_REQUEST = 0x52,
++    ACTION_APMANAGER_ENUM_END = 0x53,
+ };
+ 
+ enum eActionOp_MONITOR: uint8_t {
+@@ -288,7 +296,8 @@ enum eActionOp_MONITOR: uint8_t {
+     ACTION_MONITOR_STEERING_CLIENT_SET_RESPONSE = 0x53,
+     ACTION_MONITOR_STEERING_EVENT_CLIENT_ACTIVITY_NOTIFICATION = 0x54,
+     ACTION_MONITOR_STEERING_EVENT_SNR_XING_NOTIFICATION = 0x55,
+-    ACTION_MONITOR_ENUM_END = 0x56,
++    ACTION_MONITOR_VAP_DB_UPDATE_NOTIFICATION = 0x56,
++    ACTION_MONITOR_ENUM_END = 0x57,
+ };
+ 
+ enum eActionOp_CLI: uint8_t {
+@@ -406,6 +415,9 @@ enum eActionOp_BML: uint8_t {
+     ACTION_BML_UNREGISTER_TOPOLOGY_QUERY = 0xc2,
+     ACTION_BML_TRIGGER_CHANNEL_SELECTION_REQUEST = 0xc3,
+     ACTION_BML_TRIGGER_CHANNEL_SELECTION_RESPONSE = 0xc4,
++    ACTION_BML_TRIGGER_RECONFIG_APMLD_REQUEST = 0xc5,
++    ACTION_BML_UPDATE_HIDDEN_SSID_REQUEST = 0xc6,
++    ACTION_BML_UPDATE_HIDDEN_SSID_RESPONSE = 0xc7,
+     ACTION_BML_CHANNEL_SCAN_SET_CONTINUOUS_PARAMS_REQUEST = 0xc8,
+     ACTION_BML_CHANNEL_SCAN_SET_CONTINUOUS_PARAMS_RESPONSE = 0xc9,
+     ACTION_BML_CHANNEL_SCAN_GET_CONTINUOUS_PARAMS_REQUEST = 0xca,
+@@ -442,7 +454,11 @@ enum eActionOp_BML: uint8_t {
+     ACTION_BML_UNASSOC_STA_RCPI_QUERY_RESPONSE = 0xee,
+     ACTION_BML_GET_UNASSOC_STA_QUERY_RESULT_REQUEST = 0xef,
+     ACTION_BML_GET_UNASSOC_STA_QUERY_RESULT_RESPONSE = 0xf0,
+-    ACTION_BML_ENUM_END = 0xf1,
++    ACTION_BML_CLIENT_ASSOC_CONTROL_REQUEST = 0xf1,
++    ACTION_BML_CLIENT_ASSOC_CONTROL_RESPONSE = 0xf2,
++    ACTION_BML_11K_BEACON_QUERY_REQUEST = 0xf3,
++    ACTION_BML_11K_BEACON_QUERY_RESPONSE = 0xf4,
++    ACTION_BML_ENUM_END = 0xf5,
+ };
+ 
+ enum class eActionOp_AP_MANAGER_STATE : uint8_t {
+diff --git a/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_backhaul.h b/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_backhaul.h
+index 97519c595..90b322d24 100644
+--- a/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_backhaul.h
++++ b/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_backhaul.h
+@@ -1074,6 +1074,69 @@ class cACTION_BACKHAUL_CHANNEL_SCAN_FINISHED_NOTIFICATION : public BaseClass
+         sMacAddr* m_radio_mac = nullptr;
+ };
+ 
++class cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION : public BaseClass
++{
++    public:
++        cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION(uint8_t* buff, size_t buff_len, bool parse = false);
++        explicit cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION(std::shared_ptr<BaseClass> base, bool parse = false);
++        ~cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION();
++
++        static eActionOp_BACKHAUL get_action_op(){
++            return (eActionOp_BACKHAUL)(ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION);
++        }
++        uint8_t& connected();
++        uint8_t& backhaul_switch();
++        void class_swap() override;
++        bool finalize() override;
++        static size_t get_initial_size();
++
++    private:
++        bool init();
++        eActionOp_BACKHAUL* m_action_op = nullptr;
++        uint8_t* m_connected = nullptr;
++        uint8_t* m_backhaul_switch = nullptr;
++};
++
++class cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION : public BaseClass
++{
++    public:
++        cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION(uint8_t* buff, size_t buff_len, bool parse = false);
++        explicit cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION(std::shared_ptr<BaseClass> base, bool parse = false);
++        ~cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION();
++
++        static eActionOp_BACKHAUL get_action_op(){
++            return (eActionOp_BACKHAUL)(ACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION);
++        }
++        uint8_t& connected();
++        void class_swap() override;
++        bool finalize() override;
++        static size_t get_initial_size();
++
++    private:
++        bool init();
++        eActionOp_BACKHAUL* m_action_op = nullptr;
++        uint8_t* m_connected = nullptr;
++};
++
++class cACTION_BACKHAUL_SUPPLICANT_RESTART : public BaseClass
++{
++    public:
++        cACTION_BACKHAUL_SUPPLICANT_RESTART(uint8_t* buff, size_t buff_len, bool parse = false);
++        explicit cACTION_BACKHAUL_SUPPLICANT_RESTART(std::shared_ptr<BaseClass> base, bool parse = false);
++        ~cACTION_BACKHAUL_SUPPLICANT_RESTART();
++
++        static eActionOp_BACKHAUL get_action_op(){
++            return (eActionOp_BACKHAUL)(ACTION_BACKHAUL_SUPPLICANT_RESTART);
++        }
++        void class_swap() override;
++        bool finalize() override;
++        static size_t get_initial_size();
++
++    private:
++        bool init();
++        eActionOp_BACKHAUL* m_action_op = nullptr;
++};
++
+ }; // close namespace: beerocks_message
+ 
+ #endif //_BEEROCKS/TLVF_BEEROCKS_MESSAGE_BACKHAUL_H_
+diff --git a/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_backhaul.cpp b/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_backhaul.cpp
+index c72a2cef9..561860abc 100644
+--- a/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_backhaul.cpp
++++ b/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_backhaul.cpp
+@@ -3632,4 +3632,208 @@ bool cACTION_BACKHAUL_CHANNEL_SCAN_FINISHED_NOTIFICATION::init()
+     return true;
+ }
+ 
++cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION::cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION(uint8_t* buff, size_t buff_len, bool parse) :
++    BaseClass(buff, buff_len, parse) {
++    m_init_succeeded = init();
++}
++cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION::cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION(std::shared_ptr<BaseClass> base, bool parse) :
++BaseClass(base->getBuffPtr(), base->getBuffRemainingBytes(), parse){
++    m_init_succeeded = init();
++}
++cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION::~cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION() {
++}
++uint8_t& cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION::connected() {
++    return (uint8_t&)(*m_connected);
++}
++
++uint8_t& cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION::backhaul_switch() {
++    return (uint8_t&)(*m_backhaul_switch);
++}
++
++void cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION::class_swap()
++{
++    tlvf_swap(8*sizeof(eActionOp_BACKHAUL), reinterpret_cast<uint8_t*>(m_action_op));
++}
++
++bool cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION::finalize()
++{
++    if (m_parse__) {
++        TLVF_LOG(DEBUG) << "finalize() called but m_parse__ is set";
++        return true;
++    }
++    if (m_finalized__) {
++        TLVF_LOG(DEBUG) << "finalize() called for already finalized class";
++        return true;
++    }
++    if (!isPostInitSucceeded()) {
++        TLVF_LOG(ERROR) << "post init check failed";
++        return false;
++    }
++    if (m_inner__) {
++        if (!m_inner__->finalize()) {
++            TLVF_LOG(ERROR) << "m_inner__->finalize() failed";
++            return false;
++        }
++        auto tailroom = m_inner__->getMessageBuffLength() - m_inner__->getMessageLength();
++        m_buff_ptr__ -= tailroom;
++    }
++    class_swap();
++    m_finalized__ = true;
++    return true;
++}
++
++size_t cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION::get_initial_size()
++{
++    size_t class_size = 0;
++    class_size += sizeof(uint8_t); // connected
++    class_size += sizeof(uint8_t); // backhaul_switch
++    return class_size;
++}
++
++bool cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION::init()
++{
++    if (getBuffRemainingBytes() < get_initial_size()) {
++        TLVF_LOG(ERROR) << "Not enough available space on buffer. Class init failed";
++        return false;
++    }
++    m_connected = reinterpret_cast<uint8_t*>(m_buff_ptr__);
++    if (!buffPtrIncrementSafe(sizeof(uint8_t))) {
++        LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << sizeof(uint8_t) << ") Failed!";
++        return false;
++    }
++    m_backhaul_switch = reinterpret_cast<uint8_t*>(m_buff_ptr__);
++    if (!buffPtrIncrementSafe(sizeof(uint8_t))) {
++        LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << sizeof(uint8_t) << ") Failed!";
++        return false;
++    }
++    if (m_parse__) { class_swap(); }
++    return true;
++}
++
++cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION::cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION(uint8_t* buff, size_t buff_len, bool parse) :
++    BaseClass(buff, buff_len, parse) {
++    m_init_succeeded = init();
++}
++cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION::cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION(std::shared_ptr<BaseClass> base, bool parse) :
++BaseClass(base->getBuffPtr(), base->getBuffRemainingBytes(), parse){
++    m_init_succeeded = init();
++}
++cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION::~cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION() {
++}
++uint8_t& cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION::connected() {
++    return (uint8_t&)(*m_connected);
++}
++
++void cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION::class_swap()
++{
++    tlvf_swap(8*sizeof(eActionOp_BACKHAUL), reinterpret_cast<uint8_t*>(m_action_op));
++}
++
++bool cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION::finalize()
++{
++    if (m_parse__) {
++        TLVF_LOG(DEBUG) << "finalize() called but m_parse__ is set";
++        return true;
++    }
++    if (m_finalized__) {
++        TLVF_LOG(DEBUG) << "finalize() called for already finalized class";
++        return true;
++    }
++    if (!isPostInitSucceeded()) {
++        TLVF_LOG(ERROR) << "post init check failed";
++        return false;
++    }
++    if (m_inner__) {
++        if (!m_inner__->finalize()) {
++            TLVF_LOG(ERROR) << "m_inner__->finalize() failed";
++            return false;
++        }
++        auto tailroom = m_inner__->getMessageBuffLength() - m_inner__->getMessageLength();
++        m_buff_ptr__ -= tailroom;
++    }
++    class_swap();
++    m_finalized__ = true;
++    return true;
++}
++
++size_t cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION::get_initial_size()
++{
++    size_t class_size = 0;
++    class_size += sizeof(uint8_t); // connected
++    return class_size;
++}
++
++bool cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION::init()
++{
++    if (getBuffRemainingBytes() < get_initial_size()) {
++        TLVF_LOG(ERROR) << "Not enough available space on buffer. Class init failed";
++        return false;
++    }
++    m_connected = reinterpret_cast<uint8_t*>(m_buff_ptr__);
++    if (!buffPtrIncrementSafe(sizeof(uint8_t))) {
++        LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << sizeof(uint8_t) << ") Failed!";
++        return false;
++    }
++    if (m_parse__) { class_swap(); }
++    return true;
++}
++
++cACTION_BACKHAUL_SUPPLICANT_RESTART::cACTION_BACKHAUL_SUPPLICANT_RESTART(uint8_t* buff, size_t buff_len, bool parse) :
++    BaseClass(buff, buff_len, parse) {
++    m_init_succeeded = init();
++}
++cACTION_BACKHAUL_SUPPLICANT_RESTART::cACTION_BACKHAUL_SUPPLICANT_RESTART(std::shared_ptr<BaseClass> base, bool parse) :
++BaseClass(base->getBuffPtr(), base->getBuffRemainingBytes(), parse){
++    m_init_succeeded = init();
++}
++cACTION_BACKHAUL_SUPPLICANT_RESTART::~cACTION_BACKHAUL_SUPPLICANT_RESTART() {
++}
++void cACTION_BACKHAUL_SUPPLICANT_RESTART::class_swap()
++{
++    tlvf_swap(8*sizeof(eActionOp_BACKHAUL), reinterpret_cast<uint8_t*>(m_action_op));
++}
++
++bool cACTION_BACKHAUL_SUPPLICANT_RESTART::finalize()
++{
++    if (m_parse__) {
++        TLVF_LOG(DEBUG) << "finalize() called but m_parse__ is set";
++        return true;
++    }
++    if (m_finalized__) {
++        TLVF_LOG(DEBUG) << "finalize() called for already finalized class";
++        return true;
++    }
++    if (!isPostInitSucceeded()) {
++        TLVF_LOG(ERROR) << "post init check failed";
++        return false;
++    }
++    if (m_inner__) {
++        if (!m_inner__->finalize()) {
++            TLVF_LOG(ERROR) << "m_inner__->finalize() failed";
++            return false;
++        }
++        auto tailroom = m_inner__->getMessageBuffLength() - m_inner__->getMessageLength();
++        m_buff_ptr__ -= tailroom;
++    }
++    class_swap();
++    m_finalized__ = true;
++    return true;
++}
++
++size_t cACTION_BACKHAUL_SUPPLICANT_RESTART::get_initial_size()
++{
++    size_t class_size = 0;
++    return class_size;
++}
++
++bool cACTION_BACKHAUL_SUPPLICANT_RESTART::init()
++{
++    if (getBuffRemainingBytes() < get_initial_size()) {
++        TLVF_LOG(ERROR) << "Not enough available space on buffer. Class init failed";
++        return false;
++    }
++    if (m_parse__) { class_swap(); }
++    return true;
++}
++
+ 
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
+index 13c496979..258c1db19 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
+@@ -154,8 +154,9 @@ eActionOp_BACKHAUL:
+   ACTION_BACKHAUL_TOPOLOGY_NOTIFICATION_COMMAND: 86
+   ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION: 87
+   ACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION: 88
++  ACTION_BACKHAUL_SUPPLICANT_RESTART: 89
+ 
+-  ACTION_BACKHAUL_ENUM_END: 89
++  ACTION_BACKHAUL_ENUM_END: 90
+ 
+ ####################################################
+ ####################################################
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
+index 91feadea2..c05c6f03b 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
+@@ -250,3 +250,8 @@ cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION:
+ cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION:
+   _type: class
+   connected: uint8_t  # 1 = backhaul connected (enable FH VAPs), 0 = backhaul disconnected (disable FH VAPs)
++
++
++cACTION_BACKHAUL_SUPPLICANT_RESTART:
++  _type: class
++
+diff --git a/framework/platform/bpl/cfg/linux/bpl_cfg.cpp b/framework/platform/bpl/cfg/linux/bpl_cfg.cpp
+index 8a3a5d54e..e251c47e0 100644
+--- a/framework/platform/bpl/cfg/linux/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/linux/bpl_cfg.cpp
+@@ -1009,6 +1009,12 @@ bool cfg_get_traffic_separation_persistence_enabled(bool &enabled)
+     return true;
+ }
+ 
++bool cfg_get_bsta_reconfigure_with_supplicant_restart(bool &enabled)
++{
++    enabled = false;
++    return true;
++}
++
+ bool cfg_persist_iface_bridge_assignment(const std::string & /*bridge*/,
+                                          const std::string & /*iface*/)
+ {
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
+index 78384becb..0f5c02b3a 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
+@@ -1201,6 +1201,20 @@ bool cfg_get_traffic_separation_persistence_enabled(bool &enabled)
+     return true;
+ }
+ 
++bool cfg_get_bsta_reconfigure_with_supplicant_restart(bool &enabled)
++{
++    int retVal = -1;
++
++    if (cfg_get_prplmesh_param_int_default("bsta_reconfigure_with_supplicant_restart", &retVal,
++                                           0) == RETURN_ERR) {
++        MAPF_DBG("Failed to read bsta_reconfigure_with_supplicant_restart, using default=0");
++        enabled = false;
++        return true;
++    }
++    enabled = (retVal != 0);
++    return true;
++}
++
+ bool cfg_persist_iface_bridge_assignment(const std::string &bridge, const std::string &iface)
+ {
+     // Find the UCI network device section whose 'name' option matches the bridge.
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index eefe29a51..367889adc 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -1474,8 +1474,9 @@ bool bpl_cfg_set_sta_vap_bh_credentials(const std::string &iface,
+             return false;
+         }
+ 
+-        options["mode"]   = "sta";
+-        options["device"] = matching_device;
++        options["mode"]    = "sta";
++        options["device"]  = matching_device;
++        options["network"] = "lan";
+ 
+         // Find a reference section by identifying which section has mode="sta".
+         // The device option is NOT used as the selection criterion here.
+@@ -1667,7 +1668,10 @@ eBstaSupplicantRestartStatus bpl_cfg_update_bsta_mld_grp(const std::string &radi
+         return eBstaSupplicantRestartStatus::SUPP_RST_NOT_REQUIRED;
+     }
+ 
+-    // Ensure the mld option in the matched wifi-iface section is set to mld_name
++    // Ensure the mld option in the matched wifi-iface section is set to mld_name.
++    // Track whether the wifi-iface section itself was modified so we can return
++    // SUPP_RST_REQUIRED even when the wifi-mld section is already in sync.
++    bool mld_option_changed = false;
+     std::string current_mld_value;
+     bool has_mld = uci_get_option(package_name, section_type, matched_section, "mld",
+                                   current_mld_value);
+@@ -1682,6 +1686,7 @@ eBstaSupplicantRestartStatus bpl_cfg_update_bsta_mld_grp(const std::string &radi
+                        << matched_section;
+             return eBstaSupplicantRestartStatus::SUPP_RST_NOT_REQUIRED;
+         }
++        mld_option_changed = true;
+     } else if (current_mld_value != mld_name) {
+         LOG(INFO) << "bpl_cfg_update_bsta_mld_grp: updating section " << matched_section
+                   << " mld option from '" << current_mld_value << "' to '" << mld_name << "'";
+@@ -1692,6 +1697,7 @@ eBstaSupplicantRestartStatus bpl_cfg_update_bsta_mld_grp(const std::string &radi
+                        << matched_section;
+             return eBstaSupplicantRestartStatus::SUPP_RST_NOT_REQUIRED;
+         }
++        mld_option_changed = true;
+     }
+ 
+     // --- wifi-mld section check ---
+@@ -1736,7 +1742,10 @@ eBstaSupplicantRestartStatus bpl_cfg_update_bsta_mld_grp(const std::string &radi
+ 
+         LOG(DEBUG) << "bpl_cfg_update_bsta_mld_grp: wifi-mld section " << mld_name
+                    << " is in sync with wifi-iface section";
+-        return eBstaSupplicantRestartStatus::SUPP_RST_NOT_REQUIRED;
++        // If the mld option was added/changed in the wifi-iface section, a supplicant
++        // restart is still required even though the wifi-mld section content is in sync.
++        return mld_option_changed ? eBstaSupplicantRestartStatus::SUPP_RST_REQUIRED
++                                  : eBstaSupplicantRestartStatus::SUPP_RST_NOT_REQUIRED;
+     }
+ 
+     // wifi-mld section does not exist — create it from the matched wifi-iface section
+@@ -1766,6 +1775,8 @@ eBstaSupplicantRestartStatus bpl_cfg_update_bsta_mld_grp(const std::string &radi
+     } else {
+         new_mld_opts["disabled"] = "1";
+     }
++    // Set network=lan for the new wifi-mld section so netifd places it in the correct bridge.
++    new_mld_opts["network"] = "lan";
+     if (!uci_set_section(package_name, mld_sect_type, mld_name, new_mld_opts, true)) {
+         LOG(ERROR) << "bpl_cfg_update_bsta_mld_grp: failed to populate wifi-mld section "
+                    << mld_name;
+diff --git a/framework/platform/bpl/include/bpl/bpl_cfg.h b/framework/platform/bpl/include/bpl/bpl_cfg.h
+index c5019503f..7027b8e7b 100644
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -1454,6 +1454,18 @@ bool cfg_get_traffic_separation_bridge_mapping_enabled(bool &enabled);
+  */
+ bool cfg_get_traffic_separation_persistence_enabled(bool &enabled);
+ 
++/**
++ * @brief Get bsta_reconfigure_with_supplicant_restart flag from UCI.
++ *
++ * Reads `bsta_reconfigure_with_supplicant_restart` from prplmesh UCI config.
++ * When enabled, the backhaul FSM will perform a full RESTART (including
++ * wpa_supplicant restart) upon receiving ACTION_BACKHAUL_SUPPLICANT_RESTART.
++ *
++ * @param[out] enabled true if bSTA reconfiguration with supplicant restart is enabled.
++ * @return true on success, false on failure.
++ */
++bool cfg_get_bsta_reconfigure_with_supplicant_restart(bool &enabled);
++
+ 
+ /**
+  * @brief Persist an interface's bridge assignment in the network UCI config.
+-- 
+2.34.1
+
