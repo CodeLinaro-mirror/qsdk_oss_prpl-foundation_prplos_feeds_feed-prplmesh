@@ -1,0 +1,334 @@
+From 0f830125987631a9ce8cde4ed8fc16aa6eb5eb2c Mon Sep 17 00:00:00 2001
+From: Nirmal Raj S <nirm@qti.qualcomm.com>
+Date: Wed, 3 Jun 2026 15:09:44 +0530
+Subject: [PATCH] prevent agent reset caused by MQTT broker keepalive timeout
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The slave_wlan_hal connects to the local MQTT broker with a keepalive
+of 60 s. The manual mosquitto loop (loop_read + loop_write) was used
+without ever calling mosquitto_loop_misc(). That function is responsible
+for sending PINGREQ keepalive packets; without it no PINGREQ is ever
+sent, the broker disconnects the client after 60 s of silence, the
+MQTT socket fd becomes invalid, the event loop fires on_disconnect/
+on_error for slave_hal_ext_events, and the agent resets.
+
+Fix:
+- mqtt_client.h/cpp: add MQTTClient::ping() which calls
+  mosquitto_loop_misc() to send a PINGREQ keepalive packet.
+- slave_wlan_hal.h: add virtual send_ping() default no-op to the
+  slave_wlan_hal interface.
+- slave_wlan_hal_nl80211.h/cpp: override send_ping() with a 30-second
+  interval timer (last_ping_time_); calls mqtt_client.ping() when due.
+- slave_wlan_hal_dummy/onewifi/whm .h/.cpp: add dummy send_ping()
+  no-op overrides for HALs that do not use an MQTT broker.
+- son_slave_thread.h/cpp: add send_slave_hal_ping() which delegates to
+  m_slave_wlan_hal->send_ping(). fsm_all() calls send_slave_hal_ping() on
+  every 200 ms FSM timer tick, guaranteeing a PINGREQ is sent every
+  30 s — well within the broker's keepalive * 1.5 = 90 s disconnect
+  deadline.
+
+Signed-off-by: Nirmal Raj S <nirm@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/son_slave_thread.cpp  | 12 ++++++++++++
+ agent/src/beerocks/slave/son_slave_thread.h    | 10 ++++++++++
+ .../bwl/dummy/slave_wlan_hal_dummy.cpp         |  5 +++++
+ .../beerocks/bwl/dummy/slave_wlan_hal_dummy.h  |  1 +
+ .../beerocks/bwl/include/bwl/slave_wlan_hal.h  |  9 +++++++++
+ .../bwl/nl80211/slave_wlan_hal_nl80211.cpp     | 18 +++++++++++++++++-
+ .../bwl/nl80211/slave_wlan_hal_nl80211.h       |  6 ++++++
+ .../bwl/onewifi/slave_wlan_hal_onewifi.cpp     |  5 +++++
+ .../bwl/onewifi/slave_wlan_hal_onewifi.h       |  1 +
+ common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp |  5 +++++
+ common/beerocks/bwl/whm/slave_wlan_hal_whm.h   |  1 +
+ .../platform/mqttapi/include/mqtt_client.h     | 10 ++++++++++
+ framework/platform/mqttapi/mqtt_client.cpp     | 16 +++++++++++++---
+ 13 files changed, 95 insertions(+), 4 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index f4464581c..232af7361 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -891,8 +891,20 @@ void slave_thread::handle_client_disconnected(int fd)
+     LOG(INFO) << "Uknown client socket disconnected!";
+ }
+ 
++void slave_thread::send_slave_hal_ping()
++{
++    if (m_slave_wlan_hal) {
++        m_slave_wlan_hal->send_ping();
++    }
++}
++
+ bool slave_thread::fsm_all()
+ {
++    // Send MQTT PINGREQ keepalive to the broker if keepalive/2 seconds have
++    // elapsed since the last message exchange. This keeps the MQTT connection
++    // alive even when no SMD events are flowing.
++    send_slave_hal_ping();
++
+     auto radio_fsm = [&](const sManagedRadio &radio_manager, const std::string &fronthaul_iface) {
+         if (!monitor_heartbeat_check(fronthaul_iface) ||
+             !ap_manager_heartbeat_check(fronthaul_iface)) {
+diff --git a/agent/src/beerocks/slave/son_slave_thread.h b/agent/src/beerocks/slave/son_slave_thread.h
+index a21571223..d23a3bcb8 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.h
++++ b/agent/src/beerocks/slave/son_slave_thread.h
+@@ -249,6 +249,16 @@ private:
+     bool register_event_handlers();
+     void clear_event_handlers();
+ 
++    /**
++     * @brief Send an MQTT PINGREQ keepalive if keepalive/2 seconds have elapsed
++     *        since the last message was sent or received.
++     *
++     * Called from fsm_all() on every FSM timer tick (200 ms). The actual PINGREQ
++     * is only sent when slave_wlan_hal::needs_keepalive() returns true, so there
++     * is no overhead on busy ticks where MQTT traffic is already flowing.
++     */
++    void send_slave_hal_ping();
++
+ public:
+     /**
+      * @brief Checks if there is a link to the Multi-AP Controller.
+diff --git a/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.cpp b/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.cpp
+index 6108483ea..428332301 100644
+--- a/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.cpp
++++ b/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.cpp
+@@ -30,6 +30,11 @@ int slave_wlan_hal_dummy::smd_set_neighbor(const void* payload, int payload_len)
+     return 0;
+ }
+ 
++void slave_wlan_hal_dummy::send_ping()
++{
++    // Dummy implementation — no MQTT broker in this HAL.
++}
++
+ bool slave_wlan_hal_dummy::process_ext_events(int fd)
+ {
+     return true;
+diff --git a/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.h b/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.h
+index 6bc911c7e..2a7312659 100644
+--- a/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.h
++++ b/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.h
+@@ -14,6 +14,7 @@ namespace dummy {
+ class slave_wlan_hal_dummy : public virtual slave_wlan_hal {
+ public:
+     virtual int smd_set_neighbor(const void* payload, int payload_len) override;
++    virtual void send_ping() override;
+ 
+     explicit slave_wlan_hal_dummy(const std::string& iface_name,
+                                base_wlan_hal::hal_event_cb_t callback,
+diff --git a/common/beerocks/bwl/include/bwl/slave_wlan_hal.h b/common/beerocks/bwl/include/bwl/slave_wlan_hal.h
+index 31389e1f3..9b10343fc 100644
+--- a/common/beerocks/bwl/include/bwl/slave_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/slave_wlan_hal.h
+@@ -30,6 +30,15 @@ public:
+     virtual ~slave_wlan_hal() = default;
+ 
+     virtual int smd_set_neighbor(const void* payload, int payload_len) = 0;
++
++    /**
++     * @brief Send an MQTT PINGREQ keepalive to the broker if needed.
++     *
++     * Checks whether keepalive/2 seconds have elapsed since the last message
++     * was sent or received and, if so, drives the mosquitto manual loop to
++     * dispatch a PINGREQ. No-op when traffic is already flowing.
++     */
++    virtual void send_ping() {}
+ };
+ 
+ // Slave HAL factory types
+diff --git a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp
+index 16cefcc75..60e6de7ed 100644
+--- a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp
+@@ -16,7 +16,8 @@ namespace nl80211 {
+ 
+ slave_wlan_hal_nl80211::slave_wlan_hal_nl80211(const std::string &iface_name, hal_event_cb_t callback,
+                                    const bwl::hal_conf_t &hal_conf)
+-    : base_wlan_hal(bwl::HALType::Slave, iface_name, IfaceType::Intel, callback, hal_conf)
++    : base_wlan_hal(bwl::HALType::Slave, iface_name, IfaceType::Intel, callback, hal_conf),
++      last_ping_time_(std::chrono::steady_clock::now())
+ {
+     int fd = mqtt_client.init(iface_name, "localhost", 1883,
+         [this](const char* topic, const void* payload, int payload_len) {
+@@ -73,12 +74,27 @@ int slave_wlan_hal_nl80211::smd_set_neighbor(const void* payload, int payload_le
+ bool slave_wlan_hal_nl80211::process_ext_events(int fd)
+ {
+     if (fd == mqtt_client.get_fd()) {
++        // Readable event on the MQTT socket — always process to consume incoming data.
+         mqtt_client.process();
+         return true;
+     }
+     return false;
+ }
+ 
++void slave_wlan_hal_nl80211::send_ping()
++{
++    // Send MQTT PINGREQ every 30 seconds to keep the broker connection alive.
++    constexpr int MQTT_PING_INTERVAL_SEC = 30;
++    auto now = std::chrono::steady_clock::now();
++    auto elapsed_sec = std::chrono::duration_cast<std::chrono::seconds>(
++        now - last_ping_time_).count();
++    if (elapsed_sec >= MQTT_PING_INTERVAL_SEC) {
++        LOG(DEBUG) << "MQTT keepalive: sending PINGREQ (elapsed=" << elapsed_sec << "s)";
++        mqtt_client.ping();
++        last_ping_time_ = now;
++    }
++}
++
+ // Dummy implementations for pure virtual functions
+ bwl::HALState slave_wlan_hal_nl80211::attach(bool)
+ {
+diff --git a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h
+index 7b246e4fe..c19268b49 100644
+--- a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h
+@@ -8,6 +8,7 @@
+ #include <bwl/slave_wlan_hal.h>
+ #include <mqtt_client.h>
+ #include <vector>
++#include <chrono>
+ 
+ namespace bwl {
+ namespace nl80211 {
+@@ -15,6 +16,7 @@ namespace nl80211 {
+ class slave_wlan_hal_nl80211 : public virtual slave_wlan_hal {
+ public:
+     virtual int smd_set_neighbor(const void* payload, int payload_len) override;
++    virtual void send_ping() override;
+ 
+     explicit slave_wlan_hal_nl80211(const std::string& iface_name,
+                                base_wlan_hal::hal_event_cb_t callback,
+@@ -56,6 +58,10 @@ private:
+ 
+     beerocks::mqttapi::MQTTClient mqtt_client;
+     std::vector<int> m_fds_ext_events = {-1};
++
++    // Tracks when the last MQTT PINGREQ was sent.
++    // send_ping() uses this to enforce a 30-second keepalive interval.
++    std::chrono::steady_clock::time_point last_ping_time_;
+ };
+ 
+ } // namespace nl80211
+diff --git a/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.cpp b/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.cpp
+index 9674c46b3..a7dc13792 100644
+--- a/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.cpp
++++ b/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.cpp
+@@ -30,6 +30,11 @@ int slave_wlan_hal_onewifi::smd_set_neighbor(const void* payload, int payload_le
+     return 0;
+ }
+ 
++void slave_wlan_hal_onewifi::send_ping()
++{
++    // Dummy implementation — no MQTT broker in this HAL.
++}
++
+ bool slave_wlan_hal_onewifi::process_ext_events(int fd)
+ {
+     return true;
+diff --git a/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.h b/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.h
+index eef2efd13..104495b7e 100644
+--- a/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.h
++++ b/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.h
+@@ -14,6 +14,7 @@ namespace onewifi {
+ class slave_wlan_hal_onewifi : public virtual slave_wlan_hal {
+ public:
+     virtual int smd_set_neighbor(const void* payload, int payload_len) override;
++    virtual void send_ping() override;
+ 
+     explicit slave_wlan_hal_onewifi(const std::string& iface_name,
+                                base_wlan_hal::hal_event_cb_t callback,
+diff --git a/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
+index 46b766b2a..b8b3c2c71 100644
+--- a/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
+@@ -30,6 +30,11 @@ int slave_wlan_hal_whm::smd_set_neighbor(const void* payload, int payload_len)
+     return 0;
+ }
+ 
++void slave_wlan_hal_whm::send_ping()
++{
++    // Dummy implementation — no MQTT broker in this HAL.
++}
++
+ bool slave_wlan_hal_whm::process_ext_events(int fd)
+ {
+     return true;
+diff --git a/common/beerocks/bwl/whm/slave_wlan_hal_whm.h b/common/beerocks/bwl/whm/slave_wlan_hal_whm.h
+index 45ef6a972..de98f5277 100644
+--- a/common/beerocks/bwl/whm/slave_wlan_hal_whm.h
++++ b/common/beerocks/bwl/whm/slave_wlan_hal_whm.h
+@@ -14,6 +14,7 @@ namespace whm {
+ class slave_wlan_hal_whm : public virtual slave_wlan_hal {
+ public:
+     virtual int smd_set_neighbor(const void* payload, int payload_len) override;
++    virtual void send_ping() override;
+ 
+     explicit slave_wlan_hal_whm(const std::string& iface_name,
+                                base_wlan_hal::hal_event_cb_t callback,
+diff --git a/framework/platform/mqttapi/include/mqtt_client.h b/framework/platform/mqttapi/include/mqtt_client.h
+index 7c4316d42..5abd979eb 100644
+--- a/framework/platform/mqttapi/include/mqtt_client.h
++++ b/framework/platform/mqttapi/include/mqtt_client.h
+@@ -25,6 +25,16 @@ public:
+     void process();
+     void cleanup();
+ 
++    /**
++     * @brief Send an MQTT PINGREQ keepalive packet to the broker.
++     *
++     * Calls mosquitto_loop_misc() which handles time-based tasks including
++     * sending PINGREQ when the keepalive timer is due. Should be called
++     * periodically (e.g. every 30 s) when using the manual loop API so the
++     * broker does not disconnect the client due to keepalive timeout.
++     */
++    void ping();
++
+     int publish(const std::string& topic, const void* payload, int payload_len, int qos, bool retain);
+     int subscribe(const std::string& topic, int qos);
+     void unsubscribe(const std::string& topic);
+diff --git a/framework/platform/mqttapi/mqtt_client.cpp b/framework/platform/mqttapi/mqtt_client.cpp
+index fea283941..fb3881a52 100644
+--- a/framework/platform/mqttapi/mqtt_client.cpp
++++ b/framework/platform/mqttapi/mqtt_client.cpp
+@@ -88,9 +88,9 @@ void MQTTClient::process()
+ 
+     int rc = mosquitto_loop_read(mosq, 1);
+     if (rc == MOSQ_ERR_CONN_LOST) {
+-        LOG(ERROR) << "MQTT connection lost";
++        LOG(ERROR) << "MQTT connection lost during read";
+     }
+-    
++
+     if (mosquitto_want_write(mosq)) {
+         rc = mosquitto_loop_write(mosq, 1);
+         if (rc == MOSQ_ERR_CONN_LOST) {
+@@ -109,6 +109,17 @@ void MQTTClient::cleanup()
+     mqtt_fd = -1;
+ }
+ 
++void MQTTClient::ping()
++{
++    if (!mosq || mqtt_fd == -1) {
++        return;
++    }
++    // mosquitto_loop_misc() handles time-based tasks including sending PINGREQ
++    // when the keepalive timer is due. Calling it here sends the keepalive ping
++    // without reading or writing application data.
++    mosquitto_loop_misc(mosq);
++}
++
+ int MQTTClient::publish(const std::string& topic, const void* payload, int payload_len, int qos, bool retain)
+ {
+     if (!mosq) return MOSQ_ERR_NO_CONN;
+@@ -151,4 +162,3 @@ void MQTTClient::on_message(const struct mosquitto_message* msg)
+ 
+ } // namespace mqttapi
+ } // namespace beerocks
+-
+-- 
+2.34.1
+
