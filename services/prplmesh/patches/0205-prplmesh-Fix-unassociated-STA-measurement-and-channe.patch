@@ -1,0 +1,548 @@
+From 2c786159e60e041f3270ad846a5b3cfe6d367173 Mon Sep 17 00:00:00 2001
+From: Sureshkumar <suresure@qti.qualcomm.com>
+Date: Fri, 5 Jun 2026 15:30:20 +0530
+Subject: [PATCH] prplmesh: Fix unassociated STA measurement and channel
+ utilization reporting
+
+Four improvements across the agent and controller:
+
+1. Channel utilization in radio statistics
+   The radio statistics update path in all three wireless abstraction
+   backends (nl80211, dwpal, dwpald) did not populate the channel
+   utilization field. As a result, the AP Metrics TLV always reported
+   zero utilization to the controller.
+
+   Each backend now calls the channel utilization helper during the
+   radio statistics update. If the call fails, utilization is set to
+   zero with a warning rather than leaving the field uninitialized.
+
+2. Per-band channel utilization for MLO radios (nl80211)
+   The nl80211 channel utilization implementation selected the first
+   available survey entry regardless of frequency. On MLO platforms
+   where multiple links share the same base interface, all links would
+   read the same survey entry and report identical utilization.
+
+   The implementation now selects the survey entry whose frequency
+   matches the radio's operating channel. If no exact match is found,
+   it falls back to the first in-use entry to preserve behaviour on
+   non-MLO platforms. The utilization value is computed from the
+   busy-time and total-time counters in the selected entry.
+
+3. Network-wide unassociated STA measurement trigger
+   The controller previously had no way for the steering application
+   to request unassociated STA measurements from all candidate agents
+   in a single call. The application had to maintain its own topology
+   view and issue per-agent requests.
+
+   A new network-level action is added that accepts the STA MAC,
+   operating class, and channel. It iterates all connected agents,
+   skips the serving agent (where the STA is already associated) and
+   any radio that does not support the requested channel, and sends
+   the measurement request to every qualifying radio. This reduces
+   the number of queries to one per candidate agent and eliminates
+   unnecessary requests to radios on different bands.
+
+   The BTM abridged and disassociation-imminent configuration
+   parameters are removed from the agent configuration file. These
+   values are now supplied per-steering-attempt by the steering
+   application, giving the application full control over the BTM
+   request mode bits.
+
+4. Operating class mismatch in unassociated STA response handling
+   When the controller received an unassociated STA link metrics
+   response, it matched the response to a radio by comparing the
+   operating class in the response against the radio's scan
+   capabilities. Agents may respond with a wider operating class
+   (for example, 80 MHz) when queried with a narrower one (20 MHz)
+   for the same channel.
+
+   The controller now falls back to channel-based matching when no
+   exact operating class match is found. If any radio on the agent
+   supports the response channel in any of its operating classes,
+   the response is accepted and the station statistics are updated.
+
+   A typo in the data model write path that caused the signal
+   strength field name to include a leading space is also corrected,
+   which prevented the field from being written and caused the
+   steering application to always receive a zero signal strength.
+---
+ agent/config/beerocks_agent.conf.in           |  15 +-
+ .../beerocks/bwl/dwpal/mon_wlan_hal_dwpal.cpp |   6 +
+ .../bwl/dwpald/mon_wlan_hal_dwpald.cpp        |   6 +
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     |  68 +++++-
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      |   6 +
+ controller/nbapi/odl/controller.odl.in        |  24 +++
+ controller/nbapi/on_action.cpp                | 196 ++++++++++++++++++
+ controller/src/beerocks/master/db/db.cpp      |   2 +-
+ .../master/tasks/link_metrics_task.cpp        |  30 +++
+ 9 files changed, 338 insertions(+), 15 deletions(-)
+
+diff --git a/agent/config/beerocks_agent.conf.in b/agent/config/beerocks_agent.conf.in
+index 3d3ecbbd1..325d5e5e1 100644
+--- a/agent/config/beerocks_agent.conf.in
++++ b/agent/config/beerocks_agent.conf.in
+@@ -70,17 +70,10 @@ send_btm_to_non_11v_sta=1
+ # beacon_11k_default_measurement_mode = BEACON_MEASUREMENT_MODE_TABLE (2) -> Beacon Table measurement mode (default)
+ beacon_11k_default_measurement_mode=2
+ 
+-# btm_abridged: BTM Request Abridged bit for agent-initiated steering (CLIENT_BSS_STEER path).
+-# btm_abridged = 0 -> Clear Abridged bit (STA may consider all BSSes, not just the neighbor list)
+-# btm_abridged = 1 -> Set Abridged bit (STA only considers BSSes in the neighbor list) (default)
+-# Note: This setting does NOT affect MAP controller-driven steering (values come from the controller TLV).
+-btm_abridged=1
+-
+-# btm_disassoc_imminent: BTM Request Disassociation Imminent bit for agent-initiated steering.
+-# btm_disassoc_imminent = 0 -> Disassociation Imminent bit NOT set (STA may choose to stay)
+-# btm_disassoc_imminent = 1 -> Set Disassociation Imminent bit (AP will disassociate STA if it does not roam) (default)
+-# Note: This setting does NOT affect MAP controller-driven steering (values come from the controller TLV).
+-btm_disassoc_imminent=1
++# btm_abridged and btm_disassoc_imminent have been moved to the steering app
++# configuration (steering_config.json: BTMAbridged, BTMDisassocImminent).
++# They are now passed per-steer via qmesh_cmd_client_steering() so the
++# steering app has full control over these BTM Request Mode bits.
+ 
+ [backhaul]
+ backhaul_preferred_bssid=
+diff --git a/common/beerocks/bwl/dwpal/mon_wlan_hal_dwpal.cpp b/common/beerocks/bwl/dwpal/mon_wlan_hal_dwpal.cpp
+index d188efbec..fd89664e5 100644
+--- a/common/beerocks/bwl/dwpal/mon_wlan_hal_dwpal.cpp
++++ b/common/beerocks/bwl/dwpal/mon_wlan_hal_dwpal.cpp
+@@ -732,6 +732,12 @@ bool mon_wlan_hal_dwpal::update_radio_stats(SRadioStats &radio_stats)
+     calc_curr_traffic(PacketsSent, radio_stats.tx_packets_cnt, radio_stats.tx_packets);
+     calc_curr_traffic(PacketsReceived, radio_stats.rx_packets_cnt, radio_stats.rx_packets);
+ 
++    // Populate channel utilization for AP Metrics TLV (IEEE 1905.1 0x94)
++    if (!get_channel_utilization(radio_stats.utilization)) {
++        LOG(WARNING) << "Failed to get channel utilization, defaulting to 0";
++        radio_stats.utilization = 0;
++    }
++
+     return true;
+ }
+ 
+diff --git a/common/beerocks/bwl/dwpald/mon_wlan_hal_dwpald.cpp b/common/beerocks/bwl/dwpald/mon_wlan_hal_dwpald.cpp
+index 01540b662..278cbe7ae 100644
+--- a/common/beerocks/bwl/dwpald/mon_wlan_hal_dwpald.cpp
++++ b/common/beerocks/bwl/dwpald/mon_wlan_hal_dwpald.cpp
+@@ -770,6 +770,12 @@ bool mon_wlan_hal_dwpal::update_radio_stats(SRadioStats &radio_stats)
+     calc_curr_traffic(PacketsSent, radio_stats.tx_packets_cnt, radio_stats.tx_packets);
+     calc_curr_traffic(PacketsReceived, radio_stats.rx_packets_cnt, radio_stats.rx_packets);
+ 
++    // Populate channel utilization for AP Metrics TLV (IEEE 1905.1 0x94)
++    if (!get_channel_utilization(radio_stats.utilization)) {
++        LOG(WARNING) << "Failed to get channel utilization, defaulting to 0";
++        radio_stats.utilization = 0;
++    }
++
+     return true;
+ }
+ 
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index f927f6e12..6a90dd48a 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -1225,12 +1225,74 @@ bool base_wlan_hal_nl80211::get_channel_utilization(uint8_t &channel_utilization
+         return false;
+     }
+ 
+-    if (!survey_info.get_channel_utilization(channel_utilization)) {
+-        LOG(ERROR) << "Survey information contains no channel utilization data for interface "
+-                   << get_iface_name();
++    // Get the radio's primary channel frequency for per-band survey selection.
++    // This is critical for MLO setups where multiple links (2.4G/5G/6G) share
++    // the same base interface (e.g., wlan0_link0/1/2 all map to wlan0).
++    // Without frequency filtering, all bands would read the same survey entry.
++    uint32_t radio_freq_mhz = 0;
++    if (m_radio_info.channel > 0 &&
++        m_radio_info.frequency_band != beerocks::eFreqType::FREQ_UNKNOWN) {
++        radio_freq_mhz = static_cast<uint32_t>(
++            son::wireless_utils::channel_to_freq(m_radio_info.channel,
++                                                 m_radio_info.frequency_band));
++    }
++
++    // Select the survey entry for this radio:
++    // Priority 1: entry whose frequency matches this radio's operating channel
++    // Priority 2: first entry with in_use=true (fallback for non-MLO / no freq info)
++    const nl80211_client::sChannelSurveyInfo *survey_entry = nullptr;
++
++    if (radio_freq_mhz > 0) {
++        for (const auto &entry : survey_info.data) {
++            if (entry.frequency_mhz == radio_freq_mhz) {
++                survey_entry = &entry;
++                LOG(DEBUG) << "get_channel_utilization: matched survey entry by freq="
++                           << radio_freq_mhz << " iface=" << get_iface_name();
++                break;
++            }
++        }
++    }
++
++    if (!survey_entry) {
++        // Fallback: use first in_use entry (non-MLO case or freq not yet known)
++        for (const auto &entry : survey_info.data) {
++            if (entry.in_use) {
++                survey_entry = &entry;
++                LOG(DEBUG) << "get_channel_utilization: fallback to in_use entry"
++                           << " freq=" << entry.frequency_mhz
++                           << " iface=" << get_iface_name();
++                break;
++            }
++        }
++    }
++
++    if (!survey_entry) {
++        LOG(ERROR) << "Survey information contains no matching channel for interface "
++                   << get_iface_name() << " (radio_freq=" << radio_freq_mhz << ")";
++        return false;
++    }
++
++    uint64_t curr_time_on   = survey_entry->time_on_ms;
++    uint64_t curr_time_busy = survey_entry->time_busy_ms;
++
++    if (curr_time_on == 0) {
++        LOG(WARNING) << "Survey time_on_ms is 0 for interface " << get_iface_name();
+         return false;
+     }
+ 
++    if (curr_time_busy > curr_time_on) {
++        curr_time_busy = curr_time_on;
++    }
++
++    channel_utilization =
++        static_cast<uint8_t>((curr_time_busy * UINT8_MAX) / curr_time_on);
++
++    LOG(DEBUG) << "get_channel_utilization: iface=" << get_iface_name()
++               << " freq=" << radio_freq_mhz
++               << " busy=" << curr_time_busy << " on=" << curr_time_on
++               << " util=" << int(channel_utilization)
++               << " (" << (curr_time_busy * 100 / curr_time_on) << "%)";
++
+     return true;
+ }
+ 
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 50f56c39a..9e6a7e50e 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -146,6 +146,12 @@ bool mon_wlan_hal_nl80211::update_radio_stats(SRadioStats &radio_stats)
+     radio_stats.errors_received = iface_stats.rx_errors;
+     radio_stats.noise           = 0;
+ 
++    // Populate channel utilization for AP Metrics TLV (IEEE 1905.1 0x94)
++    if (!get_channel_utilization(radio_stats.utilization)) {
++        LOG(WARNING) << "Failed to get channel utilization, defaulting to 0";
++        radio_stats.utilization = 0;
++    }
++
+     return true;
+ }
+ 
+diff --git a/controller/nbapi/odl/controller.odl.in b/controller/nbapi/odl/controller.odl.in
+index fc1a3f2eb..0b8c06907 100644
+--- a/controller/nbapi/odl/controller.odl.in
++++ b/controller/nbapi/odl/controller.odl.in
+@@ -610,6 +610,30 @@
+                     /* Update all unassociated stations stats, from all agents and all radios */
+                     bool UpdateUnassociatedStationsStats();
+ 
++                    /**
++                     * Trigger unassociated STA RCPI measurement on all agents.
++                     *
++                     * The controller sends UnassocSTALinkMetricsQuery to every connected
++                     * agent that supports unassoc STA link metrics on non-current channels,
++                     * asking each to measure the STA on its current operating channel
++                     * (op_class + channel = STA's serving channel).
++                     *
++                     * This is the network-wide broadcast variant of AddUnassociatedStation.
++                     * The caller (qmesh-steering-app) does NOT need to know which radios or
++                     * agents exist — the controller handles agent discovery internally.
++                     *
++                     * Results arrive as QMESH_EVENT_UNASSOC_STA_LINK_METRICS events.
++                     *
++                     * Example:
++                     *   ubus call Device.WiFi.DataElements.Network UnassocSTARCPIQuery
++                     *   '{"un_station_mac":"aa:bb:cc:dd:ee:ff","operating_class":115,"channel":36}'
++                     */
++                    bool UnassocSTARCPIQuery(
++                        %in %mandatory string un_station_mac,
++                        %in %mandatory uint8  operating_class,
++                        %in %mandatory uint8  channel
++                    );
++
+                     void ReconfigApmld(
+                         %in %mandatory string al_mac,
+                         %in %mandatory string mld_mac,
+diff --git a/controller/nbapi/on_action.cpp b/controller/nbapi/on_action.cpp
+index 4ddd3e588..27b1bd638 100644
+--- a/controller/nbapi/on_action.cpp
++++ b/controller/nbapi/on_action.cpp
+@@ -1273,6 +1273,199 @@ amxd_status_t update_unassociatedStations_stats(amxd_object_t *object, amxd_func
+     return result;
+ }
+ 
++/**
++ * @brief Trigger unassociated STA RCPI measurement on ALL agents.
++ *
++ * Network-wide broadcast variant of AddUnassociatedStation.
++ * Called by qmesh-steering-app via qmesh_cmd_unassoc_sta_rcpi_query().
++ *
++ * The caller passes the STA's current operating channel (op_class + channel).
++ * This function iterates all connected agents in the DM, checks each for
++ * unassoc STA link metrics capability on non-current channels, and sends
++ * UnassocSTALinkMetricsQuery to every qualifying radio.
++ *
++ * This eliminates the need for the steering app to maintain a topology DB
++ * and fixes the bug where candidate radio channels were used instead of
++ * the STA's serving channel.
++ *
++ * Example:
++ *   ubus call Device.WiFi.DataElements.Network UnassocSTARCPIQuery
++ *   '{"un_station_mac":"aa:bb:cc:dd:ee:ff","operating_class":115,"channel":36}'
++ */
++amxd_status_t unassoc_sta_rcpi_query(amxd_object_t *object, amxd_function_t *func,
++                                      amxc_var_t *args, amxc_var_t *ret)
++{
++    auto controller_ctx = g_database->get_controller_ctx();
++    if (!controller_ctx) {
++        LOG(ERROR) << "unassoc_sta_rcpi_query: no controller context";
++        return amxd_status_unknown_error;
++    }
++
++    std::string sta_mac_str = GET_CHAR(args, "un_station_mac");
++    if (!network_utils::is_valid_mac(sta_mac_str)) {
++        LOG(ERROR) << "unassoc_sta_rcpi_query: invalid sta_mac '" << sta_mac_str << "'";
++        return amxd_status_invalid_value;
++    }
++
++    uint8_t channel  = amxc_var_dyncast(uint8_t, GET_ARG(args, "channel"));
++    uint8_t op_class = amxc_var_dyncast(uint8_t, GET_ARG(args, "operating_class"));
++
++    if (channel < 1 || op_class < 1) {
++        LOG(ERROR) << "unassoc_sta_rcpi_query: invalid channel=" << (int)channel
++                   << " op_class=" << (int)op_class;
++        return amxd_status_invalid_value;
++    }
++
++    sMacAddr sta_mac = tlvf::mac_from_string(sta_mac_str);
++    int sent_count   = 0;
++
++    /* Find the STA's serving radio and serving agent from the controller DB.
++     *
++     * Serving radio: excluded from the unassoc query — the STA is already
++     * associated there and the serving agent already knows its RSSI via
++     * AssocSTA link metrics.
++     *
++     * Serving agent: excluded entirely — the STA is associated to this agent.
++     * Only CANDIDATE agents (different agents) should measure the STA.
++     * This avoids sending unnecessary queries to the serving agent's other
++     * radios (2.4G, 6G) which cannot tune to the STA's serving channel. */
++    sMacAddr serving_radio_uid = {};
++    sMacAddr serving_agent_mac = {};
++    {
++        auto station = g_database->get_station(sta_mac);
++        if (station && station->get_bss()) {
++            serving_radio_uid = station->get_bss()->radio.radio_uid;
++            /* Find the agent that owns the serving radio */
++            for (const auto &agent : g_database->get_all_connected_agents()) {
++                if (agent->radios.count(serving_radio_uid)) {
++                    serving_agent_mac = agent->al_mac;
++                    break;
++                }
++            }
++            LOG(DEBUG) << "unassoc_sta_rcpi_query: serving radio="
++                       << tlvf::mac_to_string(serving_radio_uid)
++                       << " serving agent=" << tlvf::mac_to_string(serving_agent_mac)
++                       << " (both will be excluded from query)";
++        } else {
++            LOG(DEBUG) << "unassoc_sta_rcpi_query: STA " << sta_mac_str
++                       << " not found in DB or not associated — querying all radios";
++        }
++    }
++
++    /* Iterate all Device instances in the DM to find qualifying agents/radios */
++    amxd_object_t *device_obj = amxd_object_get_child(object, "Device");
++    if (!device_obj) {
++        LOG(ERROR) << "unassoc_sta_rcpi_query: Device object not found under Network";
++        return amxd_status_object_not_found;
++    }
++
++    amxc_var_t value;
++    amxc_var_init(&value);
++
++    amxd_object_for_each(instance, dev_it, device_obj) {
++        amxd_object_t *dev_inst = amxc_llist_it_get_data(dev_it, amxd_object_t, it);
++
++        /* Get agent AL MAC */
++        amxd_object_get_param(dev_inst, "ID", &value);
++        const char *agent_mac_cstr = amxc_var_constcast(cstring_t, &value);
++        if (!agent_mac_cstr || !network_utils::is_valid_mac(std::string(agent_mac_cstr))) {
++            continue;
++        }
++        std::string agent_mac_s(agent_mac_cstr);
++
++        /* Skip the serving agent entirely — the STA is associated there.
++         * Only candidate agents (different agents) should measure the STA.
++         * This avoids sending unnecessary queries to the serving agent's
++         * 2.4G/6G radios which cannot tune to the STA's serving channel. */
++        if (serving_agent_mac != beerocks::net::network_utils::ZERO_MAC &&
++            tlvf::mac_from_string(agent_mac_s) == serving_agent_mac) {
++            LOG(DEBUG) << "unassoc_sta_rcpi_query: skipping serving agent "
++                       << agent_mac_s << " (STA is associated there)";
++            continue;
++        }
++
++        /* Iterate Radio instances for this agent.
++         * No capability pre-filter here — the controller's internal
++         * add_unassociated_station() already checks UnassociatedSTALinkMetrics
++         * capability (both CurrentlyOn and CurrentlyOff) and will reject the
++         * request if the agent does not support it. */
++        amxd_object_t *radio_obj = amxd_object_get_child(dev_inst, "Radio");
++        if (!radio_obj) {
++            continue;
++        }
++
++        amxd_object_for_each(instance, radio_it, radio_obj) {
++            amxd_object_t *radio_inst = amxc_llist_it_get_data(radio_it, amxd_object_t, it);
++
++            amxd_object_get_param(radio_inst, "ID", &value);
++            const char *radio_mac_cstr = amxc_var_constcast(cstring_t, &value);
++            if (!radio_mac_cstr || !network_utils::is_valid_mac(std::string(radio_mac_cstr))) {
++                continue;
++            }
++            std::string radio_mac_s(radio_mac_cstr);
++
++            /* Skip the serving radio — the STA is already associated there.
++             * The serving agent already knows the STA's RSSI via AssocSTA
++             * link metrics.  Sending an unassoc query to the serving radio
++             * is redundant and causes the driver to report 0 STAs measured
++             * (since the STA is associated, not unassociated, on that radio). */
++            if (serving_radio_uid != beerocks::net::network_utils::ZERO_MAC &&
++                tlvf::mac_from_string(radio_mac_s) == serving_radio_uid) {
++                LOG(DEBUG) << "unassoc_sta_rcpi_query: skipping serving radio "
++                           << radio_mac_s << " (STA is associated there)";
++                continue;
++            }
++
++            /* Only send to radios that support the query channel.
++             * Skip radios on different bands (e.g. 2.4G, 6G) that cannot
++             * measure the STA on the serving channel (e.g. ch=36 for 5G).
++             * This ensures only 1 unassoc query is sent — to the same-band
++             * radio on the candidate agent. */
++            {
++                auto radio_db = g_database->get_radio_by_uid(
++                    tlvf::mac_from_string(radio_mac_s));
++                if (radio_db) {
++                    bool channel_supported = false;
++                    for (const auto &op_class :
++                         radio_db->scan_capabilities.operating_classes) {
++                        const auto &channels = op_class.second;
++                        if (std::find(channels.begin(), channels.end(), channel) !=
++                            channels.end()) {
++                            channel_supported = true;
++                            break;
++                        }
++                    }
++                    if (!channel_supported) {
++                        LOG(DEBUG) << "unassoc_sta_rcpi_query: skipping radio "
++                                   << radio_mac_s << " (ch=" << (int)channel
++                                   << " not in scan capabilities — different band)";
++                        continue;
++                    }
++                }
++            }
++
++            if (!controller_ctx->add_unassociated_station(
++                    sta_mac, channel, op_class,
++                    tlvf::mac_from_string(agent_mac_s),
++                    tlvf::mac_from_string(radio_mac_s))) {
++                LOG(WARNING) << "unassoc_sta_rcpi_query: add_unassociated_station failed"
++                             << " agent=" << agent_mac_s << " radio=" << radio_mac_s;
++            } else {
++                sent_count++;
++                LOG(DEBUG) << "unassoc_sta_rcpi_query: query sent"
++                           << " agent=" << agent_mac_s << " radio=" << radio_mac_s;
++            }
++        }
++    }
++
++    amxc_var_clean(&value);
++
++    LOG(INFO) << "unassoc_sta_rcpi_query: sta=" << sta_mac_str
++              << " op_class=" << (int)op_class << " ch=" << (int)channel
++              << " → dispatched to " << sent_count << " radio(s)";
++    return amxd_status_ok;
++}
++
+ /**
+  * @brief Initiates setting Channel Selection parameters with the Creation TLV at the current Radio and the given parameters
+  *
+@@ -1837,6 +2030,9 @@ std::vector<beerocks::nbapi::sFunctions> get_func_list(void)
+         {"update_unassociatedStations_stats",
+          DATAELEMENTS_ROOT_DM ".Network.UpdateUnassociatedStationsStats",
+          update_unassociatedStations_stats},
++        {"unassoc_sta_rcpi_query",
++         DATAELEMENTS_ROOT_DM ".Network.UnassocSTARCPIQuery",
++         unassoc_sta_rcpi_query},
+         {"channel_selection_request",
+          DATAELEMENTS_ROOT_DM ".Network.Device.Radio.ChannelSelectionRequest",
+          channel_selection_request},
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 870fd85d7..2d3b0f154 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -10175,7 +10175,7 @@ void db::update_unassociated_station_stats(const sMacAddr &mac_address,
+                     LOG(DEBUG) << "Successfully added object with path : " << new_station_path;
+                 }
+                 m_ambiorix_datamodel->set(new_station_path, "MACAddress", mac_address);
+-                m_ambiorix_datamodel->set(new_station_path, " SignalStrength",
++                m_ambiorix_datamodel->set(new_station_path, "SignalStrength",
+                                           new_stats.uplink_rcpi_dbm_enc);
+                 m_ambiorix_datamodel->set(new_station_path, "X_PRPLWARE-COM_TimeStamp",
+                                           new_stats.time_stamp);
+diff --git a/controller/src/beerocks/master/tasks/link_metrics_task.cpp b/controller/src/beerocks/master/tasks/link_metrics_task.cpp
+index 1444db590..74f96f97a 100644
+--- a/controller/src/beerocks/master/tasks/link_metrics_task.cpp
++++ b/controller/src/beerocks/master/tasks/link_metrics_task.cpp
+@@ -428,10 +428,40 @@ bool LinkMetricsTask::handle_cmdu_1905_unassociated_station_link_metric_response
+             }
+         }
+ 
++        /* Fix: If no exact op_class match, fall back to channel-based matching.
++         * The agent may respond with op_class=128 (80MHz) when queried with
++         * op_class=115 (20MHz) for the same channel (e.g. ch=36 in 5GHz).
++         * Accept the response if any radio on this agent supports the response
++         * channel in any of its operating classes. */
++        if (tlvf::mac_to_string(radio_mac_address) ==
++            beerocks::net::network_utils::ZERO_MAC_STRING) {
++            uint8_t response_channel = sta_metrics.channel_number;
++            for (auto &radio : (*agent)->radios) {
++                for (auto &operating_class : radio.second->scan_capabilities.operating_classes) {
++                    const auto &channels = operating_class.second;
++                    if (std::find(channels.begin(), channels.end(), response_channel) !=
++                        channels.end()) {
++                        radio_mac_address = radio.first;
++                        LOG(INFO) << "Unassoc response op_class mismatch (received="
++                                  << (int)operating_class_received
++                                  << ") but channel " << (int)response_channel
++                                  << " found in op_class " << (int)operating_class.first
++                                  << " on radio " << tlvf::mac_to_string(radio.first)
++                                  << " — accepting response";
++                        break;
++                    }
++                }
++                if (radio_mac_address != beerocks::net::network_utils::ZERO_MAC) {
++                    break;
++                }
++            }
++        }
++
+         if (tlvf::mac_to_string(radio_mac_address) ==
+             beerocks::net::network_utils::ZERO_MAC_STRING) {
+             LOG(ERROR) << "Agent with mac_addr: " << tlvf::mac_to_string((*agent)->al_mac)
+                        << " has no radio that supports operating_class " << operating_class_received
++                       << " or channel " << (int)sta_metrics.channel_number
+                        << " !!, un_station stats will not get updated! ";
+             return false;
+         }
+-- 
+2.34.1
+
