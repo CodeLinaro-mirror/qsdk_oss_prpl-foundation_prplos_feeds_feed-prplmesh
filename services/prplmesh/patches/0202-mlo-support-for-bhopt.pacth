@@ -1,0 +1,746 @@
+From 2a6f596d367da93c4fa93c7d16d74393af7467dd Mon Sep 17 00:00:00 2001
+From: Sandeep Tomer <stomer@qti.qualcomm.com>
+Date: Sun, 7 Jun 2026 16:40:34 +0530
+Subject: [PATCH] [prplmesh] add mlo related changes to prplMesh
+
+Signed-off-by: Sandeep Tomer <stomer@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 | 102 +++++++++++++----
+ .../fronthaul_manager/ap_manager/ap_manager.h |  24 ++++
+ .../fronthaul_manager/monitor/monitor.cpp     |  30 +++--
+ .../tasks/link_metrics_collection_task.cpp    | 103 ++++++++++++++----
+ .../tasks/link_metrics_collection_task.h      |  23 ++++
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     |  39 +++++++
+ .../bwl/nl80211/base_wlan_hal_nl80211.h       |  11 ++
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      |  81 ++++++++++++--
+ .../bwl/nl80211/sta_wlan_hal_nl80211.cpp      |  10 +-
+ .../tlvf/beerocks_message_apmanager.h         |   2 +
+ .../tlvf/beerocks_message_apmanager.cpp       |  11 ++
+ .../tlvf/beerocks_message_apmanager.yaml      |   1 +
+ controller/src/beerocks/master/controller.cpp |  18 +--
+ 13 files changed, 375 insertions(+), 80 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 19a504037..1798e1e7f 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -2491,35 +2491,71 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+             return;
+         }
+ 
+-        LOG(INFO) << "[BEACON_DBG] ap_manager: creating BeaconMetricsResponse entry"
+-                  << " sta_mac=" << msg->sta_mac()
+-                  << " timeout=" << msg->timeout() << "ms"
+-                  << " iface=" << m_iface;
+-
+         std::chrono::milliseconds timer_interval(msg->timeout());
+-        sBeaconMetricsResponse beacon_metrics_response = {};
+ 
+-        beacon_metrics_response.sta_mac = msg->sta_mac();
++        // Check if an entry already exists for this STA.
++        // If so, reset the timer to extend the collection window instead of creating a new entry.
++        // This ensures all beacon responses for the same STA accumulate in a single entry,
++        // and the timer fires only after the last query's timeout has elapsed.
++        auto existing_it = std::find_if(
++            m_beacon_metrics_response.begin(), m_beacon_metrics_response.end(),
++            [&](const sBeaconMetricsResponse &r) { return r.sta_mac == msg->sta_mac(); });
++
++        if (existing_it != m_beacon_metrics_response.end()) {
++            // Entry already exists — reset the timer to extend the collection window
++            LOG(INFO) << "[BEACON_DBG] ap_manager: resetting BeaconMetricsResponse timer"
++                      << " sta_mac=" << msg->sta_mac()
++                      << " timeout=" << msg->timeout() << "ms"
++                      << " iface=" << m_iface;
++
++            m_timer_manager->remove_timer(existing_it->resp_timer);
++            existing_it->resp_timer = m_timer_manager->add_timer(
++                tlvf::mac_to_string(msg->sta_mac()) + " - Beacon Metrics Response",
++                timer_interval, timer_interval,
++                [&](int fd, beerocks::EventLoop &loop) {
++                    beacon_metrics_response_cb(fd);
++                    return true;
++                });
+ 
+-        /* Set a timer to send the stored beacon reports for target STA */
+-        beacon_metrics_response.resp_timer = m_timer_manager->add_timer(
+-            tlvf::mac_to_string(msg->sta_mac()) + " - Beacon Metrics Response", timer_interval,
+-            timer_interval, [&](int fd, beerocks::EventLoop &loop) {
+-                beacon_metrics_response_cb(fd);
+-                return true;
+-            });
++            if (existing_it->resp_timer == beerocks::net::FileDescriptor::invalid_descriptor) {
++                LOG(ERROR) << "Failed to reset the beacon metrics response timer";
++                m_beacon_metrics_response.erase(existing_it);
++            }
++        } else {
++            // No entry exists — create a new one
++            LOG(INFO) << "[BEACON_DBG] ap_manager: creating BeaconMetricsResponse entry"
++                      << " sta_mac=" << msg->sta_mac()
++                      << " timeout=" << msg->timeout() << "ms"
++                      << " iface=" << m_iface
++                      << " is_primary=" << int(msg->is_primary());
++
++            sBeaconMetricsResponse beacon_metrics_response = {};
++            beacon_metrics_response.sta_mac   = msg->sta_mac();
++            // Store the is_primary flag from the message.
++            // Primary ap_manager (STA's serving link) sends response even with 0 reports.
++            // Non-primary ap_managers only send response if they collected reports.
++            beacon_metrics_response.is_primary = (msg->is_primary() != 0);
++
++            /* Set a timer to send the stored beacon reports for target STA */
++            beacon_metrics_response.resp_timer = m_timer_manager->add_timer(
++                tlvf::mac_to_string(msg->sta_mac()) + " - Beacon Metrics Response", timer_interval,
++                timer_interval, [&](int fd, beerocks::EventLoop &loop) {
++                    beacon_metrics_response_cb(fd);
++                    return true;
++                });
+ 
+-        if (beacon_metrics_response.resp_timer ==
+-            beerocks::net::FileDescriptor::invalid_descriptor) {
+-            LOG(ERROR) << "Failed to create the beacon metrics response timer";
+-            return;
+-        }
++            if (beacon_metrics_response.resp_timer ==
++                beerocks::net::FileDescriptor::invalid_descriptor) {
++                LOG(ERROR) << "Failed to create the beacon metrics response timer";
++                return;
++            }
+ 
+-        m_beacon_metrics_response.push_back(beacon_metrics_response);
++            m_beacon_metrics_response.push_back(beacon_metrics_response);
+ 
+-        LOG(INFO) << "[BEACON_DBG] ap_manager: BeaconMetricsResponse entry created"
+-                  << " sta_mac=" << beacon_metrics_response.sta_mac
+-                  << " total_pending_entries=" << m_beacon_metrics_response.size();
++            LOG(INFO) << "[BEACON_DBG] ap_manager: BeaconMetricsResponse entry created"
++                      << " sta_mac=" << beacon_metrics_response.sta_mac
++                      << " total_pending_entries=" << m_beacon_metrics_response.size();
++        }
+ 
+         break;
+     }
+@@ -2618,6 +2654,17 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+     }
+ }
+ 
++bool ApManager::should_send_beacon_metrics_response(const sBeaconMetricsResponse &response)
++{
++    // Always send if we have reports — any ap_manager that collected reports should send them
++    if (!response.beacon_report.empty()) {
++        return true;
++    }
++    // No reports: only the primary ap_manager sends the empty response (spec compliance)
++    // Non-primary ap_managers suppress the empty response to avoid duplicate 0-report responses
++    return response.is_primary;
++}
++
+ void ApManager::beacon_metrics_response_cb(int fd)
+ {
+     auto it = std::find_if(
+@@ -2633,6 +2680,15 @@ void ApManager::beacon_metrics_response_cb(int fd)
+ 
+     sBeaconMetricsResponse &response = *it;
+ 
++    // Use the standalone suppression function to decide whether to send the response.
++    // Non-primary ap_managers with no reports are suppressed to avoid duplicate empty responses.
++    if (!should_send_beacon_metrics_response(response)) {
++        LOG(DEBUG) << "Suppressing empty beacon metrics response for " << response.sta_mac
++                   << " (non-primary ap_manager, no reports collected)";
++        m_beacon_metrics_response.erase(it);
++        return;
++    }
++
+     auto cmdu_tx_header =
+         cmdu_tx.create(0, ieee1905_1::eMessageType::BEACON_METRICS_RESPONSE_MESSAGE);
+     if (!cmdu_tx_header) {
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
+index a93ccb0f5..c254c1b64 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
+@@ -330,6 +330,13 @@ private:
+         };
+         std::vector<sBeaconReport> beacon_report;
+         int resp_timer = beerocks::net::FileDescriptor::invalid_descriptor;
++        /**
++         * @brief Indicates whether this ap_manager is the primary one for this STA's beacon
++         * metrics response. The primary ap_manager (the one for the STA's serving link) sends
++         * the response even if no reports were collected. Non-primary ap_managers only send
++         * the response if they have collected reports, to avoid sending empty duplicate responses.
++         */
++        bool is_primary = true;
+     };
+ 
+     /* To store scheduled Beacon Metrics Responses */
+@@ -338,6 +345,23 @@ private:
+     /* Timer callback for scheduled Beacon Metrics Responses */
+     void beacon_metrics_response_cb(int fd);
+ 
++    /**
++     * @brief Determines whether this ap_manager should send the beacon metrics response.
++     *
++     * This is a standalone function that encapsulates the suppression logic for non-primary
++     * ap_managers in MLO setups. In MLO, ACTION_APMANAGER_MULTI_CHAN_BEACON_11K_REQUEST is
++     * sent to all ap_managers so that whichever one receives the BEACON-RESP-RX events can
++     * store the reports. However, only one ap_manager should send the final response to the
++     * controller:
++     *   - If there are reports: always send (any ap_manager that collected reports sends it)
++     *   - If there are no reports AND is_primary: send (spec compliance - must respond)
++     *   - If there are no reports AND NOT is_primary: suppress (avoid empty duplicate response)
++     *
++     * @param response The beacon metrics response entry to evaluate.
++     * @return true if the response should be sent, false if it should be suppressed.
++     */
++    static bool should_send_beacon_metrics_response(const sBeaconMetricsResponse &response);
++
+ };
+ 
+ } // namespace son
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+index 09712fa35..da1a65f70 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+@@ -1679,15 +1679,27 @@ void Monitor::handle_cmdu_vs_message(ieee1905_1::CmduMessageRx &cmdu_rx)
+                    << ", id=" << beerocks_header->id();
+ 
+         auto sta_node = mon_db.sta_find(sta_mac);
++
++        // Determine the VAP interface to use for the beacon request.
++        // In MLO setups, the STA (bSTA MLD MAC) may be stored in the associated_clients
++        // of the MLD radio (e.g. 6GHz), but the STA is actually connected via a different
++        // link (e.g. 2.4GHz). In that case the STA won't be in this monitor's DB.
++        // We still attempt to send REQ_BEACON using this monitor's own interface —
++        // hostapd knows the STA via the MLD association, and sta_beacon_11k_request()
++        // will try all link interfaces automatically.
++        std::string vap_iface;
+         if (sta_node == nullptr) {
+-            LOG(ERROR) << "Beacon 11k Request: STA " << sta_mac
+-                       << " not found in monitor DB, id=" << beerocks_header->id();
+-            return;
+-        }
+-        auto vap_node = mon_db.vap_get_by_id(sta_node->get_vap_id());
+-        if (!vap_node) {
+-            LOG(ERROR) << "station " << sta_mac << " has no vap";
+-            return;
++            LOG(WARNING) << "Beacon 11k Request: STA " << sta_mac
++                         << " not found in monitor DB, id=" << beerocks_header->id()
++                         << " — attempting REQ_BEACON on " << monitor_iface << " anyway (MLO)";
++            vap_iface = monitor_iface;
++        } else {
++            auto vap_node = mon_db.vap_get_by_id(sta_node->get_vap_id());
++            if (!vap_node) {
++                LOG(ERROR) << "station " << sta_mac << " has no vap";
++                return;
++            }
++            vap_iface = vap_node->get_iface();
+         }
+ 
+         int dialog_token;
+@@ -1724,7 +1736,7 @@ void Monitor::handle_cmdu_vs_message(ieee1905_1::CmduMessageRx &cmdu_rx)
+         bwl_request.new_ch_center_freq_seg_1 = request->params().new_ch_center_freq_seg_1;
+         bwl_request.reporting_detail         = request->params().reporting_detail;
+ 
+-        mon_wlan_hal->sta_beacon_11k_request(vap_node->get_iface(), bwl_request, dialog_token);
++        mon_wlan_hal->sta_beacon_11k_request(vap_iface, bwl_request, dialog_token);
+ 
+         sEvent11k event_11k = {tlvf::mac_to_string(request->params().sta_mac),
+                                tlvf::mac_to_string(request->params().bssid), dialog_token,
+diff --git a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+index df0e8023e..65e2db1c2 100644
+--- a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+@@ -51,7 +51,7 @@ using namespace multi_vendor;
+ #define MULTI_CHAN_MIN_BCN_REQ_DELAY 400
+ 
+ /* Minimum timeout to send the Beacon Metrics Response (in ms) */
+-#define MULTI_CHAN_MIN_BCN_RESP_TIMEOUT 1000
++#define MULTI_CHAN_MIN_BCN_RESP_TIMEOUT 10000
+ 
+ namespace beerocks {
+ 
+@@ -441,28 +441,26 @@ bool LinkMetricsCollectionTask::schedule_beacon_metrics_query(
+         beacon_params.chan_report_list.push_back(new_report);
+     }
+ 
+-    auto request_out = message_com::create_vs_message<
+-        beerocks_message::cACTION_APMANAGER_MULTI_CHAN_BEACON_11K_REQUEST>(m_cmdu_tx, mid);
+-    if (request_out == nullptr) {
+-        LOG(ERROR) << "Failed building cACTION_APMANAGER_MULTI_CHAN_BEACON_11K_REQUEST message!";
+-        return false;
+-    }
+-
+-    request_out->sta_mac() = beacon_params.params.sta_mac;
+-
+     /* Timeout to send the Beacon Metrics Response. */
++    uint32_t timeout_ms;
+     if (ap_channel_reports_list_length != 0) {
+-        request_out->timeout() =
+-            (beacon_params.chan_report_list.size() *
+-                 (MULTI_CHAN_MIN_BCN_REQ_DELAY + beacon_params.params.duration) +
+-             MULTI_CHAN_MIN_BCN_RESP_TIMEOUT);
++        timeout_ms = (beacon_params.chan_report_list.size() *
++                          (MULTI_CHAN_MIN_BCN_REQ_DELAY + beacon_params.params.duration) +
++                      MULTI_CHAN_MIN_BCN_RESP_TIMEOUT);
+     } else {
+-        request_out->timeout() = MULTI_CHAN_MIN_BCN_RESP_TIMEOUT;
++        timeout_ms = MULTI_CHAN_MIN_BCN_RESP_TIMEOUT;
+     }
+ 
+-    /* Inform the AP Manager to catch the beacon metrics responses */
+-    auto ap_manager_fd = m_btl_ctx.get_ap_manager_fd(beacon_params.iface_name);
+-    m_btl_ctx.send_cmdu(ap_manager_fd, m_cmdu_tx);
++    /* Inform ALL AP Managers to catch the beacon metrics responses.
++     * In MLO setups, the monitor may send REQ_BEACON on a different link interface than
++     * the STA's serving link. By notifying all ap_managers, whichever one receives the
++     * BEACON-RESP-RX events will have an entry to store the reports.
++     * The primary ap_manager (STA's serving link) is marked so it sends the response
++     * even if no reports were collected (spec compliance). Non-primary ap_managers
++     * suppress empty responses to avoid duplicate 0-report responses. */
++    send_beacon_request_to_all_ap_managers(beacon_params.params.sta_mac,
++                                           timeout_ms,
++                                           beacon_params.iface_name);
+ 
+     /* Delay between consecutive beacon metrics queries. */
+     std::chrono::milliseconds timer_interval(MULTI_CHAN_MIN_BCN_REQ_DELAY +
+@@ -568,6 +566,31 @@ void LinkMetricsCollectionTask::handle_beacon_metrics_query(ieee1905_1::CmduMess
+     LOG(DEBUG) << "Found the radio that has the sation. radio: " << radio->front.iface_mac
+                << "; station: " << requested_sta_mac;
+ 
++    // For MLO setups, the station may be stored in the MLD radio's associated_clients,
++    // but the beacon request must be sent to the monitor for the radio that owns the
++    // station's actual serving link (link-specific radio).
++    // Use link_mac (link-specific BSSID) to find the correct radio/monitor.
++    // Fall back to bssid (AP MLD BSSID) if link_mac is not set (non-MLO case).
++    std::string beacon_iface_name = radio->front.iface_name;
++    auto client_it = radio->associated_clients.find(requested_sta_mac);
++    if (client_it != radio->associated_clients.end()) {
++        // Prefer link_mac (link-specific BSSID) over bssid (AP MLD BSSID)
++        const sMacAddr &lookup_mac =
++            (client_it->second.link_mac != net::network_utils::ZERO_MAC)
++            ? client_it->second.link_mac
++            : client_it->second.bssid;
++        if (lookup_mac != net::network_utils::ZERO_MAC) {
++            auto link_radio = db->get_radio_by_mac(lookup_mac, AgentDB::eMacType::BSSID);
++            if (link_radio) {
++                beacon_iface_name = link_radio->front.iface_name;
++                LOG(DEBUG) << "Beacon query: using link radio interface=" << beacon_iface_name
++                           << " (link_mac=" << client_it->second.link_mac
++                           << ", bssid=" << client_it->second.bssid
++                           << ", original radio iface=" << radio->front.iface_name << ")";
++            }
++        }
++    }
++
+     auto it = std::find_if(m_beacon_metrics_query.begin(), m_beacon_metrics_query.end(),
+                            [&requested_sta_mac](const sBeaconMetricsQuery &query) {
+                                return query.params.sta_mac == requested_sta_mac;
+@@ -597,7 +620,7 @@ void LinkMetricsCollectionTask::handle_beacon_metrics_query(ieee1905_1::CmduMess
+ 
+     m_btl_ctx.send_cmdu_to_controller({}, m_cmdu_tx);
+ 
+-    if (!schedule_beacon_metrics_query(*tlvBeaconMetricsQuery, mid, radio->front.iface_name)) {
++    if (!schedule_beacon_metrics_query(*tlvBeaconMetricsQuery, mid, beacon_iface_name)) {
+         LOG(ERROR) << "Failed to schedule Beacon Metrics Query for " << requested_sta_mac;
+         return;
+     }
+@@ -1986,6 +2009,48 @@ void LinkMetricsCollectionTask::handle_metric_reporting_policy_updated_event(voi
+     }
+ }
+ 
++void LinkMetricsCollectionTask::send_beacon_request_to_all_ap_managers(
++    const sMacAddr &sta_mac,
++    uint32_t timeout_ms,
++    const std::string &primary_iface_name)
++{
++    auto db = AgentDB::get();
++
++    LOG(DEBUG) << "send_beacon_request_to_all_ap_managers: sta_mac=" << sta_mac
++               << " timeout_ms=" << timeout_ms
++               << " primary_iface=" << primary_iface_name;
++
++    for (const auto radio : db->get_radios_list()) {
++        if (!radio) {
++            continue;
++        }
++
++        // Determine if this radio is the primary ap_manager (STA's serving link).
++        // The primary ap_manager sends the response even if no reports were collected.
++        // Non-primary ap_managers suppress empty responses to avoid duplicates.
++        const bool is_primary = (radio->front.iface_name == primary_iface_name);
++
++        auto request_out = message_com::create_vs_message<
++            beerocks_message::cACTION_APMANAGER_MULTI_CHAN_BEACON_11K_REQUEST>(m_cmdu_tx);
++        if (request_out == nullptr) {
++            LOG(ERROR) << "Failed building cACTION_APMANAGER_MULTI_CHAN_BEACON_11K_REQUEST"
++                       << " for iface=" << radio->front.iface_name;
++            continue;
++        }
++
++        request_out->sta_mac()    = sta_mac;
++        request_out->timeout()    = static_cast<uint16_t>(timeout_ms);
++        request_out->is_primary() = is_primary ? 1 : 0;
++
++        LOG(DEBUG) << "send_beacon_request_to_all_ap_managers: sending to iface="
++                   << radio->front.iface_name
++                   << " is_primary=" << int(request_out->is_primary());
++
++        auto ap_manager_fd = m_btl_ctx.get_ap_manager_fd(radio->front.iface_name);
++        m_btl_ctx.send_cmdu(ap_manager_fd, m_cmdu_tx);
++    }
++}
++
+ void LinkMetricsCollectionTask::handle_event(uint8_t event_enum_value, const void *event_obj)
+ {
+     switch (eEvent(event_enum_value)) {
+diff --git a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.h b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.h
+index 6cf94d6e1..0b643b3f5 100644
+--- a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.h
++++ b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.h
+@@ -332,6 +332,29 @@ private:
+     bool beacon_metrics_query_cb(int fd);
+     bool schedule_beacon_metrics_query(wfa_map::tlvBeaconMetricsQuery &beacon_metrics_query,
+                                        uint16_t mid, const std::string &iface_name);
++
++    /**
++     * @brief Sends ACTION_APMANAGER_MULTI_CHAN_BEACON_11K_REQUEST to ALL ap_managers.
++     *
++     * In MLO setups, the monitor may send the REQ_BEACON on a different link interface than
++     * the STA's serving link. The BEACON-RESP-RX events come back on the link interface where
++     * REQ_BEACON was sent. By sending the request to all ap_managers, whichever one receives
++     * the BEACON-RESP-RX events will have an entry to store the reports.
++     *
++     * The primary ap_manager (the one for the STA's serving link, identified by primary_iface)
++     * is marked with is_primary=1. Non-primary ap_managers are marked with is_primary=0.
++     * This allows the ap_manager to suppress empty responses from non-primary instances,
++     * avoiding duplicate 0-report responses to the controller.
++     *
++     * All new logic is isolated in this standalone function.
++     *
++     * @param sta_mac MAC address of the STA for which beacon metrics are requested.
++     * @param timeout_ms Timeout in milliseconds for the beacon metrics response timer.
++     * @param primary_iface_name Interface name of the primary ap_manager (STA's serving link).
++     */
++    void send_beacon_request_to_all_ap_managers(const sMacAddr &sta_mac,
++                                                uint32_t timeout_ms,
++                                                const std::string &primary_iface_name);
+ };
+ 
+ } // namespace beerocks
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index f927f6e12..cc44a6d39 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -932,6 +932,9 @@ bool base_wlan_hal_nl80211::refresh_vaps_info(int id)
+ 
+ 
+         // Send NL CALL to fetch bss name incase mlo capability iface
++        // Save the original BSS name (MLD interface, e.g. "wlan1.1") before get_bss_link_id
++        // modifies it to the link-specific name (e.g. "wlan1.1_link0").
++        std::string original_bss = vap_element.bss;
+         if (!m_nl80211_client->get_bss_link_id(vap_element.bss,vap_element.mac,vap_element.link_id)) {
+             LOG(ERROR) << " get_bss_link_id failed " ;
+         }
+@@ -939,6 +942,37 @@ bool base_wlan_hal_nl80211::refresh_vaps_info(int id)
+         LOG(INFO) << "vap_element.link_id updated to: " << vap_element.link_id;
+         LOG(INFO) << "vap_element.bss updated to: " << vap_element.bss;
+ 
++        // If get_bss_link_id changed the BSS name to a link-specific name (e.g. "wlan1.1_link0"),
++        // also register the MLD interface control socket (e.g. "wlan1.1").
++        // This is needed so that commands like REQ_BEACON can be sent to the MLD interface,
++        // where the STA is actually associated in an MLO setup.
++        if (original_bss != vap_element.bss) {
++            LOG(DEBUG) << "Registering MLD VAP control socket for " << original_bss;
++            add_interface(original_bss);
++
++            // Also register all other link interfaces of the same base interface
++            // so that REQ_BEACON can be tried on any link (not just this monitor's link).
++            // Build the wpa_ctrl directory path and check socket existence first
++            // to avoid the retry delays in register_wpa_ctrl_interface().
++            auto wpa_ctrl_dir = m_hal_conf.wpa_ctrl_path;
++            auto dir_pos = wpa_ctrl_dir.find_last_of("/");
++            if (dir_pos != std::string::npos) {
++                wpa_ctrl_dir = wpa_ctrl_dir.substr(0, dir_pos + 1);
++            }
++            for (int link_idx = 0; link_idx < 8; link_idx++) {
++                std::string extra_link = original_bss + "_link" + std::to_string(link_idx);
++                if (extra_link == vap_element.bss) {
++                    continue; // already registered below
++                }
++                if (!beerocks::os_utils::wpa_ctrl_skt_exists(wpa_ctrl_dir + extra_link)) {
++                    continue; // socket doesn't exist, skip
++                }
++                LOG(DEBUG) << "Registering additional link interface " << extra_link
++                           << " for base " << original_bss;
++                add_interface(extra_link);
++            }
++        }
++
+         if (add_interface(vap_element.bss) < 0) {
+             LOG(INFO) << "Failed to add interface for " << vap_element.bss
+                       << ". Is it not monitored?";
+@@ -1446,6 +1480,11 @@ const std::string base_wlan_hal_nl80211::get_iface_from_fd(int fd)
+     return (m_wpa_ctrl_client.get_interface(fd));
+ }
+ 
++bool base_wlan_hal_nl80211::is_wpa_ctrl_interface_registered(const std::string &interface) const
++{
++    return m_wpa_ctrl_client.has_interface(interface);
++}
++
+ 
+ } // namespace nl80211
+ } // namespace bwl
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
+index d1e0e2f38..7c658c476 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
+@@ -104,6 +104,17 @@ protected:
+     bool wpa_ctrl_send_msg(const std::string &cmd, char **reply, const std::string &ifname = {});
+     bool wpa_ctrl_send_msg(const std::string &cmd, const std::string &ifname = {});
+ 
++    /**
++     * @brief Check whether a WPA control interface is registered (has a control socket).
++     *
++     * Used by subclasses to determine which link interfaces are valid before
++     * attempting to send commands on them.
++     *
++     * @param[in] interface Interface name to check.
++     * @return True if the interface has a registered WPA control socket.
++     */
++    bool is_wpa_ctrl_interface_registered(const std::string &interface) const;
++
+     virtual void send_ctrl_iface_cmd(std::string cmd); // HACK for development, to be removed
+ 
+     // Send NL80211 message to vap interface
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 9e6a7e50e..b80c2b56b 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -414,13 +414,36 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+ {
+     LOG(TRACE) << __func__;
+ 
+-    // Determine if this is an MLO BSSID and get link ID
++    // In an MLO setup, vap_iface_name may be a link-specific name (e.g. "wlan1.1_link0")
++    // because get_bss_link_id() modifies vap_element.bss to append "_linkN".
++    // However, REQ_BEACON must be sent to the MLD (base) interface (e.g. "wlan1.1"),
++    // because the STA is associated on the MLD interface, not the per-link interface.
++    // Strip the "_linkN" suffix if present to get the base VAP interface name.
++    std::string base_vap_iface = vap_iface_name;
++    auto link_pos = base_vap_iface.rfind("_link");
++    if (link_pos != std::string::npos) {
++        std::string suffix = base_vap_iface.substr(link_pos + 5); // characters after "_link"
++        if (!suffix.empty() && std::all_of(suffix.begin(), suffix.end(), ::isdigit)) {
++            base_vap_iface = base_vap_iface.substr(0, link_pos);
++            LOG(DEBUG) << __func__ << " - stripped link suffix: " << vap_iface_name
++                       << " -> " << base_vap_iface;
++        }
++    }
++
++    // Determine if this is an MLO BSSID and get link ID using the base interface.
++    // Skip the NL80211 lookup for wildcard/broadcast BSSID (ff:ff:ff:ff:ff:ff) since
++    // no AP has that MAC — the lookup would always fail and is unnecessary.
+     sMacAddr bssid_addr;
+     std::copy(std::begin(req.bssid.oct), std::end(req.bssid.oct), std::begin(bssid_addr.oct));
+-    int8_t link_id = get_link_id_from_bssid(vap_iface_name, bssid_addr, m_nl80211_client.get());
+-
+-    // Construct the appropriate interface name for MLO or non-MLO
+-    std::string target_interface = get_interface_for_link(vap_iface_name, link_id);
++    // Check for wildcard/broadcast BSSID (ff:ff:ff:ff:ff:ff)
++    static const uint8_t WILDCARD_BSSID_BYTES[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
++    bool is_wildcard_bssid = (memcmp(bssid_addr.oct, WILDCARD_BSSID_BYTES, sizeof(WILDCARD_BSSID_BYTES)) == 0);
++    int8_t link_id = -1;
++    if (!is_wildcard_bssid) {
++        link_id = get_link_id_from_bssid(base_vap_iface, bssid_addr, m_nl80211_client.get());
++    } else {
++        LOG(DEBUG) << __func__ << " - wildcard BSSID ff:ff:ff:ff:ff:ff, skipping MLO link lookup";
++    }
+ 
+     // parameters preperations
+     // Mode
+@@ -510,14 +533,36 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+                 << ", duration=" << req.duration
+                 << ", measurement_mode=" << int(measurement_mode)
+                 << ", req_mode=0x" << std::hex << int(req_mode) << std::dec
+-                << ", interface=" << target_interface
++                << ", interface=" << vap_iface_name
++                << ", base_interface=" << base_vap_iface
+                 << ", link_id=" << int(link_id)
+                 << ", cmd=[" << cmd << "]";
+ 
+-    // Send the command
++    // Send REQ_BEACON to link interfaces in order: _link0, _link1, _link2, ...
++    // Only try registered link interfaces (those with an active wpa_ctrl socket).
++    // Stop immediately on the first success — no duplicate queries are sent.
++    // Responses (BEACON-REQ-TX-STATUS, BEACON-RESP-RX, RADIO_MEASUREMENT_REPORT)
++    // will arrive on any link interface socket and are handled by the event processing
++    // path (process_nl80211_event for the monitor, MGMT_Frame for the ap_manager).
+     parsed_obj_map_t reply;
+-    if (!wpa_ctrl_send_msg(cmd, reply, target_interface)) {
+-        LOG(ERROR) << __func__ << " failed";
++    bool succeeded = false;
++    for (int link_idx = 0; link_idx < 8 && !succeeded; link_idx++) {
++        std::string link_iface = base_vap_iface + "_link" + std::to_string(link_idx);
++        if (!is_wpa_ctrl_interface_registered(link_iface)) {
++            continue; // skip unregistered interfaces — registered ones may not start at _link0
++        }
++        LOG(DEBUG) << __func__ << " - trying REQ_BEACON on link interface " << link_iface;
++        if (wpa_ctrl_send_msg(cmd, reply, link_iface)) {
++            LOG(DEBUG) << __func__ << " - REQ_BEACON succeeded on link interface " << link_iface;
++            succeeded = true; // stop here — no duplicate to other links
++        } else {
++            LOG(WARNING) << __func__ << " - REQ_BEACON failed on " << link_iface
++                         << ", trying next link interface";
++        }
++    }
++    if (!succeeded) {
++        LOG(ERROR) << __func__ << " - REQ_BEACON failed on all registered link interfaces for "
++                   << base_vap_iface;
+         return false;
+     }
+ 
+@@ -641,8 +686,22 @@ bool mon_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+ 
+     auto vap_id = get_vap_id_with_bss(interface);
+     if (vap_id < 0) {
+-        LOG(DEBUG) << "skip event handling for interface: " << interface << " with unknown vap_id " << vap_id;
+-        return true;
++        // Fallback: if the event arrived on the base interface (e.g. "wlan1.1"),
++        // try to find the VAP via its link-specific name (e.g. "wlan1.1_link0").
++        // This is needed because REQ_BEACON is sent to the base interface, so
++        // BEACON-REQ-TX-STATUS events arrive on the base interface socket,
++        // but vap_element.bss is stored as the link-specific name after
++        // get_bss_link_id() modifies it in refresh_vaps_info().
++        for (int link_idx = 0; link_idx < 8 && vap_id < 0; link_idx++) {
++            vap_id = get_vap_id_with_bss(interface + "_link" + std::to_string(link_idx));
++        }
++        if (vap_id < 0) {
++            LOG(DEBUG) << "skip event handling for interface: " << interface
++                       << " with unknown vap_id";
++            return true;
++        }
++        LOG(DEBUG) << __func__ << " - resolved base interface " << interface
++                   << " to vap_id=" << vap_id << " via link interface fallback";
+     }
+ 
+     // Handle the event
+diff --git a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
+index 7cd4c2a31..09eccc659 100644
+--- a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
+@@ -229,11 +229,11 @@ bool sta_wlan_hal_nl80211::roam(const sMacAddr &bssid, ChannelFreqPair channel)
+         return false;
+     }
+ 
+-    auto freq = son::wireless_utils::channel_to_freq(int(channel.first), channel.second);
+-    if (!set_network(m_active_network_id, "freq_list", std::to_string(freq))) {
+-        LOG(ERROR) << "Failed setting frequency on interface " << get_iface_name();
+-        return false;
+-    }
++//    auto freq = son::wireless_utils::channel_to_freq(int(channel.first), channel.second);
++//    if (!set_network(m_active_network_id, "freq_list", std::to_string(freq))) {
++//        LOG(ERROR) << "Failed setting frequency on interface " << get_iface_name();
++//        return false;
++//    }
+ 
+     auto bssid_str = tlvf::mac_to_string(bssid);
+ 
+diff --git a/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_apmanager.h b/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_apmanager.h
+index 3e955997d..be34b3259 100644
+--- a/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_apmanager.h
++++ b/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_apmanager.h
+@@ -1396,6 +1396,7 @@ class cACTION_APMANAGER_MULTI_CHAN_BEACON_11K_REQUEST : public BaseClass
+         }
+         sMacAddr& sta_mac();
+         uint16_t& timeout();
++        uint8_t& is_primary();
+         void class_swap() override;
+         bool finalize() override;
+         static size_t get_initial_size();
+@@ -1405,6 +1406,7 @@ class cACTION_APMANAGER_MULTI_CHAN_BEACON_11K_REQUEST : public BaseClass
+         eActionOp_APMANAGER* m_action_op = nullptr;
+         sMacAddr* m_sta_mac = nullptr;
+         uint16_t* m_timeout = nullptr;
++        uint8_t* m_is_primary = nullptr;
+ };
+ 
+ class cACTION_APMANAGER_MLD_UPDATE_REQUEST : public BaseClass
+diff --git a/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_apmanager.cpp b/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_apmanager.cpp
+index cd4fd24ad..6e0178f36 100644
+--- a/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_apmanager.cpp
++++ b/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_apmanager.cpp
+@@ -5074,6 +5074,10 @@ uint16_t& cACTION_APMANAGER_MULTI_CHAN_BEACON_11K_REQUEST::timeout() {
+     return (uint16_t&)(*m_timeout);
+ }
+ 
++uint8_t& cACTION_APMANAGER_MULTI_CHAN_BEACON_11K_REQUEST::is_primary() {
++    return (uint8_t&)(*m_is_primary);
++}
++
+ void cACTION_APMANAGER_MULTI_CHAN_BEACON_11K_REQUEST::class_swap()
+ {
+     tlvf_swap(8*sizeof(eActionOp_APMANAGER), reinterpret_cast<uint8_t*>(m_action_op));
+@@ -5113,6 +5117,7 @@ size_t cACTION_APMANAGER_MULTI_CHAN_BEACON_11K_REQUEST::get_initial_size()
+     size_t class_size = 0;
+     class_size += sizeof(sMacAddr); // sta_mac
+     class_size += sizeof(uint16_t); // timeout
++    class_size += sizeof(uint8_t); // is_primary
+     return class_size;
+ }
+ 
+@@ -5133,6 +5138,12 @@ bool cACTION_APMANAGER_MULTI_CHAN_BEACON_11K_REQUEST::init()
+         LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << sizeof(uint16_t) << ") Failed!";
+         return false;
+     }
++    m_is_primary = reinterpret_cast<uint8_t*>(m_buff_ptr__);
++    if (!buffPtrIncrementSafe(sizeof(uint8_t))) {
++        LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << sizeof(uint8_t) << ") Failed!";
++        return false;
++    }
++    if (!m_parse__) { *m_is_primary = 1; } // default: primary ap_manager
+     if (m_parse__) { class_swap(); }
+     return true;
+ }
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+index f14308779..9560d76b1 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+@@ -353,6 +353,7 @@ cACTION_APMANAGER_MULTI_CHAN_BEACON_11K_REQUEST:
+   _type: class
+   sta_mac: sMacAddr
+   timeout: uint16_t
++  is_primary: uint8_t
+ 
+ cACTION_APMANAGER_MLD_UPDATE_REQUEST:
+   _type: class
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index b2a0132b4..eb5702047 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -5499,19 +5499,11 @@ bool Controller::send_beacon_metrics_query(const sMacAddr &agent_mac, const sMac
+         }
+ 
+         if (is_collocated) {
+-            if (serving_bss != beerocks::net::network_utils::ZERO_MAC) {
+-                // Redirect: send the query to the serving BSS instead of the co-located BSSID.
+-                LOG(INFO) << "Co-located BSSID " << bssid << " is on bSTA's own device ("
+-                          << bsta_agent->al_mac << ") — redirecting Beacon Metrics Query"
+-                          << " to serving BSS " << serving_bss;
+-                target_bssid = serving_bss;
+-            } else {
+-                // Serving BSS unknown — cannot redirect, skip the query.
+-                LOG(INFO) << "Co-located BSSID " << bssid << " is on bSTA's own device ("
+-                          << bsta_agent->al_mac << ") and serving BSS is unknown"
+-                          << " — SKIPPING Beacon Metrics Query for bSTA " << sta_mac;
+-                return true;
+-            }
++            // Serving BSS unknown — cannot redirect, skip the query.
++            LOG(INFO) << "Co-located BSSID " << bssid << " is on bSTA's own device ("
++                        << bsta_agent->al_mac << ") and serving BSS is unknown"
++                        << " — SKIPPING Beacon Metrics Query for bSTA " << sta_mac;
++            return true;
+         } else {
+             LOG(DEBUG) << "Co-location check: BSSID " << bssid
+                        << " not found in bSTA agent's BSS list — sending query as-is";
+-- 
+2.34.1
+
