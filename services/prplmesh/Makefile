@@ -24,7 +24,8 @@ PKG_CONFIG_DEPENDS:= \
 	CONFIG_TARGET_brcmbca \
 	CONFIG_USE_PRPLMESH_WHM \
 	CONFIG_PRPLMESH_ENABLE_UNIT_TESTS \
-	CONFIG_PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND
+	CONFIG_PRPLMESH_ENABLE_AMBIORIX_UBUS_BACKEND \
+	CONFIG_PRPLMESH_ENABLE_MQTT
 
 CMAKE_BINARY_SUBDIR:=build
 
@@ -53,9 +54,11 @@ define Package/prplmesh
 		+ubus \
 		+ubox \
 		+ebtables \
-        +libpcap \
-		+libmosquitto \
-		+mosquitto
+        +libpcap
+#	MQTT dependency
+	DEPENDS+= \
+		+PRPLMESH_ENABLE_MQTT:libmosquitto \
+		+PRPLMESH_ENABLE_MQTT:mosquitto
 #	intel_mips and intel_x86 specific dependencies:
 	DEPENDS+= \
 		+TARGET_intel_mips:dwpal_6x-uci \
@@ -167,6 +170,12 @@ endif
 
 ifeq ($(CONFIG_PRPLMESH_ENABLE_UNIT_TESTS),y)
 	CMAKE_OPTIONS += -DBUILD_TESTS=ON
+endif
+
+ifeq ($(CONFIG_PRPLMESH_ENABLE_MQTT),y)
+    CMAKE_OPTIONS += -DENABLE_MQTT=ON
+else
+    CMAKE_OPTIONS += -DENABLE_MQTT=OFF
 endif
 
 define Build/Prepare
