@@ -1,0 +1,250 @@
+From a5a35ddc4fc361cff9f54582e10c415f2a56de1b Mon Sep 17 00:00:00 2001
+From: Nirmal Raj S <nirm@qti.qualcomm.com>
+Date: Wed, 10 Jun 2026 20:41:15 +0530
+Subject: [PATCH] add fh_vaps_state_control flag and fix FH VAP state logic
+
+skip reload_config in set_primary_vlan_id in TS disabled case
+
+Signed-off-by: Nirmal Raj S <nirm@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/agent_db.h           |  9 +++++
+ agent/src/beerocks/slave/son_slave_thread.cpp | 34 ++++++++++++++++---
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 16 +++++++--
+ framework/platform/bpl/cfg/dm/bpl_cfg.cpp     |  7 ++++
+ framework/platform/bpl/cfg/linux/bpl_cfg.cpp  |  7 ++++
+ framework/platform/bpl/cfg/rdk/bpl_cfg.cpp    |  7 ++++
+ framework/platform/bpl/cfg/uci/bpl_cfg.cpp    | 12 +++++++
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     |  3 +-
+ framework/platform/bpl/include/bpl/bpl_cfg.h  | 15 ++++++++
+ 9 files changed, 102 insertions(+), 8 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index d060d12e1..05eb84bff 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -197,6 +197,15 @@ public:
+             eUnsupportedProfileDisallowPolicy::NO_OVERRIDE;
+         bool ts_bridge_mapping_enabled  = false;
+         bool ts_persistence_enabled     = false;
++
++        /**
++         * @brief Flag to enable FH VAPs state control.
++         *
++         * When true, the agent sends cACTION_APMANAGER_SET_FH_VAPS_STATE messages
++         * to enable/disable fronthaul VAPs based on backhaul/controller connectivity.
++         * Controlled by the 'fh_vaps_state_control' option in /etc/config/prplmesh.
++         */
++        bool fh_vaps_state_control = false;
+     } device_conf;
+ 
+     struct sControllerInfo {
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 65ac945dc..f4dac425c 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -714,6 +714,11 @@ bool slave_thread::read_platform_configuration()
+                      << beerocks::utils::get_zwdfs_string(db->device_conf.zwdfs_flag);
+     }
+ 
++    if (!bpl::cfg_get_fh_vaps_state_control(db->device_conf.fh_vaps_state_control)) {
++        LOG(WARNING) << "cfg_get_fh_vaps_state_control() failed! using default configuration: "
++                     << db->device_conf.fh_vaps_state_control;
++    }
++
+     if (!bpl::cfg_get_best_channel_rank_threshold(db->device_conf.best_channel_rank_threshold)) {
+         LOG(WARNING) << "cfg_get_best_channel_rank_threshold() failed!"
+                      << " using default configuration ";
+@@ -822,6 +827,7 @@ bool slave_thread::read_platform_configuration()
+                << db->device_conf.check_connectivity_to_controller_enable;
+     LOG(DEBUG) << "check_indirect_connectivity_to_controller: "
+                << db->device_conf.check_indirect_connectivity_to_controller_enable;
++    LOG(DEBUG) << "fh_vaps_state_control: " << db->device_conf.fh_vaps_state_control;
+ 
+     return true;
+ }
+@@ -5708,10 +5714,17 @@ void slave_thread::notify_controller_reachability(bool reachable)
+                << ", current m_backhaul_l2_connected=" << int(m_backhaul_l2_connected);
+ 
+     // Send FH VAP state to all AP managers based on controller reachability.
+-    // Disable when controller is not reachable, enable when it becomes reachable.
+-    LOG(DEBUG) << "Controller reachability changed - sending FH VAP "
+-               << (reachable ? "enable" : "disable") << " to all AP managers";
+-    send_fh_vap_state_to_ap_managers(reachable);
++    // Skip disabling FH VAPs if the backhaul L2 link is still up (e.g. during controller
++    // re-discovery after BACKHAUL_MANAGER_CONNECTED). FH VAPs should only be disabled
++    // when the backhaul L2 connection itself is down.
++    if (!reachable && m_backhaul_l2_connected) {
++        LOG(DEBUG) << "notify_controller_reachability: skipping FH VAP disable"
++                   << " - backhaul L2 is still connected";
++    } else {
++        LOG(DEBUG) << "Controller reachability changed - sending FH VAP "
++                   << (reachable ? "enable" : "disable") << " to all AP managers";
++        send_fh_vap_state_to_ap_managers(reachable);
++    }
+ 
+     if (m_controller_reachable == reachable) {
+         LOG(ERROR) << "Reachability hasn't changed. Returning early.";
+@@ -5764,6 +5777,19 @@ void slave_thread::update_bsta_state_to_ap_managers()
+ void slave_thread::send_fh_vap_state_to_ap_managers(bool enable)
+ {
+ #ifdef USE_PRPLMESH_NLHAL
++    {
++        auto db = AgentDB::get();
++        if (!db->device_conf.fh_vaps_state_control) {
++            LOG(DEBUG) << "send_fh_vap_state_to_ap_managers: fh_vaps_state_control disabled, skipping";
++            return;
++        }
++    }
++
++    if (bpl::cfg_is_master() > 0) {
++        LOG(DEBUG) << "send_fh_vap_state_to_ap_managers: skipping for CONTROLLER mode";
++        return;
++    }
++
+     LOG(DEBUG) << "send_fh_vap_state_to_ap_managers: "
+                << (enable ? "enabling" : "disabling") << " FH VAPs on all radios";
+ 
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index ba5fa8b9a..a2f202739 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -3170,9 +3170,19 @@ bool ap_wlan_hal_nl80211::set_primary_vlan_id(uint16_t primary_vlan_id)
+             // lookup fails (e.g. link-specific BSSID differs from conf BSSID).
+             const auto &vap_id = conf.get_vap_by_bssid(vap.second.mac);
+             const std::string &target_vap = vap_id.empty() ? base_iface : vap_id;
+-            conf.set_create_vap_value(target_vap, "multi_ap_vlanid",
+-                                      std::to_string(primary_vlan_id));
+-            if (!conf.store(target_vap)) {
++            // vlanid=0 means "remove VLAN" — pass empty string so set_create_vap_value
++            // deletes the multi_ap_vlanid key from the conf (TS disabled case).
++            const std::string vlanid_str =
++                (primary_vlan_id != 0) ? std::to_string(primary_vlan_id) : "";
++            conf.set_create_vap_value(target_vap, "multi_ap_vlanid", vlanid_str);
++            // Only write the conf file and reload hostapd when the value actually changed.
++            // set_create_vap_value sets update_required() only when the stored value differs
++            // from the new value, so this avoids a spurious RELOAD_CONFIG when the conf
++            // file already contains the correct multi_ap_vlanid.
++            if (!conf.update_required()) {
++                LOG(DEBUG) << "set_primary_vlan_id: conf already up-to-date for bss="
++                           << vap.second.bss << ", skipping store/RELOAD_CONFIG";
++            } else if (!conf.store(target_vap)) {
+                 LOG(ERROR) << "set_primary_vlan_id: failed to save hostapd conf for bss="
+                            << vap.second.bss;
+             } else {
+diff --git a/framework/platform/bpl/cfg/dm/bpl_cfg.cpp b/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
+index 30b0f5d9b..9c39c7379 100644
+--- a/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
+@@ -760,5 +760,12 @@ bool cfg_get_dhcp_gateway_ip(std::string &gw_ip)
+     return false;
+ }
+ 
++bool cfg_get_fh_vaps_state_control(bool &fh_vaps_state_control)
++{
++    // FH VAPs state control is disabled by default on WHM platform.
++    fh_vaps_state_control = false;
++    return true;
++}
++
+ } // namespace bpl
+ } // namespace beerocks
+diff --git a/framework/platform/bpl/cfg/linux/bpl_cfg.cpp b/framework/platform/bpl/cfg/linux/bpl_cfg.cpp
+index 8a3a5d54e..5e9387333 100644
+--- a/framework/platform/bpl/cfg/linux/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/linux/bpl_cfg.cpp
+@@ -1063,5 +1063,12 @@ bool cfg_get_dhcp_gateway_ip(std::string &gw_ip)
+     return true;
+ }
+ 
++bool cfg_get_fh_vaps_state_control(bool &fh_vaps_state_control)
++{
++    // FH VAPs state control is disabled by default on linux platform.
++    fh_vaps_state_control = false;
++    return true;
++}
++
+ } // namespace bpl
+ } // namespace beerocks
+diff --git a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+index 0f122a954..2d333132a 100644
+--- a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+@@ -1612,5 +1612,12 @@ bool cfg_get_client_password(std::string &client_password)
+     return get_config_string_field("client_password", client_password);
+ }
+ 
++bool cfg_get_fh_vaps_state_control(bool &fh_vaps_state_control)
++{
++    // FH VAPs state control is disabled by default on RDKB platform.
++    fh_vaps_state_control = false;
++    return true;
++}
++
+ } // namespace bpl
+ } // namespace beerocks
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
+index 78384becb..0c60bb465 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
+@@ -1345,6 +1345,18 @@ bool cfg_update_prplmesh_option(const std::string &package_name, const std::stri
+                                              new_value);
+ }
+ 
++bool cfg_get_fh_vaps_state_control(bool &fh_vaps_state_control)
++{
++    int retVal = -1;
++    if (cfg_get_prplmesh_param_int_default("fh_vaps_state_control", &retVal, 0) == RETURN_ERR) {
++        MAPF_INFO("Failed to read fh_vaps_state_control parameter - using default value 0");
++        fh_vaps_state_control = false;
++        return false;
++    }
++    fh_vaps_state_control = (retVal == 1);
++    return true;
++}
++
+ bool cfg_get_dhcp_gateway_ip(std::string &gw_ip)
+ {
+     std::string cmd = "ip r | awk '/^def/{print $3}'";
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index b56f8e7ff..cd98cf8d7 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -2334,7 +2334,8 @@ bool cfg_set_wifi_iface_multi_ap_vlanid(const std::string &iface_name, uint16_t
+     bool any_updated      = false;
+ 
+     OptionsUnorderedMap options;
+-    options["multi_ap_vlanid"] = std::to_string(vlanid);
++    // vlanid=0 means "remove VLAN" — pass empty string so uci_set_section deletes the option.
++    options["multi_ap_vlanid"] = (vlanid != 0) ? std::to_string(vlanid) : "";
+ 
+     // Update ALL wifi-iface sections with matching ifname.
+     // For MLO backhaul APs, multiple sections (one per band) share the same ifname.
+diff --git a/framework/platform/bpl/include/bpl/bpl_cfg.h b/framework/platform/bpl/include/bpl/bpl_cfg.h
+index 3cf5cca95..cbbe098ce 100644
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -1688,6 +1688,21 @@ bool cfg_get_client_id(std::string &client_id);
+  */
+ bool cfg_get_client_password(std::string &client_password);
+ 
++/**
++ * @brief Returns whether the FH VAPs state control feature is enabled.
++ *
++ * When enabled, the agent will send cACTION_APMANAGER_SET_FH_VAPS_STATE messages
++ * to the AP manager to enable/disable fronthaul VAPs based on backhaul/controller
++ * connectivity state.
++ *
++ * Reads the 'fh_vaps_state_control' option from /etc/config/prplmesh.
++ * Default value is false (disabled).
++ *
++ * @param [out] fh_vaps_state_control true if the feature is enabled, false otherwise.
++ * @return true on success, otherwise false.
++ */
++bool cfg_get_fh_vaps_state_control(bool &fh_vaps_state_control);
++
+ } // namespace bpl
+ } // namespace beerocks
+ 
+-- 
+2.34.1
+
