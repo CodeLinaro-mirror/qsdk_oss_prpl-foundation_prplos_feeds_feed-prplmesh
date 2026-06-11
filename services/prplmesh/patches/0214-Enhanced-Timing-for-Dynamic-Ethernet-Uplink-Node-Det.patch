@@ -1,0 +1,222 @@
+From d78187715ae6f0d3856ffa11d33011daa5505ffb Mon Sep 17 00:00:00 2001
+From: Vinu Bharath R <vinubhar@qti.qualcomm.com>
+Date: Tue, 9 Jun 2026 17:27:17 +0530
+Subject: [PATCH] Enhanced Timing for Dynamic Ethernet Uplink Node Detection
+
+Signed-off-by: Vinu Bharath R <vinubhar@qti.qualcomm.com>
+---
+ .../backhaul_manager/backhaul_manager.cpp     | 117 +++++++++++++++---
+ .../slave/backhaul_manager/backhaul_manager.h |  18 +++
+ 2 files changed, 119 insertions(+), 16 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 912202ed9..4df3a74da 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -1033,7 +1033,11 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+             // Check if ethernet interface is up and gateway-reachable
+             if (m_eth_link_up) {
+                 // wired backhaul
++#ifdef USE_PRPLMESH_NLHAL
++                eth_link_up = beerocks::net::network_utils::linux_iface_is_up_and_running(db->ethernet.wan.iface_name) && is_gateway_reachable_via_interface(db->ethernet.wan.iface_name);
++#else
+                 eth_link_up = beerocks::net::network_utils::linux_iface_is_up_and_running(db->ethernet.wan.iface_name) && is_gateway_reachable();
++#endif
+             } else {
+                 // wireless backhaul
+                 std::string selected_eth_iface;
+@@ -1492,11 +1496,42 @@ bool BackhaulManager::backhaul_fsm_wireless(bool &skip_select)
+     // Wait for WPS command
+     case EState::WAIT_WPS: {
+         auto db = AgentDB::get();
+-        if (!db->device_conf.local_gw &&
+-            std::chrono::steady_clock::now() > state_time_stamp_timeout) {
+-            LOG(ERROR) << STATE_WAIT_WPS_TIMEOUT_SECONDS
+-                       << " seconds has passed on state WAIT_WPS, move state to RESTART!";
+-            FSM_MOVE_STATE(RESTART);
++
++        // Check for ethernet link availability during WAIT_WPS timeout period
++        if (!db->device_conf.local_gw) {
++            auto now = std::chrono::steady_clock::now();
++
++            // Check if timeout has expired
++            if (now > state_time_stamp_timeout) {
++                LOG(ERROR) << STATE_WAIT_WPS_TIMEOUT_SECONDS
++                           << " seconds has passed on state WAIT_WPS, move state to RESTART!";
++                FSM_MOVE_STATE(RESTART);
++                break;
++            }
++
++            // Poll for ethernet link availability every 5 seconds during WAIT_WPS
++            int time_elapsed_ms =
++                std::chrono::duration_cast<std::chrono::milliseconds>(now - eth_link_poll_timer)
++                    .count();
++
++            if (time_elapsed_ms > POLL_TIMER_TIMEOUT_MS) {
++                eth_link_poll_timer = now;
++
++                // Check if any ethernet interface is up and gateway reachable
++                std::string selected_eth_iface;
++                if (select_gateway_reachable_eth_interface(selected_eth_iface)) {
++                    db->ethernet.wan.iface_name = selected_eth_iface;
++
++                    if (beerocks::net::network_utils::linux_iface_is_up_and_running(db->ethernet.wan.iface_name) &&
++                        is_gateway_reachable_via_interface(db->ethernet.wan.iface_name)) {
++
++                        LOG(INFO) << "Ethernet link became available during WAIT_WPS on interface "
++                                  << db->ethernet.wan.iface_name << " - switch to wired backhaul";
++                        FSM_MOVE_STATE(RESTART);
++                        break;
++                    }
++                }
++            }
+         }
+ 
+         // If we're still in WAIT_WPS and haven't yet kicked off a reassociate,
+@@ -1911,6 +1946,49 @@ bool BackhaulManager::resolve_gateway_ip(std::string &gw_ip)
+     return true;
+ }
+ 
++#ifdef USE_PRPLMESH_NLHAL
++// OpenWrt implementation using arping
++bool BackhaulManager::arping_confirm_gateway(const std::string &iface, const std::string &bridge,
++                                             const std::string &gw_ip)
++{
++    LOG(INFO) << "Confirming GW IP (" << gw_ip << ") is reachable on " << iface;
++
++    // Build arping command
++    std::string arping_cmd = "arping -c 1 -I " + iface;
++
++    // Add bridge parameter if provided
++    if (!bridge.empty()) {
++        arping_cmd += " -B " + bridge;
++    }
++
++    arping_cmd += " " + gw_ip + " 2>/dev/null | grep 'Received' | awk '{print $2;}'";
++
++    // Execute arping command
++    FILE *fp = popen(arping_cmd.c_str(), "r");
++    if (!fp) {
++        LOG(ERROR) << "Failed to execute arping command";
++        return false;
++    }
++
++    // Read the number of replies
++    char buffer[32];
++    int replies = 0;
++    if (fgets(buffer, sizeof(buffer), fp) != nullptr) {
++        replies = std::atoi(buffer);
++    }
++    pclose(fp);
++
++    // Check if we received
++    if (replies > 0) {
++        LOG(INFO) << "GW IP (" << gw_ip << ") reachable on " << iface;
++        return true;
++    } else {
++        LOG(INFO) << "GW IP (" << gw_ip << ") not reachable on " << iface;
++        return false;
++    }
++}
++#else
++// PrplOS implementation using ping + route/FDB verification
+ bool BackhaulManager::verify_route_via_wan(const std::string &gw_ip, const std::string &wan_iface,
+                                            const std::string &bridge_iface)
+ {
+@@ -2135,6 +2213,17 @@ bool BackhaulManager::ping_gateway(const std::string &gw_ip)
+     return gateway_reachable;
+ }
+ 
++bool BackhaulManager::is_gateway_reachable()
++{
++    if (m_gateway_ip.empty()) {
++        LOG(WARNING) << "Gateway IP not set, cannot check reachability";
++        return false;
++    }
++
++    return ping_gateway(m_gateway_ip);
++}
++#endif // USE_PRPLMESH_NLHAL
++
+ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMessageRx &cmdu_rx)
+ {
+     auto beerocks_header = message_com::parse_intel_vs_message(cmdu_rx);
+@@ -4493,16 +4582,6 @@ void BackhaulManager::create_sta_hal_for_bh_switching()
+     }
+ }
+ 
+-bool BackhaulManager::is_gateway_reachable()
+-{
+-    if (m_gateway_ip.empty()) {
+-        LOG(WARNING) << "Gateway IP not set, cannot check reachability";
+-        return false;
+-    }
+-
+-    return ping_gateway(m_gateway_ip);
+-}
+-
+ bool BackhaulManager::is_gateway_reachable_via_interface(const std::string &iface)
+ {
+     // Get bridge interface from database
+@@ -4518,6 +4597,11 @@ bool BackhaulManager::is_gateway_reachable_via_interface(const std::string &ifac
+     // Store the resolved gateway IP in the member variable
+     m_gateway_ip = gw_ip;
+ 
++#ifdef USE_PRPLMESH_NLHAL
++    // OpenWrt: Use arping for determining gateway reachability
++    return arping_confirm_gateway(iface, bridge_iface, gw_ip);
++#else
++    // PrplOS: Use legacy route/FDB/ping verification
+     // Verify route goes via this interface
+     if (!verify_route_via_wan(gw_ip, iface, bridge_iface)) {
+         return false;
+@@ -4534,8 +4618,9 @@ bool BackhaulManager::is_gateway_reachable_via_interface(const std::string &ifac
+         }
+     }
+ 
+-    // check reachability using gateway IP
++    // Check reachability using gateway IP
+     return is_gateway_reachable();
++#endif
+ }
+ 
+ bool BackhaulManager::select_gateway_reachable_eth_interface(std::string &selected_iface)
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+index 1d9c76ec1..b4b41fe0a 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+@@ -356,6 +356,23 @@ private:
+      */
+     bool resolve_gateway_ip(std::string &gw_ip);
+ 
++#ifdef USE_PRPLMESH_NLHAL
++    // OpenWrt implementation using arping
++    /**
++     * @brief Confirms gateway reachability using ARP ping (arping).
++     *
++     * Uses arping to send ARP requests and verify gateway is reachable on the specified interface.
++     * This is more reliable than ICMP ping for Layer 2 reachability verification.
++     *
++     * @param[in] iface The interface to send ARP requests on.
++     * @param[in] bridge The bridge interface name.
++     * @param[in] gw_ip The gateway IP address.
++     * @return true if gateway responds to ARP requests, false otherwise.
++     */
++    bool arping_confirm_gateway(const std::string &iface, const std::string &bridge,
++                                const std::string &gw_ip);
++#else
++    // PrplOS implementation using ping + route/FDB verification
+     /**
+      * @brief Verifies that the route to the gateway goes via the WAN interface.
+      *
+@@ -404,6 +421,7 @@ private:
+      * @return true if gateway responds to ping, false otherwise.
+      */
+     bool is_gateway_reachable();
++#endif // USE_PRPLMESH_NLHAL
+ 
+ private:
+     /**
+-- 
+2.34.1
+
