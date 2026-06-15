@@ -1,0 +1,281 @@
+From 1694adcdd2f10794361027d204afe00593ab5701 Mon Sep 17 00:00:00 2001
+From: Sandeep Tomer <stomer@qti.qualcomm.com>
+Date: Fri, 12 Jun 2026 15:51:46 +0530
+Subject: [PATCH] [prplmesh] Add SSID filtered beacon report
+
+1. add ssid in REQ_BEACON command.
+2. add scan duration to 1 sec.
+3. enable active mode of beacon req.
+
+Signed-off-by: Sandeep Tomer <stomer@qti.qualcomm.com>
+---
+ agent/config/beerocks_agent.conf.in           | 10 +++-
+ agent/src/beerocks/slave/agent_db.h           |  3 +-
+ .../beerocks/slave/beerocks_agent_main.cpp    | 20 ++++++-
+ .../tasks/link_metrics_collection_task.cpp    | 52 +++++++++++++++---
+ .../bcl/include/bcl/beerocks_config_file.h    |  1 +
+ .../bcl/source/beerocks_config_file.cpp       |  1 +
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 55 ++++++++++++++++---
+ 7 files changed, 122 insertions(+), 20 deletions(-)
+
+diff --git a/agent/config/beerocks_agent.conf.in b/agent/config/beerocks_agent.conf.in
+index 3d3ecbbd1..829525ba1 100644
+--- a/agent/config/beerocks_agent.conf.in
++++ b/agent/config/beerocks_agent.conf.in
+@@ -67,10 +67,18 @@ send_btm_to_non_11v_sta=1
+ 
+ # beacon_11k_default_measurement_mode = BEACON_MEASUREMENT_MODE_PASSIVE (0) -> Passive measurement mode
+ # beacon_11k_default_measurement_mode = BEACON_MEASUREMENT_MODE_ACTIVE (1) -> Active measurement mode
+-# beacon_11k_default_measurement_mode = BEACON_MEASUREMENT_MODE_TABLE (2) -> Beacon Table measurement mode (default)
++# beacon_11k_default_measurement_mode = BEACON_MEASUREMENT_MODE_TABLE (2) -> Beacon Table measurement mode (default for regular STAs)
+ beacon_11k_default_measurement_mode=2
+ 
++# beacon_11k_bsta_measurement_mode: Beacon measurement mode used for backhaul STAs (bSTAs).
++# bSTAs typically cannot respond to Beacon Table requests (they have no cached beacon table),
++# so Active mode is used by default to trigger an actual over-the-air measurement.
++# beacon_11k_bsta_measurement_mode = BEACON_MEASUREMENT_MODE_PASSIVE (0) -> Passive measurement mode
++# beacon_11k_bsta_measurement_mode = BEACON_MEASUREMENT_MODE_ACTIVE (1) -> Active measurement mode (default for bSTA)
++# beacon_11k_bsta_measurement_mode = BEACON_MEASUREMENT_MODE_TABLE (2) -> Beacon Table measurement mode
++beacon_11k_bsta_measurement_mode=1
++
+ # btm_abridged and btm_disassoc_imminent have been moved to the steering app
+ # configuration (steering_config.json: BTMAbridged, BTMDisassocImminent).
+ # They are now passed per-steer via qmesh_cmd_client_steering() so the
+ # steering app has full control over these BTM Request Mode bits.
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index e7eb15ce7..c1c3c1180 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -183,7 +183,8 @@ public:
+         bool enable_auto_chansel_handling;
+         bool enable_smd                             = false;
+         int8_t num_of_bands = 0;
+-        uint8_t beacon_11k_default_measurement_mode = 2;
++        uint8_t beacon_11k_default_measurement_mode = 2; ///< Beacon measurement mode for regular (fronthaul) STAs. Default: TABLE (2).
++        uint8_t beacon_11k_bsta_measurement_mode    = 1; ///< Beacon measurement mode for backhaul STAs (bSTAs). Default: ACTIVE (1).
+ 
+         /**
+          * BTM Request flags for agent-initiated steering (CLIENT_BSS_STEER path).
+diff --git a/agent/src/beerocks/slave/beerocks_agent_main.cpp b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+index f97f6260a..64a1bf3da 100644
+--- a/agent/src/beerocks/slave/beerocks_agent_main.cpp
++++ b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+@@ -722,9 +722,27 @@ static int run_beerocks_slave(beerocks::config_file::sConfigSlave &beerocks_slav
+             db->device_conf.beacon_11k_default_measurement_mode = static_cast<uint8_t>(beacon_11k_mode);
+         }
+         
+-        // Set the global beacon 11k measurement mode in the bwl layer
++        // Set the global beacon 11k measurement mode in the bwl layer (used as fallback only)
+         bwl::nl80211::set_beacon_11k_measurement_mode(db->device_conf.beacon_11k_default_measurement_mode);
+ 
++        // Read and validate beacon_11k_bsta_measurement_mode configuration
++        if (!beerocks_slave_conf.beacon_11k_bsta_measurement_mode.empty()) {
++            auto bsta_beacon_mode = beerocks::string_utils::stoi(
++                beerocks_slave_conf.beacon_11k_bsta_measurement_mode);
++            if (bsta_beacon_mode < BEACON_MEASUREMENT_MODE_PASSIVE ||
++                bsta_beacon_mode > BEACON_MEASUREMENT_MODE_TABLE) {
++                LOG(WARNING) << "Invalid beacon_11k_bsta_measurement_mode value: "
++                             << bsta_beacon_mode
++                             << ", using ACTIVE mode (1) as default";
++                db->device_conf.beacon_11k_bsta_measurement_mode = BEACON_MEASUREMENT_MODE_ACTIVE;
++            } else {
++                db->device_conf.beacon_11k_bsta_measurement_mode =
++                    static_cast<uint8_t>(bsta_beacon_mode);
++            }
++            LOG(DEBUG) << "Set beacon_11k_bsta_measurement_mode to: "
++                       << int(db->device_conf.beacon_11k_bsta_measurement_mode);
++        }
++
+         // Read btm_abridged (optional, default: true)
+         if (!beerocks_slave_conf.btm_abridged.empty()) {
+             db->device_conf.btm_abridged =
+diff --git a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+index 65e2db1c2..53855a649 100644
+--- a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+@@ -45,7 +45,7 @@
+ using namespace multi_vendor;
+ 
+ /* Multi chan beacon request duration (in ms) */
+-#define MULTI_CHAN_BCN_REQ_DURATION 10
++#define MULTI_CHAN_BCN_REQ_DURATION 1000
+ 
+ /* Minimum delay between consecutive Beacon Metrics Queries (in ms) */
+ #define MULTI_CHAN_MIN_BCN_REQ_DELAY 400
+@@ -382,25 +382,62 @@ bool LinkMetricsCollectionTask::schedule_beacon_metrics_query(
+ 
+     auto &params = beacon_params.params;
+ 
+-    params.bssid                  = beacon_metrics_query.bssid();
+-    params.channel                = beacon_metrics_query.channel_number();
+-    params.measurement_mode       = beerocks::MEASURE_MODE_ACTIVE;
+-    params.duration               = MULTI_CHAN_BCN_REQ_DURATION;
++    params.bssid    = beacon_metrics_query.bssid();
++    params.channel  = beacon_metrics_query.channel_number();
++    params.duration = MULTI_CHAN_BCN_REQ_DURATION;
+     params.expected_reports_count = 1;
+     params.rand_ival              = beerocks::BEACON_MEASURE_DEFAULT_RANDOMIZATION_INTERVAL;
+     params.sta_mac                = beacon_metrics_query.associated_sta_mac();
+     params.op_class               = beacon_metrics_query.operating_class();
+-    params.reporting_detail       = beacon_metrics_query.reporting_detail_value();
++    params.reporting_detail = beacon_metrics_query.reporting_detail_value();
++
++    // Acquire DB lock once for all DB accesses in this function.
++    auto db = AgentDB::get();
++
++    // Select beacon measurement mode based on whether the STA is a backhaul STA (bSTA).
++    // bSTAs typically have no cached beacon table, so TABLE mode would yield no results.
++    // Regular fronthaul STAs use TABLE mode (faster, no over-the-air measurement needed).
++    {
++        bool is_bsta    = false;
++        auto sta_radio  = db->get_radio_by_mac(beacon_metrics_query.associated_sta_mac(),
++                                               AgentDB::eMacType::CLIENT);
++        if (sta_radio) {
++            auto client_it =
++                sta_radio->associated_clients.find(beacon_metrics_query.associated_sta_mac());
++            if (client_it != sta_radio->associated_clients.end()) {
++                for (const auto &bss : sta_radio->front.bssids) {
++                    if (bss.mac == client_it->second.bssid && bss.backhaul_bss) {
++                        is_bsta = true;
++                        break;
++                    }
++                }
++            }
++        }
++        params.measurement_mode = is_bsta ? db->device_conf.beacon_11k_bsta_measurement_mode
++                                          : db->device_conf.beacon_11k_default_measurement_mode;
++        LOG(DEBUG) << "Beacon query measurement_mode=" << int(params.measurement_mode)
++                   << " (is_bsta=" << is_bsta << ")"
++                   << " sta_mac=" << beacon_metrics_query.associated_sta_mac();
++    }
+     /* values based on https://github.com/prplfoundation/prplMesh/pull/1114#discussion_r406326546 */
+     params.repeats            = 0;
+     params.parallel           = 0;
+     params.enable             = 0;
+     params.request            = 1;
+     params.mandatory_duration = 0;
+-    params.use_optional_ssid  = 0;
+ 
++    // Copy SSID and set the flag if SSID is present
+     string_utils::copy_string(params.ssid, beacon_metrics_query.ssid_str().c_str(),
+                               beerocks::message::WIFI_SSID_MAX_LENGTH);
++    
++    // Enable SSID subelement if SSID is provided
++    params.use_optional_ssid = !beacon_metrics_query.ssid_str().empty() ? 1 : 0;
++    
++    LOG(DEBUG) << "Beacon query SSID parsing: "
++               << "ssid_str='" << beacon_metrics_query.ssid_str() << "'"
++               << ", ssid_length=" << beacon_metrics_query.ssid_str().length()
++               << ", use_optional_ssid=" << int(params.use_optional_ssid)
++               << ", copied_ssid='" << params.ssid << "'";
+ 
+     auto ap_channel_reports_list_length = beacon_metrics_query.ap_channel_reports_list_length();
+ 
+@@ -433,7 +470,6 @@ bool LinkMetricsCollectionTask::schedule_beacon_metrics_query(
+     }
+ 
+     // USED IN TESTS: Explicitly send the query with the values from dev_send_1905
+-    auto db = AgentDB::get();
+     if (db->device_conf.certification_mode) {
+         sBeaconMetricsQuery::sChanReport new_report = {};
+         new_report.op_class                         = params.op_class;
+diff --git a/common/beerocks/bcl/include/bcl/beerocks_config_file.h b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+index 74f2d77cc..b0549d272 100644
+--- a/common/beerocks/bcl/include/bcl/beerocks_config_file.h
++++ b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+@@ -116,6 +116,7 @@ public:
+         std::string clients_unicast_measurements;
+         std::string send_btm_to_non_11v_sta;
+         std::string beacon_11k_default_measurement_mode;
++        std::string beacon_11k_bsta_measurement_mode;
+         std::string btm_abridged;
+         std::string btm_disassoc_imminent;
+         //[slaveX]
+diff --git a/common/beerocks/bcl/source/beerocks_config_file.cpp b/common/beerocks/bcl/source/beerocks_config_file.cpp
+index 9e8f52fbf..c42019b71 100644
+--- a/common/beerocks/bcl/source/beerocks_config_file.cpp
++++ b/common/beerocks/bcl/source/beerocks_config_file.cpp
+@@ -171,6 +171,7 @@ bool config_file::read_slave_config_file(const std::string &config_file_path, sC
+             std::make_tuple("clients_unicast_measurements=", &conf.clients_unicast_measurements, 0),
+             std::make_tuple("send_btm_to_non_11v_sta=", &conf.send_btm_to_non_11v_sta, 0),
+             std::make_tuple("beacon_11k_default_measurement_mode=", &conf.beacon_11k_default_measurement_mode, 0),
++            std::make_tuple("beacon_11k_bsta_measurement_mode=", &conf.beacon_11k_bsta_measurement_mode, 0),
+             std::make_tuple("btm_abridged=", &conf.btm_abridged, 0),
+             std::make_tuple("btm_disassoc_imminent=", &conf.btm_disassoc_imminent, 0),
+         };
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index b80c2b56b..c24c9f4dc 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -464,7 +464,11 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+         LOG(WARNING) << __func__ << " op_class not set, calculated from radio: " << int(op_class);
+     }
+ 
+-    uint8_t measurement_mode = g_beacon_11k_measurement_mode;
++    // Use the measurement mode from the request parameters.
++    // This allows per-STA differentiation (e.g. TABLE for regular STAs, ACTIVE for bSTAs).
++    // The global g_beacon_11k_measurement_mode is kept as a fallback for callers that do
++    // not set req.measurement_mode explicitly, but the task layer always sets it now.
++    uint8_t measurement_mode = req.measurement_mode;
+ 
+     // REQ_BEACON 02:14:5f:b8:ae:9f req_mode=01 510B000011110004f021318193
+     // op_class (2), channel (2), randomization_interval (4), measurement duration (4), measurement mode (2), bssid (12)
+@@ -484,14 +488,47 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+                       beerocks::string_utils::int_to_hex_string(req.bssid.oct[2], 2) +
+                       beerocks::string_utils::int_to_hex_string(req.bssid.oct[3], 2) +
+                       beerocks::string_utils::int_to_hex_string(req.bssid.oct[4], 2) +
+-                      beerocks::string_utils::int_to_hex_string(req.bssid.oct[5], 2) +
+-                      // Reporting detail subelement
+-                      // subelement id (2):
+-                      beerocks::string_utils::int_to_hex_string(2, 2) +
+-                      // length:
+-                      beerocks::string_utils::int_to_hex_string(1, 2) +
+-                      // value:
+-                      beerocks::string_utils::int_to_hex_string(req.reporting_detail, 2);
++                      beerocks::string_utils::int_to_hex_string(req.bssid.oct[5], 2);
++
++    // Add SSID subelement if requested (element ID 0x00)
++    if (req.use_optional_ssid != 0 && req.ssid[0] != '\0') {
++        // Calculate SSID length
++        size_t ssid_len = strnlen(reinterpret_cast<const char*>(req.ssid), 
++                                   beerocks::message::WIFI_SSID_MAX_LENGTH);
++        
++        LOG(DEBUG) << "Adding SSID subelement to beacon request: "
++                   << "ssid='" << req.ssid << "'"
++                   << ", ssid_len=" << ssid_len
++                   << ", use_optional_ssid=" << int(req.use_optional_ssid);
++        
++        // SSID subelement:
++        // subelement id (0x00):
++        cmd += beerocks::string_utils::int_to_hex_string(0, 2);
++        // length:
++        cmd += beerocks::string_utils::int_to_hex_string(ssid_len, 2);
++        
++        // SSID value (as hex string):
++        for (size_t i = 0; i < ssid_len; i++) {
++            cmd += beerocks::string_utils::int_to_hex_string(
++                static_cast<uint8_t>(req.ssid[i]), 2);
++        }
++        
++        LOG(DEBUG) << "SSID subelement encoded: element_id=0x00"
++                   << ", length=" << ssid_len
++                   << ", ssid_hex=" << cmd.substr(cmd.length() - (ssid_len * 2));
++    } else {
++        LOG(DEBUG) << "SSID subelement NOT added: "
++                   << "use_optional_ssid=" << int(req.use_optional_ssid)
++                   << ", ssid_empty=" << (req.ssid[0] == '\0' ? "true" : "false");
++    }
++
++    // Reporting detail subelement
++    // subelement id (2):
++    cmd += beerocks::string_utils::int_to_hex_string(2, 2);
++    // length:
++    cmd += beerocks::string_utils::int_to_hex_string(1, 2);
++    // value:
++    cmd += beerocks::string_utils::int_to_hex_string(req.reporting_detail, 2);
+ 
+     if (req.use_optional_ap_ch_report != 0) {
+         if (req.channel != 255) {
+-- 
+2.34.1
+
