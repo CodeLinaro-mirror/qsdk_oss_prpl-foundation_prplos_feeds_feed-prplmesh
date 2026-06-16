@@ -1,0 +1,152 @@
+From 0d3f73fc873362535c8b75f2398ac3771606e2c5 Mon Sep 17 00:00:00 2001
+From: Sonali Naresh <sonanare@qti.qualcomm.com>
+Date: Tue, 16 Jun 2026 09:39:40 +0530
+Subject: [PATCH] MAP R6.1: Hidden SSID Enablement in PrplOS
+
+Added necessary changes to read the SSID Advertisement.
+The DataModel is already available in PrplOS. Used the same
+to read it and store in the configuration.
+
+Signed-off-by: Sonali Naresh <sonanare@qti.qualcomm.com>
+---
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   | 46 ++++++++++++++++++-
+ controller/whm/wifi_manager.cpp               | 15 ++++++
+ .../platform/bpl/cfg/dm/bpl_cfg_wifi.cpp      | 19 ++++++++
+ 3 files changed, 78 insertions(+), 2 deletions(-)
+
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index 8d6cfd1..f9731bd 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -488,9 +488,37 @@ bool ap_wlan_hal_whm::sta_bss_steer(const sBtmRequestParams &params)
+ 
+ bool ap_wlan_hal_whm::update_bss_hidden_ssid(const sMacAddr &bssid, bool ssid_advertisement)
+ {
+-    // Stub: UCI update only (no hostapd.conf access on this HAL)
+     LOG(DEBUG) << "update_bss_hidden_ssid: bssid=" << bssid
+                << " ssid_advertisement=" << ssid_advertisement;
++
++    // Resolve VAP by BSSID
++    int vap_id = get_vap_id_with_mac(tlvf::mac_to_string(bssid));
++    if (!check_vap_id(vap_id)) {
++        LOG(ERROR) << "update_bss_hidden_ssid: no VAP found for bssid=" << bssid;
++        return false;
++    }
++
++    const auto &vap_info = m_radio_info.available_vaps[vap_id];
++    auto vap_it          = m_vapsExtInfo.find(vap_info.bss);
++    if (vap_it == m_vapsExtInfo.end()) {
++        LOG(ERROR) << "update_bss_hidden_ssid: VAP ext info not found for " << vap_info.bss;
++        return false;
++    }
++
++    // Set SSIDAdvertisementEnabled in the WHM data model.
++    // WHM internally updates ignore_bcast_ssid in hostapd.conf and reloads hostapd
++    // for the affected BSS — no direct hostapd.conf manipulation is needed here.
++    AmbiorixVariant new_obj(AMXC_VAR_ID_HTABLE);
++    new_obj.add_child("SSIDAdvertisementEnabled", ssid_advertisement ? 1 : 0);
++
++    if (!m_ambiorix_cl.update_object(vap_it->second.path, new_obj)) {
++        LOG(ERROR) << "update_bss_hidden_ssid: failed to set SSIDAdvertisementEnabled for "
++                   << vap_info.bss;
++        return false;
++    }
++
++    LOG(INFO) << "update_bss_hidden_ssid: SSIDAdvertisementEnabled=" << ssid_advertisement
++              << " set for bssid=" << bssid << " vap=" << vap_info.bss;
+     return true;
+ }
+ 
+@@ -687,18 +715,32 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+                    << " mld_unit: " << mld_unit;
+ 
+         // Skip update if no changes for FronthaulBSS/BackhaulBSS
++        // Also check SSIDAdvertisementEnabled so that a hidden-SSID-only change is not skipped.
+         std::string current_ssid, current_password, current_mode;
+         int8_t current_mldID = -1;
++        bool current_ssid_adv = true; // default: advertised
+         bool params_retrieved = true;
+         params_retrieved &= m_ambiorix_cl.get_param(current_ssid, wifi_ssid_path, "SSID");
+         params_retrieved &= m_ambiorix_cl.get_param(current_password, wifi_vap_path + "Security.", "KeyPassPhrase");
+         params_retrieved &= m_ambiorix_cl.get_param(current_mode, wifi_vap_path + "Security.", "ModeEnabled");
+         params_retrieved &= m_ambiorix_cl.get_param(current_mldID, wifi_ssid_path, "MLDUnit");
++        m_ambiorix_cl.get_param(current_ssid_adv, wifi_vap_path, "SSIDAdvertisementEnabled");
++
++        // Derive the expected SSIDAdvertisementEnabled from bss_info_conf.hidden_ssid
++        // hidden_ssid=ENABLED  → SSIDAdvertisementEnabled should be false (0)
++        // hidden_ssid=DISABLED → SSIDAdvertisementEnabled should be true  (1)
++        // hidden_ssid=UNSET    → treat as advertised (true) for comparison purposes
++        bool expected_ssid_adv = true;
++        if (bss_info_conf.hidden_ssid == WSC::eWscVendorExtHiddenSsid::ENABLED) {
++            expected_ssid_adv = false;
++        }
++
+         if (params_retrieved &&
+             current_ssid == bss_info_conf.ssid && current_password == bss_info_conf.network_key &&
+             current_mode ==
+                 wbapi_utils::security_mode_to_string(bss_info_conf.authentication_type) &&
+-                current_mldID == mld_unit) {
++                current_mldID == mld_unit &&
++                current_ssid_adv == expected_ssid_adv) {
+             LOG(DEBUG) << "No changes detected for " << ifname
+                        << ". Skipping update for VAP: " << wifi_vap_path;
+              continue; // Skip updating this VAP
+diff --git a/controller/whm/wifi_manager.cpp b/controller/whm/wifi_manager.cpp
+index ceb5acf..75a2976 100644
+--- a/controller/whm/wifi_manager.cpp
++++ b/controller/whm/wifi_manager.cpp
+@@ -183,6 +183,21 @@ void WifiManager::subscribe_to_bss_info_config_change()
+         LOG(ERROR) << "Failed to subscribe to Device.WiFi.AccessPoint changes";
+     }
+ 
++    // Subscribe to SSIDAdvertisementEnabled changes so the controller detects when
++    // the hidden SSID setting is changed on the GW and propagates it to agents via
++    // the BSS Advanced Configuration TLV in the next AP-Autoconfiguration Renew.
++    filter = "(path matches '" + wbapi_utils::search_path_ap() +
++             "[0-9]+.$')"
++             " && (notification == '" +
++             AMX_CL_OBJECT_CHANGED_EVT +
++             "')"
++             " && (contains('parameters.SSIDAdvertisementEnabled'))";
++
++    if (!m_ambiorix_cl->subscribe_to_object_event(wbapi_utils::search_path_ap(), event_handler,
++                                                  filter)) {
++        LOG(ERROR) << "Failed to subscribe to Device.WiFi.AccessPoint SSIDAdvertisementEnabled changes";
++    }
++
+     filter = "(path matches '" + wbapi_utils::search_path_apmld() +
+              "[0-9]+.APMLDConfig.$')"
+              " && (notification == '" +
+diff --git a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+index bffa8b3..34f8289 100644
+--- a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+@@ -206,6 +206,25 @@ bool bpl_cfg_get_wireless_settings(std::list<son::wireless_utils::sBssInfoConf>
+                    << eVapType_str(configuration.vap_type) << ", vap_label is '"
+                    << configuration.vap_label << "' for SSID=" << configuration.ssid;
+ 
++        // Read SSIDAdvertisementEnabled and map to both hidden_ssid and ssid_advertisement:
++        // SSIDAdvertisementEnabled=0 → SSID is hidden  → hidden_ssid=ENABLED,  ssid_advertisement=false
++        // SSIDAdvertisementEnabled=1 → SSID is visible → hidden_ssid=DISABLED, ssid_advertisement=true
++        bool ssid_adv_enabled = true; // default: SSID is advertised
++        ap.read_child(ssid_adv_enabled, "SSIDAdvertisementEnabled");
++        if (!ssid_adv_enabled) {
++            configuration.hidden_ssid = WSC::eWscVendorExtHiddenSsid::ENABLED;
++        } else {
++            configuration.hidden_ssid = WSC::eWscVendorExtHiddenSsid::DISABLED;
++        }
++        // ssid_advertisement is used by the controller's add_bss_advanced_configuration_tlv()
++        // to encode the BSS Advanced Configuration TLV sent in the AP-Autoconfiguration WSC M2.
++        // It must be kept in sync with hidden_ssid.
++        configuration.ssid_advertisement = ssid_adv_enabled;
++        LOG(DEBUG) << "bpl_cfg_get_wireless_settings: SSIDAdvertisementEnabled=" << ssid_adv_enabled
++                   << " -> hidden_ssid=" << int(configuration.hidden_ssid)
++                   << " ssid_advertisement=" << ssid_adv_enabled
++                   << " for iface=" << iface;
++
+         bool ap_enable = false;
+         ap.read_child(ap_enable, "Enable");
+         if (ap_enable && bpl_cfg_get_wifi_credentials(iface, configuration)) {
+-- 
+2.34.1
+
