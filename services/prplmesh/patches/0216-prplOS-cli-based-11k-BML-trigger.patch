@@ -1,0 +1,244 @@
+From 4c53915c7a7bc5ba7c8b24eb1567866d236f2059 Mon Sep 17 00:00:00 2001
+From: Aryan Khare <aryakhar@qti.qualcomm.com>
+Date: Tue, 16 Jun 2026 16:41:44 +0530
+Subject: [PATCH] prplOS: cli-based 11k BML trigger
+
+BML query and response WHM implementation
+
+Signed-off-by: Aryan Khare <aryakhar@qti.qualcomm.com>
+---
+ .../fronthaul_manager/monitor/monitor.cpp     |  37 +++--
+ common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp  | 135 ++++++++++++++++--
+ 2 files changed, 147 insertions(+), 25 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+index da1a65f70..3f20e3660 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+@@ -2222,18 +2222,26 @@ bool Monitor::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+     } break;
+ 
+     case Event::RRM_Beacon_Response: {
+-        /* TODO: The AP Manager already handles all the related stuff for
+-         * Beacon Metrics Response, remove this case.
+-         */
+-        break;
++        // WHM: sendRemoteMeasumentRequest returns results synchronously.
++        // Each result entry is pushed as a separate RRM_Beacon_Response event.
++        // nl80211: AP HAL handles BEACON-RESP-RX via Event::MGMT_Frame -> AP Manager.
++        //          The nl80211 monitor HAL no longer pushes this event (see mon_wlan_hal_nl80211.cpp).
++
++        if (!data) {
++            LOG(ERROR) << "RRM_Beacon_Response: null data pointer";
++            break;
++        }
+ 
+         auto hal_data = static_cast<bwl::SBeaconResponse11k *>(data);
+-        LOG(INFO) << "Received beacon measurement response on BSSID: "
+-                  << (sMacAddr &)hal_data->bssid
+-                  << ", dialog_token: " << int(hal_data->dialog_token);
++        LOG(DEBUG) << "WHM RRM_Beacon_Response: bssid=" << tlvf::mac_to_string(hal_data->bssid.oct)
++                   << ", sta_mac=" << tlvf::mac_to_string(hal_data->sta_mac.oct)
++                   << ", channel=" << int(hal_data->channel)
++                   << ", rcpi=" << int(hal_data->rcpi)
++                   << ", rsni=" << int(hal_data->rsni)
++                   << ", dialog_token=" << int(hal_data->dialog_token);
++
+         auto bssid_str = tlvf::mac_to_string((sMacAddr &)hal_data->bssid);
+ 
+-        // TODO: Can be changed to iterator loop?
+         auto event_map = pending_11k_events.equal_range("RRM_EVENT_BEACON_REP_RXED");
+         for (auto it = event_map.first; it != event_map.second;) {
+             if (((it->second.dialog_token == hal_data->dialog_token) ||
+@@ -2251,7 +2259,6 @@ bool Monitor::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+                     break;
+                 }
+ 
+-                // TODO: TEMPORARY CONVERSION!
+                 response->params().channel                  = hal_data->channel;
+                 response->params().op_class                 = hal_data->op_class;
+                 response->params().dialog_token             = hal_data->dialog_token;
+@@ -2273,11 +2280,17 @@ bool Monitor::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+                 tlvf::mac_from_array(hal_data->sta_mac.oct, response->params().sta_mac);
+                 tlvf::mac_from_array(hal_data->bssid.oct, response->params().bssid);
+ 
+-                it = pending_11k_events.erase(it);
+-                LOG(INFO) << "Sending beacon measurement response on BSSID: "
+-                          << response->params().bssid << " to task_id: " << id;
++                LOG(DEBUG) << "WHM RRM_Beacon_Response: sending response to task_id=" << id
++                           << " bssid=" << response->params().bssid
++                           << " sta_mac=" << response->params().sta_mac
++                           << " channel=" << int(response->params().channel)
++                           << " rcpi=" << int(response->params().rcpi)
++                           << " rsni=" << int(response->params().rsni);
+ 
++                it = pending_11k_events.erase(it);
+                 send_cmdu(cmdu_tx);
++                // Do NOT break here - continue to send responses for all matching pending events
++                // (WHM returns multiple reports per request)
+                 break;
+             } else {
+                 ++it;
+diff --git a/common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp
+index 1f42ce3a8..0187ee658 100644
+--- a/common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp
+@@ -501,17 +501,41 @@ bool mon_wlan_hal_whm::sta_channel_load_11k_request(const std::string &vap_iface
+ bool mon_wlan_hal_whm::sta_beacon_11k_request(const std::string &vap_iface_name,
+                                               const SBeaconRequest11k &req, int &dialog_token)
+ {
++    std::string wifi_ap_path = wbapi_utils::search_path_ap_by_iface(vap_iface_name);
++
++    // Check IEEE80211kEnabled flag - log warning if not set but proceed anyway.
++    // The PWHM DM may have IEEE80211kEnabled=false even when the API works.
++    bool ieee80211k_enabled = false;
++    if (!m_ambiorix_cl.get_param(ieee80211k_enabled, wifi_ap_path, "IEEE80211kEnabled")) {
++        LOG(WARNING) << "sta_beacon_11k_request: failed to read IEEE80211kEnabled from "
++                     << wifi_ap_path << ", proceeding anyway";
++    }
++    if (!ieee80211k_enabled) {
++        LOG(WARNING) << "sta_beacon_11k_request: IEEE80211kEnabled=false on " << vap_iface_name
++                     << " (" << wifi_ap_path << "), proceeding anyway";
++        // Do NOT return false here - the API may still work even if the DM flag is not set
++    }
++
++    // Build args matching the PWHM sendRemoteMeasumentRequest API:
++    //   mac, bssid, class, channel, mode, timeout  (all required)
++    //   ssid, neighbor, duration, optionalElements  (optional)
+     AmbiorixVariant result;
+     AmbiorixVariant args(AMXC_VAR_ID_HTABLE);
+-    args.add_child("mac", tlvf::mac_to_string(req.sta_mac.oct));
+-    args.add_child("bssid", tlvf::mac_to_string(req.bssid.oct));
+-    args.add_child("class", uint8_t(req.op_class));
++    args.add_child("mac",     tlvf::mac_to_string(req.sta_mac.oct));
++    args.add_child("bssid",   tlvf::mac_to_string(req.bssid.oct));
++    args.add_child("class",   uint8_t(req.op_class));   // operating class (e.g. 128 for 80MHz 5GHz)
+     args.add_child("channel", uint8_t(req.channel));
+-    args.add_child("ssid", std::string((const char *)req.ssid));
+-    args.add_child("mode", int(req.measurement_mode));
+-    args.add_child("neighbor", false);
+-    args.add_child("duration", uint16_t(req.duration));
+-    args.add_child("timeout", 0);
++    args.add_child("mode",    int(req.measurement_mode)); // 0=passive, 1=active, 2=table
++    args.add_child("timeout", 3000);                    // ms to wait for STA response
++
++    // Optional: ssid (empty = wildcard), neighbor, duration
++    if (req.ssid[0] != '\0') {
++        args.add_child("ssid", std::string((const char *)req.ssid));
++    }
++    args.add_child("neighbor", true);
++    if (req.duration > 0) {
++        args.add_child("duration", uint16_t(req.duration));
++    }
+ 
+     if (req.use_optional_ap_ch_report) {
+         std::stringstream optionalElements;
+@@ -524,15 +548,100 @@ bool mon_wlan_hal_whm::sta_beacon_11k_request(const std::string &vap_iface_name,
+         args.add_child("optionalElements", optionalElements.str());
+     }
+ 
+-    std::string wifi_ap_path = wbapi_utils::search_path_ap_by_iface(vap_iface_name);
+-    bool ret = m_ambiorix_cl.call(wifi_ap_path, "sendRemoteMeasumentRequest", args, result);
++    LOG(DEBUG) << "WHM 11k beacon request: sta_mac=" << tlvf::mac_to_string(req.sta_mac.oct)
++               << ", bssid=" << tlvf::mac_to_string(req.bssid.oct)
++               << ", channel=" << int(req.channel)
++               << ", op_class=" << int(req.op_class)
++               << ", duration=" << req.duration
++               << ", mode=" << int(req.measurement_mode)
++               << ", ap_path=" << wifi_ap_path;
+ 
+-    LOG(DEBUG) << "11k request for " << tlvf::mac_to_string(req.sta_mac.oct) << " bssid "
+-               << tlvf::mac_to_string(req.bssid.oct);
++    bool ret = m_ambiorix_cl.call(wifi_ap_path, "sendRemoteMeasumentRequest", args, result);
+     if (!ret) {
+-        LOG(ERROR) << "sta_beacon_11k_request() failed!";
++        LOG(ERROR) << "sta_beacon_11k_request: sendRemoteMeasumentRequest failed for "
++                   << tlvf::mac_to_string(req.sta_mac.oct);
+         return false;
+     }
++
++    // PWHM returns results synchronously as: [[{BSSID, Channel, RCPI, RSNI}, ...]]
++    // Parse the outer list wrapper
++    auto outer_list = result.read_children<AmbiorixVariantListSmartPtr>();
++    if (!outer_list || outer_list->empty()) {
++        LOG(WARNING) << "sta_beacon_11k_request: no results returned from sendRemoteMeasumentRequest"
++                     << " for sta=" << tlvf::mac_to_string(req.sta_mac.oct);
++        return true;
++    }
++
++    // Parse the inner list of beacon reports
++    auto inner_list = outer_list->front().read_children<AmbiorixVariantListSmartPtr>();
++    if (!inner_list || inner_list->empty()) {
++        LOG(WARNING) << "sta_beacon_11k_request: empty beacon report list for sta="
++                     << tlvf::mac_to_string(req.sta_mac.oct);
++        return true;
++    }
++
++    LOG(DEBUG) << "WHM 11k beacon request: received " << inner_list->size()
++               << " beacon report(s) for sta=" << tlvf::mac_to_string(req.sta_mac.oct);
++
++    dialog_token = 0; // WHM does not use dialog tokens
++
++    // Push one RRM_Beacon_Response event per report entry
++    for (auto &item : *inner_list) {
++        auto data_map = item.read_children<AmbiorixVariantMapSmartPtr>();
++        if (!data_map) {
++            LOG(WARNING) << "sta_beacon_11k_request: failed to parse beacon report item";
++            continue;
++        }
++
++        auto resp_buff = ALLOC_SMART_BUFFER(sizeof(SBeaconResponse11k));
++        auto resp      = reinterpret_cast<SBeaconResponse11k *>(resp_buff.get());
++        LOG_IF(!resp, FATAL) << "Memory allocation failed!";
++        memset(resp_buff.get(), 0, sizeof(SBeaconResponse11k));
++
++        // Fields from the original request (PWHM does not echo these back)
++        std::copy(std::begin(req.sta_mac.oct), std::end(req.sta_mac.oct),
++                  std::begin(resp->sta_mac.oct));
++        resp->op_class     = req.op_class;     // not returned by PWHM, copy from request
++        resp->dialog_token = 0;                // WHM does not use dialog tokens
++        resp->rep_mode     = 0;                // 0 = report OK
++
++        // Fields returned by PWHM: BSSID, Channel, RCPI, RSNI
++        std::string bssid_str;
++        if (data_map->find("BSSID") != data_map->end()) {
++            (*data_map)["BSSID"].get(bssid_str);
++            tlvf::mac_from_string(resp->bssid.oct, bssid_str);
++        }
++
++        uint32_t channel = 0;
++        if (data_map->find("Channel") != data_map->end()) {
++            (*data_map)["Channel"].get(channel);
++            resp->channel = static_cast<uint8_t>(channel);
++        }
++
++        // RCPI: received channel power indicator (0-255 scale, 255 = max)
++        uint32_t rcpi = 0;
++        if (data_map->find("RCPI") != data_map->end()) {
++            (*data_map)["RCPI"].get(rcpi);
++            resp->rcpi = static_cast<uint8_t>(rcpi);
++        }
++
++        // RSNI: received signal to noise indicator (0-255 scale)
++        uint32_t rsni = 0;
++        if (data_map->find("RSNI") != data_map->end()) {
++            (*data_map)["RSNI"].get(rsni);
++            resp->rsni = static_cast<uint8_t>(rsni);
++        }
++
++        LOG(DEBUG) << "WHM 11k beacon report: bssid=" << bssid_str
++                   << ", channel=" << int(resp->channel)
++                   << ", op_class=" << int(resp->op_class)
++                   << ", rcpi=" << int(resp->rcpi)
++                   << ", rsni=" << int(resp->rsni)
++                   << ", sta_mac=" << tlvf::mac_to_string(req.sta_mac.oct);
++
++        event_queue_push(Event::RRM_Beacon_Response, resp_buff);
++    }
++
+     return true;
+ }
+ 
+-- 
+2.34.1
+
