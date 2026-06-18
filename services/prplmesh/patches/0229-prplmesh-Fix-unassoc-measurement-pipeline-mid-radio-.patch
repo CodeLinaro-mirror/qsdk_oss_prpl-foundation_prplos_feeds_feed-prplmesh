@@ -1,0 +1,128 @@
+From 32cf933e24c25e074d58544c67a733aaab5f9219 Mon Sep 17 00:00:00 2001
+From: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+Date: Fri, 19 Jun 2026 02:53:50 +0530
+Subject: prplmesh: Fix unassoc measurement pipeline — mid, radio
+matching, RSSI encoding
+
+Three fixes to the unassociated STA link metrics measurement flow:
+
+1. Fix unassoc response missing message-id in monitor
+   monitor.cpp Event::Unassociation_Stations_Stats built the
+   ACTION_MONITOR_CLIENT_UNASSOCIATED_STA_LINK_METRIC_RESPONSE without
+   passing the message-id from the original request. son_slave_thread
+   used mid=0 when building the 1905 0x8010 CMDU, so the controller
+   discarded every response. Fix: store beerocks_header->id() in
+   m_unassoc_request_mid when the request arrives and pass it to
+   create_vs_message in the response handler.
+
+2. Fix unassoc query radio matching to use channel-only lookup
+   The controller queries with op_class=115 (20MHz) while the radio
+   operates at op_class=128 (80MHz). The original dual check
+   (channel AND wifi_channel.get_freq_type() == which_freq_op_cls())
+   was redundant — both op_class 115 and 128 return FREQ_5G. Remove
+   the freq_type guard; channel presence in channels_list is sufficient.
+
+3. Fix double RSSI→RCPI conversion in nl80211 unassoc stats
+   mon_wlan_hal_nl80211.cpp stored signal_strength as pre-computed
+   RCPI = (rssi_dbm + 110) * 2. son_slave_thread then cast this RCPI
+   value as if it were dBm and re-encoded it, saturating to RCPI_MAX=220
+   on every measurement. Fix: store rssi_dbm directly in signal_strength
+   so son_slave_thread's existing convert_rcpi_from_rssi() path produces
+   the correct RCPI.
+
+Signed-off-by: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+---
+ .../src/beerocks/fronthaul_manager/monitor/monitor.cpp |  3 ++-
+ agent/src/beerocks/fronthaul_manager/monitor/monitor.h |  5 +++++
+ .../slave/tasks/link_metrics_collection_task.cpp       | 10 ++++++----
+ common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp   |  9 ++++++---
+ 4 files changed, 19 insertions(+), 8 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+index da1a65f70..168c7cbf4 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+@@ -1384,6 +1384,7 @@ void Monitor::handle_cmdu_vs_message(ieee1905_1::CmduMessageRx &cmdu_rx)
+                 << "addClass ACTION_MONITOR_CLIENT_UNASSOCIATED_STA_LINK_METRIC_REQUEST failed";
+             return;
+         }
++        m_unassoc_request_mid = beerocks_header->id();
+ 
+         // The list can also be empty which mean the controller is not interested on any station
+         using SUnassocStaParams = bwl::mon_wlan_hal::sUnassocStaParams;
+@@ -2525,7 +2526,7 @@ bool Monitor::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+ 
+         auto response = message_com::create_vs_message<
+             beerocks_message::cACTION_MONITOR_CLIENT_UNASSOCIATED_STA_LINK_METRIC_RESPONSE>(
+-            cmdu_tx);
++            cmdu_tx, m_unassoc_request_mid);
+         if (response == nullptr) {
+             LOG(ERROR)
+                 << "Failed building cACTION_MONITOR_CLIENT_UNASSOCIATED_STA_LINK_METRIC_RESPONSE "
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.h b/agent/src/beerocks/fronthaul_manager/monitor/monitor.h
+index e8b78bd22..fd00ec6f0 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.h
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.h
+@@ -214,6 +214,11 @@ private:
+ 
+     bool m_remove_agent_client = false;
+ 
++    // Message-ID of the last ACTION_MONITOR_CLIENT_UNASSOCIATED_STA_LINK_METRIC_REQUEST.
++    // Stored here so the async Event::Unassociation_Stations_Stats handler can echo it back
++    // in the response, allowing son_slave_thread to correlate the response with the query.
++    uint16_t m_unassoc_request_mid = 0;
++
+ };
+ } // namespace son
+ 
+diff --git a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+index 90e4355a7..4f8cd07e3 100644
+--- a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+@@ -892,10 +892,12 @@ void LinkMetricsCollectionTask::handle_unassociated_sta_link_metrics_query(
+                        << ", radio_iface=" << radio->front.iface_name
+                        << ", channel=" << int(channel)
+                        << ", operating_class=" << int(oper_class);
+-            //The telemtry does not contain any reference to the radio, thus the need to detect it using channel and operating_class
+-            if (radio->channels_list.find(channel) != radio->channels_list.end() &&
+-                radio->wifi_channel.get_freq_type() ==
+-                    son::wireless_utils::which_freq_op_cls(oper_class)) {
++            /* Match by channel only. The query op_class (e.g. 115/20MHz) may differ from the
++             * radio's current op_class (e.g. 128/80MHz) even though both are on the same 5G
++             * channel. Both map to FREQ_5G so the freq_type check is redundant, but the
++             * bandwidth difference can cause which_freq_op_cls comparisons to behave
++             * unexpectedly in edge cases. Channel membership in channels_list is sufficient. */
++            if (radio->channels_list.find(channel) != radio->channels_list.end()) {
+                 auto &map_stations_per_channel = map_stations_per_radio[radio->front.iface_mac];
+                 if (map_stations_per_channel.find(channel) == map_stations_per_channel.end()) {
+                     map_stations_per_channel.insert(std::make_pair(channel, std::list<sMacAddr>()));
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index c24c9f4dc..9bf6ca530 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -1215,8 +1215,11 @@ bool mon_wlan_hal_nl80211::process_roc_expired_event()
+             // Convert RSSI-dB to dBm (using noise_floor_to_chanwidth = 94)
+             int rssi_dbm = rssi_db_to_dbm(rssi, 94);
+ 
+-            // Convert to RCPI: RCPI = (RSSI_dBm + 110) * 2
+-            new_stat.signal_strength = (rssi_dbm + 110) * 2;
++            // Store dBm in signal_strength. son_slave_thread converts dBm → RCPI
++            // via convert_rcpi_from_rssi(). Do NOT pre-compute RCPI here — that
++            // caused double-conversion (son_slave_thread re-encoded the RCPI value
++            // as if it were dBm, always saturating to RCPI_MAX=220).
++            new_stat.signal_strength = rssi_dbm;
+             new_stat.channel         = measurement.channel;
+ 
+             // Calculate operating_class based on channel and bandwidth using the proper utility function
+@@ -1243,7 +1246,7 @@ bool mon_wlan_hal_nl80211::process_roc_expired_event()
+                         << ", operating_class=" << int(new_stat.operating_class)
+                         << ", rssi_raw_db=" << int(rssi)
+                         << ", rssi_dbm=" << rssi_dbm
+-                        << ", rcpi=" << int(new_stat.signal_strength)
++                        << ", signal_strength_dBm=" << int(new_stat.signal_strength)
+                         << ", time_stamp_ms=" << new_stat.time_stamp;
+ 
+             stats_out.un_stations_stats.push_back(new_stat);
+-- 
+2.34.1
+
