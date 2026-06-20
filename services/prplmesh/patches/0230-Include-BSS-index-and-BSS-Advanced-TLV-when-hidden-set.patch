@@ -1,0 +1,129 @@
+From 4fe7cd4b94d255e13844ef35508784822dd0c89c Mon Sep 17 00:00:00 2001
+From: Sonali Naresh <sonanare@qti.qualcomm.com>
+Date: Sat, 20 Jun 2026 12:55:34 +0530
+Subject: [PATCH] Include BSS index and BSS Advanced TLV only when hidden is
+ set
+
+Signed-off-by: Sonali Naresh <sonanare@qti.qualcomm.com>
+---
+ controller/src/beerocks/master/controller.cpp | 80 ++++++++++++++-----
+ 1 file changed, 59 insertions(+), 21 deletions(-)
+
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index eb57020..0b60db4 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -1175,27 +1175,42 @@ bool Controller::autoconfig_wsc_add_m2(WSC::m1 &m1,
+                                                authkey, keywrapkey))
+         return false;
+ 
+-    // Include the BSS_Index attribute in M2 whenever a non-zero bss_index has been assigned,
+-    // regardless of whether the agent supports RSN Overriding.
++    // Per EasyMesh R6.1 spec section 7.1 / Table 19, the BSS_Index WSC attribute (0x1BBC)
++    // exists solely to correlate this M2 frame with an RSN Parameters Configuration TLV
++    // and/or a BSS Advanced Configuration TLV that the Controller includes in the same
++    // AP-Autoconfiguration WSC message for the same BSS, while the BSSID is not yet known:
++    //   "If triggered to include an RSN Parameters Configuration TLV or a BSS Advanced
++    //    Configuration TLV for a given BSS (or Affiliated AP) in an 1905 AP-Autoconfiguration
++    //    WSC message (extended) with an WSC TLV containing M2 frame, a Multi-AP Controller
++    //    shall include a BSS_Index attribute in the corresponding WSC TLV containing M2 frame."
+     //
+-    // Background: the original condition was agent.rsn_overriding_supported (for retro
+-    // compatibility with older agents that did not understand the BSS_Index attribute).
+-    // However, BSS_Index is also required for BSS Advanced Configuration TLV correlation
+-    // (spec section 7.1 / Table 19): the agent uses the same BSS_Index value that appears
+-    // in the M2 WSC TLV to match the corresponding entry in the BSS Advanced Configuration
+-    // TLV when the BSSID is not yet known (initial configuration).
++    // Therefore the BSS_Index attribute shall be embedded in the M2 ONLY when this BSS will
++    // be accompanied by one of those two correlated TLVs in this same message. Emitting
++    // BSS_Index without a correlated TLV is not spec-compliant and can confuse receivers
++    // (and certification harnesses).
+     //
+-    // Without this fix, info.m2_config.bss_index stays 0 on agents that do not set the
+-    // RSN_Overriding bit, so the BSS_Index correlation path in
+-    // handle_bss_advanced_configuration_tlv() is never taken and the hidden/SSIDAdvertisement
+-    // setting is silently dropped.
+-    const bool include_bss_index = (bss_info_conf != nullptr && bss_info_conf->bss_index != 0)
+-                                   || agent.rsn_overriding_supported;
++    // For this BSS, a correlated TLV is included when either:
++    //   - a BSS Advanced Configuration TLV is needed: the SSIDAdvertisement setting is
++    //     non-default (i.e. the SSID is hidden: ssid_advertisement == false), or
++    //   - an RSN Parameters Configuration TLV is needed: the BSS uses RSN (WPA3-PCM)
++    //     (authentication_type == WSC_AUTH_RSN) and the agent supports RSN Overriding.
++    bool bss_needs_advanced_config = false;
++    bool bss_needs_rsn_config      = false;
++    if (bss_info_conf != nullptr) {
++        bss_needs_advanced_config = !bss_info_conf->ssid_advertisement;
++        bss_needs_rsn_config =
++            (bss_info_conf->authentication_type == WSC::eWscAuth::WSC_AUTH_RSN) &&
++            agent.rsn_overriding_supported;
++    }
++    const bool include_bss_index = (bss_info_conf != nullptr && bss_info_conf->bss_index != 0) &&
++                                   (bss_needs_advanced_config || bss_needs_rsn_config);
++
+     auto m2 = WSC::m2::create(*tlv, m2_cfg, include_bss_index);
+     if (!m2)
+         return false;
+ 
+-    // No need to call m2->finalize since it's done during the WSC::m2::create
++    // Finalize m2 since it needs to be in network byte order for global authentication
++    m2->finalize();
+ 
+     if (!autoconfig_wsc_authentication(m1, m2, authkey))
+         return false;
+@@ -1657,6 +1672,15 @@ static bool add_bss_advanced_configuration_tlv(
+             continue;
+         }
+ 
++        // Per spec section 7.1.3 ("If triggered to change any parameter..."), only emit a BSS
++        // entry when this BSS has a non-default advanced setting to convey. Today the only
++        // advanced parameter is SSIDAdvertisement, so emit an entry only when the SSID is hidden
++        // (ssid_advertisement == false). BSSes that use the default (advertised) SSID do not
++        // need an entry.
++        if (bss_info_conf.ssid_advertisement) {
++            continue;
++        }
++
+         auto bss_entry = radio_entry->create_bsss();
+         if (!bss_entry) {
+             LOG(ERROR) << "Failed creating BSS entry in BSS Advanced Configuration TLV";
+@@ -1937,16 +1961,30 @@ bool Controller::handle_cmdu_1905_autoconfiguration_WSC(const sMacAddr &src_mac,
+                                              bss_info_confs, radio->band);
+     }
+ 
+-    // Per spec section 7.1.3 / Table 19: add BSS Advanced Configuration TLV alongside the M2
+-    // WSC TLV so the agent can apply BSS-level settings (e.g., SSID advertisement).
+-    // Only included when at least one BSS is being configured (not in teardown-only flow).
+-    if (has_configured_bss) {
+-        if (!add_bss_advanced_configuration_tlv(cmdu_tx, ruid,
+-                                                database.get_configured_bss_info(ruid))) {
++    // Per spec section 7.1.3 / Table 19: the BSS Advanced Configuration TLV is included alongside
++    // the M2 WSC TLV only "if triggered to change/convey an advanced BSS parameter". The only
++    // advanced parameter currently defined is SSIDAdvertisement, so the TLV is added only when at
++    // least one configured BSS on this radio has a non-default setting (i.e. a hidden SSID,
++    // ssid_advertisement == false). For the default case (all SSIDs advertised) the TLV is not
++    // needed and is omitted, which keeps the M2 minimal and matches the spec's "if triggered"
++    // wording (and avoids surprising certification harnesses with an unsolicited TLV).
++    const auto &configured_bsses = database.get_configured_bss_info(ruid);
++    const bool any_bss_needs_advanced_config =
++        std::any_of(configured_bsses.begin(), configured_bsses.end(),
++                    [](const wireless_utils::sBssInfoConf &bss) {
++                        return !bss.teardown && !bss.ssid_advertisement;
++                    });
++
++    if (has_configured_bss && any_bss_needs_advanced_config) {
++        if (!add_bss_advanced_configuration_tlv(cmdu_tx, ruid, configured_bsses)) {
+             LOG(ERROR) << "Failed adding BSS Advanced Configuration TLV to "
+                           "AP_AUTOCONFIGURATION_WSC_MESSAGE for ruid="
+                        << ruid;
+         }
++    } else {
++        LOG(DEBUG) << "No BSS on ruid=" << ruid
++                   << " requires a non-default advanced setting; omitting BSS Advanced "
++                      "Configuration TLV";
+     }
+ 
+     // Set per-agent SMD capabilities struct so that add_qca_smd_policy_config_tlv() inside
+-- 
+2.34.1
+
