@@ -1,0 +1,652 @@
+From ee63cf7c1891e8e1cfb9c621632797775fbff046 Mon Sep 17 00:00:00 2001
+From: Sureshkumar <suresure@qti.qualcomm.com>
+Date: Mon, 22 Jun 2026 22:32:35 +0530
+Subject: [PATCH] [prplmesh] fix beacon metrics query and improve debug logging
+
+1.Remove excessive noise logging that was flooding syslog during survey polling
+  when noise data is unavailable.
+
+2.Parse channel report list from incoming beacon query requests and use it for
+  proper per-channel processing.
+
+3.Fix multi-channel beacon query failure caused by a parsing issue by sending
+  separate requests per channel instead of a combined multi-channel request.
+
+4.Improve beacon request and response logging with concise single-line debug messages
+  for better readability and troubleshooting.
+
+5.Simplify database debug logging for beacon measurements with compact,
+  informative output.
+
+6.Update internal interfaces to support passing channel report information for
+  correct query handling.
+
+7.Ignore invalid signal strength entries in unassociated station link metric responses
+  to prevent incorrect data processing.
+
+8.Restrict unassociated station queries to the appropriate target band only.
+
+9.Update link info in backhaul DM path
+
+Signed-off-by: Sureshkumar <suresure@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/son_slave_thread.cpp |  36 +++-
+ .../bwl/shared/nl80211_client_impl.cpp        |   1 -
+ controller/nbapi/odl/device.odl.in            |  10 ++
+ controller/nbapi/on_action.cpp                |  71 +++++---
+ controller/src/beerocks/master/controller.cpp | 161 ++++++++++++++++--
+ controller/src/beerocks/master/controller.h   |   3 +-
+ controller/src/beerocks/master/db/db.cpp      |  57 +++++--
+ controller/src/beerocks/master/db/db.h        |   8 +-
+ .../master/tasks/link_metrics_task.cpp        |   3 +-
+ .../beerocks/master/tasks/topology_task.cpp   |  11 +-
+ 10 files changed, 298 insertions(+), 63 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 17b16b7a0..2475c9fa3 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -4476,20 +4476,35 @@ bool slave_thread::handle_cmdu_monitor_message(const std::string &fronthaul_ifac
+         for (size_t count = 0; count < response_in->stations_list_length(); count++) {
+             beerocks_message::sUnassociatedStationStats &station_in =
+                 std::get<1>(response_in->stations_list(count));
++
++            // Always register the queried operating class so a response TLV is emitted
++            // for it even when all its stations are filtered out (Multi-AP spec §10.3.2
++            // and §17.2.26 require a response entry per queried operating class).
+             if (map_stations_per_operating_class.find(station_in.operating_class) ==
+                 map_stations_per_operating_class.end()) {
+                 map_stations_per_operating_class.insert(
+                     std::make_pair(station_in.operating_class, std::list<stations_stats>()));
+             }
+ 
++            // Exclude stations whose measurement has not yet completed.
++            // The driver zero-initialises signal_strength and time_stamp for
++            // NonAssociatedDevices that have not been measured yet.  Including
++            // them would produce an invalid RCPI (derived from 0) and a
++            // uint32_t overflow in measurement_to_report_delta_msec
++            // (now() - epoch(0001-01-01)).
++            if (station_in.time_stamp == 0 || station_in.signal_strength == 0) {
++                LOG(ERROR) << "Invalid measurement for station " << station_in.sta_mac
++                           << " (signal_strength=" << station_in.signal_strength
++                           << ", time_stamp=" << station_in.time_stamp << ")";
++                continue;
++            }
++
++            auto &stations_of_operating_class =
++                map_stations_per_operating_class[station_in.operating_class];
++
+             stations_stats one_station_stats;
+             one_station_stats.channel_number = station_in.channel;
+-            if (station_in.signal_strength == 0) {
+-                // WHM NaStaMonitor reports SignalStrength=0 when measurement is still not ready
+-                // or when the STA is not visible on the requested channel. Do not convert this
+-                // value with convert_rcpi_from_rssi(), since that would produce a fake valid RCPI.
+-                one_station_stats.uplink_rcpi_dbm_enc = 0;
+-            } else {
++            {
+                 // WHM returns SignalStrength in dBm (e.g. -24).
+                 // Convert RSSI (dBm) → RCPI using the standard formula: RCPI = 2*(RSSI+110).
+                 // Then verify the round-trip by decoding RCPI back to RSSI.
+@@ -4522,8 +4537,7 @@ bool slave_thread::handle_cmdu_monitor_message(const std::string &fronthaul_ifac
+                        << " raw_signal_strength_dBm=" << station_in.signal_strength
+                        << " uplink_rcpi_dbm_enc=" << int(one_station_stats.uplink_rcpi_dbm_enc);
+ 
+-            map_stations_per_operating_class[station_in.operating_class].push_back(
+-                one_station_stats);
++            stations_of_operating_class.push_back(one_station_stats);
+         }
+ 
+         //Now send a telemetries to the controller, each telemetry with only 1 operating_class
+@@ -4534,7 +4548,11 @@ bool slave_thread::handle_cmdu_monitor_message(const std::string &fronthaul_ifac
+                 return false;
+             }
+             response_out->operating_class_of_channel_list() = operating_class.first;
+-            response_out->alloc_sta_list(operating_class.second.size());
++            if (!response_out->alloc_sta_list(operating_class.second.size())) {
++                LOG(ERROR) << "alloc_sta_list failed for operating_class="
++                           << int(operating_class.first);
++                return false;
++            }
+             size_t count(0);
+             for (auto &station : operating_class.second) {
+                 auto &stats_out          = std::get<1>(response_out->sta_list(count++));
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.cpp b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+index 63c72f87c..064e408ae 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -1398,7 +1398,6 @@ bool nl80211_client_impl::get_survey_info(const std::string &interface_name,
+                 channel_survey_info.noise_dbm =
+                     (int8_t)nla_get_u8(sinfo[NL80211_SURVEY_INFO_NOISE]);
+             } else {
+-                LOG(TRACE) << "NL80211_SURVEY_INFO_NOISE attribute is missing";
+             }
+ 
+             if (sinfo[NL80211_SURVEY_INFO_CHANNEL_TIME]) {
+diff --git a/controller/nbapi/odl/device.odl.in b/controller/nbapi/odl/device.odl.in
+index 5130fac05..f6adca5cc 100644
+--- a/controller/nbapi/odl/device.odl.in
++++ b/controller/nbapi/odl/device.odl.in
+@@ -144,6 +144,16 @@
+                 %read-only string BackhaulMACAddress = "";
+                 %read-only string BackhaulDeviceID = "";
+                 %read-only string MACAddress = "";
++                /**
++                * BSSID of the BSS on the parent device to which the backhaul STA is associated.
++                * Only valid when LinkType is "Wi-Fi", empty otherwise.
++                */
++                %read-only string ServingBSSID = "";
++                /**
++                * Radio UID of the local radio on this device that carries the wireless backhaul
++                * link. Only valid when LinkType is "Wi-Fi", empty otherwise.
++                */
++                %read-only string BackhaulRadioUID = "";
+                 object Stats {
+                     %read-only uint64 BytesSent = 0;
+                     %read-only uint64 BytesReceived = 0;
+diff --git a/controller/nbapi/on_action.cpp b/controller/nbapi/on_action.cpp
+index 802b60ea6..567222d0d 100644
+--- a/controller/nbapi/on_action.cpp
++++ b/controller/nbapi/on_action.cpp
+@@ -1420,29 +1420,32 @@ amxd_status_t unassoc_sta_rcpi_query(amxd_object_t *object, amxd_function_t *fun
+                 continue;
+             }
+ 
+-            /* Only send to radios that support the query channel.
+-             * Skip radios on different bands (e.g. 2.4G, 6G) that cannot
+-             * measure the STA on the serving channel (e.g. ch=36 for 5G).
+-             * This ensures only 1 unassoc query is sent — to the same-band
+-             * radio on the candidate agent. */
++            /* Only send to the radio link whose CURRENT operating channel
++             * matches the STA's serving channel.
++             *
++             * For SLO STAs on an MLO AP, each MLO link interface (e.g.
++             * wlan19_link1, wlan19_link2) appears as a separate Radio in the
++             * DM.  Both links may list ch=40 in their scan_capabilities, but
++             * only ONE link is currently operating on ch=40.  Using
++             * scan_capabilities caused duplicate queries to both link
++             * interfaces, resulting in two add_peer_neighbor() calls on the
++             * same ath12k peer table → "cannot add associated peer as
++             * neighbor peer".
++             *
++             * Using the current operating channel (wifi_channel.get_channel())
++             * ensures exactly one query per physical radio band. */
+             {
+                 auto radio_db = g_database->get_radio_by_uid(
+                     tlvf::mac_from_string(radio_mac_s));
+                 if (radio_db) {
+-                    bool channel_supported = false;
+-                    for (const auto &op_class :
+-                         radio_db->scan_capabilities.operating_classes) {
+-                        const auto &channels = op_class.second;
+-                        if (std::find(channels.begin(), channels.end(), channel) !=
+-                            channels.end()) {
+-                            channel_supported = true;
+-                            break;
+-                        }
+-                    }
+-                    if (!channel_supported) {
++                    auto wifi_channel =
++                        g_database->get_radio_wifi_channel(radio_db->radio_uid);
++                    if (wifi_channel.get_channel() != channel) {
+                         LOG(DEBUG) << "unassoc_sta_rcpi_query: skipping radio "
+-                                   << radio_mac_s << " (ch=" << (int)channel
+-                                   << " not in scan capabilities — different band)";
++                                   << radio_mac_s
++                                   << " (current ch=" << int(wifi_channel.get_channel())
++                                   << " != query ch=" << int(channel)
++                                   << " — different band or MLO link)";
+                         continue;
+                     }
+                 }
+@@ -1971,8 +1974,38 @@ amxd_status_t send_beacon_metrics_query(amxd_object_t *object, amxd_function_t *
+     sMacAddr sta_mac   = tlvf::mac_from_string(sta_mac_str);
+     sMacAddr bssid     = tlvf::mac_from_string(bssid_str);
+ 
++    /* Parse optional ap_channel_reports parameter.
++     * Expected format: list of htable objects, each with "op_class" and "channel" keys.
++     * Example: [{"op_class":115,"channel":36},{"op_class":81,"channel":6}]
++     * When provided, channel=255 is used in the TLV and the agent paces the 802.11k
++     * BeaconRequests internally, returning a single BEACON_METRICS_RESPONSE with all
++     * measurements — ensuring a single dialog_token so the controller does not clear
++     * previous MeasurementReport instances when the second channel's response arrives. */
++    std::vector<std::pair<uint8_t,uint8_t>> ap_channel_reports;
++    {
++        amxc_var_t *ap_ch_list = GET_ARG(args, "ap_channel_reports");
++        if (ap_ch_list && amxc_var_type_of(ap_ch_list) == AMXC_VAR_ID_LIST) {
++            amxc_var_t *entry = nullptr;
++            amxc_llist_for_each(it, amxc_var_constcast(amxc_llist_t, ap_ch_list)) {
++                entry = amxc_var_from_llist_it(it);
++                if (!entry) continue;
++                uint32_t oc  = amxc_var_dyncast(uint32_t, GET_ARG(entry, "op_class"));
++                uint32_t ch  = amxc_var_dyncast(uint32_t, GET_ARG(entry, "channel"));
++                if (oc > 255 || ch > 255) {
++                    LOG(WARNING) << "SendBeaconMetricsQuery: ap_channel_reports entry out of range"
++                                 << " op_class=" << oc << " channel=" << ch << " — skipping";
++                    continue;
++                }
++                ap_channel_reports.emplace_back(static_cast<uint8_t>(oc),
++                                                static_cast<uint8_t>(ch));
++                LOG(DEBUG) << "SendBeaconMetricsQuery: ap_channel_reports entry"
++                           << " op_class=" << oc << " channel=" << ch;
++            }
++        }
++    }
++
+     if (!controller_ctx->send_beacon_metrics_query(agent_mac, sta_mac, operating_class, channel,
+-                                                   bssid, ssid)) {
++                                                   bssid, ssid, ap_channel_reports)) {
+         LOG(ERROR) << "SendBeaconMetricsQuery: Failed to send BEACON_METRICS_QUERY_MESSAGE to agent: " << agent_mac_str;
+         return amxd_status_unknown_error;
+     }
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index b2a0132b4..0943182d6 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -3221,8 +3221,6 @@ bool Controller::handle_cmdu_1905_beacon_response(const sMacAddr &src_mac,
+     auto beacon_response_tlv = cmdu_rx.getClass<wfa_map::tlvBeaconMetricsResponse>();
+     if (beacon_response_tlv) {
+         auto sta_mac = beacon_response_tlv->associated_sta_mac();
+-        LOG(DEBUG) << "Processing beacon metrics for STA " << sta_mac
+-                   << " num_reports=" << beacon_response_tlv->measurement_report_list_length();
+ 
+         // Use the message ID as a proxy for the dialog token so that back-to-back
+         // queries (each with a different mid) cause stale MeasurementReport instances
+@@ -3235,6 +3233,52 @@ bool Controller::handle_cmdu_1905_beacon_response(const sMacAddr &src_mac,
+             dialog_token = 0xFF;
+         }
+ 
++        size_t num_reports = beacon_response_tlv->measurement_report_list_length();
++
++        LOG(INFO) << "BEACON-RESP-RX: sta=" << sta_mac << " agent=" << src_mac
++                  << " num_reports=" << num_reports
++                  << " dialog_token=" << (int)dialog_token;
++
++        if (num_reports == 0) {
++            LOG(INFO) << "BEACON-RESP-RX: num_reports=0 sta=" << sta_mac;
++        } else {
++            for (size_t i = 0; i < num_reports; i++) {
++                auto rt = beacon_response_tlv->measurement_report_list(i);
++                if (!std::get<0>(rt)) {
++                    LOG(WARNING) << "BEACON-RESP-RX: failed to parse report[" << i << "]";
++                    continue;
++                }
++                auto &r = std::get<1>(rt);
++                int8_t rssi_dbm = (int8_t)(r.rcpi() / 2 - 110);
++                std::string bssid_ssid = database.get_bss_ssid(r.bssid());
++                LOG(INFO) << "BEACON-RESP-RX: report[" << i << "]"
++                          << " BSSID=" << r.bssid()
++                          << " SSID='" << (bssid_ssid.empty() ? "?" : bssid_ssid) << "'"
++                          << " ch=" << int(r.channel())
++                          << " op_class=" << int(r.op_class())
++                          << " RCPI=" << int(r.rcpi())
++                          << " RSSI=" << (int)rssi_dbm << "dBm"
++                          << " RSNI=" << int(r.rsni())
++                          << " rep_mode=0x" << std::hex << int(r.measurement_req_mode()) << std::dec;
++            }
++        }
++
++        // Get STA's serving BSS SSID for SSID filter (once per response).
++        // With wildcard BSSID queries the STA may report 50+ BSSIDs (neighbor APs,
++        // IOT/Guest SSIDs on the same channel). Only entries matching the STA's
++        // associated SSID are relevant for steering decisions.
++        std::string sta_ssid;
++        {
++            std::string sta_parent_str =
++                database.get_sta_parent(tlvf::mac_to_string(sta_mac));
++            if (!sta_parent_str.empty()) {
++                sta_ssid = database.get_bss_ssid(
++                    tlvf::mac_from_string(sta_parent_str));
++            }
++            LOG(DEBUG) << "Beacon SSID filter: STA=" << sta_mac
++                       << " serving_ssid='" << sta_ssid << "'";
++        }
++
+         // Process each measurement report
+         for (size_t i = 0; i < beacon_response_tlv->measurement_report_list_length(); i++) {
+             auto report_tuple = beacon_response_tlv->measurement_report_list(i);
+@@ -3245,14 +3289,14 @@ bool Controller::handle_cmdu_1905_beacon_response(const sMacAddr &src_mac,
+ 
+             auto &report = std::get<1>(report_tuple);
+ 
+-            LOG(DEBUG) << "Beacon Report[" << i << "]: STA=" << sta_mac
+-                       << " BSSID=" << report.bssid()
+-                       << " Channel=" << int(report.channel())
+-                       << " OpClass=" << int(report.op_class())
+-                       << " RCPI=" << int(report.rcpi())
+-                       << " RSNI=" << int(report.rsni())
+-                       << " Duration=" << report.duration()
+-                       << " MeasurementToken=" << int(report.measurement_token());
++            LOG(INFO) << "  PRPL-CONTROLLER-BEACON-RESP-RX: Report[" << i << "]"
++                      << " BSSID=" << report.bssid()
++                      << " ch=" << int(report.channel())
++                      << " op_class=" << int(report.op_class())
++                      << " RCPI=" << int(report.rcpi())
++                      << " RSSI=" << (int8_t)(report.rcpi()/2 - 110) << " dBm"
++                      << " RSNI=" << int(report.rsni())
++                      << " token=" << int(report.measurement_token());
+ 
+             // Store beacon measurement in the data model
+             beerocks_message::sBeaconResponse11k beacon = {};
+@@ -3273,6 +3317,20 @@ bool Controller::handle_cmdu_1905_beacon_response(const sMacAddr &src_mac,
+             // a new query and clear stale MeasurementReport instances.
+             beacon.dialog_token      = dialog_token;
+ 
++            // SSID filter: skip entries whose BSSID belongs to a different SSID
++            // (IOT/Guest/neighbor APs). Fail-open: if sta_ssid is empty (STA not
++            // yet in DB) or report_ssid is empty (BSSID not in controller DB),
++            // pass the entry through to avoid regression.
++            if (!sta_ssid.empty()) {
++                std::string report_ssid = database.get_bss_ssid(report.bssid());
++                if (!report_ssid.empty() && report_ssid != sta_ssid) {
++                    LOG(DEBUG) << "Beacon Report[" << i << "]: BSSID=" << report.bssid()
++                               << " SSID='" << report_ssid << "' != STA SSID='"
++                               << sta_ssid << "' — skipping (SSID mismatch)";
++                    continue;
++                }
++            }
++
+             if (!database.dm_add_sta_beacon_measurement(beacon)) {
+                 LOG(ERROR) << "Failed to store beacon measurement in DM for STA " << sta_mac;
+             }
+@@ -5427,7 +5485,8 @@ bool Controller::send_policy_config_request(const sMacAddr &agent_mac)
+ 
+ bool Controller::send_beacon_metrics_query(const sMacAddr &agent_mac, const sMacAddr &sta_mac,
+                                            uint8_t operating_class, uint8_t channel,
+-                                           const sMacAddr &bssid, const std::string &ssid)
++                                           const sMacAddr &bssid, const std::string &ssid,
++                                           const std::vector<std::pair<uint8_t,uint8_t>> &ap_channel_reports)
+ {
+     LOG(DEBUG) << "NBAPI SendBeaconMetricsQuery for agent " << agent_mac << " sta " << sta_mac;
+ 
+@@ -5521,13 +5580,82 @@ bool Controller::send_beacon_metrics_query(const sMacAddr &agent_mac, const sMac
+                    << " — sending query as-is";
+     }
+ 
+-    // Create Beacon Metrics Query message
++    /* Per-channel single-query mode.
++     *
++     * The agent's TLVF parser (tlvBeaconMetricsQuery.cpp) has a bug where it
++     * fails to iterate the ap_channel_reports_list when channel=255 is used
++     * (multi-channel mode):
++     *   "TLVF: Requested index is greater than the number of available entries"
++     * This causes the agent to silently drop the 802.11k Beacon Request and
++     * never send a BEACON_METRICS_RESPONSE.
++     *
++     * Workaround: when ap_channel_reports is provided, send one separate
++     * BEACON_METRICS_QUERY_MESSAGE per channel, each with the actual channel
++     * number and operating class, and an empty ap_channel_reports_list.
++     * This avoids the TLVF ap_channel_reports_list accessor entirely.
++     *
++     * The app accumulates responses via pendingBcnRpt counter in stadb, so
++     * receiving multiple BEACON_METRICS_RESPONSE messages (one per channel)
++     * is handled correctly. */
++
++    if (!ap_channel_reports.empty()) {
++        /* Multi-channel: send one message per channel */
++        bool all_sent = true;
++        for (const auto &entry : ap_channel_reports) {
++            uint8_t ch       = entry.second;
++            uint8_t op_class = entry.first;
++
++            if (!cmdu_tx.create(0, ieee1905_1::eMessageType::BEACON_METRICS_QUERY_MESSAGE)) {
++                LOG(ERROR) << "Failed building BEACON_METRICS_QUERY_MESSAGE for ch=" << (int)ch;
++                return false;
++            }
++
++            auto tlv = cmdu_tx.addClass<wfa_map::tlvBeaconMetricsQuery>();
++            if (!tlv) {
++                LOG(ERROR) << "Failed to add tlvBeaconMetricsQuery TLV for ch=" << (int)ch;
++                return false;
++            }
++
++            tlv->associated_sta_mac()     = sta_mac;
++            tlv->operating_class()        = op_class;
++            tlv->channel_number()         = ch;
++            tlv->bssid()                  = target_bssid;
++            tlv->reporting_detail_value() = 0;
++            tlv->ap_channel_reports_list_length() = 0;
++
++            if (!ssid.empty()) {
++                if (!tlv->alloc_ssid(ssid.length())) {
++                    LOG(ERROR) << "Failed to allocate SSID buffer for ch=" << (int)ch;
++                    return false;
++                }
++                std::memcpy(tlv->ssid(), ssid.data(), ssid.length());
++                tlv->ssid_length() = ssid.length();
++            } else {
++                tlv->ssid_length() = 0;
++            }
++
++            LOG(INFO) << "BEACON-SEND: agent=" << agent_mac << " sta=" << sta_mac
++                      << " op_class=" << (int)op_class << " channel=" << (int)ch
++                      << " ssid=" << (ssid.empty() ? "(empty)" : ssid);
++
++            if (!son_actions::send_cmdu_to_agent(agent_mac, cmdu_tx, database)) {
++                LOG(ERROR) << "Failed to send per-channel Beacon Metrics Query"
++                           << " ch=" << (int)ch << " to agent: " << agent_mac;
++                all_sent = false;
++            } else {
++                LOG(DEBUG) << "Sent per-channel Beacon Metrics Query"
++                           << " ch=" << (int)ch << " to agent " << agent_mac;
++            }
++        }
++        return all_sent;
++    }
++
++    /* Single-channel path (no ap_channel_reports provided) */
+     if (!cmdu_tx.create(0, ieee1905_1::eMessageType::BEACON_METRICS_QUERY_MESSAGE)) {
+         LOG(ERROR) << "Failed building BEACON_METRICS_QUERY_MESSAGE!";
+         return false;
+     }
+ 
+-    // Add Beacon Metrics Query TLV
+     auto beacon_metrics_query_tlv = cmdu_tx.addClass<wfa_map::tlvBeaconMetricsQuery>();
+     if (!beacon_metrics_query_tlv) {
+         LOG(ERROR) << "Failed to add tlvBeaconMetricsQuery TLV";
+@@ -5539,8 +5667,8 @@ bool Controller::send_beacon_metrics_query(const sMacAddr &agent_mac, const sMac
+     beacon_metrics_query_tlv->channel_number()         = channel;
+     beacon_metrics_query_tlv->bssid()                  = target_bssid;
+     beacon_metrics_query_tlv->reporting_detail_value() = 0;
++    beacon_metrics_query_tlv->ap_channel_reports_list_length() = 0;
+ 
+-    // Set SSID if provided
+     if (!ssid.empty()) {
+         if (!beacon_metrics_query_tlv->alloc_ssid(ssid.length())) {
+             LOG(ERROR) << "Failed to allocate SSID buffer";
+@@ -5552,11 +5680,10 @@ bool Controller::send_beacon_metrics_query(const sMacAddr &agent_mac, const sMac
+         beacon_metrics_query_tlv->ssid_length() = 0;
+     }
+ 
+-    LOG(INFO) << "SendBeaconMetricsQuery: agent=" << agent_mac << " sta=" << sta_mac
++    LOG(INFO) << "BEACON-SEND: agent=" << agent_mac << " sta=" << sta_mac
+               << " op_class=" << (int)operating_class << " channel=" << (int)channel
+-              << " bssid=" << target_bssid << " ssid=" << (ssid.empty() ? "(empty)" : ssid);
++              << " ssid=" << (ssid.empty() ? "(empty)" : ssid);
+ 
+-    // Send the CMDU to the agent
+     if (!son_actions::send_cmdu_to_agent(agent_mac, cmdu_tx, database)) {
+         LOG(ERROR) << "Failed to send Beacon Metrics Query to agent: " << agent_mac;
+         return false;
+diff --git a/controller/src/beerocks/master/controller.h b/controller/src/beerocks/master/controller.h
+index b387c2452..0f7697161 100644
+--- a/controller/src/beerocks/master/controller.h
++++ b/controller/src/beerocks/master/controller.h
+@@ -140,7 +140,8 @@ public:
+      */
+     bool send_beacon_metrics_query(const sMacAddr &agent_mac, const sMacAddr &sta_mac,
+                                    uint8_t operating_class, uint8_t channel, const sMacAddr &bssid,
+-                                   const std::string &ssid = "");
++                                   const std::string &ssid = "",
++                                   const std::vector<std::pair<uint8_t,uint8_t>> &ap_channel_reports = {});
+ 
+     /**
+      * @brief Trigger channel scan initiated by NBAPI.
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index f243a1f51..813f1cd0e 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -491,6 +491,12 @@ bool db::dm_add_sta_beacon_measurement(const beerocks_message::sBeaconResponse11
+     // handle_cmdu_1905_beacon_response, so it changes with every new query.
+     // m_dialog_tokens defaults to 0 for new entries; the controller ensures
+     // dialog_token is never 0, so the first response always triggers a clear.
++    LOG(DEBUG) << "DM-STORE: sta=" << beacon.sta_mac << " bssid=" << beacon.bssid
++               << " ch=" << int(beacon.channel) << " RCPI=" << int(beacon.rcpi)
++               << " RSSI=" << (int8_t)(beacon.rcpi/2 - 110) << "dBm"
++               << " token=" << int(beacon.dialog_token)
++               << (m_dialog_tokens[beacon.sta_mac] != beacon.dialog_token
++                   ? " (new query — clearing stale reports)" : " (same query — appending)");
+     if (m_dialog_tokens[beacon.sta_mac] != beacon.dialog_token) {
+         LOG(DEBUG) << "dm_add_sta_beacon_measurement: new query detected for STA "
+                    << beacon.sta_mac << " (token " << int(m_dialog_tokens[beacon.sta_mac])
+@@ -8694,6 +8700,10 @@ bool db::dm_set_device_multi_ap_backhaul(const Agent &agent)
+             m_ambiorix_datamodel->set(multiap_backhaul_path, "BackhaulMACAddress", std::string{});
+         ret_val &=
+             m_ambiorix_datamodel->set(multiap_backhaul_path, "BackhaulDeviceID", std::string{});
++        ret_val &=
++            m_ambiorix_datamodel->set(multiap_backhaul_path, "ServingBSSID", std::string{});
++        ret_val &=
++            m_ambiorix_datamodel->set(multiap_backhaul_path, "BackhaulRadioUID", std::string{});
+         return ret_val;
+     }
+ 
+@@ -8720,6 +8730,19 @@ bool db::dm_set_device_multi_ap_backhaul(const Agent &agent)
+     ret_val &= m_ambiorix_datamodel->set(multiap_backhaul_path, "BackhaulMACAddress",
+                                          agent.backhaul.parent_interface);
+ 
++    if (agent.backhaul.wireless_backhaul_radio) {
++        ret_val &= m_ambiorix_datamodel->set(multiap_backhaul_path, "ServingBSSID",
++                                             agent.backhaul.parent_interface);
++        ret_val &= m_ambiorix_datamodel->set(
++            multiap_backhaul_path, "BackhaulRadioUID",
++            agent.backhaul.wireless_backhaul_radio->radio_uid);
++    } else {
++        ret_val &=
++            m_ambiorix_datamodel->set(multiap_backhaul_path, "ServingBSSID", std::string{});
++        ret_val &=
++            m_ambiorix_datamodel->set(multiap_backhaul_path, "BackhaulRadioUID", std::string{});
++    }
++
+     auto parent_agent = agent.backhaul.parent_agent.lock();
+     if (!parent_agent &&
+         agent.backhaul.parent_interface != beerocks::net::network_utils::ZERO_MAC) {
+@@ -10148,7 +10171,9 @@ const beerocks::mac_map<UnassociatedStation> &db::get_unassociated_stations() co
+ 
+ void db::update_unassociated_station_stats(const sMacAddr &mac_address,
+                                            UnassociatedStation::Stats &new_stats,
+-                                           const std::string &radio_dm_path = std::string())
++                                           const std::string &radio_dm_path,
++                                           const sMacAddr &responding_radio_mac,
++                                           const sMacAddr &responding_agent_al_mac)
+ {
+     auto station = m_unassociated_stations.find(mac_address);
+     if (station != m_unassociated_stations.end()) {
+@@ -10193,17 +10218,25 @@ void db::update_unassociated_station_stats(const sMacAddr &mac_address,
+                        << "SignalStrength: " << new_stats.uplink_rcpi_dbm_enc << " TimeStamp"
+                        << new_stats.time_stamp;
+ 
+-            // Trigger QCOM_Vendor event for unassociated station link metrics
+-            const auto &agents = station->second->get_agents();
+-            if (!agents.empty()) {
+-                // Get the first agent monitoring this station
+-                auto agent_it                = agents.begin();
+-                const sMacAddr &agent_al_mac = agent_it->first;
+-                const sMacAddr &radio_mac    = agent_it->second;
+-
+-                // Trigger the event
+-                dm_trigger_unassoc_sta_link_metrics_event(mac_address, new_station_path, radio_mac,
+-                                                          agent_al_mac);
++            // Trigger QCOM_Vendor event for unassociated station link metrics.
++            // Use the responding radio/agent if provided; otherwise fall back to the
++            // first registered agent (legacy behaviour for callers that don't pass them).
++            sMacAddr event_radio_mac    = responding_radio_mac;
++            sMacAddr event_agent_al_mac = responding_agent_al_mac;
++
++            if (event_radio_mac == beerocks::net::network_utils::ZERO_MAC ||
++                event_agent_al_mac == beerocks::net::network_utils::ZERO_MAC) {
++                const auto &agents = station->second->get_agents();
++                if (!agents.empty()) {
++                    auto agent_it       = agents.begin();
++                    event_agent_al_mac  = agent_it->first;
++                    event_radio_mac     = agent_it->second;
++                }
++            }
++
++            if (event_radio_mac != beerocks::net::network_utils::ZERO_MAC) {
++                dm_trigger_unassoc_sta_link_metrics_event(mac_address, new_station_path,
++                                                          event_radio_mac, event_agent_al_mac);
+             }
+         }
+     }
+diff --git a/controller/src/beerocks/master/db/db.h b/controller/src/beerocks/master/db/db.h
+index 4401b92d2..d700acda8 100644
+--- a/controller/src/beerocks/master/db/db.h
++++ b/controller/src/beerocks/master/db/db.h
+@@ -2714,6 +2714,8 @@ public:
+      * BackhaulMACAddress -> Parent Backhaul MAC Address (Parent's BH BSS, or ETH MAC)
+      * BackhaulDeviceID -> Parent Device ID (AL_MAC)
+      * MACAddress -> Current Device's Backhaul Interface MAC (BH STA or ETH MAC)
++     * ServingBSSID -> BSSID of the BSS to which the bSTA is associated (Wi-Fi only, empty otherwise)
++     * BackhaulRadioUID -> Radio UID of the local radio carrying the wireless backhaul link (Wi-Fi only)
+      *
+      * DM path : "Device.WiFi.DataElements.Network.Device.{i}.MultiAPDevice.Backhaul"
+      *
+@@ -3367,7 +3369,11 @@ public:
+      */
+     void update_unassociated_station_stats(const sMacAddr &mac_address,
+                                            UnassociatedStation::Stats &new_stats,
+-                                           const std::string &radio_dm_path);
++                                           const std::string &radio_dm_path,
++                                           const sMacAddr &responding_radio_mac =
++                                               beerocks::net::network_utils::ZERO_MAC,
++                                           const sMacAddr &responding_agent_al_mac =
++                                               beerocks::net::network_utils::ZERO_MAC);
+ 
+     std::shared_ptr<Agent::sEthSwitch> get_eth_switch(const sMacAddr &mac);
+ 
+diff --git a/controller/src/beerocks/master/tasks/link_metrics_task.cpp b/controller/src/beerocks/master/tasks/link_metrics_task.cpp
+index 369b9bca7..ee2486d06 100644
+--- a/controller/src/beerocks/master/tasks/link_metrics_task.cpp
++++ b/controller/src/beerocks/master/tasks/link_metrics_task.cpp
+@@ -558,7 +558,8 @@ bool LinkMetricsTask::handle_cmdu_1905_unassociated_station_link_metric_response
+             strftime(buf, sizeof buf, "%FT%TZ", gmtime(&received_time));
+             stats.time_stamp = buf;
+ 
+-            database.update_unassociated_station_stats(sta_metrics.sta_mac, stats, radio->dm_path);
++            database.update_unassociated_station_stats(sta_metrics.sta_mac, stats, radio->dm_path,
++                                                       radio_mac_address, src_mac);
+         }
+     }
+     return true;
+diff --git a/controller/src/beerocks/master/tasks/topology_task.cpp b/controller/src/beerocks/master/tasks/topology_task.cpp
+index 67c18ced5..0d746f862 100644
+--- a/controller/src/beerocks/master/tasks/topology_task.cpp
++++ b/controller/src/beerocks/master/tasks/topology_task.cpp
+@@ -256,8 +256,13 @@ bool topology_task::handle_topology_response(const sMacAddr &src_mac,
+         }
+     }
+ 
+-    // Update external agents multi ap backhaul datamodel
+-    if (!agent->is_gateway) {
++    // Update external agents multi ap backhaul datamodel only when the backhaul parent is already
++    // resolved. For wireless agents: the bSTA must already be in the DB (no race); for wired
++    // agents: parent resolution happens later via graph inference, which calls
++    // dm_set_device_multi_ap_backhaul itself. When the parent is unresolved here, the deferred
++    // path in handle_topology_notification will call dm_set_device_multi_ap_backhaul once the
++    // bSTA joins the parent BSS.
++    if (!agent->is_gateway && !agent->backhaul.parent_agent.expired()) {
+         database.dm_set_device_multi_ap_backhaul(*agent);
+     }
+ 
+@@ -1043,6 +1048,8 @@ bool topology_task::handle_topology_notification(const sMacAddr &src_mac,
+                             child_agent_ptr->backhaul.backhaul_iface_type =
+                                 beerocks::IFACE_TYPE_WIFI_UNSPECIFIED;
+                             child_agent_ptr->backhaul.parent_interface = bssid;
++                            child_agent_ptr->backhaul.wireless_backhaul_radio =
++                                database.get_radio_by_backhaul_cap(bssid);
+                             if (!database.dm_set_device_multi_ap_backhaul(*child_agent_ptr)) {
+                                 LOG(ERROR)
+                                     << "Failed to update backhaul DM for agent "
+-- 
+2.34.1
+
