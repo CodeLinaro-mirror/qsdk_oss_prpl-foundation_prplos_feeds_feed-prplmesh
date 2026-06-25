@@ -1,0 +1,779 @@
+From 746f44902b038c908eb0420eab41aa27b3e2721b Mon Sep 17 00:00:00 2001
+From: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+Date: Thu, 25 Jun 2026 14:58:40 +0530
+Subject: [PATCH] [PATCH] [prplMesh] 11k iPhone fixes, per-mode beacon
+ duration,  steer_ire BTM detection, ACL persistence fix
+
+1.Fix 11k beacon requests failing for iPhone clients: add mandatory SSID and
+  Beacon Reporting Information subelements required by 802.11 spec. Without
+  these, iPhones respond with an error report causing "Invalid 11k report
+  length!" on the agent side.
+
+2.Fix Active/Passive 11k scan mode silently failing for iPhones: check STA's
+  RRM capabilities before sending the beacon request and fall back to Beacon
+  Table mode if the STA does not support the requested scan mode. Steering app
+  beacon requests are unaffected.
+
+3.Add per-mode configurable 11k beacon measurement durations matching Prop
+  defaults (Active=50 TU, Passive=110 TU, Table=200 TU). Previously the
+  duration was hardcoded to 10 TU for all modes regardless of scan type.
+
+4.Fix steer_ire CLI command using hardcoded BTM-capable assumption: query the
+  STA's actual BTM support from the DB so that non-BTM STAs are correctly
+  steered via legacy disassoc and their serving BSS is properly blocked.
+
+5.Fix ACL persisting permanently after prplmesh restart: clear all DENY_ACL
+  entries when the ap_manager reconnects to hostapd. TIMED_BLOCK ACLs survive
+  a prplmesh-only restart (hostapd not restarted) but the controller's expiry
+  timer is lost, leaving clients permanently blocked.
+
+6.Restructure bml command bml_11k_query_trigger to remove duration field as
+  1905 spec does not handle duration
+
+7. controller: suppress RadioAdded storm on AP_AUTOCONFIG M1 re-send loop
+
+dm_add_radio_element: fire RadioAdded only when a new DM instance is
+created (radio.dm_path was empty). On subsequent M1 re-sends the radio
+already has a dm_path, so RadioAdded is suppressed and only a DEBUG log
+is emitted. This stops the ~100/min RadioAdded event storm observed in
+CR4584267 where the ext agent's AP_AUTOCONFIGURATION FSM looped due to
+timer overruns.
+
+dm_set_device_ap_capabilities: always trigger Profile2ApCapability
+vendor event regardless of whether R2APCapabilities DM writes succeeded.
+On first M1 the Device.2.MultiAPDevice.R2APCapabilities sub-object may
+not be instantiated yet (DM race), but consumers still need the
+notification.
+
+Signed-off-by: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+---
+ agent/config/beerocks_agent.conf.in           |  15 ++
+ .../ap_manager/ap_manager.cpp                 |  13 ++
+ agent/src/beerocks/slave/agent_db.h           |   3 +
+ .../beerocks/slave/beerocks_agent_main.cpp    |  33 ++++
+ .../bcl/include/bcl/beerocks_config_file.h    |   3 +
+ .../bcl/source/beerocks_config_file.cpp       |   3 +
+ .../beerocks/bwl/include/bwl/mon_wlan_hal.h   |   5 +-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  36 +++-
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 163 ++++++++++++++----
+ .../bwl/onewifi/mon_wlan_hal_onewifi.cpp      |  15 ++
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   |  15 ++
+ controller/src/beerocks/bml/bml.cpp           |   4 +-
+ controller/src/beerocks/bml/bml.h             |   3 +-
+ .../beerocks/bml/internal/bml_internal.cpp    |   8 +-
+ .../src/beerocks/bml/internal/bml_internal.h  |   2 +-
+ .../src/beerocks/cli/beerocks_cli_bml.cpp     |  18 +-
+ .../src/beerocks/cli/beerocks_cli_bml.h       |   2 +-
+ controller/src/beerocks/master/db/db.cpp      |  24 ++-
+ .../src/beerocks/master/son_management.cpp    |  26 ++-
+ 19 files changed, 327 insertions(+), 64 deletions(-)
+
+diff --git a/agent/config/beerocks_agent.conf.in b/agent/config/beerocks_agent.conf.in
+index 9b6d343f5..d05886527 100644
+--- a/agent/config/beerocks_agent.conf.in
++++ b/agent/config/beerocks_agent.conf.in
+@@ -78,6 +78,21 @@ beacon_11k_default_measurement_mode=2
+ # beacon_11k_bsta_measurement_mode = BEACON_MEASUREMENT_MODE_TABLE (2) -> Beacon Table measurement mode
+ beacon_11k_bsta_measurement_mode=1
+ 
++# beacon_11k_active_measurement_duration: Measurement duration for Active beacon requests (TUs, 1 TU = 1024 usec)
++# Equivalent to Prop: ezlbd.Estimator_Adv.BcnrptActiveDuration
++# Default: 50 TU
++beacon_11k_active_measurement_duration=50
++
++# beacon_11k_passive_measurement_duration: Measurement duration for Passive beacon requests (TUs)
++# Equivalent to Prop: ezlbd.Estimator_Adv.BcnrptPassiveDuration
++# Default: 110 TU
++beacon_11k_passive_measurement_duration=110
++
++# beacon_11k_table_measurement_duration: Measurement duration for Beacon Table requests (TUs)
++# Equivalent to Prop: ezlbd.Estimator_Adv.BcnrptBcnTableDuration
++# Default: 200 TU
++beacon_11k_table_measurement_duration=200
++
+ # btm_abridged and btm_disassoc_imminent have been moved to the steering app
+ # configuration (steering_config.json: BTMAbridged, BTMDisassocImminent).
+ # They are now passed per-steer via qmesh_cmd_client_steering() so the
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index cca60b21e..fef77544f 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -3901,6 +3901,19 @@ void ApManager::handle_hostapd_attached()
+     copy_vaps_info_and_type(ap_wlan_hal, notification->vap_list().vaps,
+                             notification->vap_type_list().vap_types);
+ 
++    // Clear any stale DENY_ACL entries left over from before this prplmesh restart.
++    // Must be called AFTER copy_vaps_info_and_type() which populates available_vaps
++    // via refresh_vaps_info(). clear_blacklist() iterates available_vaps to send
++    // DENY_ACL CLEAR to each VAP — if called before VAPs are populated it does nothing.
++    // TIMED_BLOCK ACLs set before a restart persist in hostapd (hostapd is not restarted)
++    // but the controller's expiry timer is lost, leaving clients permanently blocked.
++    if (!ap_wlan_hal->clear_blacklist()) {
++        LOG(WARNING) << "handle_hostapd_attached: clear_blacklist() failed - stale ACL entries"
++                     << " may persist from before the restart";
++    } else {
++        LOG(DEBUG) << "handle_hostapd_attached: cleared stale DENY_ACL entries on reconnect";
++    }
++
+     // Send CMDU
+     send_cmdu(cmdu_tx);
+ }
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 0de24ae8c..9f89cc0bc 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -185,6 +185,9 @@ public:
+         int8_t num_of_bands = 0;
+         uint8_t beacon_11k_default_measurement_mode = 2; ///< Beacon measurement mode for regular (fronthaul) STAs. Default: TABLE (2).
+         uint8_t beacon_11k_bsta_measurement_mode    = 1; ///< Beacon measurement mode for backhaul STAs (bSTAs). Default: ACTIVE (1).
++        uint16_t beacon_11k_active_measurement_duration  = 50;  ///< Measurement duration for Active beacon requests (TU). Prop: BcnrptActiveDuration.
++        uint16_t beacon_11k_passive_measurement_duration = 110; ///< Measurement duration for Passive beacon requests (TU). Prop: BcnrptPassiveDuration.
++        uint16_t beacon_11k_table_measurement_duration   = 200; ///< Measurement duration for Beacon Table requests (TU). Prop: BcnrptBcnTableDuration.
+ 
+         /**
+          * BTM Request flags for agent-initiated steering (CLIENT_BSS_STEER path).
+diff --git a/agent/src/beerocks/slave/beerocks_agent_main.cpp b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+index 64a1bf3da..20e897cbe 100644
+--- a/agent/src/beerocks/slave/beerocks_agent_main.cpp
++++ b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+@@ -743,6 +743,39 @@ static int run_beerocks_slave(beerocks::config_file::sConfigSlave &beerocks_slav
+                        << int(db->device_conf.beacon_11k_bsta_measurement_mode);
+         }
+ 
++        // Read per-mode 11k beacon measurement durations (Active / Passive / Table).
++        // Equivalent to Prop: BcnrptActiveDuration, BcnrptPassiveDuration, BcnrptBcnTableDuration.
++        auto read_beacon_duration = [&](const std::string &conf_str, uint16_t &db_field,
++                                        const char *name, uint16_t default_val) {
++            if (!conf_str.empty()) {
++                auto val = beerocks::string_utils::stoi(conf_str);
++                if (val <= 0) {
++                    LOG(WARNING) << "Invalid " << name << " value: " << val
++                                 << ", using default " << default_val << " TU";
++                    db_field = default_val;
++                } else {
++                    db_field = static_cast<uint16_t>(val);
++                }
++                LOG(DEBUG) << name << " set to: " << db_field << " TU";
++            }
++        };
++        read_beacon_duration(beerocks_slave_conf.beacon_11k_active_measurement_duration,
++                             db->device_conf.beacon_11k_active_measurement_duration,
++                             "beacon_11k_active_measurement_duration", 50);
++        read_beacon_duration(beerocks_slave_conf.beacon_11k_passive_measurement_duration,
++                             db->device_conf.beacon_11k_passive_measurement_duration,
++                             "beacon_11k_passive_measurement_duration", 110);
++        read_beacon_duration(beerocks_slave_conf.beacon_11k_table_measurement_duration,
++                             db->device_conf.beacon_11k_table_measurement_duration,
++                             "beacon_11k_table_measurement_duration", 200);
++
++        bwl::nl80211::set_beacon_11k_active_measurement_duration(
++            db->device_conf.beacon_11k_active_measurement_duration);
++        bwl::nl80211::set_beacon_11k_passive_measurement_duration(
++            db->device_conf.beacon_11k_passive_measurement_duration);
++        bwl::nl80211::set_beacon_11k_table_measurement_duration(
++            db->device_conf.beacon_11k_table_measurement_duration);
++
+         // Read btm_abridged (optional, default: true)
+         if (!beerocks_slave_conf.btm_abridged.empty()) {
+             db->device_conf.btm_abridged =
+diff --git a/common/beerocks/bcl/include/bcl/beerocks_config_file.h b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+index b0549d272..e08ebdcb4 100644
+--- a/common/beerocks/bcl/include/bcl/beerocks_config_file.h
++++ b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+@@ -117,6 +117,9 @@ public:
+         std::string send_btm_to_non_11v_sta;
+         std::string beacon_11k_default_measurement_mode;
+         std::string beacon_11k_bsta_measurement_mode;
++        std::string beacon_11k_active_measurement_duration;
++        std::string beacon_11k_passive_measurement_duration;
++        std::string beacon_11k_table_measurement_duration;
+         std::string btm_abridged;
+         std::string btm_disassoc_imminent;
+         //[slaveX]
+diff --git a/common/beerocks/bcl/source/beerocks_config_file.cpp b/common/beerocks/bcl/source/beerocks_config_file.cpp
+index c42019b71..f386256e3 100644
+--- a/common/beerocks/bcl/source/beerocks_config_file.cpp
++++ b/common/beerocks/bcl/source/beerocks_config_file.cpp
+@@ -172,6 +172,9 @@ bool config_file::read_slave_config_file(const std::string &config_file_path, sC
+             std::make_tuple("send_btm_to_non_11v_sta=", &conf.send_btm_to_non_11v_sta, 0),
+             std::make_tuple("beacon_11k_default_measurement_mode=", &conf.beacon_11k_default_measurement_mode, 0),
+             std::make_tuple("beacon_11k_bsta_measurement_mode=", &conf.beacon_11k_bsta_measurement_mode, 0),
++            std::make_tuple("beacon_11k_active_measurement_duration=", &conf.beacon_11k_active_measurement_duration, 0),
++            std::make_tuple("beacon_11k_passive_measurement_duration=", &conf.beacon_11k_passive_measurement_duration, 0),
++            std::make_tuple("beacon_11k_table_measurement_duration=", &conf.beacon_11k_table_measurement_duration, 0),
+             std::make_tuple("btm_abridged=", &conf.btm_abridged, 0),
+             std::make_tuple("btm_disassoc_imminent=", &conf.btm_disassoc_imminent, 0),
+         };
+diff --git a/common/beerocks/bwl/include/bwl/mon_wlan_hal.h b/common/beerocks/bwl/include/bwl/mon_wlan_hal.h
+index ddcff2cef..2c77ecc0b 100644
+--- a/common/beerocks/bwl/include/bwl/mon_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/mon_wlan_hal.h
+@@ -157,9 +157,12 @@ std::shared_ptr<mon_wlan_hal> mon_wlan_hal_create(const std::string &iface_name,
+                                                   base_wlan_hal::hal_event_cb_t cb,
+                                                   const bwl::hal_conf_t &hal_conf);
+ 
+-// Global configuration setter for beacon 11k measurement mode
++// Global configuration setters for beacon 11k measurement parameters
+ namespace nl80211 {
+ void set_beacon_11k_measurement_mode(uint8_t mode);
++void set_beacon_11k_active_measurement_duration(uint16_t duration);
++void set_beacon_11k_passive_measurement_duration(uint16_t duration);
++void set_beacon_11k_table_measurement_duration(uint16_t duration);
+ }
+ 
+ } // namespace bwl
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 08f953e81..f6beed44b 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -1593,8 +1593,40 @@ bool ap_wlan_hal_nl80211::sta_deny(const sMacAddr &mac, const sMacAddr &bssid)
+ 
+ bool ap_wlan_hal_nl80211::clear_blacklist()
+ {
+-    LOG(TRACE) << __func__ << " - NOT IMPLEMENTED";
+-    return true;
++    // Send DENY_ACL CLEAR to every registered link interface so that stale
++    // DENY_ACL entries (e.g. from a TIMED_BLOCK before a prplmesh restart)
++    // are removed from hostapd.  The DENY_ACL list is per-link-interface in
++    // the MLO setup, so we must clear each link separately.
++    //
++    // We iterate available_vaps to collect the unique BSS interface names
++    // (e.g. wlan1_link0, wlan2_link0, ...) and send DENY_ACL CLEAR to each.
++    // Duplicate base interfaces (wlan1, wlan2, ...) are skipped because
++    // hostapd stores the ACL per-link, not per-MLD.
++    bool success = true;
++    std::set<std::string> cleared_ifaces;
++
++    for (const auto &vap : m_radio_info.available_vaps) {
++        const std::string &iface = vap.second.bss;
++        if (iface.empty()) {
++            continue;
++        }
++        if (cleared_ifaces.count(iface)) {
++            continue; // already cleared this interface
++        }
++        cleared_ifaces.insert(iface);
++
++        LOG(DEBUG) << "clear_blacklist: sending DENY_ACL CLEAR to iface=" << iface;
++        if (!wpa_ctrl_send_msg("DENY_ACL CLEAR", iface)) {
++            LOG(WARNING) << "clear_blacklist: DENY_ACL CLEAR failed for iface=" << iface;
++            success = false;
++        }
++    }
++
++    if (cleared_ifaces.empty()) {
++        LOG(WARNING) << "clear_blacklist: no VAPs available, nothing cleared";
++    }
++
++    return success;
+ }
+ 
+ bool ap_wlan_hal_nl80211::sta_acceptlist_modify(const sMacAddr &mac, const sMacAddr &bssid,
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 9bf6ca530..1c348c73a 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -40,6 +40,11 @@ namespace nl80211 {
+ // Global configuration for beacon 11k measurement mode
+ static uint8_t g_beacon_11k_measurement_mode = BEACON_MEASUREMENT_MODE_PASSIVE;
+ 
++// Global per-mode measurement durations (TU). 
++static uint16_t g_beacon_11k_active_measurement_duration  = 50;   // BcnrptActiveDuration
++static uint16_t g_beacon_11k_passive_measurement_duration = 110;  // BcnrptPassiveDuration
++static uint16_t g_beacon_11k_table_measurement_duration   = 200;  // BcnrptBcnTableDuration
++
+ // Function to set the global beacon 11k measurement mode
+ void set_beacon_11k_measurement_mode(uint8_t mode)
+ {
+@@ -47,6 +52,27 @@ void set_beacon_11k_measurement_mode(uint8_t mode)
+     LOG(DEBUG) << "Global beacon_11k_measurement_mode set to: " << int(g_beacon_11k_measurement_mode);
+ }
+ 
++void set_beacon_11k_active_measurement_duration(uint16_t duration)
++{
++    g_beacon_11k_active_measurement_duration = duration;
++    LOG(DEBUG) << "Global beacon_11k_active_measurement_duration set to: "
++               << g_beacon_11k_active_measurement_duration << " TU";
++}
++
++void set_beacon_11k_passive_measurement_duration(uint16_t duration)
++{
++    g_beacon_11k_passive_measurement_duration = duration;
++    LOG(DEBUG) << "Global beacon_11k_passive_measurement_duration set to: "
++               << g_beacon_11k_passive_measurement_duration << " TU";
++}
++
++void set_beacon_11k_table_measurement_duration(uint16_t duration)
++{
++    g_beacon_11k_table_measurement_duration = duration;
++    LOG(DEBUG) << "Global beacon_11k_table_measurement_duration set to: "
++               << g_beacon_11k_table_measurement_duration << " TU";
++}
++
+ // Minimal required implementation to resolve link error.
+ bool mon_wlan_hal_nl80211::nl_event_handle(struct nl_msg *msg, void *arg)
+ {
+@@ -470,6 +496,77 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+     // not set req.measurement_mode explicitly, but the task layer always sets it now.
+     uint8_t measurement_mode = req.measurement_mode;
+ 
++    // Select measurement duration based on mode (from agent config, overrides req.duration).
++    // Matches Prop: BcnrptActiveDuration / BcnrptPassiveDuration / BcnrptBcnTableDuration.
++    uint16_t measurement_duration;
++    switch (measurement_mode) {
++        case BEACON_MEASUREMENT_MODE_ACTIVE:
++            measurement_duration = g_beacon_11k_active_measurement_duration;
++            break;
++        case BEACON_MEASUREMENT_MODE_PASSIVE:
++            measurement_duration = g_beacon_11k_passive_measurement_duration;
++            break;
++        default: // TABLE and any other mode
++            measurement_duration = g_beacon_11k_table_measurement_duration;
++            break;
++    }
++
++    // Per-STA measurement mode validation:
++    // If Active or Passive mode is requested, verify the STA actually supports it via
++    // hostapd's "STA <mac>" command (rrm_capability field).
++    // iPhones and some clients only support Beacon Table (mode=2) — sending Active/Passive
++    // to them causes hostapd to log "does not support active beacon report" and drop the request.
++    //
++    // This check is intentionally at the BWL layer so it does NOT impact higher-level callers
++    // (e.g., the steering app) that already set the correct mode per STA. If the steering app
++    // sets TABLE for iPhones, the check passes unchanged. If it sets Active/Passive for capable
++    // STAs, the check also passes unchanged. Only the global/default path is protected here.
++    //
++    // RRM Enabled Capabilities (IEEE 802.11-2020, Section 9.4.2.45), byte 0:
++    //   Bit 4 (0x10) = Beacon Passive Measurement Capability
++    //   Bit 5 (0x20) = Beacon Active Measurement Capability
++    //   Bit 6 (0x40) = Beacon Table Measurement Capability
++    if (measurement_mode != BEACON_MEASUREMENT_MODE_TABLE) {
++        // Find the first registered link interface to query STA capabilities
++        std::string query_iface;
++        for (int link_idx = 0; link_idx < 8; link_idx++) {
++            std::string link_iface = base_vap_iface + "_link" + std::to_string(link_idx);
++            if (is_wpa_ctrl_interface_registered(link_iface)) {
++                query_iface = link_iface;
++                break;
++            }
++        }
++        if (!query_iface.empty()) {
++            std::string sta_cmd = "STA " + tlvf::mac_to_string(req.sta_mac.oct);
++            char *sta_reply     = nullptr;
++            if (wpa_ctrl_send_msg(sta_cmd, &sta_reply, query_iface) && sta_reply) {
++                std::string reply_str(sta_reply);
++                auto rrm_pos = reply_str.find("rrm_capability=");
++                if (rrm_pos != std::string::npos) {
++                    // Parse first byte of rrm_capability (10 hex chars = 5 bytes)
++                    std::string rrm_hex  = reply_str.substr(rrm_pos + 15, 2);
++                    uint8_t rrm_byte0    = static_cast<uint8_t>(std::strtoul(rrm_hex.c_str(), nullptr, 16));
++                    bool supports_passive = (rrm_byte0 & 0x10) != 0;
++                    bool supports_active  = (rrm_byte0 & 0x20) != 0;
++                    if ((measurement_mode == BEACON_MEASUREMENT_MODE_PASSIVE && !supports_passive) ||
++                        (measurement_mode == BEACON_MEASUREMENT_MODE_ACTIVE  && !supports_active)) {
++                        LOG(DEBUG) << "Beacon 11k: STA " << tlvf::mac_to_string(req.sta_mac.oct)
++                                   << " does not support measurement_mode=" << int(measurement_mode)
++                                   << " (rrm_byte0=0x" << std::hex << int(rrm_byte0) << std::dec
++                                   << "), falling back to Beacon Table mode";
++                        measurement_mode = BEACON_MEASUREMENT_MODE_TABLE;
++                    }
++                } else {
++                    // No rrm_capability field → STA has no RRM support at all
++                    // Fall back to Beacon Table mode to avoid hostapd rejection
++                    LOG(DEBUG) << "Beacon 11k: STA " << tlvf::mac_to_string(req.sta_mac.oct)
++                               << " has no rrm_capability field, falling back to Beacon Table mode";
++                    measurement_mode = BEACON_MEASUREMENT_MODE_TABLE;
++                }
++            }
++        }
++    }
++
+     // REQ_BEACON 02:14:5f:b8:ae:9f req_mode=01 510B000011110004f021318193
+     // op_class (2), channel (2), randomization_interval (4), measurement duration (4), measurement mode (2), bssid (12)
+ 
+@@ -481,7 +578,7 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+                       beerocks::string_utils::int_to_hex_string(op_class, 2) +
+                       beerocks::string_utils::int_to_hex_string(req.channel, 2) +
+                       beerocks::string_utils::int_to_hex_string(htobe16(req.rand_ival), 4) +
+-                      beerocks::string_utils::int_to_hex_string(htobe16(req.duration), 4) +
++                      beerocks::string_utils::int_to_hex_string(htobe16(measurement_duration), 4) +
+                       beerocks::string_utils::int_to_hex_string(measurement_mode, 2) +
+                       beerocks::string_utils::int_to_hex_string(req.bssid.oct[0], 2) +
+                       beerocks::string_utils::int_to_hex_string(req.bssid.oct[1], 2) +
+@@ -490,39 +587,43 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+                       beerocks::string_utils::int_to_hex_string(req.bssid.oct[4], 2) +
+                       beerocks::string_utils::int_to_hex_string(req.bssid.oct[5], 2);
+ 
+-    // Add SSID subelement if requested (element ID 0x00)
+-    if (req.use_optional_ssid != 0 && req.ssid[0] != '\0') {
+-        // Calculate SSID length
+-        size_t ssid_len = strnlen(reinterpret_cast<const char*>(req.ssid), 
+-                                   beerocks::message::WIFI_SSID_MAX_LENGTH);
+-        
+-        LOG(DEBUG) << "Adding SSID subelement to beacon request: "
+-                   << "ssid='" << req.ssid << "'"
+-                   << ", ssid_len=" << ssid_len
+-                   << ", use_optional_ssid=" << int(req.use_optional_ssid);
+-        
+-        // SSID subelement:
+-        // subelement id (0x00):
++    // Add SSID subelement (ID=0) - mandated by 802.11 spec for beacon requests.
++    // Always add SSID by looking up from VAP info, regardless of req.use_optional_ssid.
++    // Required for strict clients like iPhones that refuse beacon requests without
++    // an SSID subelement (causes "Invalid 11k report length!" on response parsing).
++    std::string ssid_for_request;
++    std::string base_target_iface;
++    extractBase1Interface(vap_iface_name, base_target_iface);
++    for (const auto &vap : m_radio_info.available_vaps) {
++        std::string base_vap_iface_check;
++        extractBase1Interface(vap.second.bss, base_vap_iface_check);
++        if (base_vap_iface_check == base_target_iface && !vap.second.ssid.empty()) {
++            ssid_for_request = vap.second.ssid;
++            break;
++        }
++    }
++    if (!ssid_for_request.empty()) {
++        // subelement ID = 0 (SSID)
+         cmd += beerocks::string_utils::int_to_hex_string(0, 2);
+-        // length:
+-        cmd += beerocks::string_utils::int_to_hex_string(ssid_len, 2);
+-        
+-        // SSID value (as hex string):
+-        for (size_t i = 0; i < ssid_len; i++) {
+-            cmd += beerocks::string_utils::int_to_hex_string(
+-                static_cast<uint8_t>(req.ssid[i]), 2);
++        // length
++        cmd += beerocks::string_utils::int_to_hex_string(ssid_for_request.length(), 2);
++        // SSID bytes
++        for (unsigned char c : ssid_for_request) {
++            cmd += beerocks::string_utils::int_to_hex_string(c, 2);
+         }
+-        
+-        LOG(DEBUG) << "SSID subelement encoded: element_id=0x00"
+-                   << ", length=" << ssid_len
+-                   << ", ssid_hex=" << cmd.substr(cmd.length() - (ssid_len * 2));
+-    } else {
+-        LOG(DEBUG) << "SSID subelement NOT added: "
+-                   << "use_optional_ssid=" << int(req.use_optional_ssid)
+-                   << ", ssid_empty=" << (req.ssid[0] == '\0' ? "true" : "false");
++        LOG(DEBUG) << "Beacon 11k: added SSID subelement: " << ssid_for_request;
+     }
+ 
+-    // Reporting detail subelement
++    // Add Beacon Reporting Information subelement (ID=1) - mandated by 802.11 spec.
++    // Specifies reporting conditions. Required for strict clients like iPhones.
++    // Reporting Condition = 0x00: report after each measurement
++    // Reporting Reference = 0x00: no threshold
++    cmd += beerocks::string_utils::int_to_hex_string(1, 2);  // subelement ID = 1
++    cmd += beerocks::string_utils::int_to_hex_string(2, 2);  // length = 2
++    cmd += beerocks::string_utils::int_to_hex_string(0, 2);  // reporting condition = 0
++    cmd += beerocks::string_utils::int_to_hex_string(0, 2);  // reporting reference = 0
++
++    // Reporting detail subelement (ID=2)
+     // subelement id (2):
+     cmd += beerocks::string_utils::int_to_hex_string(2, 2);
+     // length:
+@@ -567,7 +668,7 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+                 << ", bssid=" << tlvf::mac_to_string(req.bssid.oct)
+                 << ", op_class=" << int(op_class)
+                 << ", channel=" << int(req.channel)
+-                << ", duration=" << req.duration
++                << ", duration=" << measurement_duration << " TU (config-driven)"
+                 << ", measurement_mode=" << int(measurement_mode)
+                 << ", req_mode=0x" << std::hex << int(req_mode) << std::dec
+                 << ", interface=" << vap_iface_name
+diff --git a/common/beerocks/bwl/onewifi/mon_wlan_hal_onewifi.cpp b/common/beerocks/bwl/onewifi/mon_wlan_hal_onewifi.cpp
+index ef2db9ab2..21a9caeca 100644
+--- a/common/beerocks/bwl/onewifi/mon_wlan_hal_onewifi.cpp
++++ b/common/beerocks/bwl/onewifi/mon_wlan_hal_onewifi.cpp
+@@ -606,6 +606,21 @@ void set_beacon_11k_measurement_mode(uint8_t mode)
+     (void)mode;
+ }
+ 
++void set_beacon_11k_active_measurement_duration(uint16_t duration)
++{
++    (void)duration;
++}
++
++void set_beacon_11k_passive_measurement_duration(uint16_t duration)
++{
++    (void)duration;
++}
++
++void set_beacon_11k_table_measurement_duration(uint16_t duration)
++{
++    (void)duration;
++}
++
+ } // namespace nl80211
+ 
+ } // namespace bwl
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index 8d6cfd165..f6c2c9bcb 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -2975,6 +2975,21 @@ void set_beacon_11k_measurement_mode(uint8_t mode)
+     // This is a stub implementation to resolve linker errors on Purple OS platform
+     // The actual implementation is only available in the nl80211 HAL
+ }
++void set_beacon_11k_active_measurement_duration(uint16_t duration)
++{
++    LOG(DEBUG) << "set_beacon_11k_active_measurement_duration called with duration=" << duration
++               << " TU - NOT IMPLEMENTED for whm HAL (Purple OS platform)";
++}
++void set_beacon_11k_passive_measurement_duration(uint16_t duration)
++{
++    LOG(DEBUG) << "set_beacon_11k_passive_measurement_duration called with duration=" << duration
++               << " TU - NOT IMPLEMENTED for whm HAL (Purple OS platform)";
++}
++void set_beacon_11k_table_measurement_duration(uint16_t duration)
++{
++    LOG(DEBUG) << "set_beacon_11k_table_measurement_duration called with duration=" << duration
++               << " TU - NOT IMPLEMENTED for whm HAL (Purple OS platform)";
++}
+ } // namespace nl80211
+ 
+ std::shared_ptr<ap_wlan_hal> ap_wlan_hal_create(std::string iface_name, bwl::hal_conf_t hal_conf,
+diff --git a/controller/src/beerocks/bml/bml.cpp b/controller/src/beerocks/bml/bml.cpp
+index 66a2da27b..a23786e39 100644
+--- a/controller/src/beerocks/bml/bml.cpp
++++ b/controller/src/beerocks/bml/bml.cpp
+@@ -925,7 +925,7 @@ int bml_client_clear_client(BML_CTX ctx, const char *sta_mac)
+ 
+ int bml_11k_query_trigger(BML_CTX ctx, const char *sta_mac, 
+                           uint8_t channel, uint8_t op_class, 
+-                          uint16_t duration, const char *bssid)
++                          const char *bssid)
+ {
+     // Validate input parameters
+     if (!ctx || !sta_mac || !bssid) {
+@@ -934,7 +934,7 @@ int bml_11k_query_trigger(BML_CTX ctx, const char *sta_mac,
+ 
+     auto pBML = static_cast<bml_internal *>(ctx);
+     return pBML->send_11k_beacon_query(tlvf::mac_from_string(std::string(sta_mac)), 
+-                                       channel, op_class, duration,
++                                       channel, op_class,
+                                        tlvf::mac_from_string(std::string(bssid)));
+ }
+ 
+diff --git a/controller/src/beerocks/bml/bml.h b/controller/src/beerocks/bml/bml.h
+index 8ec5c5d6c..c3f3069e4 100644
+--- a/controller/src/beerocks/bml/bml.h
++++ b/controller/src/beerocks/bml/bml.h
+@@ -823,14 +823,13 @@ int bml_client_clear_client(BML_CTX ctx, const char *sta_mac);
+  * @param [in] sta_mac MAC address of the associated station
+  * @param [in] channel Target channel for measurement (0 = current channel)
+  * @param [in] op_class Operating class (0 = current op_class)
+- * @param [in] duration Measurement duration in TUs (default: 50)
+  * @param [in] bssid Target BSSID (use ff:ff:ff:ff:ff:ff for broadcast to all agents)
+  *
+  * @return BML_RET_OK on success
+  */
+ int bml_11k_query_trigger(BML_CTX ctx, const char *sta_mac, 
+                           uint8_t channel, uint8_t op_class, 
+-                          uint16_t duration, const char *bssid);
++                          const char *bssid);
+ 
+ #ifdef FEATURE_PRE_ASSOCIATION_STEERING
+ 
+diff --git a/controller/src/beerocks/bml/internal/bml_internal.cpp b/controller/src/beerocks/bml/internal/bml_internal.cpp
+index 9ddae80d3..414816e33 100644
+--- a/controller/src/beerocks/bml/internal/bml_internal.cpp
++++ b/controller/src/beerocks/bml/internal/bml_internal.cpp
+@@ -4436,11 +4436,10 @@ bool bml_internal::wake_up(uint8_t action_opcode, int value)
+ }
+ 
+ int bml_internal::send_11k_beacon_query(const sMacAddr &sta_mac, uint8_t channel,
+-                                        uint8_t op_class, uint16_t duration, const sMacAddr &bssid)
++                                        uint8_t op_class, const sMacAddr &bssid)
+ {
+     LOG(DEBUG) << "send_11k_beacon_query for STA: " << sta_mac << ", channel=" << int(channel)
+-               << ", op_class=" << int(op_class) << ", duration=" << duration
+-               << ", bssid=" << bssid;
++               << ", op_class=" << int(op_class) << ", bssid=" << bssid;
+ 
+     // Command supported only on local master
+     if (!is_local_master()) {
+@@ -4477,8 +4476,7 @@ int bml_internal::send_11k_beacon_query(const sMacAddr &sta_mac, uint8_t channel
+     LOG(DEBUG) << "11K_QUERY_TX_CONTROLLER: Transmitting 11k beacon query - "
+                << "STA_MAC=" << sta_mac 
+                << ", CHANNEL=" << int(channel)
+-               << ", OP_CLASS=" << int(op_class)
+-               << ", DURATION=" << duration;
++               << ", OP_CLASS=" << int(op_class);
+ 
+     // Empty SSID (wildcard)
+     if (!request->alloc_ssid(0)) {
+diff --git a/controller/src/beerocks/bml/internal/bml_internal.h b/controller/src/beerocks/bml/internal/bml_internal.h
+index e8f9aa5e9..18b2286a7 100644
+--- a/controller/src/beerocks/bml/internal/bml_internal.h
++++ b/controller/src/beerocks/bml/internal/bml_internal.h
+@@ -248,7 +248,7 @@ public:
+     * @return BML_RET_OK on success.
+     */
+     int send_11k_beacon_query(const sMacAddr &sta_mac, uint8_t channel, uint8_t op_class,
+-                              uint16_t duration, const sMacAddr &bssid);
++                              const sMacAddr &bssid);
+ 
+     /**
+     * @brief Send Client Association Control (block/unblock clients) for a given BSSID.
+diff --git a/controller/src/beerocks/cli/beerocks_cli_bml.cpp b/controller/src/beerocks/cli/beerocks_cli_bml.cpp
+index a9e9e8060..cb625c437 100644
+--- a/controller/src/beerocks/cli/beerocks_cli_bml.cpp
++++ b/controller/src/beerocks/cli/beerocks_cli_bml.cpp
+@@ -645,10 +645,10 @@ void cli_bml::setFunctionsMapAndArray()
+                        "Prints unassoc STA link metric query result for given sta",
+                        static_cast<pFunction>(&cli_bml::get_unassoc_sta_rcpi_result_caller), 1, 1,
+                        STRING_ARG);
+-    insertCommandToMap("bml_11k_query_trigger", "<sta_mac> <channel> <op_class> <duration> <bssid>",
++    insertCommandToMap("bml_11k_query_trigger", "<sta_mac> <channel> <op_class> <bssid>",
+                        "Trigger 11k beacon metrics query for associated STA. Use ff:ff:ff:ff:ff:ff for broadcast to all agents",
+-                       static_cast<pFunction>(&cli_bml::bml_11k_query_trigger_caller), 5, 5,
+-                       STRING_ARG, INT_ARG, INT_ARG, INT_ARG, STRING_ARG);
++                       static_cast<pFunction>(&cli_bml::bml_11k_query_trigger_caller), 4, 4,
++                       STRING_ARG, INT_ARG, INT_ARG, STRING_ARG);
+     insertCommandToMap("bml_trigger_client_assoc_control",
+                        "<bssid> <association_control> <time_period_sec> <sta_count> <sta_mac_1> [<sta_mac_2> ...]",
+                        "Trigger Client Association Control Request\n"
+@@ -2930,10 +2930,10 @@ int cli_bml::trigger_client_assoc_control(const std::string &bssid,
+  */
+ int cli_bml::bml_11k_query_trigger_caller(int numOfArgs)
+ {
+-    if (numOfArgs == 5) {
++    if (numOfArgs == 4) {
+         return trigger_11k_beacon_query(args.stringArgs[0], uint8_t(args.intArgs[1]),
+-                                       uint8_t(args.intArgs[2]), uint16_t(args.intArgs[3]),
+-                                       args.stringArgs[4]);
++                                       uint8_t(args.intArgs[2]),
++                                       args.stringArgs[3]);
+     }
+     return -1;
+ }
+@@ -2950,13 +2950,13 @@ int cli_bml::bml_11k_query_trigger_caller(int numOfArgs)
+  * @return 0 on success.
+  */
+ int cli_bml::trigger_11k_beacon_query(const std::string &sta_mac, uint8_t channel,
+-                                     uint8_t op_class, uint16_t duration, const std::string &bssid)
++                                     uint8_t op_class, const std::string &bssid)
+ {
+     std::cout << __func__ << ", sta_mac=" << sta_mac << ", channel=" << int(channel)
+-              << ", op_class=" << int(op_class) << ", duration=" << duration
++              << ", op_class=" << int(op_class)
+               << ", bssid=" << bssid << std::endl;
+ 
+-    int ret = bml_11k_query_trigger(ctx, sta_mac.c_str(), channel, op_class, duration, bssid.c_str());
++    int ret = bml_11k_query_trigger(ctx, sta_mac.c_str(), channel, op_class, bssid.c_str());
+ 
+     printBmlReturnVals("bml_11k_query_trigger", ret);
+ 
+diff --git a/controller/src/beerocks/cli/beerocks_cli_bml.h b/controller/src/beerocks/cli/beerocks_cli_bml.h
+index 9769bd122..c9ddc71e0 100644
+--- a/controller/src/beerocks/cli/beerocks_cli_bml.h
++++ b/controller/src/beerocks/cli/beerocks_cli_bml.h
+@@ -252,7 +252,7 @@ private:
+     int send_unassoc_sta_rcpi_query(const std::string &sta_mac, int16_t opclass, int16_t channel);
+     int get_unassoc_sta_rcpi_query_result(const std::string &sta_mac);
+     int trigger_11k_beacon_query(const std::string &sta_mac, uint8_t channel, uint8_t op_class,
+-                                 uint16_t duration, const std::string &bssid);
++                                 const std::string &bssid);
+     template <typename T> const std::string string_from_int_array(T *arr, size_t arr_max_size);
+     // Variable
+     std::string beerocks_conf_path;
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 6d06557b6..b01ac710b 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -420,8 +420,12 @@ bool db::dm_add_radio_element(Agent::sRadio &radio, Agent &agent)
+         return true;
+     }
+ 
++    // Track whether this is a new DM instance or a re-onboard of an existing radio.
++    // RadioAdded must only fire once per radio object lifetime, not on every M1 re-send.
++    const bool is_new_dm_instance = radio.dm_path.empty();
++
+     // Radio path is empty, so this is newly introduced object, add to datamodel.
+-    if (radio.dm_path.empty()) {
++    if (is_new_dm_instance) {
+ 
+         const std::string path_to_radio = agent.dm_path + ".Radio";
+ 
+@@ -435,9 +439,14 @@ bool db::dm_add_radio_element(Agent::sRadio &radio, Agent &agent)
+ 
+     bool ret_val = m_ambiorix_datamodel->set(radio.dm_path, "ID", radio.radio_uid);
+ 
+-    // Trigger vendor-specific event for radio addition
+-    if (ret_val) {
++    // Trigger vendor-specific event only when a new DM instance was created.
++    // Suppressing RadioAdded on re-onboard (M1 re-send) prevents a continuous
++    // event storm when the agent's AP_AUTOCONFIGURATION FSM loops due to timer overruns.
++    if (ret_val && is_new_dm_instance) {
+         dm_trigger_radio_added_event(radio.radio_uid, radio.dm_path, agent.al_mac);
++    } else if (!is_new_dm_instance) {
++        LOG(DEBUG) << "dm_add_radio_element: skipping RadioAdded for existing radio "
++                   << radio.radio_uid << " (re-onboard)";
+     }
+ 
+     return ret_val;
+@@ -9425,10 +9434,11 @@ bool db::dm_set_device_ap_capabilities(const Agent &agent)
+                      << agent.al_mac;
+     }
+ 
+-    /* Trigger vendor events for Profile2 AP Capability after DM writes */
+-    if (ret_val) {
+-        dm_trigger_profile2_ap_capability_event(agent.al_mac, agent.dm_path);
+-    }
++    // Always trigger Profile2ApCapability vendor event regardless of whether
++    // R2APCapabilities DM writes succeeded. The DM sub-object may not be instantiated
++    // yet on the first M1 (race on ext-agent onboarding), but consumers still need
++    // the notification so they can read the data they need.
++    dm_trigger_profile2_ap_capability_event(agent.al_mac, agent.dm_path);
+ 
+     return ret_val;
+ }
+diff --git a/controller/src/beerocks/master/son_management.cpp b/controller/src/beerocks/master/son_management.cpp
+index 19f040c4d..8022eebcd 100644
+--- a/controller/src/beerocks/master/son_management.cpp
++++ b/controller/src/beerocks/master/son_management.cpp
+@@ -18,6 +18,7 @@
+ #include "tasks/dynamic_channel_selection_task.h"
+ #include "tasks/ire_network_optimization_task.h"
+ #include "tasks/load_balancer_task.h"
++#include "tasks/client_steering_task.h"
+ #include "tasks/optimal_path_task.h"
+ #include "tasks/statistics_polling_task.h"
+ 
+@@ -656,9 +657,28 @@ void son_management::handle_cli_message(int sd, std::shared_ptr<beerocks_header>
+         //extend ACTION_CLI_BACKHAUL_ROAM_REQUEST to have imminent variable
+         uint8_t disassoc_imminent = uint8_t(1);
+ 
+-        LOG(DEBUG) << "CLI steer IRE request for " << slave_mac << " to hostap: " << hostap_mac;
+-        son_actions::steer_sta(database, cmdu_tx, tasks, slave_mac, hostap_mac, triggered_by,
+-                               std::string(), disassoc_imminent);
++        // Query actual BTM support from the STA's assoc frame capabilities.
++        // This ensures effective_acl and steering type are computed correctly
++        // inside client_steering_task (BTM Request vs legacy disassoc/deauth).
++        // Fallback to prplMesh internal 11v DB if assoc-frame caps are unavailable.
++        bool is_btm_supported = true; // safe default
++        auto sta_cap          = database.get_sta_current_capabilities(slave_mac);
++        if (sta_cap) {
++            is_btm_supported = (sta_cap->btm_supported != 0);
++        } else {
++            auto station = database.get_station(tlvf::mac_from_string(slave_mac));
++            if (station) {
++                is_btm_supported = database.get_node_11v_capability(*station);
++            }
++        }
++        LOG(DEBUG) << "CLI steer IRE request for " << slave_mac << " to hostap: " << hostap_mac
++                   << " is_btm_supported=" << is_btm_supported;
++        auto new_task = std::make_shared<client_steering_task>(
++            database, cmdu_tx, tasks, slave_mac, hostap_mac, triggered_by,
++            std::string() /* steering_type */, bool(disassoc_imminent),
++            static_cast<int>(database.config.steering_disassoc_timer_msec.count()),
++            false /* steer_restricted */, true /* acl_allowed */, is_btm_supported);
++        tasks.add_task(new_task);
+         break;
+     }
+     case beerocks_message::ACTION_CLI_CLIENT_BSS_STEER_REQUEST: {
+-- 
+2.34.1
+
