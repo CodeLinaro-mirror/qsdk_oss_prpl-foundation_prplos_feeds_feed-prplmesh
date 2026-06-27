@@ -1,0 +1,306 @@
+From 8ac898844766bb4202cf2ae4c9a5e7fc3ac280be Mon Sep 17 00:00:00 2001
+From: Nirmal Raj S <nirm@qti.qualcomm.com>
+Date: Wed, 1 Jul 2026 22:03:40 +0530
+Subject: [PATCH] agent/bwl: fix WDS trunk plumbing for MLO backhaul clients
+
+- nl80211: detect MLO clients via hostapd STA command on AP-STA-CONNECTED,
+  override BSSID with AP MLD MAC, populate affiliated links and MLO mode flags;
+  handle WDS-STA-INTERFACE-ADDED event and push STA_WDS_Iface_Ready notification
+- son_slave_thread: store MLO clients in radio->associated_clients (was missing,
+  causing WDS trunk to never be plumbed); cache WDS iface notifications that
+  arrive before AP-STA-CONNECTED and dispatch them after MLD entry is committed;
+  use base interface name (strip _link suffix) for iface-up check on nl80211
+- traffic_separation_task: match BSS by apmld_mac in addition to mac so MLO
+  clients stored with AP MLD MAC as bssid are found by fill_wds_trunk_from_db
+
+Signed-off-by: Nirmal Raj S <nirm@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/son_slave_thread.cpp |  63 ++++++-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 160 ++++++++++++++++++
+ 2 files changed, 221 insertions(+), 2 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 6a2f7ed2e..806aa6477 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -2814,15 +2814,57 @@ bool slave_thread::process_client_association(
+             db->associated_sta_mlds[client_mac] = std::move(mld_info);
+             LOG(INFO) << "MLO client stored successfully (total in map: "
+                       << db->associated_sta_mlds.size() << ")";
+-            return true;
+         } else {
+             LOG(WARNING) << "MLO client has no affiliated STAs, storing anyway STA MLD="
+                          << client_mac << ", AP MLD=" << bssid;
+             db->associated_sta_mlds[client_mac] = std::move(mld_info);
+             LOG(INFO) << "MLO client stored successfully (total in map: "
+                       << db->associated_sta_mlds.size() << ")";
+-            return true;
+         }
++        // Parse link_mac from the notification message
++        auto &link_mac = notification_in->link_mac();
++
++        auto radio = db->get_radio_by_mac(bssid, AgentDB::eMacType::BSSID);
++        if (!radio) {
++            LOG(DEBUG) << "Radio containing bssid " << bssid << " not found";
++            return false;
++        }
++
++        radio->associated_clients.emplace(
++            client_mac, AgentDB::sRadio::sClient{bssid, notification_in->association_frame_length(),
++                                                 notification_in->association_frame(),
++                                                 notification_in->capabilities().btm_supported,
++                                                 link_mac,
++                                                 static_cast<bool>(notification_in->is_mlo())});
++
++        LOG(DEBUG) << "Client association stored (MLO): client_mac=" << client_mac
++                   << " bssid=" << bssid << " link_mac=" << link_mac
++                   << " is_mlo=" << static_cast<bool>(notification_in->is_mlo())
++                   << " radio=" << radio->front.iface_name;
++
++        // Release any cached WDS iface notification for this MLO client.
++        // The WDS-STA-INTERFACE-ADDED event can arrive before AP-STA-CONNECTED for MLO
++        // clients; the notification is cached and must be dispatched here after the
++        // MLD entry is stored so TrafficSeparationTask can plumb the VLAN trunk.
++        auto pending_wds_it = m_pending_wds_iface_notifications.find(client_mac);
++        if (pending_wds_it != m_pending_wds_iface_notifications.end()) {
++            if (pending_wds_it->second.bssid == bssid) {
++                LOG(DEBUG) << "Releasing cached WDS iface notification for MLO client "
++                           << client_mac << " iface=" << pending_wds_it->second.iface_name;
++                // Use set_client_wds_iface so that client.wds_iface_name is set in the DB
++                // before TS_NEW_WDS_IFACE is fired. Without this, fill_wds_trunk_from_db
++                // cannot match the iface to any client and the WDS trunk is never plumbed.
++                set_client_wds_iface(*radio, client_mac, bssid,
++                                     pending_wds_it->second.iface_name);
++            } else {
++                LOG(DEBUG) << "Dropping cached WDS iface notification for MLO client "
++                           << client_mac << ", cached_bssid=" << pending_wds_it->second.bssid
++                           << ", association_bssid=" << bssid;
++            }
++            m_pending_wds_iface_notifications.erase(pending_wds_it);
++        }
++
++        return true;
+     } else {
+         // Handle legacy (non-MLO) client
+ 
+@@ -2885,6 +2927,11 @@ bool slave_thread::process_client_association(
+                                                  link_mac,
+                                                  static_cast<bool>(notification_in->is_mlo())});
+ 
++        LOG(DEBUG) << "Client association stored (legacy): client_mac=" << client_mac
++                   << " bssid=" << bssid << " link_mac=" << link_mac
++                   << " is_mlo=" << static_cast<bool>(notification_in->is_mlo())
++                   << " radio=" << radio->front.iface_name;
++
+         auto pending_wds_it = m_pending_wds_iface_notifications.find(client_mac);
+         if (pending_wds_it != m_pending_wds_iface_notifications.end()) {
+             if (pending_wds_it->second.bssid == bssid) {
+@@ -7284,8 +7331,20 @@ bool slave_thread::update_vaps_info(const std::string &iface,
+         const bool disallow_profile2_was = bss.backhaul_bss_disallow_profile2_agent_association;
+         const auto previous_bssid        = bss.mac;
+         const std::string previous_iface_name = bss.iface_name;
++#ifdef USE_PRPLMESH_NLHAL
++        std::string base_interface = "";
++        size_t pos = iface.find("_link");
++        if (pos != std::string::npos) {
++            base_interface = iface.substr(0, pos);
++        } else {
++            base_interface = iface;
++        }
++        const bool is_enabled = has_bssid && !iface_name.empty() &&
++                                network_utils::linux_iface_is_up_and_running(base_interface);
++#else
+         const bool is_enabled                 = has_bssid && !iface_name.empty() &&
+                                 network_utils::linux_iface_is_up_and_running(iface_name);
++#endif
+ 
+         const auto clear_previous_fh_iface = [&]() {
+             if (!was_enabled || !was_pure_fh_bss || previous_iface_name.empty()) {
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 948daf400..fa5310889 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -144,6 +144,8 @@ static ap_wlan_hal::Event nl80211_to_bwl_event(const std::string &opcode)
+         return ap_wlan_hal::Event::WPS_Event_Cancel;
+     } else if (opcode == "AP-STA-POSSIBLE-PSK-MISMATCH") {
+         return ap_wlan_hal::Event::AP_Sta_Possible_Psk_Mismatch;
++    } else if (opcode == "WDS-STA-INTERFACE-ADDED") {
++        return ap_wlan_hal::Event::STA_WDS_Iface_Ready;
+     }
+ 
+     return ap_wlan_hal::Event::Invalid;
+@@ -3714,6 +3716,119 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+             son::wireless_utils::print_station_capabilities(msg->params.capabilities);
+         }
+ 
++        // --- MLO Detection via hostapd STA command ---
++        // Query hostapd for station info to detect MLO clients.
++        // The STA command response includes:
++        //   MLO=yes/no           - MLO indicator
++        //   peer_addr[N]=<mac>   - affiliated STA link MACs (N = link ID)
++        //   EMLSR_support=yes/no - EMLSR capability
++        //   EMLMR_support=yes/no - EMLMR capability
++        //   link_type[N]=STR/NSTR - link type per link ID
++        {
++            bool is_mlo = false;
++            std::vector<sAffiliatedStaInfo> affiliated_links;
++            uint8_t mlo_modes = 0;
++
++            parsed_obj_map_t sta_reply;
++            if (wpa_ctrl_send_msg("STA " + src_mac, sta_reply, interface)) {
++                // Check MLO=yes field - present for MLO clients, MLO=no for legacy
++                auto mlo_it = sta_reply.find("MLO");
++                if (mlo_it != sta_reply.end() && mlo_it->second == "yes") {
++                    is_mlo = true;
++                }
++
++                if (is_mlo) {
++                    // For MLO clients, override BSSID with AP MLD MAC
++                    const std::string &ap_mld_mac =
++                        m_radio_info.available_vaps[vap_id].ap_mld_mac;
++                    if (!ap_mld_mac.empty()) {
++                        msg->params.bssid = tlvf::mac_from_string(ap_mld_mac);
++                    }
++
++                    // Collect affiliated link MACs from peer_addr[N]
++                    // peer_addr[N] is the STA's link-specific MAC for link ID N
++                    int8_t cur_mld_id = m_radio_info.available_vaps[vap_id].mld_id;
++                    for (int i = 0;
++                         i < static_cast<int>(beerocks::message::DEV_MAX_RADIOS); i++) {
++                        std::string peer_key = "peer_addr[" + std::to_string(i) + "]";
++                        auto peer_it         = sta_reply.find(peer_key);
++                        if (peer_it == sta_reply.end() || peer_it->second.empty()) {
++                            break;
++                        }
++
++                        sAffiliatedStaInfo aff_info{};
++                        aff_info.affiliated_sta_mac = tlvf::mac_from_string(peer_it->second);
++
++                        // Find AP BSSID for link ID i from available_vaps
++                        // (VAP with same mld_id and link_id == i)
++                        aff_info.bssid =
++                            tlvf::mac_from_string(m_radio_info.available_vaps[vap_id].mac);
++                        for (const auto &vap_kv : m_radio_info.available_vaps) {
++                            if (vap_kv.second.mld_id == cur_mld_id &&
++                                vap_kv.second.link_id == static_cast<int8_t>(i)) {
++                                aff_info.bssid = tlvf::mac_from_string(vap_kv.second.mac);
++                                break;
++                            }
++                        }
++
++                        affiliated_links.push_back(aff_info);
++                    }
++
++                    // Determine MLO mode from EMLSR/EMLMR support flags
++                    auto emlsr_it = sta_reply.find("EMLSR_support");
++                    if (emlsr_it != sta_reply.end() && emlsr_it->second == "yes") {
++                        mlo_modes |= beerocks::message::MLO_MODE_EMLSR;
++                    }
++                    auto emlmr_it = sta_reply.find("EMLMR_support");
++                    if (emlmr_it != sta_reply.end() && emlmr_it->second == "yes") {
++                        mlo_modes |= beerocks::message::MLO_MODE_EMLMR;
++                    }
++                    // Check link_type[N] for STR/NSTR across all links
++                    for (int i = 0;
++                         i < static_cast<int>(beerocks::message::DEV_MAX_RADIOS); i++) {
++                        std::string lt_key = "link_type[" + std::to_string(i) + "]";
++                        auto lt_it         = sta_reply.find(lt_key);
++                        if (lt_it == sta_reply.end()) {
++                            continue;
++                        }
++                        if (lt_it->second == "STR") {
++                            mlo_modes |= beerocks::message::MLO_MODE_STR;
++                        } else if (lt_it->second == "NSTR") {
++                            mlo_modes |= beerocks::message::MLO_MODE_NSTR;
++                        }
++                    }
++                    // Default to STR if no mode was determined
++                    if (mlo_modes == 0) {
++                        mlo_modes = beerocks::message::MLO_MODE_STR;
++                    }
++
++                    LOG(DEBUG) << "MLO client detected: mac=" << src_mac
++                               << " ap_mld_mac="
++                               << m_radio_info.available_vaps[vap_id].ap_mld_mac
++                               << " num_affiliated=" << affiliated_links.size()
++                               << " mlo_modes=0x" << std::hex << int(mlo_modes) << std::dec;
++                }
++            } else {
++                LOG(DEBUG) << "STA command failed for " << src_mac << " on " << interface
++                           << " - MLO detection skipped";
++            }
++
++            // Fill MLO fields in the notification message
++            msg->params.is_mlo = is_mlo ? 1 : 0;
++            msg->params.num_affiliated_sta = static_cast<uint8_t>(std::min(
++                affiliated_links.size(),
++                static_cast<size_t>(beerocks::message::DEV_MAX_RADIOS)));
++            msg->params.mlo_modes = mlo_modes;
++            for (size_t i = 0; i < msg->params.num_affiliated_sta; i++) {
++                msg->params.affiliated_sta[i] = affiliated_links[i];
++            }
++        }
++
++        LOG(DEBUG) << "Pushing STA_Connected event for MAC: " << msg->params.mac
++                   << ", BSSID: " << msg->params.bssid
++                   << ", is_mlo: " << int(msg->params.is_mlo)
++                   << ", num_affiliated: " << int(msg->params.num_affiliated_sta);
++
+         // Add the message to the queue
+         event_queue_push(Event::STA_Connected, msg_buff);
+ 
+@@ -4040,6 +4155,51 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+         break;
+     }
+ 
++    // WDS STA interface created by hostapd for a newly associated backhaul STA
++    case Event::STA_WDS_Iface_Ready: {
++        // Event format: WDS-STA-INTERFACE-ADDED ifname=<iface> sta_addr=<mac>
++        const std::string wds_iface = parsed_obj["ifname"];
++        const std::string sta_mac   = parsed_obj["sta_addr"];
++
++        if (wds_iface.empty() || sta_mac.empty()) {
++            LOG(ERROR) << "WDS-STA-INTERFACE-ADDED: missing ifname or sta_addr";
++            break;
++        }
++
++        // Resolve the backhaul BSS bssid and vap_id from available_vaps.
++        sMacAddr bssid  = beerocks::net::network_utils::ZERO_MAC;
++        int8_t bh_vap_id = beerocks::IFACE_ID_INVALID;
++        for (const auto &vap_kv : m_radio_info.available_vaps) {
++            if (vap_kv.second.backhaul) {
++                bssid     = tlvf::mac_from_string(vap_kv.second.mac);
++                bh_vap_id = vap_kv.first;
++                break;
++            }
++        }
++
++        if (bh_vap_id == beerocks::IFACE_ID_INVALID) {
++            LOG(WARNING) << "WDS-STA-INTERFACE-ADDED: no backhaul VAP found on this radio";
++            break;
++        }
++
++        auto msg_buff = ALLOC_SMART_BUFFER(sizeof(sACTION_APMANAGER_WDS_IFACE_NOTIFICATION));
++        auto msg = reinterpret_cast<sACTION_APMANAGER_WDS_IFACE_NOTIFICATION *>(msg_buff.get());
++        LOG_IF(!msg, FATAL) << "Memory allocation failed!";
++        memset(msg_buff.get(), 0, sizeof(sACTION_APMANAGER_WDS_IFACE_NOTIFICATION));
++
++        msg->params.mac    = tlvf::mac_from_string(sta_mac);
++        msg->params.bssid  = bssid;
++        msg->params.vap_id = bh_vap_id;
++        strlcpy(msg->params.wds_iface_name, wds_iface.c_str(),
++                sizeof(msg->params.wds_iface_name));
++
++        LOG(INFO) << "WDS-STA-INTERFACE-ADDED: sta=" << sta_mac
++                  << " bssid=" << bssid << " wds_iface=" << wds_iface;
++
++        event_queue_push(Event::STA_WDS_Iface_Ready, msg_buff);
++        break;
++    }
++
+     // Gracefully ignore unhandled events
+     // TODO: Probably should be changed to an error once WAV will stop
+     //       sending empty or irrelevant events...
+-- 
+2.34.1
+

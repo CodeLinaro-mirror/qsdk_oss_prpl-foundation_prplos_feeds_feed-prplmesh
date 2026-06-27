@@ -1,8 +1,8 @@
 From 5609230be4b2e06ba632312d5e675fb54cf62f4f Mon Sep 17 00:00:00 2001
 From: Sureshkumar <suresure@qti.qualcomm.com>
-Date: Tue, 2 Jun 2026 18:59:28 +0530
+Date: Thu, 25 Jun 2026 14:25:25 +0530
 Subject: [PATCH] [prplmesh] steering: fix MLO join/leave loop and BTM steering
- for MLO clients
+  for MLO clients
 
 - Introduce MLO-aware handling of disconnect events: track links
   individually and only trigger LEAVE when all affiliated links are
@@ -26,17 +26,17 @@ Subject: [PATCH] [prplmesh] steering: fix MLO join/leave loop and BTM steering
 Signed-off-by: Sureshkumar <suresure@qti.qualcomm.com>
 ---
  .../ap_manager/ap_manager.cpp                 |   5 +
- agent/src/beerocks/slave/son_slave_thread.cpp | 213 +++++++++++++-----
+ agent/src/beerocks/slave/son_slave_thread.cpp | 227 ++++++++++++------
  .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  30 ++-
  .../src/beerocks/master/son_actions.cpp       |  34 ++-
  .../master/tasks/client_steering_task.cpp     |  27 ++-
- 5 files changed, 231 insertions(+), 78 deletions(-)
+ 5 files changed, 231 insertions(+), 92 deletions(-)
 
 diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
-index 8a60dd735..266f5ebbe 100644
+index aedeee965..a08717afc 100644
 --- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
 +++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
-@@ -1683,12 +1683,17 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+@@ -1733,12 +1733,17 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
                         << " on BSSID " << tlvf::mac_to_string(request->bssid())
                         << ", disassoc=" << (sta_info.disassoc ? "yes" : "no");
  
@@ -55,15 +55,20 @@ index 8a60dd735..266f5ebbe 100644
              if (!ap_wlan_hal->sta_deny(sta_info.mac, request->bssid())) {
                  LOG(WARNING) << "Failed to deny STA " << tlvf::mac_to_string(sta_info.mac);
 diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
-index 16d5a6504..c73840f83 100644
+index bd5f1b27b..d95e873bf 100644
 --- a/agent/src/beerocks/slave/son_slave_thread.cpp
 +++ b/agent/src/beerocks/slave/son_slave_thread.cpp
-@@ -3243,8 +3243,101 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
-             }
+@@ -3496,12 +3496,106 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+             return false;
          }
  
++        auto db          = AgentDB::get();
+         auto &client_mac = notification_in->params().mac;
+         auto &bssid      = notification_in->params().bssid;
+         LOG(INFO) << "client disconnected sta_mac=" << client_mac << " from bssid=" << bssid;
+ 
 -        // If exists, remove client association information for disconnected client.
--        db->erase_client(client_mac);
+-        auto db    = AgentDB::get();
 +        // Fix: MLD lookup MUST happen BEFORE erase_client().
 +        // erase_client(mld_mac) also removes from associated_sta_mlds, so the
 +        // lookup would fail if called after erase_client.
@@ -153,16 +158,36 @@ index 16d5a6504..c73840f83 100644
 +                break;
 +            }
 +        }
-+
 +        // For non-MLD clients: call erase_client to remove from radio->associated_clients.
 +        // For MLD clients: do NOT call erase_client(mld_mac) — it removes associated_sta_mlds.
 +        if (!is_mld_client) {
 +            db->erase_client(client_mac);
 +        }
++
+         auto radio = db->get_radio_by_mac(bssid, AgentDB::eMacType::BSSID);
+         if (radio) {
+             auto client_it = radio->associated_clients.find(client_mac);
+@@ -3522,95 +3616,60 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+             m_pending_wds_iface_notifications.erase(pending_wds_it);
+         }
  
-         if (reconcile_ts_sta_ifaces) {
-             LOG(DEBUG) << "Trigger traffic separation WDS clear on backhaul-BSS disconnect";
-@@ -3258,74 +3351,54 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+-        // Find if STA is MLD, if so update BSSID as AP MLD MAC
+-        auto mld_it = db->associated_sta_mlds.find(client_mac);
+-        if (mld_it != db->associated_sta_mlds.end()) {
+-            LOG(DEBUG) << "Removing MLO client from associated_sta_mlds: STA MLD=" << client_mac
+-                       << ", AP MLD=" << mld_it->second.mld_config.ap_mld_mac;
+-
+-            bssid = mld_it->second.mld_config.ap_mld_mac;
+-
+-            db->erase_client(client_mac);
+-            mld_it = db->associated_sta_mlds.end();
+-        } else {
+-            db->erase_client(client_mac);
+-        }
+-
+         // notify master
+         if (!link_to_controller()) {
+             LOG(DEBUG) << "Controller is not connected";
              return true;
          }
  
@@ -225,8 +250,13 @@ index 16d5a6504..c73840f83 100644
 -        }
 -        client_association_event_tlv->client_mac() = tlv_disc_client_mac;
 -        client_association_event_tlv->bssid()      = tlv_disc_bssid;
++            client_association_event_tlv->client_mac() = tlv_disc_client_mac;
++            client_association_event_tlv->bssid()      = tlv_disc_bssid;
+ 
 -        client_association_event_tlv->association_event() =
 -            wfa_map::tlvClientAssociationEvent::CLIENT_HAS_LEFT_THE_BSS;
++            client_association_event_tlv->association_event() =
++                wfa_map::tlvClientAssociationEvent::CLIENT_HAS_LEFT_THE_BSS;
  
 -        if (!db->controller_info.prplmesh_controller) {
 -            LOG(DEBUG) << "non-prplMesh, not adding ClientAssociationEvent VS TLV";
@@ -234,21 +264,16 @@ index 16d5a6504..c73840f83 100644
 -            // Add vendor specific tlv
 -            auto vs_tlv =
 -                message_com::add_vs_tlv<beerocks_message::tlvVsClientAssociationEvent>(cmdu_tx);
-+            client_association_event_tlv->client_mac() = tlv_disc_client_mac;
-+            client_association_event_tlv->bssid()      = tlv_disc_bssid;
-+            client_association_event_tlv->association_event() =
-+                wfa_map::tlvClientAssociationEvent::CLIENT_HAS_LEFT_THE_BSS;
- 
--            if (!vs_tlv) {
--                LOG(ERROR) << "add_vs_tlv tlvVsClientAssociationEvent failed";
--                return false;
 +            if (!db->controller_info.prplmesh_controller) {
 +                LOG(DEBUG) << "non-prplMesh, not adding ClientAssociationEvent VS TLV";
 +            } else {
 +                // Add vendor specific tlv
 +                auto vs_tlv =
 +                    message_com::add_vs_tlv<beerocks_message::tlvVsClientAssociationEvent>(cmdu_tx);
-+
+ 
+-            if (!vs_tlv) {
+-                LOG(ERROR) << "add_vs_tlv tlvVsClientAssociationEvent failed";
+-                return false;
 +                if (!vs_tlv) {
 +                    LOG(ERROR) << "add_vs_tlv tlvVsClientAssociationEvent failed";
 +                    return false;
@@ -276,7 +301,7 @@ index 16d5a6504..c73840f83 100644
          // profile-2
  
          // build 1905.1 0x8022 Client Disassociation Stats
-@@ -3669,8 +3742,24 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+@@ -3938,8 +3997,24 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
              LOG(ERROR) << "addClass tlvClientAssociationEvent failed";
              return false;
          }
@@ -303,10 +328,10 @@ index 16d5a6504..c73840f83 100644
              wfa_map::tlvClientAssociationEvent::CLIENT_HAS_JOINED_THE_BSS;
          if (client_association_event_tlv->client_mac() != beerocks::net::network_utils::ZERO_MAC)
 diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
-index 90c8bcbd5..22d6c549e 100644
+index ef9ac51be..be421f01e 100644
 --- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
 +++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
-@@ -1496,13 +1496,13 @@ bool ap_wlan_hal_nl80211::sta_disassoc(int8_t vap_id, const std::string &mac, ui
+@@ -1486,13 +1486,13 @@ bool ap_wlan_hal_nl80211::sta_disassoc(int8_t vap_id, const std::string &mac, ui
      }
  
      std::string ifname = m_radio_info.available_vaps[vap_id].bss;
@@ -323,7 +348,7 @@ index 90c8bcbd5..22d6c549e 100644
          std::string target_interface = get_interface_for_link(ifname, link_id);
  
          LOG(DEBUG) << "Steering: sta_disassoc - sta_mac=" << mac
-@@ -1627,8 +1627,30 @@ bool ap_wlan_hal_nl80211::sta_bss_steer(const sBtmRequestParams &params)
+@@ -1617,8 +1617,30 @@ bool ap_wlan_hal_nl80211::sta_bss_steer(const sBtmRequestParams &params)
      // Target BSSID
      cmd += std::string() + " neighbor=" + tlvf::mac_to_string(params.bssid) + "," + std::to_string(NEIGHBOR_REPORT_BSSID_INFO_EASYMESH) + "," + std::to_string(params.oper_class) + "," + std::to_string(params.chan) + ",0," + NEIGHBOR_REPORT_SUBELEM_CANDIDATE_PREF_MAX_HEX;
  
@@ -356,10 +381,10 @@ index 90c8bcbd5..22d6c549e 100644
          return false;
      }
 diff --git a/controller/src/beerocks/master/son_actions.cpp b/controller/src/beerocks/master/son_actions.cpp
-index a44bc1d54..43f2d8e2e 100644
+index 438e02728..a33c93009 100644
 --- a/controller/src/beerocks/master/son_actions.cpp
 +++ b/controller/src/beerocks/master/son_actions.cpp
-@@ -72,8 +72,38 @@ void son_actions::handle_completed_connection(db &database, ieee1905_1::CmduMess
+@@ -73,8 +73,38 @@ void son_actions::handle_completed_connection(db &database, ieee1905_1::CmduMess
              (!new_hostap_mac.empty()) &&
              (new_hostap_mac != network_utils::ZERO_MAC_STRING) &&
              (previous_hostap_mac != new_hostap_mac)) {
