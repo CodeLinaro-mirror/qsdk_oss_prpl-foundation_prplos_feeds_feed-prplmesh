@@ -1,0 +1,130 @@
+From: Gnanaprakash Elumalai <gelumal@qti.qualcomm.com>
+Date: Fri, 27 Jun 2026 00:00:00 +0530
+Subject: [PATCH] controller: skip unassoc query to serving agent; set link metrics interval to 3s
+
+UnassociatedStation::m_agents may contain a stale entry for the agent
+the STA is currently associated to.  send_unassociated_sta_link_metrics_
+query_message() iterates m_agents unconditionally, causing a
+tlvUnassociatedStaLinkMetricsQuery to be sent to the serving agent every
+cycle.  The serving agent correctly rejects it with
+STA_ASSOCIATED_WITH_A_BSS_OPERATED_BY_THE_AGENT.
+
+Fix: before adding a STA+agent pair to global_map, check whether the
+STA is currently associated to any BSS on that agent via
+database.get_radio(agent_al_mac, serving_radio_uid) and skip if so.
+The stale agent entry is collected and pruned from m_agents after the
+inner loop (post-loop to avoid iterator invalidation), so subsequent
+query cycles pay no lookup cost for it.
+
+A remove_agent() method is added to UnassociatedStation to support the
+pruning.
+
+Also reduce the default link_metrics_request_interval_sec from 60s to 3s
+so the controller polls associated STA link metrics at a rate suitable
+for active steering decisions.
+
+Signed-off-by: Gnanaprakash Elumalai <gelumal@qti.qualcomm.com>
+---
+ controller/src/beerocks/master/controller.cpp       | 35 ++++++++++++++++++++++++++
+ controller/src/beerocks/master/db/unassociatedStation.h | 11 ++++++++
+ framework/platform/bpl/db/uci/prplmesh_db.in        |  2 +-
+ framework/platform/bpl/include/bpl/bpl_cfg.h        |  2 +-
+ 4 files changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index d26f53405..6b6215cc0 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -6732,8 +6732,32 @@ bool Controller::send_unassociated_sta_link_metrics_query_message(
+     auto un_stations_db = database.get_unassociated_stations();
+     if (un_stations_db.size()) {
+         for (auto &station : un_stations_db) {
++            /* Stale m_agents entries (agents where the STA is now associated) collected
++             * here and pruned after the inner loop to avoid iterator invalidation. */
++            std::vector<sMacAddr> stale_agents;
++
+             for (const auto &agent : station.second->get_agents()) {
+
++                /* Skip agents where this STA is currently associated.
++                 * m_agents may contain stale entries from before the STA
++                 * associated; sending an unassoc query there causes the
++                 * agent to reject it with STA_ASSOCIATED_WITH_A_BSS_OPERATED_BY_THE_AGENT.
++                 * Record the entry as stale so it is pruned from m_agents below. */
++                {
++                    auto sta_db = database.get_station(station.first);
++                    if (sta_db && sta_db->get_bss()) {
++                        sMacAddr serving_radio = sta_db->get_bss()->radio.radio_uid;
++                        if (database.get_radio(agent.first, serving_radio)) {
++                            LOG(DEBUG) << "send_unassoc_query: skipping agent "
++                                       << tlvf::mac_to_string(agent.first)
++                                       << " — STA " << tlvf::mac_to_string(station.first)
++                                       << " is currently associated there (stale m_agents entry)";
++                            stale_agents.push_back(agent.first);
++                            continue;
++                        }
++                    }
++                }
++
+                 if (global_map.find(agent.first) == global_map.end()) {
+                     global_map.insert(
+                         std::make_pair(agent.first, map_operating_classes_per_agent()));
+@@ -6758,6 +6782,11 @@ bool Controller::send_unassociated_sta_link_metrics_query_message(
+                 auto &list_stations = stations_per_channel[channel];
+                 list_stations.emplace_back(station.first);
+             }
++
++            /* Prune stale m_agents entries now that the inner loop is done. */
++            for (const auto &stale : stale_agents) {
++                station.second->remove_agent(stale);
++            }
+         }
+     } else { // this is a command to remove all monitored stations
+         for (const auto &agent : database.get_all_connected_agents()) {
+diff --git a/controller/src/beerocks/master/db/unassociatedStation.h b/controller/src/beerocks/master/db/unassociatedStation.h
+index d566037ca..9a37088e4 100644
+--- a/controller/src/beerocks/master/db/unassociatedStation.h
++++ b/controller/src/beerocks/master/db/unassociatedStation.h
+@@ -106,6 +106,17 @@ public:
+         }
+     }
+
++    /**
++     * @brief remove agent from monitoring this station
++     *
++     * @param agent_mac_addr agent mac_addr to remove
++     * @return true if the agent was found and removed, false otherwise.
++     */
++    bool remove_agent(const sMacAddr &agent_mac_addr)
++    {
++        return m_agents.erase(agent_mac_addr) > 0;
++    }
++
+     /**
+      * @brief get agents monitoring this specific station
+      *
+diff --git a/framework/platform/bpl/db/uci/prplmesh_db.in b/framework/platform/bpl/db/uci/prplmesh_db.in
+index d99510952..46cd61758 100644
+--- a/framework/platform/bpl/db/uci/prplmesh_db.in
++++ b/framework/platform/bpl/db/uci/prplmesh_db.in
+@@ -25,7 +25,7 @@ config prplmesh 'config'
+     option dfs_reentry '1'
+     option roaming_hysteresis_percent_bonus '10'
+     option steering_disassoc_timer_msec '200'
+-    option link_metrics_request_interval_sec '60'
++    option link_metrics_request_interval_sec '3'
+     option clients_measurement_mode '1'
+     option radio_stats_enable '1'
+     option unsuccessful_assoc_report_policy '1'
+diff --git a/framework/platform/bpl/include/bpl/bpl_cfg.h b/framework/platform/bpl/include/bpl/bpl_cfg.h
+index a63d8f6f7..aff0fe87e 100644
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -177,7 +177,7 @@ constexpr int DEFAULT_BEST_CHANNEL_RANKING_TH = 0;
+ constexpr int DEFAULT_MULTI_AP_PROFILE = 2;
+
+ // Link metrics tasks send request with this interval.
+-constexpr std::chrono::seconds DEFAULT_LINK_METRICS_REQUEST_INTERVAL_VALUE_SEC{60};
++constexpr std::chrono::seconds DEFAULT_LINK_METRICS_REQUEST_INTERVAL_VALUE_SEC{3};
+
+ // Default Linux Lan interface names. It needs to be space separated.
+ constexpr char DEFAULT_LINUX_LAN_INTERFACE_NAMES[] =
