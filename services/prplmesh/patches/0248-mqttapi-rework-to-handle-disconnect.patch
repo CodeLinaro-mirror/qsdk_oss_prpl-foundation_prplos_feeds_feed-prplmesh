@@ -1,0 +1,1461 @@
+From 34c2b415f121d8e9c9e0ce2e9ab4ae94f9284206 Mon Sep 17 00:00:00 2001
+From: Jain Roy <jambi@qti.qualcomm.com>
+Date: Wed, 8 Jul 2026 19:20:50 +0530
+Subject: [PATCH] mqttapi rework to handle disconnect
+
+Signed-off-by: Jain Roy <jambi@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/son_slave_thread.cpp | 134 ++++---
+ agent/src/beerocks/slave/son_slave_thread.h   |  11 +-
+ common/beerocks/bwl/CMakeLists.txt            |   1 +
+ .../bwl/dummy/slave_wlan_hal_dummy.cpp        |  14 +-
+ .../beerocks/bwl/dummy/slave_wlan_hal_dummy.h |   7 +-
+ .../beerocks/bwl/include/bwl/slave_wlan_hal.h |  18 +-
+ .../bwl/nl80211/slave_wlan_hal_nl80211.cpp    | 123 ++++--
+ .../bwl/nl80211/slave_wlan_hal_nl80211.h      |  29 +-
+ .../bwl/onewifi/slave_wlan_hal_onewifi.cpp    |  16 +-
+ .../bwl/onewifi/slave_wlan_hal_onewifi.h      |   9 +-
+ .../beerocks/bwl/whm/slave_wlan_hal_whm.cpp   |  16 +-
+ common/beerocks/bwl/whm/slave_wlan_hal_whm.h  |   9 +-
+ .../platform/mqttapi/include/mqtt_client.h    |  73 +++-
+ .../mqttapi/include/mqtt_client_dummy.h       |  13 -
+ .../mqttapi/include/mqtt_client_impl.h        |  24 +-
+ .../platform/mqttapi/mqtt_client_dummy.cpp    |  46 +--
+ .../platform/mqttapi/mqtt_client_impl.cpp     | 366 +++++++++++++++---
+ 17 files changed, 585 insertions(+), 324 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 5c822183f..9f5aa1c02 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -401,8 +401,14 @@ bool slave_thread::thread_init()
+         LOG_IF(!m_slave_wlan_hal, FATAL) << "Failed creating HAL instance!";
+     }
+ 
+-    if (!register_event_handlers()) {
+-        LOG(DEBUG) << "Failed to register slave_wlan_hal event handlers";
++    // Attach the slave_wlan_hal to establish ext socket connection
++    auto hal_state = m_slave_wlan_hal->attach();
++    if (hal_state == bwl::HALState::Operational) {
++        if (!register_event_handlers()) {
++            LOG(ERROR) << "Failed to register slave_wlan_hal event handlers";
++        }
++    } else {
++        LOG(ERROR) << "Failed to attach slave_wlan_hal, state: " << int(hal_state);
+     }
+ 
+     m_task_pool.add_task(std::make_shared<ApAutoConfigurationTask>(*this, cmdu_tx));
+@@ -434,6 +440,9 @@ bool slave_thread::thread_init()
+ void slave_thread::stop_slave_thread()
+ {
+     clear_event_handlers();
++    if (m_slave_wlan_hal) {
++        m_slave_wlan_hal.reset();
++    }
+     agent_reset();
+     should_stop = true;
+ }
+@@ -893,19 +902,18 @@ void slave_thread::handle_client_disconnected(int fd)
+     LOG(INFO) << "Uknown client socket disconnected!";
+ }
+ 
+-void slave_thread::send_slave_hal_ping()
++void slave_thread::slave_wlan_hal_fsm()
+ {
+-    if (m_slave_wlan_hal) {
+-        m_slave_wlan_hal->send_ping();
++    if (m_slave_wlan_hal && 
++        m_slave_wlan_hal->get_state() == bwl::HALState::Operational) {
++        m_slave_wlan_hal->run_fsm();
+     }
+ }
+ 
+ bool slave_thread::fsm_all()
+ {
+-    // Send MQTT PINGREQ keepalive to the broker if keepalive/2 seconds have
+-    // elapsed since the last message exchange. This keeps the MQTT connection
+-    // alive even when no SMD events are flowing.
+-    send_slave_hal_ping();
++    //Run slave_wlan_hal FSM
++    slave_wlan_hal_fsm();
+ 
+     auto radio_fsm = [&](const sManagedRadio &radio_manager, const std::string &fronthaul_iface) {
+         if (!monitor_heartbeat_check(fronthaul_iface) ||
+@@ -7865,8 +7873,68 @@ bool slave_thread::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_p
+     typedef bwl::slave_wlan_hal::Event Event;
+     auto event = (Event)(event_ptr->first);
+     switch (event) {
++    case Event::Register_Ext_Event_Fd: {
++        auto ext_fd_ptr = std::static_pointer_cast<int>(event_ptr->second);
++        int ext_fd = *ext_fd_ptr;
++        beerocks::EventLoop::EventHandlers ext_event_handlers{
++            .name = "slave_hal_ext_events",
++            .on_read = [this](int fd, beerocks::EventLoop &loop) {
++                if (!m_slave_wlan_hal || !m_slave_wlan_hal->process_ext_events(fd)) {
++                    LOG(ERROR) << "on_read process_ext_events(" << fd << ") failed!";
++                    return false;
++                }
++                return true;
++            },
++            .on_write = nullptr,
++            .on_disconnect = [this](int fd, beerocks::EventLoop &loop) {
++                LOG(ERROR) << "slave_wlan_hal ext events disconnected! on fd " << fd;
++                auto it = std::find(slave_hal_ext_events.begin(), slave_hal_ext_events.end(), fd);
++                if (it != slave_hal_ext_events.end()) {
++                    slave_hal_ext_events.erase(it);
++                }
++                if (m_slave_wlan_hal) {
++                    m_slave_wlan_hal->reattach();
++                }
++                return true;
++            },
++            .on_error = [this](int fd, beerocks::EventLoop &loop) {
++                LOG(ERROR) << "slave_wlan_hal ext events error! on fd " << fd;
++                auto it = std::find(slave_hal_ext_events.begin(), slave_hal_ext_events.end(), fd);
++                if (it != slave_hal_ext_events.end()) {
++                    slave_hal_ext_events.erase(it);
++                }
++                if (m_slave_wlan_hal) {
++                    m_slave_wlan_hal->reattach();
++                }
++                return true;
++            },
++        };
++
++        if (m_event_loop->register_handlers(ext_fd, ext_event_handlers)) {
++            LOG(DEBUG) << "Registered handlers for slave_wlan_hal fd " << ext_fd;
++            // Add fd to slave_hal_ext_events
++            slave_hal_ext_events.push_back(ext_fd);
++        } else {
++            LOG(ERROR) << "Failed to register handlers for slave_wlan_hal fd " << ext_fd;
++        }
++        break;
++    }
++    case Event::Unregister_Ext_Event_Fd: {
++        auto ext_fd_ptr = std::static_pointer_cast<int>(event_ptr->second);
++        int ext_fd = *ext_fd_ptr;
++        if (m_event_loop->remove_handlers(ext_fd)) {
++            LOG(DEBUG) << "Removed handlers for slave_wlan_hal fd " << ext_fd;
++            auto it = std::find(slave_hal_ext_events.begin(), slave_hal_ext_events.end(), ext_fd);
++            if (it != slave_hal_ext_events.end()) {
++                slave_hal_ext_events.erase(it);
++            }
++        } else {
++            LOG(ERROR) << "Failed to remove handlers for slave_wlan_hal fd " << ext_fd;
++        }
++        break;
++    }
+     case Event::SMD_Roaming_Completed: {
+-        LOG(DEBUG) << "Received SMD Roaming topic Event " << event;
++        LOG(DEBUG) << "Received SMD Roaming Completed Event " << event;
+         break;
+     }
+     default: {
+@@ -7884,6 +7952,7 @@ bool slave_thread::register_event_handlers()
+     slave_hal_int_events = m_slave_wlan_hal->get_int_events_fd();
+     if (slave_hal_int_events < 0) {
+         LOG(DEBUG) << "No slave_wlan_hal internal events fd to register";
++        return false;
+     } else {
+         beerocks::EventLoop::EventHandlers int_event_handlers{
+             .name = "slave_hal_int_events",
+@@ -7914,51 +7983,6 @@ bool slave_thread::register_event_handlers()
+             LOG(DEBUG) << "Registered slave_wlan_hal int event with fd = " << slave_hal_int_events;
+         }
+     }
+-    
+-    // register external event handlers
+-    slave_hal_ext_events = m_slave_wlan_hal->get_ext_events_fds();
+-    if (slave_hal_ext_events.empty()) {
+-        LOG(DEBUG) << "No slave_wlan_hal external events fds to register";
+-    } else {
+-        beerocks::EventLoop::EventHandlers ext_event_handlers{
+-            .name = "slave_hal_ext_events",
+-            .on_read = [this](int fd, beerocks::EventLoop &loop) {
+-                if (!m_slave_wlan_hal || !m_slave_wlan_hal->process_ext_events(fd)) {
+-                    LOG(ERROR) << "on_read process_ext_events(" << fd << ") failed!";
+-                    return false;
+-                }
+-                return true;
+-            },
+-            .on_write = nullptr,
+-            .on_disconnect = [this](int fd, beerocks::EventLoop &loop) {
+-                LOG(ERROR) << "slave_wlan_hal ext events disconnected! on fd " << fd;
+-                auto it = std::find(slave_hal_ext_events.begin(), slave_hal_ext_events.end(), fd);
+-                if (it != slave_hal_ext_events.end()) {
+-                    *it = beerocks::net::FileDescriptor::invalid_descriptor;
+-                }
+-                return false;
+-            },
+-            .on_error = [this](int fd, beerocks::EventLoop &loop) {
+-                LOG(ERROR) << "slave_wlan_hal ext events error! on fd " << fd;
+-                auto it = std::find(slave_hal_ext_events.begin(), slave_hal_ext_events.end(), fd);
+-                if (it != slave_hal_ext_events.end()) {
+-                    *it = beerocks::net::FileDescriptor::invalid_descriptor;
+-                }
+-                return false;
+-            },
+-        };
+-        for (auto &ext_event_fd : slave_hal_ext_events) {
+-            if (ext_event_fd > 0) {
+-                if (!m_event_loop->register_handlers(ext_event_fd, ext_event_handlers)) {
+-                    LOG(ERROR) << "Unable to register handlers for slave_wlan_hal ext event fd " << ext_event_fd;
+-                    return false;
+-                }
+-                LOG(DEBUG) << "Registered slave_wlan_hal ext event with fd = " << ext_event_fd;
+-            } else if (ext_event_fd < 0) {
+-                ext_event_fd = beerocks::net::FileDescriptor::invalid_descriptor;
+-            }
+-        }
+-    }
+ 
+     return true;
+ }
+diff --git a/agent/src/beerocks/slave/son_slave_thread.h b/agent/src/beerocks/slave/son_slave_thread.h
+index 77e7cfcf8..db0e682d6 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.h
++++ b/agent/src/beerocks/slave/son_slave_thread.h
+@@ -249,16 +249,7 @@ private:
+     bool hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr);
+     bool register_event_handlers();
+     void clear_event_handlers();
+-
+-    /**
+-     * @brief Send an MQTT PINGREQ keepalive if keepalive/2 seconds have elapsed
+-     *        since the last message was sent or received.
+-     *
+-     * Called from fsm_all() on every FSM timer tick (200 ms). The actual PINGREQ
+-     * is only sent when slave_wlan_hal::needs_keepalive() returns true, so there
+-     * is no overhead on busy ticks where MQTT traffic is already flowing.
+-     */
+-    void send_slave_hal_ping();
++    void slave_wlan_hal_fsm();
+ 
+ public:
+     /**
+diff --git a/common/beerocks/bwl/CMakeLists.txt b/common/beerocks/bwl/CMakeLists.txt
+index 48b2d2f91..a2078886f 100644
+--- a/common/beerocks/bwl/CMakeLists.txt
++++ b/common/beerocks/bwl/CMakeLists.txt
+@@ -181,6 +181,7 @@ elseif(BWL_TYPE STREQUAL "DUMMY")
+         ${MODULE_PATH}/dummy/ap_wlan_hal_dummy.cpp
+         ${MODULE_PATH}/dummy/base_wlan_hal_dummy.cpp
+         ${MODULE_PATH}/dummy/sta_wlan_hal_dummy.cpp
++        ${MODULE_PATH}/dummy/slave_wlan_hal_dummy.cpp
+     )
+ 
+ elseif(BWL_TYPE STREQUAL "ONEWIFI")
+diff --git a/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.cpp b/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.cpp
+index 428332301..f232df091 100644
+--- a/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.cpp
++++ b/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.cpp
+@@ -25,16 +25,6 @@ slave_wlan_hal_dummy::~slave_wlan_hal_dummy()
+     detach();
+ }
+ 
+-int slave_wlan_hal_dummy::smd_set_neighbor(const void* payload, int payload_len)
+-{
+-    return 0;
+-}
+-
+-void slave_wlan_hal_dummy::send_ping()
+-{
+-    // Dummy implementation — no MQTT broker in this HAL.
+-}
+-
+ bool slave_wlan_hal_dummy::process_ext_events(int fd)
+ {
+     return true;
+@@ -42,7 +32,7 @@ bool slave_wlan_hal_dummy::process_ext_events(int fd)
+ 
+ bwl::HALState slave_wlan_hal_dummy::attach(bool)
+ {
+-    return bwl::HALState::Operational;
++    return (m_hal_state = HALState::Uninitialized);
+ }
+ 
+ bool slave_wlan_hal_dummy::detach()
+@@ -122,7 +112,7 @@ bool slave_wlan_hal_dummy::set(const std::string& param, const std::string& valu
+ 
+ std::shared_ptr<slave_wlan_hal> slave_wlan_hal_create(const std::string &iface_name,
+                                                   base_wlan_hal::hal_event_cb_t callback,
+-                                                  const bwl::hal_conf_t &hal_conf)
++                                                  const hal_conf_t &hal_conf)
+ {
+     return std::make_shared<dummy::slave_wlan_hal_dummy>(iface_name, callback, hal_conf);
+ }
+diff --git a/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.h b/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.h
+index 2a7312659..59bee49bb 100644
+--- a/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.h
++++ b/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.h
+@@ -13,18 +13,12 @@ namespace dummy {
+ 
+ class slave_wlan_hal_dummy : public virtual slave_wlan_hal {
+ public:
+-    virtual int smd_set_neighbor(const void* payload, int payload_len) override;
+-    virtual void send_ping() override;
+-
+     explicit slave_wlan_hal_dummy(const std::string& iface_name,
+                                base_wlan_hal::hal_event_cb_t callback,
+                                const hal_conf_t& hal_conf);
+     virtual ~slave_wlan_hal_dummy();
+ 
+     // Inherited from base_wlan_hal
+-    virtual bool process_ext_events(int fd = 0) override;
+-
+-    // Required virtual function implementations
+     virtual bwl::HALState attach(bool block) override;
+     virtual bool detach() override;
+     virtual bool refresh_radio_info() override;
+@@ -40,6 +34,7 @@ public:
+     virtual sMacAddr get_bsta_mld_mac() override;
+     virtual sMacAddr get_ap_mld_mac() override;
+     virtual bool set(const std::string& param, const std::string& value, int vap_id) override;
++    virtual bool process_ext_events(int fd = 0) override;
+ };
+ 
+ } // namespace dummy
+diff --git a/common/beerocks/bwl/include/bwl/slave_wlan_hal.h b/common/beerocks/bwl/include/bwl/slave_wlan_hal.h
+index 9b10343fc..98279bd32 100644
+--- a/common/beerocks/bwl/include/bwl/slave_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/slave_wlan_hal.h
+@@ -21,6 +21,9 @@ public:
+     enum class Event {
+         Invalid = 0,
+ 
++        Register_Ext_Event_Fd,
++        Unregister_Ext_Event_Fd,
++
+         // SMD Events
+         SMD_Roaming_Completed
+     };
+@@ -29,22 +32,15 @@ public:
+ public:
+     virtual ~slave_wlan_hal() = default;
+ 
+-    virtual int smd_set_neighbor(const void* payload, int payload_len) = 0;
+-
+-    /**
+-     * @brief Send an MQTT PINGREQ keepalive to the broker if needed.
+-     *
+-     * Checks whether keepalive/2 seconds have elapsed since the last message
+-     * was sent or received and, if so, drives the mosquitto manual loop to
+-     * dispatch a PINGREQ. No-op when traffic is already flowing.
+-     */
+-    virtual void send_ping() {}
++    virtual bool reattach() { return true; }
++    virtual void run_fsm() { return; }
++    virtual int smd_set_neighbor(const void* payload, int payload_len) { return 0; }
+ };
+ 
+ // Slave HAL factory types
+ std::shared_ptr<slave_wlan_hal> slave_wlan_hal_create(const std::string &iface_name,
+                                                   base_wlan_hal::hal_event_cb_t cb,
+-                                                  const bwl::hal_conf_t &hal_conf);
++                                                  const hal_conf_t &hal_conf);
+ 
+ } // namespace bwl
+ 
+diff --git a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp
+index 7e7dd2e17..17fa5dab9 100644
+--- a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp
+@@ -8,6 +8,9 @@
+ #include <bcl/network/network_utils.h>
+ #include <easylogging++.h>
+ 
++#define MQTT_LOOP_RUN_INTERVAL 1000 // milliseconds
++#define MQTT_CONN_RETRY_TIMEOUT 5000 // milliseconds
++
+ using namespace beerocks;
+ using namespace mqttapi;
+ 
+@@ -15,49 +18,76 @@ namespace bwl {
+ namespace nl80211 {
+ 
+ slave_wlan_hal_nl80211::slave_wlan_hal_nl80211(const std::string &iface_name, hal_event_cb_t callback,
+-                                   const bwl::hal_conf_t &hal_conf)
+-    : base_wlan_hal(bwl::HALType::Slave, iface_name, IfaceType::Intel, callback, hal_conf),
+-      last_ping_time_(std::chrono::steady_clock::now())
++                                   const hal_conf_t &hal_conf)
++    : base_wlan_hal(HALType::Slave, iface_name, IfaceType::Intel, callback, hal_conf)
+ {
++    m_last_loop_run_time = std::chrono::steady_clock::now();
++
+     mqtt_client = beerocks::mqttapi::mqtt_client_create();
+     if (!mqtt_client) {
++        m_hal_state = HALState::Failed;
+         LOG(ERROR) << "Failed to create MQTT client";
+         return;
+     }
+-    int fd = mqtt_client->init(iface_name, "localhost", 1883,
+-        [this](const char* topic, const void* payload, int payload_len) {
+-            on_mqtt_message(topic, payload, payload_len);
+-        });
+-    if (fd < 0) {
++    
++    beerocks::mqttapi::MQTTClient::Callbacks callbacks{
++        .process_msg_cb = [this](const char* topic, const void* payload, int payload_len) {
++            process_message(topic, payload, payload_len);
++        },
++        .register_fd_cb = [this](int fd) {
++            register_fd(fd);
++        },
++        .unregister_fd_cb = [this](int fd) {
++            unregister_fd(fd);
++        }
++    };
++    
++    bool init_result = mqtt_client->init(iface_name, callbacks, MQTT_CONN_RETRY_TIMEOUT);
++    if (!init_result) {
++        m_hal_state = HALState::Failed;
+         LOG(ERROR) << "Failed to initialize MQTT client";
+-        m_fds_ext_events = {};
+         return;
+     }
+-    
+-    m_fds_ext_events = {fd};
++
++    m_hal_state = HALState::Initializing;
+     subscribe_to_smd_events();
+ }
+ 
+-const std::vector<int> &slave_wlan_hal_nl80211::get_ext_events_fds() const
++void slave_wlan_hal_nl80211::register_fd(int fd)
+ {
+-    return (m_fds_ext_events);
++    LOG(DEBUG) << "register_fd callback: " << fd;
++    if (fd >= 0) {
++        event_queue_push(Event::Register_Ext_Event_Fd, std::make_shared<int>(fd));
++    }
++}
++
++void slave_wlan_hal_nl80211::unregister_fd(int fd)
++{
++    LOG(DEBUG) << "unregister_fd callback: " << fd;
++    if (fd >= 0) {
++        event_queue_push(Event::Unregister_Ext_Event_Fd, std::make_shared<int>(fd));
++    }
+ }
+ 
+ slave_wlan_hal_nl80211::~slave_wlan_hal_nl80211()
+ {
+-    detach();
++    if (mqtt_client) {
++        mqtt_client->deinit();
++    }
++    
++    m_hal_state = HALState::Uninitialized;
+ }
+ 
+ void slave_wlan_hal_nl80211::subscribe_to_smd_events()
+ {
+-    if (mqtt_client && mqtt_client->get_fd() >= 0) {
++    if (mqtt_client) {
+         mqtt_client->subscribe("hostapd/transmit/SMD", 1);
+     } else {
+         LOG(ERROR) << "MQTT client is not valid for subscription";
+     }
+ }
+ 
+-void slave_wlan_hal_nl80211::on_mqtt_message(const char* topic, const void* payload, int payload_len)
++void slave_wlan_hal_nl80211::process_message(const char* topic, const void* payload, int payload_len)
+ {
+     LOG(DEBUG) << " Processing message on topic " << topic;
+     // Process message
+@@ -69,7 +99,7 @@ void slave_wlan_hal_nl80211::on_mqtt_message(const char* topic, const void* payl
+ 
+ int slave_wlan_hal_nl80211::smd_set_neighbor(const void* payload, int payload_len)
+ {
+-    if (!mqtt_client || mqtt_client->get_fd() < 0) {
++    if (!mqtt_client) {
+         LOG(ERROR) << "MQTT client is not valid for publishing";
+         return -1;
+     }
+@@ -87,27 +117,62 @@ bool slave_wlan_hal_nl80211::process_ext_events(int fd)
+     return false;
+ }
+ 
+-void slave_wlan_hal_nl80211::send_ping()
++bool slave_wlan_hal_nl80211::reattach()
+ {
+-    // Send MQTT PINGREQ every 30 seconds to keep the broker connection alive.
+-    constexpr int MQTT_PING_INTERVAL_SEC = 30;
++    if (!mqtt_client) {
++        LOG(ERROR) << "MQTT client is null, cannot reattach";
++        return false;
++    }
++
++    if (m_hal_state == HALState::Operational) {
++        mqtt_client->reconnect();
++        return true;
++    } else {
++        LOG(ERROR) << "Failed to initiate MQTT reconnect";
++        return false;
++    }
++}
++
++void slave_wlan_hal_nl80211::run_fsm()
++{
++    if (!mqtt_client) {
++        return;
++    }
++
+     auto now = std::chrono::steady_clock::now();
+-    auto elapsed_sec = std::chrono::duration_cast<std::chrono::seconds>(
+-        now - last_ping_time_).count();
+-    if (elapsed_sec >= MQTT_PING_INTERVAL_SEC) {
+-        mqtt_client->ping();
+-        last_ping_time_ = now;
++    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - m_last_loop_run_time).count() >= MQTT_LOOP_RUN_INTERVAL) {
++        mqtt_client->run_loop();
++        m_last_loop_run_time = now;
+     }
++
++    return;
+ }
+ 
+-// Dummy implementations for pure virtual functions
+-bwl::HALState slave_wlan_hal_nl80211::attach(bool)
++HALState slave_wlan_hal_nl80211::attach(bool)
+ {
+-    return bwl::HALState::Operational;
++    if (mqtt_client && m_hal_state == HALState::Initializing) {
++        if(!mqtt_client->connect("localhost", 1883, 60)) {
++            LOG(ERROR) << "Failed to connect to MQTT broker";
++            return (m_hal_state = HALState::Failed);
++        }
++
++        LOG(DEBUG) << "MQTT Connection initiated";
++        return (m_hal_state = HALState::Operational);
++    }
++
++    return m_hal_state;
+ }
+ 
+ bool slave_wlan_hal_nl80211::detach()
+ {
++    LOG(DEBUG) << "Detaching slave WLAN HAL and disconnecting MQTT client";
++
++    if (mqtt_client) {
++        LOG(DEBUG) << "Disconnecting MQTT client";
++        mqtt_client->disconnect();
++        m_hal_state = HALState::Initializing;
++    }
++
+     return true;
+ }
+ 
+@@ -183,7 +248,7 @@ bool slave_wlan_hal_nl80211::set(const std::string& param, const std::string& va
+ 
+ std::shared_ptr<slave_wlan_hal> slave_wlan_hal_create(const std::string &iface_name,
+                                                   base_wlan_hal::hal_event_cb_t callback,
+-                                                  const bwl::hal_conf_t &hal_conf)
++                                                  const hal_conf_t &hal_conf)
+ {
+     return std::make_shared<nl80211::slave_wlan_hal_nl80211>(iface_name, callback, hal_conf);
+ }
+diff --git a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h
+index e59a00a63..687821b3a 100644
+--- a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h
+@@ -15,22 +15,13 @@ namespace nl80211 {
+ 
+ class slave_wlan_hal_nl80211 : public virtual slave_wlan_hal {
+ public:
+-    virtual int smd_set_neighbor(const void* payload, int payload_len) override;
+-    virtual void send_ping() override;
+-
+     explicit slave_wlan_hal_nl80211(const std::string& iface_name,
+                                base_wlan_hal::hal_event_cb_t callback,
+                                const hal_conf_t& hal_conf);
+     virtual ~slave_wlan_hal_nl80211();
+ 
+-    const std::vector<int> &get_ext_events_fds() const;
+-
+     // Inherited from base_wlan_hal
+-    virtual bool process_ext_events(int fd = 0) override;
+-    void subscribe_to_smd_events();
+-
+-    // Required virtual function implementations
+-    virtual bwl::HALState attach(bool block) override;
++    virtual HALState attach(bool block) override;
+     virtual bool detach() override;
+     virtual bool refresh_radio_info() override;
+     virtual bool ping() override;
+@@ -45,23 +36,27 @@ public:
+     virtual sMacAddr get_bsta_mld_mac() override;
+     virtual sMacAddr get_ap_mld_mac() override;
+     virtual bool set(const std::string& param, const std::string& value, int vap_id) override;
++    virtual bool process_ext_events(int fd = 0) override;
++
++    // Inherited from slave_wlan_hal
++    virtual bool reattach() override;
++    virtual void run_fsm() override;
++    virtual int smd_set_neighbor(const void* payload, int payload_len) override;
+ 
+ protected:
+-    // Overload for Monitor events
+     bool event_queue_push(slave_wlan_hal::Event event, std::shared_ptr<void> data = {})
+     {
+         return base_wlan_hal::event_queue_push(int(event), data);
+     }
+ 
+ private:
+-    void on_mqtt_message(const char* topic, const void* payload, int payload_len);
++    void process_message(const char* topic, const void* payload, int payload_len);
++    void register_fd(int fd);
++    void unregister_fd(int fd);
++    void subscribe_to_smd_events();
+ 
+     std::unique_ptr<beerocks::mqttapi::MQTTClient> mqtt_client;
+-    std::vector<int> m_fds_ext_events = {-1};
+-
+-    // Tracks when the last MQTT PINGREQ was sent.
+-    // send_ping() uses this to enforce a 30-second keepalive interval.
+-    std::chrono::steady_clock::time_point last_ping_time_;
++    std::chrono::steady_clock::time_point m_last_loop_run_time;
+ };
+ 
+ } // namespace nl80211
+diff --git a/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.cpp b/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.cpp
+index a7dc13792..00003b4fd 100644
+--- a/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.cpp
++++ b/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.cpp
+@@ -25,24 +25,14 @@ slave_wlan_hal_onewifi::~slave_wlan_hal_onewifi()
+     detach();
+ }
+ 
+-int slave_wlan_hal_onewifi::smd_set_neighbor(const void* payload, int payload_len)
+-{
+-    return 0;
+-}
+-
+-void slave_wlan_hal_onewifi::send_ping()
+-{
+-    // Dummy implementation — no MQTT broker in this HAL.
+-}
+-
+ bool slave_wlan_hal_onewifi::process_ext_events(int fd)
+ {
+     return true;
+ }
+ 
+-bwl::HALState slave_wlan_hal_onewifi::attach(bool)
++HALState slave_wlan_hal_onewifi::attach(bool)
+ {
+-    return bwl::HALState::Operational;
++    return (m_hal_state = HALState::Uninitialized);
+ }
+ 
+ bool slave_wlan_hal_onewifi::detach()
+@@ -122,7 +112,7 @@ bool slave_wlan_hal_onewifi::set(const std::string& param, const std::string& va
+ 
+ std::shared_ptr<slave_wlan_hal> slave_wlan_hal_create(const std::string &iface_name,
+                                                   base_wlan_hal::hal_event_cb_t callback,
+-                                                  const bwl::hal_conf_t &hal_conf)
++                                                  const hal_conf_t &hal_conf)
+ {
+     return std::make_shared<onewifi::slave_wlan_hal_onewifi>(iface_name, callback, hal_conf);
+ }
+diff --git a/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.h b/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.h
+index 104495b7e..8112928a2 100644
+--- a/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.h
++++ b/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.h
+@@ -13,19 +13,13 @@ namespace onewifi {
+ 
+ class slave_wlan_hal_onewifi : public virtual slave_wlan_hal {
+ public:
+-    virtual int smd_set_neighbor(const void* payload, int payload_len) override;
+-    virtual void send_ping() override;
+-
+     explicit slave_wlan_hal_onewifi(const std::string& iface_name,
+                                base_wlan_hal::hal_event_cb_t callback,
+                                const hal_conf_t& hal_conf);
+     virtual ~slave_wlan_hal_onewifi();
+ 
+     // Inherited from base_wlan_hal
+-    virtual bool process_ext_events(int fd = 0) override;
+-
+-    // Required virtual function implementations
+-    virtual bwl::HALState attach(bool block) override;
++    virtual HALState attach(bool block) override;
+     virtual bool detach() override;
+     virtual bool refresh_radio_info() override;
+     virtual bool ping() override;
+@@ -40,6 +34,7 @@ public:
+     virtual sMacAddr get_bsta_mld_mac() override;
+     virtual sMacAddr get_ap_mld_mac() override;
+     virtual bool set(const std::string& param, const std::string& value, int vap_id) override;
++    virtual bool process_ext_events(int fd = 0) override;
+ };
+ 
+ } // namespace onewifi
+diff --git a/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
+index 21569c940..0fdb36b80 100644
+--- a/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
+@@ -26,24 +26,14 @@ slave_wlan_hal_whm::~slave_wlan_hal_whm()
+     detach();
+ }
+ 
+-int slave_wlan_hal_whm::smd_set_neighbor(const void* payload, int payload_len)
+-{
+-    return 0;
+-}
+-
+-void slave_wlan_hal_whm::send_ping()
+-{
+-    // Dummy implementation — no MQTT broker in this HAL.
+-}
+-
+ bool slave_wlan_hal_whm::process_ext_events(int fd)
+ {
+     return true;
+ }
+ 
+-bwl::HALState slave_wlan_hal_whm::attach(bool)
++HALState slave_wlan_hal_whm::attach(bool)
+ {
+-    return bwl::HALState::Operational;
++    return (m_hal_state = HALState::Uninitialized);
+ }
+ 
+ bool slave_wlan_hal_whm::detach()
+@@ -123,7 +113,7 @@ bool slave_wlan_hal_whm::set(const std::string& param, const std::string& value,
+ 
+ std::shared_ptr<slave_wlan_hal> slave_wlan_hal_create(const std::string &iface_name,
+                                                   base_wlan_hal::hal_event_cb_t callback,
+-                                                  const bwl::hal_conf_t &hal_conf)
++                                                  const hal_conf_t &hal_conf)
+ {
+     return std::make_shared<whm::slave_wlan_hal_whm>(iface_name, callback, hal_conf);
+ }
+diff --git a/common/beerocks/bwl/whm/slave_wlan_hal_whm.h b/common/beerocks/bwl/whm/slave_wlan_hal_whm.h
+index de98f5277..7b70bf798 100644
+--- a/common/beerocks/bwl/whm/slave_wlan_hal_whm.h
++++ b/common/beerocks/bwl/whm/slave_wlan_hal_whm.h
+@@ -13,19 +13,13 @@ namespace whm {
+ 
+ class slave_wlan_hal_whm : public virtual slave_wlan_hal {
+ public:
+-    virtual int smd_set_neighbor(const void* payload, int payload_len) override;
+-    virtual void send_ping() override;
+-
+     explicit slave_wlan_hal_whm(const std::string& iface_name,
+                                base_wlan_hal::hal_event_cb_t callback,
+                                const hal_conf_t& hal_conf);
+     virtual ~slave_wlan_hal_whm();
+ 
+     // Inherited from base_wlan_hal
+-    virtual bool process_ext_events(int fd = 0) override;
+-
+-    // Required virtual function implementations
+-    virtual bwl::HALState attach(bool block) override;
++    virtual HALState attach(bool block) override;
+     virtual bool detach() override;
+     virtual bool refresh_radio_info() override;
+     virtual bool ping() override;
+@@ -40,6 +34,7 @@ public:
+     virtual sMacAddr get_bsta_mld_mac() override;
+     virtual sMacAddr get_ap_mld_mac() override;
+     virtual bool set(const std::string& param, const std::string& value, int vap_id) override;
++    virtual bool process_ext_events(int fd = 0) override;
+ };
+ 
+ } // namespace whm
+diff --git a/framework/platform/mqttapi/include/mqtt_client.h b/framework/platform/mqttapi/include/mqtt_client.h
+index dede01bab..063748cc7 100644
+--- a/framework/platform/mqttapi/include/mqtt_client.h
++++ b/framework/platform/mqttapi/include/mqtt_client.h
+@@ -8,35 +8,66 @@
+ #include <string>
+ #include <functional>
+ #include <memory>
++#include <ostream>
+ 
+ namespace beerocks {
+ namespace mqttapi {
+ 
++enum class MqttState {
++    Uninitialized = 0,
++    Initialized = 1,
++    Connecting = 2,
++    Reconnecting = 3,
++    Connected = 4
++};
++
++
+ class MQTTClient {
+ public:
+     using MessageCallback = std::function<void(const char*, const void*, int)>;
+-    
++    using RegisterFdCallback = std::function<void(int fd)>;
++    using UnregisterFdCallback = std::function<void(int fd)>;
++
+     virtual ~MQTTClient() = default;
+-    
+-    virtual int init(const std::string& id, const std::string& host, int port, MessageCallback callback) = 0;
+-    virtual int get_fd() const = 0;
+-    virtual void process() = 0;
+-    virtual void cleanup() = 0;
+-    
+-    /**
+-     * @brief Send an MQTT PINGREQ keepalive packet to the broker.
+-     *
+-     * Calls mosquitto_loop_misc() which handles time-based tasks including
+-     * sending PINGREQ when the keepalive timer is due. Should be called
+-     * periodically (e.g. every 30 s) when using the manual loop API so the
+-     * broker does not disconnect the client due to keepalive timeout.
+-     */
+-    virtual void ping() = 0;
+-
+-    virtual int publish(const std::string& topic, const void* payload, int payload_len, int qos, bool retain) = 0;
+-    virtual int subscribe(const std::string& topic, int qos) = 0;
+-    virtual void unsubscribe(const std::string& topic) = 0;
+-    
++
++    struct Callbacks {
++        MessageCallback process_msg_cb;
++        RegisterFdCallback register_fd_cb;
++        UnregisterFdCallback unregister_fd_cb;
++    };
++
++    virtual bool init(const std::string& id, const Callbacks& callbacks, int conn_retry_timeout_ms) { return false; }
++    virtual bool connect(const std::string& host, int port, int keepalive) { return false; }
++    virtual int get_fd() const { return -1; }
++    virtual void process() { return; }
++    virtual void deinit() { return; }
++
++	/**
++	* @brief Drives periodic maintenance of the MQTT client state machine.
++	*
++	* This method must be invoked at regular intervals by the application
++	* (e.g. via a timer in an event loop) to ensure correct MQTT operation.
++	*
++	* It performs time-based processing required by the underlying MQTT library,
++	* including:
++	*   - Keepalive management (sending PINGREQ and detecting timeouts)
++	*   - Connection establishment and reconnection handling
++	*   - Progress of outgoing packets (e.g. CONNECT, DISCONNECT, PUBLISH, SUBSCRIBE)
++	*
++	* This function does not handle socket read readiness. The application is
++	* responsible for invoking the read handler process() (based on EPOLLIN
++	* or equivalent) to process incoming data via mosquitto_loop_read().
++	*/
++    virtual void run_loop() { return; }
++
++    virtual int publish(const std::string& topic, const void* payload, int payload_len, int qos, bool retain) { return 0; }
++    virtual int subscribe(const std::string& topic, int qos) { return 0; }
++    virtual void unsubscribe(const std::string& topic) { return; }
++    virtual void disconnect() { return; }
++    virtual void reconnect() { return; }
++
++protected:
++	MqttState state = MqttState::Uninitialized;
+ };
+ 
+ std::unique_ptr<MQTTClient> mqtt_client_create();
+diff --git a/framework/platform/mqttapi/include/mqtt_client_dummy.h b/framework/platform/mqttapi/include/mqtt_client_dummy.h
+index 406816156..785f8cb29 100644
+--- a/framework/platform/mqttapi/include/mqtt_client_dummy.h
++++ b/framework/platform/mqttapi/include/mqtt_client_dummy.h
+@@ -13,19 +13,6 @@ class MQTTClientDummy : public MQTTClient {
+ public:
+     MQTTClientDummy();
+     ~MQTTClientDummy() override;
+-
+-    int init(const std::string& id, const std::string& host, int port, MessageCallback callback) override;
+-    int get_fd() const override;
+-    void process() override;
+-    void cleanup() override;
+-    void ping() override;
+-    int publish(const std::string& topic, const void* payload, int payload_len, int qos, bool retain) override;
+-    int subscribe(const std::string& topic, int qos) override;
+-    void unsubscribe(const std::string& topic) override;
+-
+-private:
+-    int mqtt_fd;
+-    MessageCallback mqtt_callback;
+ };
+ 
+ } // namespace mqttapi
+diff --git a/framework/platform/mqttapi/include/mqtt_client_impl.h b/framework/platform/mqttapi/include/mqtt_client_impl.h
+index 6c90e6e5b..b433c070f 100644
+--- a/framework/platform/mqttapi/include/mqtt_client_impl.h
++++ b/framework/platform/mqttapi/include/mqtt_client_impl.h
+@@ -8,6 +8,10 @@
+ #include <mosquitto.h>
+ #include <atomic>
+ #include <easylogging++.h>
++#include <vector>
++#include <string>
++#include <algorithm>
++#include <chrono>
+ 
+ namespace beerocks {
+ namespace mqttapi {
+@@ -17,25 +21,31 @@ public:
+     MQTTClientImpl();
+     ~MQTTClientImpl() override;
+ 
+-    int init(const std::string& id, const std::string& host, int port, MessageCallback callback) override;
++    bool init(const std::string& id, const Callbacks& callbacks, int conn_retry_timeout_ms) override;
++    bool connect(const std::string& host, int port, int keepalive) override;
+     int get_fd() const override;
+     void process() override;
+-    void cleanup() override;
+-    void ping() override;
++    void deinit() override;
++    void run_loop() override;
+     int publish(const std::string& topic, const void* payload, int payload_len, int qos, bool retain) override;
+     int subscribe(const std::string& topic, int qos) override;
+     void unsubscribe(const std::string& topic) override;
++    void disconnect() override;
++    void reconnect() override;
+ 
+ private:
+-    static void on_connect_static(struct mosquitto* mosq, void* obj, int rc);
+-    static void on_message_static(struct mosquitto* mosq, void* obj, const struct mosquitto_message* msg);
+-
+     void on_connect(int rc);
+     void on_message(const struct mosquitto_message* msg);
++    void on_disconnect(int rc);
++    void on_publish(int mid);
++    void on_subscribe(int mid, int qos_count, const int *granted_qos);
+ 
+     struct mosquitto* mosq;
+     int mqtt_fd;
+-    MessageCallback mqtt_callback;
++    Callbacks m_callbacks;
++    std::vector<std::pair<std::string, int>> m_subscriptions;
++    std::chrono::steady_clock::time_point m_next_connection_retry_time;
++    int m_conn_retry_timeout;
+ };
+ 
+ } // namespace mqttapi
+diff --git a/framework/platform/mqttapi/mqtt_client_dummy.cpp b/framework/platform/mqttapi/mqtt_client_dummy.cpp
+index 3faf314ed..06c4b51d1 100644
+--- a/framework/platform/mqttapi/mqtt_client_dummy.cpp
++++ b/framework/platform/mqttapi/mqtt_client_dummy.cpp
+@@ -7,56 +7,16 @@
+ namespace beerocks {
+ namespace mqttapi {
+ 
+-MQTTClientDummy::MQTTClientDummy() : mqtt_fd(-1), mqtt_callback(nullptr)
++MQTTClientDummy::MQTTClientDummy()
+ {
++    //dummy implementation
+ }
+ 
+ MQTTClientDummy::~MQTTClientDummy()
+ {
+-    cleanup();
++    //dummy implementation
+ }
+ 
+-int MQTTClientDummy::init(const std::string& id, const std::string& host, int port, MessageCallback callback)
+-{
+-    mqtt_callback = callback;
+-    mqtt_fd = -1; // Invalid file descriptor for dummy implementation
+-    return mqtt_fd;
+-}
+-
+-int MQTTClientDummy::get_fd() const
+-{
+-    return mqtt_fd;
+-}
+-
+-void MQTTClientDummy::process()
+-{
+-    // No-op in dummy implementation
+-}
+-
+-void MQTTClientDummy::cleanup()
+-{
+-    mqtt_fd = -1;
+-}
+-
+-void MQTTClientDummy::ping()
+-{
+-    // No-op in dummy implementation
+-}
+-
+-int MQTTClientDummy::publish(const std::string& topic, const void* payload, int payload_len, int qos, bool retain)
+-{
+-    return 0; // Success
+-}
+-
+-int MQTTClientDummy::subscribe(const std::string& topic, int qos)
+-{
+-    return 0; // Success
+-}
+-
+-void MQTTClientDummy::unsubscribe(const std::string& topic)
+-{
+-    // No-op in dummy implementation
+-}
+ 
+ std::unique_ptr<MQTTClient> mqtt_client_create()
+ {
+diff --git a/framework/platform/mqttapi/mqtt_client_impl.cpp b/framework/platform/mqttapi/mqtt_client_impl.cpp
+index 4b6916ae1..5a2dc5bd7 100644
+--- a/framework/platform/mqttapi/mqtt_client_impl.cpp
++++ b/framework/platform/mqttapi/mqtt_client_impl.cpp
+@@ -12,147 +12,393 @@
+ namespace beerocks {
+ namespace mqttapi {
+ 
+-MQTTClientImpl::MQTTClientImpl() : mosq(nullptr), mqtt_fd(-1)
++MQTTClientImpl::MQTTClientImpl() :
++    mosq(nullptr),
++    mqtt_fd(-1)
+ {
+     mosquitto_lib_init();
++    m_next_connection_retry_time = std::chrono::steady_clock::now();
++    LOG(DEBUG) << "MQTTClientImpl instance created";
+ }
+ 
+ MQTTClientImpl::~MQTTClientImpl()
+ {
+-    cleanup();
++    LOG(DEBUG) << "MQTTClientImpl instance being destroyed";
++    deinit();
+     mosquitto_lib_cleanup();
+ }
+ 
+-int MQTTClientImpl::init(const std::string& id, const std::string& host, int port, MessageCallback callback)
++bool MQTTClientImpl::init(const std::string& id, const Callbacks& callbacks, int conn_retry_timeout_ms)
+ {
+-    cleanup();
++    LOG(DEBUG) << "Initializing MQTT client with ID: " << id;
++    m_conn_retry_timeout = conn_retry_timeout_ms;
++    if (state != MqttState::Uninitialized) {
++        LOG(ERROR) << "MQTT client is already Initialized.";
++        return false;
++    }
+ 
+     mosq = mosquitto_new(id.c_str(), true, this);
+     if (!mosq) {
+-        LOG(ERROR) << "Error: Out of memory.";
+-        return -1;
++        LOG(ERROR) << "MQTT client alloc Error: Out of memory.";
++        return false;
+     }
+ 
+-    mosquitto_connect_callback_set(mosq, on_connect_static);
+-    mosquitto_message_callback_set(mosq, on_message_static);
++    mosquitto_connect_callback_set(mosq, [](struct mosquitto* mosq, void* obj, int rc) {
++        static_cast<MQTTClientImpl*>(obj)->on_connect(rc);
++    });
+ 
+-    if (mosquitto_connect(mosq, host.c_str(), port, 60) != MOSQ_ERR_SUCCESS) {
+-        LOG(ERROR) << "Unable to connect to MQTT broker";
+-        cleanup();
+-        return -1;
+-    }
++    mosquitto_message_callback_set(mosq, [](struct mosquitto* mosq, void* obj, const struct mosquitto_message* msg) {
++        static_cast<MQTTClientImpl*>(obj)->on_message(msg);
++    });
+ 
+-    mqtt_fd = mosquitto_socket(mosq);
+-    if (mqtt_fd == -1) {
+-        perror("mosquitto_socket");
+-        cleanup();
+-        return -1;
+-    }
++    mosquitto_disconnect_callback_set(mosq, [](struct mosquitto* mosq, void* obj, int rc) {
++        static_cast<MQTTClientImpl*>(obj)->on_disconnect(rc);
++    });
+ 
+-    int flags = fcntl(mqtt_fd, F_GETFL, 0);
+-    if (flags == -1) {
+-        perror("fcntl F_GETFL");
+-        cleanup();
+-        return -1;
++    mosquitto_publish_callback_set(mosq, [](struct mosquitto* mosq, void* obj, int mid) {
++        static_cast<MQTTClientImpl*>(obj)->on_publish(mid);
++    });
++
++    mosquitto_subscribe_callback_set(mosq, [](struct mosquitto* mosq, void* obj, int mid, int qos_count, const int *granted_qos) {
++        static_cast<MQTTClientImpl*>(obj)->on_subscribe(mid, qos_count, granted_qos);
++    });
++
++    m_callbacks = callbacks;
++
++    state = MqttState::Initialized;
++
++    LOG(DEBUG) << "MQTT client initialized successfully";
++    return true;
++}
++
++bool MQTTClientImpl::connect(const std::string& host, int port, int keepalive)
++{
++    LOG(DEBUG) << "Attempting MQTT connection to " << host << ":" << port
++             << " with keepalive=" << keepalive;
++
++    if (!mosq) {
++        LOG(ERROR) << "MQTT client not initialized";
++        return false;
+     }
+-    if (fcntl(mqtt_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+-        perror("fcntl F_SETFL");
+-        cleanup();
+-        return -1;
++
++    if (state != MqttState::Initialized) {
++        LOG(ERROR) << "Cannot connect MQTT client: invalid state: " << static_cast<int>(state);
++        return false;
+     }
+ 
+-    mqtt_callback = callback;
++    auto is_fatal = [](int rc) -> bool {
++        switch (rc) {
++            case MOSQ_ERR_INVAL:
++            case MOSQ_ERR_NOMEM:
++            case MOSQ_ERR_PROTOCOL:
++            case MOSQ_ERR_NOT_SUPPORTED:
++            case MOSQ_ERR_PAYLOAD_SIZE:
++            case MOSQ_ERR_AUTH:
++            case MOSQ_ERR_ACL_DENIED:
++            case MOSQ_ERR_TLS:
++                return true;
++            default:
++                return false;
++        }
++    };
+ 
+-    return mqtt_fd;
++    int rc = mosquitto_connect_async(mosq, host.c_str(), port, keepalive);
++    if(is_fatal(rc)) {
++        LOG(ERROR) << "MQTT Connect Fatal error: " << mosquitto_strerror(rc);
++        return false;
++    } else if (rc == MOSQ_ERR_SUCCESS) {
++        LOG(DEBUG) << "MQTT connection initiated successfully, flushing write buffer";
++        state = MqttState::Connecting;
++        mosquitto_loop_write(mosq, 1);
++    } else {
++        LOG(DEBUG) << "MQTT connection failed: " << mosquitto_strerror(rc)
++                          << ", retrying in " << m_conn_retry_timeout << " msec";
++        state = MqttState::Reconnecting;
++        m_next_connection_retry_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(m_conn_retry_timeout);
++    }
++    
++    return true;
+ }
+ 
+ int MQTTClientImpl::get_fd() const
+ {
+-    return mqtt_fd;
++    if (!mosq) {
++        return -1;
++    }
++    return mosquitto_socket(mosq);
+ }
+ 
+ void MQTTClientImpl::process()
+ {
+-    if (!mosq || mqtt_fd == -1) {
++    if (!mosq) {
+         return;
+     }
+ 
+     int rc = mosquitto_loop_read(mosq, 1);
+-    if (rc == MOSQ_ERR_CONN_LOST) {
+-        LOG(ERROR) << "MQTT connection lost during read";
++    if (rc != MOSQ_ERR_SUCCESS && rc != MOSQ_ERR_NO_CONN) {
++        LOG(ERROR) << "MQTT loop_read error: " << mosquitto_strerror(rc);
+     }
+ 
+     if (mosquitto_want_write(mosq)) {
+-        rc = mosquitto_loop_write(mosq, 1);
+-        if (rc == MOSQ_ERR_CONN_LOST) {
+-            LOG(ERROR) << "MQTT connection lost during write";
+-        }
++        mosquitto_loop_write(mosq, 1);
+     }
+ }
+ 
+-void MQTTClientImpl::cleanup()
++void MQTTClientImpl::deinit()
+ {
++    LOG(DEBUG) << "Starting MQTT client deinit process";
++
+     if (mosq) {
++        LOG(DEBUG) << "Disconnecting MQTT client";
+         mosquitto_disconnect(mosq);
++        mosquitto_loop_write(mosq, 1);
++
++        LOG(DEBUG) << "Destroying MQTT client instance";
+         mosquitto_destroy(mosq);
++
+         mosq = nullptr;
++
++        state = MqttState::Uninitialized;
++    } else {
++        LOG(ERROR) << "MQTT client already cleaned up (mosq is null)";
+     }
+-    mqtt_fd = -1;
+ }
+ 
+-void MQTTClientImpl::ping()
++void MQTTClientImpl::disconnect()
++{
++    LOG(INFO) << "Initiating MQTT client disconnect";
++
++    if (mosq) {
++        LOG(DEBUG) << "Sending disconnect packet to broker";
++        mosquitto_disconnect(mosq);
++        mosquitto_loop_write(mosq, 1);
++    } else {
++        LOG(ERROR) << "Attempted to disconnect but MQTT client is not initialized";
++    }
++
++    LOG(INFO) << "MQTT client disconnected";
++}
++
++void MQTTClientImpl::run_loop()
+ {
+-    if (!mosq || mqtt_fd == -1) {
++    if (!mosq) {
+         return;
+     }
++
++    if (state == MqttState::Reconnecting) {
++        auto now = std::chrono::steady_clock::now();
++        if (now >= m_next_connection_retry_time) {
++            m_next_connection_retry_time = now + std::chrono::milliseconds(m_conn_retry_timeout);
++            int rc = mosquitto_reconnect_async(mosq);
++            if (rc == MOSQ_ERR_SUCCESS) {
++                LOG(DEBUG) << "MQTT recconnection initiated successfully";
++                state = MqttState::Connecting;
++                mosquitto_loop_write(mosq, 1);
++            } else {
++                LOG(DEBUG) << "MQTT reconnection failed: " << mosquitto_strerror(rc)
++                                  << ", retrying in " << m_conn_retry_timeout << " msec";
++                return;
++            }       
++        }
++    } else if (state == MqttState::Connecting) {
++        int new_fd = mosquitto_socket(mosq);
++        if (new_fd >= 0 && new_fd != mqtt_fd) {
++            // unregister old fd
++            if (mqtt_fd >= 0 && m_callbacks.unregister_fd_cb) {
++                m_callbacks.unregister_fd_cb(mqtt_fd);
++            }
++
++            mqtt_fd = new_fd;
++
++            if (m_callbacks.register_fd_cb) {
++                m_callbacks.register_fd_cb(mqtt_fd);
++            }
++        }
++    }
++
+     mosquitto_loop_misc(mosq);
++    if (mosquitto_want_write(mosq)) {
++        mosquitto_loop_write(mosq, 1);
++    }
++
++    return;
+ }
+ 
+-int MQTTClientImpl::publish(const std::string& topic, const void* payload, int payload_len, int qos, bool retain)
++void MQTTClientImpl::reconnect()
+ {
+-    if (!mosq) return MOSQ_ERR_NO_CONN;
+-    return mosquitto_publish(mosq, nullptr, topic.c_str(), payload_len, payload, qos, retain);
++    if (state == MqttState::Uninitialized ||
++        state == MqttState::Initialized) {
++        LOG(ERROR) << "MQTT reconnect not allowed in this state";
++    } else {
++        LOG(DEBUG) << "MQTT reconnect requested";
++        state = MqttState::Reconnecting;
++        mqtt_fd = -1;
++    }
+ }
+ 
++int MQTTClientImpl::publish(const std::string& topic, const void* payload, int payload_len, int qos, bool retain)
++{
++    LOG(DEBUG) << "MQTT publish request for topic: " << topic
++              << ", QoS: " << qos << ", retain: " << (retain ? "true" : "false")
++              << ", payload length: " << payload_len;
++
++    if (!mosq) {
++        LOG(WARNING) << "MQTT client not initialized, cannot publish to " << topic;
++        return MOSQ_ERR_NO_CONN;
++    }
++
++    if (state != MqttState::Connected) {
++        LOG(WARNING) << "MQTT client not connected, cannot publish to " << topic;
++        return MOSQ_ERR_NO_CONN;
++    }
++
++    int rc = mosquitto_publish(mosq, nullptr, topic.c_str(), payload_len, payload, qos, retain);
++    if (rc != MOSQ_ERR_SUCCESS) {
++        LOG(ERROR) << "Failed to publish to topic " << topic
++                  << ": " << mosquitto_strerror(rc);
++    }
++
++    mosquitto_loop_write(mosq, 1);
++    return rc;
++}
+ int MQTTClientImpl::subscribe(const std::string& topic, int qos)
+ {
++    LOG(DEBUG) << "MQTT subscribe request for topic: " << topic << ", QoS: " << qos;
++
+     if (!mosq) {
++        LOG(WARNING) << "MQTT client not initialized, cannot subscribe to " << topic;
+         return MOSQ_ERR_NO_CONN;
+     }
+-    return mosquitto_subscribe(mosq, nullptr, topic.c_str(), qos);
++
++    // Check if topic already exists in subscriptions
++    auto it = std::find_if(m_subscriptions.begin(), m_subscriptions.end(),
++        [&topic](const std::pair<std::string, int>& sub) {
++            return sub.first == topic;
++        });
++
++    if (it != m_subscriptions.end()) {
++        LOG(DEBUG) << "Updating existing subscription for topic: " << topic
++                  << ", QoS from " << it->second << " to " << qos;
++        // Update existing subscription's QoS
++        it->second = qos;
++    } else {
++        LOG(DEBUG) << "Adding new subscription for topic: " << topic << ", QoS: " << qos;
++        // Add new subscription
++        m_subscriptions.push_back(std::make_pair(topic, qos));
++    }
++
++    int rc = MOSQ_ERR_SUCCESS;
++    if (state == MqttState::Connected) {
++        LOG(DEBUG) << "Sending subscription request for topic: " << topic;
++        rc = mosquitto_subscribe(mosq, nullptr, topic.c_str(), qos);
++        if (rc != MOSQ_ERR_SUCCESS) {
++            LOG(ERROR) << "Failed to subscribe to topic " << topic
++                      << ": " << mosquitto_strerror(rc);
++        }
++        mosquitto_loop_write(mosq, 1);
++    } else {
++        LOG(WARNING) << "Client not connected, deferring subscription for topic: " << topic;
++    }
++    return rc;
+ }
+ 
+ void MQTTClientImpl::unsubscribe(const std::string& topic)
+ {
+-    if (mosq) {
+-        mosquitto_unsubscribe(mosq, nullptr, topic.c_str());
++    LOG(DEBUG) << "MQTT unsubscribe request for topic: " << topic;
++
++    // Remove from stored subscriptions
++    bool found = false;
++    auto it = m_subscriptions.begin();
++    while (it != m_subscriptions.end()) {
++        if (it->first == topic) {
++            LOG(DEBUG) << "Removing subscription for topic: " << topic
++                      << ", QoS: " << it->second;
++            it = m_subscriptions.erase(it);
++            found = true;
++        } else {
++            ++it;
++        }
++    }
++
++    if (!found) {
++        LOG(WARNING) << "No existing subscription found for topic: " << topic;
++    }
++
++    if (state == MqttState::Connected) {
++        if (mosq) {
++            LOG(DEBUG) << "Sending unsubscribe request for topic: " << topic;
++            mosquitto_unsubscribe(mosq, nullptr, topic.c_str());
++            mosquitto_loop_write(mosq, 1);
++        }
++    } else {
++        LOG(WARNING) << "Client not connected, unsubscribe request for topic "
++                    << topic << " will be processed when connected";
+     }
+ }
+ 
+-void MQTTClientImpl::on_connect_static(struct mosquitto* mosq, void* obj, int rc)
++void MQTTClientImpl::on_connect(int rc)
+ {
+-    MQTTClientImpl* client = static_cast<MQTTClientImpl*>(obj);
+-    client->on_connect(rc);
++    if (rc == MOSQ_ERR_SUCCESS) {
++        LOG(INFO) << "MQTT connection established successfully";
++        // Resubscribe to all previously subscribed topics
++        for (const auto& sub : m_subscriptions) {
++            LOG(DEBUG) << "Resubscribing to topic: " << sub.first << " with QoS: " << sub.second;
++            int sub_rc = mosquitto_subscribe(mosq, nullptr, sub.first.c_str(), sub.second);
++            if (sub_rc == MOSQ_ERR_SUCCESS) {
++                LOG(DEBUG) << "Successfully resubscribed to topic: " << sub.first;
++            } else {
++                LOG(ERROR) << "Failed to resubscribe to topic " << sub.first
++                          << ": " << mosquitto_strerror(sub_rc);
++            }
++        }
++        state = MqttState::Connected;
++    } else {
++        LOG(ERROR) << "MQTT connection failed: " << mosquitto_strerror(rc) << ", Reconnecting!";
++        state = MqttState::Reconnecting;
++    }
+ }
+ 
+-void MQTTClientImpl::on_message_static(struct mosquitto* mosq, void* obj, const struct mosquitto_message* msg)
++void MQTTClientImpl::on_message(const struct mosquitto_message* msg)
+ {
+-    MQTTClientImpl* client = static_cast<MQTTClientImpl*>(obj);
+-    client->on_message(msg);
++    LOG(DEBUG) << "Received MQTT message on topic: " << msg->topic
++              << ", payload length: " << msg->payloadlen
++              << ", QoS: " << msg->qos;
++
++    if (m_callbacks.process_msg_cb && msg && msg->topic) {
++        m_callbacks.process_msg_cb(msg->topic, msg->payload, msg->payloadlen);
++    }
+ }
+ 
+-void MQTTClientImpl::on_connect(int rc)
++void MQTTClientImpl::on_disconnect(int rc)
+ {
+-    if (rc != MOSQ_ERR_SUCCESS) {
+-        LOG(ERROR) << "MQTT connection failed: " << mosquitto_strerror(rc);
++    if (rc == MOSQ_ERR_SUCCESS) {
++        state = MqttState::Initialized;
++        LOG(DEBUG) << "MQTT client disconnected from broker on demand";
++    } else {
++        LOG(DEBUG) << "MQTT client disconnected from broker unexpectedly";
++        state = MqttState::Reconnecting;
++    }
++
++    if (mqtt_fd >= 0 && m_callbacks.unregister_fd_cb) {
++        m_callbacks.unregister_fd_cb(mqtt_fd);
+     }
++    mqtt_fd = -1;
+ }
+ 
+-void MQTTClientImpl::on_message(const struct mosquitto_message* msg)
++
++void MQTTClientImpl::on_publish(int mid)
++{
++    LOG(INFO) << "Publish ACK received for message ID: " << mid;
++}
++
++void MQTTClientImpl::on_subscribe(int mid, int qos_count, const int *granted_qos)
+ {
+-    if (mqtt_callback && msg && msg->topic) {
+-        mqtt_callback(msg->topic, msg->payload, msg->payloadlen);
++    std::string qos_str;
++    for (int i = 0; i < qos_count; i++) {
++        qos_str += std::to_string(granted_qos[i]) + " ";
+     }
++    LOG(INFO) << "Subscribe ACK received for message ID: " << mid
++              << ", granted QoS levels: " << qos_str;
+ }
+ 
+ std::unique_ptr<MQTTClient> mqtt_client_create()
+-- 
+2.34.1
+
