@@ -1,0 +1,152 @@
+From a30b6d50420f6148a10590901049ae4259cefd65 Mon Sep 17 00:00:00 2001
+From: Sonali Naresh <sonanare@qti.qualcomm.com>
+Date: Mon, 29 Jun 2026 11:13:16 +0530
+Subject: [PATCH] Prevent killing of Agent process during vap Teardown
+
+Signed-off-by: Sonali Naresh <sonanare@qti.qualcomm.com>
+---
+ agent/config/scripts/reset_vaps.sh            |  1 +
+ agent/src/beerocks/slave/son_slave_thread.cpp | 33 ++++++++---
+ .../slave/tasks/ap_autoconfiguration_task.cpp | 59 ++++++++++++++++++-
+ 3 files changed, 85 insertions(+), 8 deletions(-)
+
+diff --git a/agent/config/scripts/reset_vaps.sh b/agent/config/scripts/reset_vaps.sh
+index bdc1000..6f4f500 100644
+--- a/agent/config/scripts/reset_vaps.sh
++++ b/agent/config/scripts/reset_vaps.sh
+@@ -82,6 +82,7 @@ if [ "$OS_TYPE" = "OpenWrt" ]; then
+     uci set wireless.@wifi-iface[2].wps_pushbutton='1'
+     uci set wireless.@wifi-iface[2].multi_ap='1'
+     uci set wireless.@wifi-iface[2].wds='1'
++    uci set wireless.@wifi-iface[2].disabled='1'
+ 
+     # wlan1.1 AP (5GHz)
+     uci add wireless wifi-iface
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 9a82ddb..2774981 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -2292,9 +2292,6 @@ bool slave_thread::handle_cmdu_backhaul_manager_message(
+                     return false;
+                 }
+ 
+-                LOG(INFO) << "ACTION_BACKHAUL_RADIO_TEAR_DOWN_REQUEST: marking BSSID "
+-                          << radio->front.bssids[vap_idx].mac << " (vap_idx=" << int(vap_idx)
+-                          << ") on radio=" << radio_iface << " for TEARDOWN";
+                 wifi_credentials->bssid_attr().data = radio->front.bssids[vap_idx].mac;
+                 wifi_credentials->bss_type()        = WSC::eWscVendorExtSubelementBssType::TEARDOWN;
+                 wifi_credentials->set_ssid("");
+@@ -5340,10 +5337,32 @@ bool slave_thread::agent_fsm()
+                     LOG(DEBUG) << "FRONTHAUL_IFACE - " << fronthaul_iface << " BASE: " << base_interface;
+ 
+                     if (!beerocks::net::network_utils::linux_iface_exists(base_interface)) {
+-                        LOG(ERROR) << "iface " << base_interface << " does not exist - Killing prplmesh agent";
+-                        LOG(INFO) << "KILLING BEEROCKS_AGENT";
+-                        beerocks::os_utils::kill_pid("/tmp/beerocks/pid/",
+-                                             std::string(BEEROCKS_AGENT));
++                        // PPM-FIX (certification-only): When the base wifi netdev is missing
++                        // (e.g. its only fronthaul VAP was torn down by a controller M2 with
++                        // bss_type=TEARDOWN), the legacy behaviour was to kill the entire
++                        // beerocks_agent. That causes a full prplmesh restart and orphans all
++                        // other radios. In certification mode, instead disable just this radio
++                        // and let the agent FSM continue for the remaining radios.
++                        auto db_local = AgentDB::get();
++                        if (db_local->device_conf.certification_mode) {
++                            LOG(WARNING)
++                                << "iface " << base_interface << " does not exist - "
++                                << "[CERT] disabling this radio only (skipping agent kill) "
++                                << "fronthaul_iface=" << fronthaul_iface;
++                            auto cfg_it =
++                                db_local->device_conf.front_radio.config.find(fronthaul_iface);
++                            if (cfg_it != db_local->device_conf.front_radio.config.end()) {
++                                cfg_it->second.band_enabled = false;
++                            }
++                            // Make sure we don't try to (re)start fronthaul on a missing netdev.
++                            fronthaul_stop(fronthaul_iface);
++                        } else {
++                            LOG(ERROR) << "iface " << base_interface
++                                       << " does not exist - Killing prplmesh agent";
++                            LOG(INFO) << "KILLING BEEROCKS_AGENT";
++                            beerocks::os_utils::kill_pid("/tmp/beerocks/pid/",
++                                                         std::string(BEEROCKS_AGENT));
++                        }
+                     } else {
+                         LOG(DEBUG) << "iface " << base_interface << " exits - start fronthaul process";
+                         fronthaul_stop(fronthaul_iface);
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index a80e691..1060b2c 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -3654,11 +3654,68 @@ bool ApAutoConfigurationTask::send_error_response_message(
+ bool ApAutoConfigurationTask::handle_bss_reconfiguration(
+     const std::string &radio_iface, std::vector<sBssConfig> &requested_bss_list)
+ {
+-    auto radio = AgentDB::get()->radio(radio_iface);
++    auto db_local_for_guard = AgentDB::get();
++    auto radio = db_local_for_guard->radio(radio_iface);
+     if (!radio) {
+         LOG(ERROR) << "Radio not found " << radio_iface;
+         return false;
+     }
++
++    // ----------------------------------------------------------------------
++    // PPM-FIX (certification-only): "Don't orphan a radio" guard.
++    //
++    // If the controller's M2 marks ALL requested BSSes on this radio as
++    // TEARDOWN (and the radio currently has at least one active fronthaul
++    // VAP), accepting the request would remove the radio's last VAP. The
++    // underlying netdev (e.g. wlan0.1) would then be destroyed; the per-radio
++    // monitor would lose its hostapd ctrl socket and exit; the parent
++    // beerocks_agent would treat the child death as fatal, walk its radio
++    // list in STATE_JOIN_INIT, find the missing iface and self-kill via
++    // os_utils::kill_pid(BEEROCKS_AGENT). On respawn, only the surviving
++    // radios come back, which orphans the torn-down radio.
++    //
++    // Symptom from field logs (2.4 GHz, only 1 VAP per radio):
++    //   ap_autoconfiguration_task.cpp[2608] BSSID ... is flagged for teardown!
++    //   ap_autoconfiguration_task.cpp[3877] bss_reconf{local_active=1 requested=2 new=1}
++    //   son_slave_thread.cpp[5325]      iface wlan0.1 does not exist - Killing prplmesh agent
++    //   son_slave_thread.cpp[5326]      KILLING BEEROCKS_AGENT
++    //
++    // In certification mode only, suppress the M2 reconfiguration when the
++    // result would be "zero active fronthaul VAPs on this radio". Legacy
++    // behaviour (non-cert) is preserved.
++    // ----------------------------------------------------------------------
++    if (db_local_for_guard->device_conf.certification_mode && !requested_bss_list.empty()) {
++
++        const size_t local_active_count = std::count_if(
++            radio->front.bssids.begin(), radio->front.bssids.end(),
++            [](const beerocks::AgentDB::sRadio::sFront::sBssid &b) { return b.active; });
++
++        const size_t requested_non_teardown_count = std::count_if(
++            requested_bss_list.begin(), requested_bss_list.end(),
++            [](const sBssConfig &r) {
++                const bool teardown = static_cast<bool>(
++                    r.payload_config.bss_type & WSC::eWscVendorExtSubelementBssType::TEARDOWN);
++                // An empty SSID is treated as TEARDOWN later in the M2 parser; mirror that here
++                // so we don't accidentally bypass the guard.
++                const bool empty_ssid = r.payload_config.ssid.empty();
++                return !(teardown || empty_ssid);
++            });
++
++        if (local_active_count >= 1 && requested_non_teardown_count == 0) {
++            LOG(WARNING) << "[CERT] Refusing to teardown the last VAP on radio " << radio_iface
++                         << " (local_active=" << local_active_count
++                         << " requested=" << requested_bss_list.size()
++                         << " non_teardown_in_request=0). "
++                         << "Suppressing this M2 reconfiguration to avoid orphaning the radio "
++                         << "and triggering beerocks_agent self-kill in STATE_JOIN_INIT.";
++
++            // Clear requested list so the caller skips
++            // send_ap_bss_configuration_message() (it gates on bss_infos.empty()).
++            requested_bss_list.clear();
++            return true;
++        }
++    }
++
+     using sBssid = beerocks::AgentDB::sRadio::sFront::sBssid;
+ 
+     // Local device BSS configs list (only active)
+-- 
+2.34.1
+
