@@ -1,0 +1,201 @@
+From 0f9f20e5b1dfc412ccf6469c5b0d326d1473ac3d Mon Sep 17 00:00:00 2001
+From: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+Date: Mon, 29 Jun 2026 14:35:35 +0530
+Subject: [PATCH] Fixes for Loop Avoidance
+
+Signed-off-by: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 | 11 ++---
+ agent/src/beerocks/slave/son_slave_thread.cpp | 44 +++++++++++++++++--
+ agent/src/beerocks/slave/son_slave_thread.h   | 10 +++++
+ common/beerocks/bwl/include/bwl/ap_wlan_hal.h |  2 +-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  4 +-
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   |  5 ++-
+ 6 files changed, 63 insertions(+), 13 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 5c12d1cd8..d1c48db2f 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -1171,15 +1171,16 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+             // bSTA connected: 0 = local agent (gateway), 1 = standalone extender
+             hop_count = m_local_gw ? 0 : 1;
+             LOG(INFO) << "bSTA connected: setting hop_count=" << int(hop_count)
+-                      << " on radio " << m_iface;
++                      << " on backhaul BSSes of radio " << m_iface;
+         } else {
+             // bSTA disconnected: 255 = unreachable
+             hop_count = 255;
+-            LOG(INFO) << "bSTA disconnected: setting hop_count=255 on radio " << m_iface;
++            LOG(INFO) << "bSTA disconnected: setting hop_count=255 on backhaul BSSes of radio "
++                      << m_iface;
+         }
+         if (!ap_wlan_hal->set_hop_count(hop_count)) {
+-            LOG(ERROR) << "Setting hop count failed on interface" << m_iface;
+-        };
++            LOG(ERROR) << "Setting hop count failed on backhaul BSSes of radio " << m_iface;
++        }
+         if (!notification->connected()) {
+             // Disconnect all bSTAs connected to this agent's backhaul BSSes
+             // This prevents loop formation when the agent tries to reconnect
+@@ -4401,7 +4402,7 @@ void ApManager::disconnect_all_backhaul_stas()
+         // Using wildcard MAC address to disconnect all connected stations
+         if (!ap_wlan_hal->sta_deauth(vap_entry.first,
+                                      beerocks::net::network_utils::WILD_MAC_STRING,
+-                                     wfa_map::tlvProfile2ReasonCode::AP_INITIATED)) {
++                                     wfa_map::tlvProfile2ReasonCode::LEAVING_NETWORK_DEAUTH)) {
+             LOG(ERROR) << "Failed to deauthenticate all stations from backhaul BSS "
+                        << vap.bss;
+         } else {
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index cc5e21c91..0720731bc 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -3071,6 +3071,31 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+             }
+             return true;
+         }
++
++        // Re-sync hop count to this AP manager now that it is fully initialised (ap_wlan_hal
++        // is ready).  Any BSTA_STATE_NOTIFICATION sent before JOINED_NOTIFICATION was dropped
++        // by the AP manager because ap_wlan_hal was not yet created.
++        if (radio_manager.ap_manager_fd == beerocks::net::FileDescriptor::invalid_descriptor) {
++            LOG(ERROR) << "Skipping hop-count re-sync for " << fronthaul_iface
++                       << ": ap_manager_fd is invalid";
++        } else {
++            const bool effective_bsta_connected = get_effective_bsta_connected();
++            auto bsta_notif = message_com::create_vs_message<
++                beerocks_message::cACTION_APMANAGER_BSTA_STATE_NOTIFICATION>(cmdu_tx);
++            if (!bsta_notif) {
++                LOG(ERROR) << "Failed to create BSTA_STATE_NOTIFICATION for hop-count re-sync on "
++                           << fronthaul_iface;
++            } else {
++                bsta_notif->connected() = effective_bsta_connected ? 1 : 0;
++                LOG(INFO) << "Resyncing hop count after JOINED_NOTIFICATION on " << fronthaul_iface
++                          << ": connected=" << int(bsta_notif->connected());
++                if (!send_cmdu(radio_manager.ap_manager_fd, cmdu_tx)) {
++                    LOG(ERROR) << "Failed to send hop-count re-sync BSTA_STATE_NOTIFICATION to "
++                               << fronthaul_iface;
++                }
++            }
++        }
++
+         break;
+     }
+     case beerocks_message::ACTION_APMANAGER_HOSTAP_SET_RESTRICTED_FAILSAFE_CHANNEL_RESPONSE: {
+@@ -5758,17 +5783,30 @@ void slave_thread::notify_controller_reachability(bool reachable)
+     update_bsta_state_to_ap_managers();
+ }
+ 
++bool slave_thread::get_effective_bsta_connected()
++{
++    auto db = AgentDB::get();
++
++    const bool wired_active =
++        db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wired;
++
++    return db->device_conf.local_gw ||
++           (m_controller_reachable && (wired_active || m_backhaul_l2_connected));
++}
++
+ void slave_thread::update_bsta_state_to_ap_managers()
+ {
+     auto db = AgentDB::get();
+ 
+-    const bool effective_bsta_connected =
+-        db->device_conf.local_gw || (m_backhaul_l2_connected && m_controller_reachable);
++    const bool wired_active =
++        db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wired;
++    const bool effective_bsta_connected = get_effective_bsta_connected();
+ 
+-    LOG(ERROR) << "Updating AP managers with effective bSTA state: l2_connected="
++    LOG(INFO) << "Updating AP managers with effective bSTA state: l2_connected="
+                << int(m_backhaul_l2_connected)
+                << ", controller_reachable=" << int(m_controller_reachable)
+                << ", local_gw=" << int(db->device_conf.local_gw)
++               << ", wired_active=" << int(wired_active)
+                << ", effective_connected=" << int(effective_bsta_connected);
+ 
+     m_radio_managers.do_on_each_radio_manager(
+diff --git a/agent/src/beerocks/slave/son_slave_thread.h b/agent/src/beerocks/slave/son_slave_thread.h
+index d23a3bcb8..7fd29741b 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.h
++++ b/agent/src/beerocks/slave/son_slave_thread.h
+@@ -574,6 +574,16 @@ private:
+     bool handle_unassoc_sta_link_metric_query(int fd, ieee1905_1::CmduMessageRx &cmdu_rx);
+     bool handle_bss_configuration_extended_request(int fd, ieee1905_1::CmduMessageRx &cmdu_rx);
+ 
++    /**
++     * @brief Compute the effective bSTA connected state used for hop count advertisement.
++     *
++     * On a wired backhaul there is no bSTA L2 association to track, so the state follows
++     * controller reachability alone. On a wireless backhaul, the state additionally requires
++     * the bSTA to be L2-associated (m_backhaul_l2_connected) to avoid advertising a valid hop
++     * count while the wireless link itself is down.
++     */
++    bool get_effective_bsta_connected();
++
+     /**
+      * @brief Recalculate the effective bSTA state and forward it to all AP Managers.
+      *
+diff --git a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+index 295761ba5..b190e630b 100644
+--- a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+@@ -673,7 +673,7 @@ public:
+ #endif
+     /**
+      * @brief Dynamically update the Multi-AP hop count in the assocresp_elements
+-     * vendor IE for all BSSes on this radio.
++     * vendor IE for the backhaul BSSes on this radio.
+      *
+      * Called when the backhaul STA connects or disconnects to update the hop count
+      * advertised in Association Response frames.
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 4976e3c5b..eb08f384f 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -4369,8 +4369,7 @@ bool ap_wlan_hal_nl80211::configure_service_priority(const uint8_t *data)
+ 
+ bool ap_wlan_hal_nl80211::set_hop_count(uint8_t hop_count)
+ {
+-    LOG(DEBUG) << "Setting hop_count=" << int(hop_count) << " on backhaul BSSes of radio "
+-               << get_iface_name();
++    LOG(DEBUG) << "Setting hop_count=" << int(hop_count) << " on radio " << get_iface_name();
+ 
+     std::string vendor_ie = build_multiap_assocresp_ie(hop_count);
+     std::string cmd       = "SET assocresp_elements " + vendor_ie;
+@@ -4382,6 +4381,7 @@ bool ap_wlan_hal_nl80211::set_hop_count(uint8_t hop_count)
+             continue;
+         }
+         if (!vap.backhaul) {  // Only update backhaul BSSes
++            LOG(DEBUG) << "Skipping BSS " << vap.bss << ": not a backhaul BSS";
+             continue;
+         }
+         if (!wpa_ctrl_send_msg(cmd, vap.bss)) {
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index b91419326..fc48e57a4 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -3030,8 +3030,8 @@ std::string ap_wlan_hal_whm::build_multiap_assocresp_ie_hex(uint8_t hop_count)
+ 
+ bool ap_wlan_hal_whm::set_hop_count(uint8_t hop_count)
+ {
+-    LOG(DEBUG) << "WHM: Setting hop_count=" << int(hop_count)
+-               << " on backhaul BSSes of radio " << get_iface_name();
++    LOG(DEBUG) << "WHM: Setting hop_count=" << int(hop_count) << " on radio "
++               << get_iface_name();
+ 
+     std::string ie_data = build_multiap_assocresp_ie_hex(hop_count);
+     if (ie_data.empty()) {
+@@ -3047,6 +3047,7 @@ bool ap_wlan_hal_whm::set_hop_count(uint8_t hop_count)
+             continue;
+         }
+         if (!vap.backhaul) {  // Only update backhaul BSSes
++            LOG(DEBUG) << "Skipping BSS " << vap.bss << ": not a backhaul BSS";
+             continue;
+         }
+ 
+-- 
+2.34.1
+
