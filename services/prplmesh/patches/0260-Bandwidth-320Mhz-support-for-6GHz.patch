@@ -1,0 +1,395 @@
+From 2514b0a32fe66eadbd83b8c530259ebed738dcbe Mon Sep 17 00:00:00 2001
+From: Sudharsan Eswaran <eswaran@qti.qualcomm.com>
+Date: Mon, 6 Jul 2026 21:28:27 +0530
+Subject: [PATCH] Bandwidth 320Mhz support for 6GHz
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+1. added missing NL80211_CHAN_WIDTH_320 case
+2. added explicit "if nl80211 reports 320 → BANDWIDTH_320" path,
+   bypassing the VHT-only vht_oper_chwidth mapping (which has no 320 slot)
+3. generic BANDWIDTH_320 now resolves to BANDWIDTH_320_1/_2 before
+   the channels_table_6g lookup
+4. 320Mhz BW handling is done in operating channel report message construction logic
+5. 320Mhz BW handling is done while processing channel selection request message and
+   setting the channel
+6. 320Mhz BW setting via hostapd CHAN_SWITCH command is handled
+
+Signed-off-by: Sudharsan Eswaran <eswaran@qti.qualcomm.com>
+---
+ .../slave/tasks/channel_selection_task.cpp    | 18 ++++--
+ agent/src/beerocks/slave/tlvf_utils.cpp       | 36 +++++++++++
+ .../bcl/source/beerocks_wifi_channel.cpp      | 16 ++++-
+ .../bcl/source/son/son_wireless_utils.cpp     | 16 +++++
+ .../beerocks/bwl/include/bwl/nl80211_client.h |  2 +-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 61 +++++++++++-------
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     | 62 +++++++++++--------
+ .../bwl/shared/nl80211_client_impl.cpp        |  6 ++
+ 8 files changed, 163 insertions(+), 54 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+index f384c7bf3..215ade2b6 100644
+--- a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+@@ -1211,10 +1211,20 @@ bool ChannelSelectionTask::build_channel_preference_report(const sMacAddr &radio
+         // Bandwidth of a channel is not supported.
+         auto &supported_channel_info = it_ch->second;
+         auto &supported_bw_list      = supported_channel_info.supported_bw_list;
+-        auto it_bw = std::find_if(supported_bw_list.begin(), supported_bw_list.end(),
+-                                  [&](const beerocks_message::sSupportedBandwidth &bw_info) {
+-                                      return bw_info.bandwidth == operating_bandwidth;
+-                                  });
++        // supported_bw_list stores the specific BANDWIDTH_320_1/BANDWIDTH_320_2 variant (each
++        // 6GHz channel supports only one of the two), while the operating classes table uses
++        // the generic BANDWIDTH_320 for opclass 137. Match either specific variant in that case,
++        // otherwise this lookup always fails and every 320MHz channel is marked NON_OPERABLE.
++        auto it_bw = std::find_if(
++            supported_bw_list.begin(), supported_bw_list.end(),
++            [&](const beerocks_message::sSupportedBandwidth &bw_info) {
++                if (operating_bandwidth == beerocks::eWiFiBandwidth::BANDWIDTH_320) {
++                    return bw_info.bandwidth == beerocks::eWiFiBandwidth::BANDWIDTH_320_1 ||
++                           bw_info.bandwidth == beerocks::eWiFiBandwidth::BANDWIDTH_320_2 ||
++                           bw_info.bandwidth == operating_bandwidth;
++                }
++                return bw_info.bandwidth == operating_bandwidth;
++            });
+         if (it_bw == supported_bw_list.end()) {
+             return AgentDB::sChannelPreference(
+                 operating_class, wfa_map::cPreferenceOperatingClasses::ePreference::NON_OPERABLE,
+diff --git a/agent/src/beerocks/slave/tlvf_utils.cpp b/agent/src/beerocks/slave/tlvf_utils.cpp
+index 2d9c42de6..cdb303277 100644
+--- a/agent/src/beerocks/slave/tlvf_utils.cpp
++++ b/agent/src/beerocks/slave/tlvf_utils.cpp
+@@ -359,6 +359,42 @@ bool tlvf_utils::create_operating_channel_report(ieee1905_1::CmduMessageTx &cmdu
+                     bandwidth = radio->wifi_channel.get_bandwidth();
+                 }
+ 
++                // channels_table indexes 320MHz entries by the specific BANDWIDTH_320_1 or
++                // BANDWIDTH_320_2 variant. Some channels (e.g. 33) fall in the overlap of both
++                // blocks, so radio->wifi_channel stores the generic BANDWIDTH_320 and the actual
++                // block in use must be disambiguated by the radio's real center frequency
++                if (bandwidth == beerocks::eWiFiBandwidth::BANDWIDTH_320) {
++                    auto center_channel_of_current_freq =
++                        son::wireless_utils::freq_to_channel(radio->wifi_channel.get_center_frequency());
++
++                    LOG(DEBUG) << "[BW320_DBG] create_operating_channel_report: opclass=" << int(*it)
++                               << " channel=" << radio->wifi_channel.get_channel()
++                               << " center_frequency=" << radio->wifi_channel.get_center_frequency()
++                               << " center_channel_of_current_freq=" << center_channel_of_current_freq;
++
++                    auto bw320_1_it = channel_it->second.find(beerocks::eWiFiBandwidth::BANDWIDTH_320_1);
++                    auto bw320_2_it = channel_it->second.find(beerocks::eWiFiBandwidth::BANDWIDTH_320_2);
++                    if (bw320_1_it != channel_it->second.end() &&
++                        bw320_1_it->second.center_channel == center_channel_of_current_freq) {
++                        bandwidth = beerocks::eWiFiBandwidth::BANDWIDTH_320_1;
++                    } else if (bw320_2_it != channel_it->second.end() &&
++                              bw320_2_it->second.center_channel == center_channel_of_current_freq) {
++                        bandwidth = beerocks::eWiFiBandwidth::BANDWIDTH_320_2;
++                    } else if (bw320_1_it != channel_it->second.end()) {
++                        // Fallback: current center frequency didn't match either candidate
++                        // (e.g. not yet refreshed) - keep prior best-effort behavior.
++                        LOG(WARNING) << "[BW320_DBG] create_operating_channel_report: channel="
++                                     << radio->wifi_channel.get_channel()
++                                     << " center_channel_of_current_freq="
++                                     << center_channel_of_current_freq
++                                     << " matched neither BANDWIDTH_320_1 nor BANDWIDTH_320_2"
++                                        " center channel - defaulting to BANDWIDTH_320_1";
++                        bandwidth = beerocks::eWiFiBandwidth::BANDWIDTH_320_1;
++                    } else if (bw320_2_it != channel_it->second.end()) {
++                        bandwidth = beerocks::eWiFiBandwidth::BANDWIDTH_320_2;
++                    }
++                }
++
+                 auto center_channel_it = channel_it->second.find(bandwidth);
+                 if (center_channel_it == channel_it->second.end()) {
+                     LOG(ERROR) << "Failed find bandwidth of channel "
+diff --git a/common/beerocks/bcl/source/beerocks_wifi_channel.cpp b/common/beerocks/bcl/source/beerocks_wifi_channel.cpp
+index db8261e51..1a26911be 100644
+--- a/common/beerocks/bcl/source/beerocks_wifi_channel.cpp
++++ b/common/beerocks/bcl/source/beerocks_wifi_channel.cpp
+@@ -342,7 +342,21 @@ bool WifiChannel::are_params_valid(uint8_t channel, eFreqType freq_type, uint16_
+             if (channel_it == son::wireless_utils::channels_table_6g.end()) {
+                 LOG(ERROR) << "Failed find " << channel << " channel in 6ghz channels table.";
+                 return false;
+-            } else if (channel_it->second.find(bandwidth) == channel_it->second.end()) {
++            }
++            // The channels table indexes 320MHz entries by the specific BANDWIDTH_320_1 or
++            // BANDWIDTH_320_2 variant (each 6GHz channel supports only one of the two), while
++            // callers may pass the generic BANDWIDTH_320. Try both variants in that case.
++            auto lookup_bandwidth = bandwidth;
++            if (lookup_bandwidth == eWiFiBandwidth::BANDWIDTH_320) {
++                if (channel_it->second.find(eWiFiBandwidth::BANDWIDTH_320_1) !=
++                    channel_it->second.end()) {
++                    lookup_bandwidth = eWiFiBandwidth::BANDWIDTH_320_1;
++                } else if (channel_it->second.find(eWiFiBandwidth::BANDWIDTH_320_2) !=
++                          channel_it->second.end()) {
++                    lookup_bandwidth = eWiFiBandwidth::BANDWIDTH_320_2;
++                }
++            }
++            if (channel_it->second.find(lookup_bandwidth) == channel_it->second.end()) {
+                 LOG(ERROR) << "Failed find bandwidth "
+                            << beerocks::utils::convert_bandwidth_to_string(bandwidth)
+                            << "MHz of channel " << channel << " in 6ghz channels table.";
+diff --git a/common/beerocks/bcl/source/son/son_wireless_utils.cpp b/common/beerocks/bcl/source/son/son_wireless_utils.cpp
+index 5dfed2d32..f3d01eaf4 100644
+--- a/common/beerocks/bcl/source/son/son_wireless_utils.cpp
++++ b/common/beerocks/bcl/source/son/son_wireless_utils.cpp
+@@ -1058,6 +1058,21 @@ int wireless_utils::channel_to_vht_center_freq(int channel, beerocks::eFreqType
+             LOG(ERROR) << "Failed find channel " << channel << " in 6g channel table";
+             return 0;
+         }
++        // The channels table indexes 320MHz entries by the specific BANDWIDTH_320_1 or
++        // BANDWIDTH_320_2 variant (each 6GHz channel supports only one of the two), while
++        // callers may pass the generic BANDWIDTH_320. Try both variants in that case.
++        if (bandwidth == beerocks::eWiFiBandwidth::BANDWIDTH_320) {
++            auto center_channel_it = channel_it->second.find(beerocks::eWiFiBandwidth::BANDWIDTH_320_1);
++            if (center_channel_it == channel_it->second.end()) {
++                center_channel_it = channel_it->second.find(beerocks::eWiFiBandwidth::BANDWIDTH_320_2);
++            }
++            if (center_channel_it == channel_it->second.end()) {
++                LOG(ERROR) << "Failed find bandwidth 320MHz of channel " << channel
++                           << " in channels table of 6ghz band";
++                return 0;
++            }
++            return channel_to_freq(center_channel_it->second.center_channel, freq_type);
++        }
+         auto center_channel_it = channel_it->second.find(bandwidth);
+         if (center_channel_it == channel_it->second.end()) {
+             LOG(ERROR) << "Failed find bandwidth "
+@@ -2103,6 +2118,7 @@ std::vector<uint8_t> wireless_utils::center_channel_to_beacon_channels(
+         beacon_channel = center_channel - 14;
+         beacon_channels.reserve(8);
+         break;
++    case beerocks::BANDWIDTH_320:
+     case beerocks::BANDWIDTH_320_1:
+     case beerocks::BANDWIDTH_320_2:
+         beacon_channel = center_channel - 30;
+diff --git a/common/beerocks/bwl/include/bwl/nl80211_client.h b/common/beerocks/bwl/include/bwl/nl80211_client.h
+index fb546d595..cd7740bb7 100644
+--- a/common/beerocks/bwl/include/bwl/nl80211_client.h
++++ b/common/beerocks/bwl/include/bwl/nl80211_client.h
+@@ -127,7 +127,7 @@ public:
+          * current channel width.
+          * Obtained from NL80211_ATTR_CHANNEL_WIDTH
+          */
+-        uint8_t bandwidth = 0;
++        uint16_t bandwidth = 0;
+ 
+         /*
+          * Center frequency of the first part of the
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 242e0ea20..eeb3b27d3 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -2936,10 +2936,11 @@ bool ap_wlan_hal_nl80211::switch_channel(int chan, beerocks::eWiFiBandwidth bw,
+         } else {
+             // For 6GHz (and other non-5GHz bands):
+             // For 80MHz: comparing freq vs vht_center_frequency (80MHz center) is correct.
+-            // For 160MHz: vht_center_frequency is the 160MHz block center, but
++            // For 160MHz and 320MHz: vht_center_frequency is the full-width block center, but
+             //   sec_channel_offset must reflect the primary's position within its 40MHz block.
+-            //   The 40MHz block center is ±20 MHz from the 80MHz segment center,
+-            //   which is ±40 MHz from the 160MHz block center.
++            //   Narrow the block down to its 40MHz sub-block center by repeatedly halving:
++            //   160MHz -> 80MHz segment (±40MHz) -> 40MHz segment (±20MHz);
++            //   320MHz -> 160MHz segment (±80MHz) -> 80MHz segment (±40MHz) -> 40MHz segment (±20MHz).
+             //
+             // Example: 6GHz 160MHz, primary=6195 MHz, 160MHz center=6185 MHz
+             //   Primary is in upper 80MHz (6185-6265), upper 80MHz center=6225
+@@ -2947,21 +2948,19 @@ bool ap_wlan_hal_nl80211::switch_channel(int chan, beerocks::eWiFiBandwidth bw,
+             //   40MHz center = 6185 + 20 = 6205 MHz
+             //   6195 < 6205 → sec_channel_offset=1 (secondary above primary) ✓
+             int center_for_offset = vht_center_frequency;
+-            if (bw == beerocks::BANDWIDTH_160) {
+-                int offset = freq - vht_center_frequency;
+-                if (offset > 0) {
+-                    // Primary is in upper 80MHz segment
+-                    center_for_offset = (offset < 40) ? vht_center_frequency + 20
+-                                                        : vht_center_frequency + 60;
+-                } else {
+-                    // Primary is in lower 80MHz segment
+-                    center_for_offset = (offset > -40) ? vht_center_frequency - 20
+-                                                        : vht_center_frequency - 60;
++            if (bw == beerocks::BANDWIDTH_160 || bw == beerocks::BANDWIDTH_320 ||
++                bw == beerocks::BANDWIDTH_320_1 || bw == beerocks::BANDWIDTH_320_2) {
++                int full_width_mhz = (bw == beerocks::BANDWIDTH_160) ? 160 : 320;
++                int half_step      = full_width_mhz / 4; // 40 for 160MHz, 80 for 320MHz
++                while (half_step >= 20) {
++                    int offset = freq - center_for_offset;
++                    center_for_offset += (offset > 0) ? half_step : -half_step;
++                    half_step /= 2;
+                 }
+-                LOG(DEBUG) << "switch_channel: 160MHz sec_channel_offset calc:"
++                LOG(DEBUG) << "switch_channel: " << full_width_mhz
++                            << "MHz sec_channel_offset calc:"
+                             << " freq=" << freq
+-                            << " 160MHz_center=" << vht_center_frequency
+-                            << " offset=" << (freq - vht_center_frequency)
++                            << " block_center=" << vht_center_frequency
+                             << " 40MHz_center=" << center_for_offset;
+             }
+             int sec_off = (freq < center_for_offset) ? 1 : -1;
+@@ -2990,13 +2989,26 @@ bool ap_wlan_hal_nl80211::switch_channel(int chan, beerocks::eWiFiBandwidth bw,
+     if (bw == beerocks::BANDWIDTH_20) {
+         // For 20MHz, center_freq1 should equal the primary frequency
+         cmd += " center_freq1=" + freq_str;
+-    } else if (bw == beerocks::BANDWIDTH_40 || bw == beerocks::BANDWIDTH_80 || bw == beerocks::BANDWIDTH_160) {
++    } else if (bw == beerocks::BANDWIDTH_40 || bw == beerocks::BANDWIDTH_80 ||
++              bw == beerocks::BANDWIDTH_160 || bw == beerocks::BANDWIDTH_320 ||
++              bw == beerocks::BANDWIDTH_320_1 || bw == beerocks::BANDWIDTH_320_2) {
+         cmd += " center_freq1=" + wave_vht_center_frequency;
+     }
+ 
+-    std::string bw_str = beerocks::utils::convert_bandwidth_to_string(bw);
+-    cmd += " bandwidth=" + bw_str.erase(bw_str.size() - 3);
+-    // trim "MHz" from bw_str
++    // hostapd's CHAN_SWITCH command expects a plain numeric MHz value (e.g. "bandwidth=320").
++    // convert_bandwidth_to_string() returns suffixed strings like "320MHz-1"/"320MHz-2" for the
++    // specific 6GHz 320MHz blocks, which don't fit the "just trim the MHz suffix" pattern used
++    // for the other widths, so 320MHz is mapped explicitly instead of via string trimming.
++    std::string bw_numeric_str;
++    if (bw == beerocks::BANDWIDTH_320 || bw == beerocks::BANDWIDTH_320_1 ||
++        bw == beerocks::BANDWIDTH_320_2) {
++        bw_numeric_str = "320";
++    } else {
++        std::string bw_str = beerocks::utils::convert_bandwidth_to_string(bw);
++        // trim "MHz" from bw_str
++        bw_numeric_str = bw_str.erase(bw_str.size() - 3);
++    }
++    cmd += " bandwidth=" + bw_numeric_str;
+ 
+     auto phy_valid_on_band = [&](const char* phy) -> bool {
+         if (freq_type == beerocks::FREQ_24G) {
+@@ -3024,7 +3036,14 @@ bool ap_wlan_hal_nl80211::switch_channel(int chan, beerocks::eWiFiBandwidth bw,
+     };
+     auto phy_valid_width = [&](const char* phy) -> bool {
+         // Basic PHY vs width gating (regulatory/DFS checks are out of scope here):
+-        if (bw == beerocks::BANDWIDTH_320) return (std::strcmp(phy, "eht") == 0) && (freq_type == beerocks::FREQ_6G);
++        // 320MHz is 6GHz/EHT-only, and may be requested as the generic BANDWIDTH_320 or as
++        // one of the specific BANDWIDTH_320_1/BANDWIDTH_320_2 blocks - all three mean "320MHz".
++        if (bw == beerocks::BANDWIDTH_320 || bw == beerocks::BANDWIDTH_320_1 ||
++            bw == beerocks::BANDWIDTH_320_2) {
++            LOG(DEBUG) << "[BW320_DBG] phy_valid_width: bw=" << bw << " phy=" << phy
++                       << " freq_type=" << freq_type;
++            return (std::strcmp(phy, "eht") == 0) && (freq_type == beerocks::FREQ_6G);
++        }
+         if (bw == beerocks::BANDWIDTH_160) return (std::strcmp(phy, "eht") == 0) ||
+             (std::strcmp(phy, "he")  == 0) ||
+                 (std::strcmp(phy, "vht") == 0);
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index f927f6e12..7ca4cbb69 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -676,6 +676,7 @@ bool base_wlan_hal_nl80211::refresh_radio_info()
+         int vht_oper_chwidth  = -1;
+         int secondary_channel = -1;
+         nl80211_client::interface_info if_info;
++        bool bandwidth_from_nl80211 = false;
+ 
+         // Try to get bandwidth from STATUS command first
+         auto iter = reply.find("vht_oper_chwidth");
+@@ -690,8 +691,13 @@ bool base_wlan_hal_nl80211::refresh_radio_info()
+         // Always try nl80211 as fallback/verification to get accurate bandwidth
+         // This handles cases where STATUS doesn't provide complete info
+         if (m_nl80211_client->get_interface_info(get_iface_name(), if_info)) {
+-            // Use nl80211 data if STATUS didn't provide values or for verification
+-            if (vht_oper_chwidth < 0 || secondary_channel < 0) {
++            // 320MHz (EHT, 6GHz) has no vht_oper_chwidth representation, so it must be
++            // taken directly from nl80211 instead of going through the VHT-style mapping below.
++            if (if_info.bandwidth == 320) {
++                m_radio_info.bandwidth = beerocks::eWiFiBandwidth::BANDWIDTH_320;
++                bandwidth_from_nl80211 = true;
++            } else if (vht_oper_chwidth < 0 || secondary_channel < 0) {
++                // Use nl80211 data if STATUS didn't provide values or for verification
+                 switch (if_info.bandwidth) {
+                 case 20:
+                     vht_oper_chwidth = 0;
+@@ -719,33 +725,35 @@ bool base_wlan_hal_nl80211::refresh_radio_info()
+             }
+         }
+ 
+-        // Final fallback: if still no valid values, default to 20MHz
+-        if (vht_oper_chwidth < 0) {
+-            vht_oper_chwidth = 0;
+-        }
+-        if (secondary_channel < 0) {
+-            secondary_channel = 0;
+-        }
++        if (!bandwidth_from_nl80211) {
++            // Final fallback: if still no valid values, default to 20MHz
++            if (vht_oper_chwidth < 0) {
++                vht_oper_chwidth = 0;
++            }
++            if (secondary_channel < 0) {
++                secondary_channel = 0;
++            }
+ 
+-        switch (vht_oper_chwidth) {
+-            // if vht_oper_chwidth is not set it defaults to 0
+-        case 0:
+-            if (secondary_channel == 0) {
+-                m_radio_info.bandwidth = beerocks::eWiFiBandwidth::BANDWIDTH_20;
+-            } else {
+-                m_radio_info.bandwidth = beerocks::eWiFiBandwidth::BANDWIDTH_40;
++            switch (vht_oper_chwidth) {
++                // if vht_oper_chwidth is not set it defaults to 0
++            case 0:
++                if (secondary_channel == 0) {
++                    m_radio_info.bandwidth = beerocks::eWiFiBandwidth::BANDWIDTH_20;
++                } else {
++                    m_radio_info.bandwidth = beerocks::eWiFiBandwidth::BANDWIDTH_40;
++                }
++                break;
++            case 1:
++                m_radio_info.bandwidth = beerocks::eWiFiBandwidth::BANDWIDTH_80;
++                break;
++            case 2:
++                m_radio_info.bandwidth = beerocks::eWiFiBandwidth::BANDWIDTH_160;
++                break;
++            default:
++                LOG(ERROR) << "Unknown vht_oper_chwidth " << vht_oper_chwidth
++                           << ". Defaulting bandwidth to 160Mhz.";
++                m_radio_info.bandwidth = beerocks::eWiFiBandwidth::BANDWIDTH_160;
+             }
+-            break;
+-        case 1:
+-            m_radio_info.bandwidth = beerocks::eWiFiBandwidth::BANDWIDTH_80;
+-            break;
+-        case 2:
+-            m_radio_info.bandwidth = beerocks::eWiFiBandwidth::BANDWIDTH_160;
+-            break;
+-        default:
+-            LOG(ERROR) << "Unknown vht_oper_chwidth " << vht_oper_chwidth
+-                       << ". Defaulting bandwidth to 160Mhz.";
+-            m_radio_info.bandwidth = beerocks::eWiFiBandwidth::BANDWIDTH_160;
+         }
+ 
+         //center freq = 5 GHz + (5 * index)
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.cpp b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+index 63c72f87c..1e2627105 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -417,6 +417,9 @@ bool nl80211_client_impl::get_interface_info(const std::string &interface_name,
+                     case NL80211_CHAN_WIDTH_160:
+                         interface_info.bandwidth = 160;
+                         break;
++                    case NL80211_CHAN_WIDTH_320:
++                        interface_info.bandwidth = 320;
++                        break;
+                     default:
+                         //unsupported values: ofdm bw 5 and 10
+                         interface_info.bandwidth = 0;
+@@ -472,6 +475,9 @@ bool nl80211_client_impl::get_interface_info(const std::string &interface_name,
+                                                        case NL80211_CHAN_WIDTH_160:
+                                                                interface_info.bandwidth = 160;
+                                                                break;
++                                                       case NL80211_CHAN_WIDTH_320:
++                                                               interface_info.bandwidth = 320;
++                                                               break;
+                                                        default:
+                                                                //unsupported values: ofdm bw 5 and 10
+                                                                interface_info.bandwidth = 0;
+-- 
+2.34.1
+
