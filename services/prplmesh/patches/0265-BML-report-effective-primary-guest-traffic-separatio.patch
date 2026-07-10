@@ -1,0 +1,228 @@
+From 3f0765cba5537afe30e280e5bdba30c76cb1f1f3 Mon Sep 17 00:00:00 2001
+From: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+Date: Thu, 9 Jul 2026 20:03:39 +0530
+Subject: [PATCH 265/265] BML: report effective primary/guest traffic
+ separation VLAN IDs
+
+Add db::get_traffic_separation_primary_vid()/get_traffic_separation_guest_vid()
+to resolve the effective VLAN IDs for an agent from, in order: an explicit
+Default 802.1Q setting, a per-SSID traffic separation policy (matched by
+vap_type), or the controller's configured PrivateVID/GuestVID fallback
+used for custom traffic separation.
+
+Report these on BML_NODE.gw_ire (primary_vlan_id/guest_vlan_id) instead of
+the old per-VAP vlan_id, since the VLAN assignment is per-bridge (private/
+guest), not per individual VAP, matching the 8021q-subifaces traffic
+separation design. beerocks_cli_bml now prints a per-agent "Traffic
+separation:" summary line with these two VLAN IDs.
+
+get_traffic_separation_guest_vid()'s configured-GuestVID fallback path now
+validates the value against the same [1, 4094] VLAN ID range as
+get_traffic_separation_primary_vid()'s PrivateVID fallback, returning 0
+(not set) on an out-of-range value instead of silently truncating it via
+the uint16_t cast.
+
+Signed-off-by: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+---
+ controller/src/beerocks/bml/bml_defs.h        |  6 ++
+ .../src/beerocks/cli/beerocks_cli_bml.cpp     | 11 ++-
+ .../src/beerocks/cli/beerocks_cli_bml.h       |  2 +
+ controller/src/beerocks/master/db/db.cpp      | 74 +++++++++++++++++++
+ controller/src/beerocks/master/db/db.h        | 22 ++++++
+ .../src/beerocks/master/db/network_map.cpp    |  3 +
+ 6 files changed, 117 insertions(+), 1 deletion(-)
+
+diff --git a/controller/src/beerocks/bml/bml_defs.h b/controller/src/beerocks/bml/bml_defs.h
+index e44b29db9..6755b4c14 100644
+--- a/controller/src/beerocks/bml/bml_defs.h
++++ b/controller/src/beerocks/bml/bml_defs.h
+@@ -229,6 +229,12 @@ struct BML_NODE {
+             uint8_t backhaul_mac[BML_MAC_ADDR_LEN];
+             uint8_t reserved[2];
+ 
++            /* Primary VLAN ID (default 802.1Q), 0 if traffic separation is not enabled. */
++            uint16_t primary_vlan_id;
++
++            /* Guest VLAN ID, 0 if not set. */
++            uint16_t guest_vlan_id;
++
+             /* Wi-Fi Radio */
+             struct N_RADIO {
+ 
+diff --git a/controller/src/beerocks/cli/beerocks_cli_bml.cpp b/controller/src/beerocks/cli/beerocks_cli_bml.cpp
+index 300709462..c4a14d4cd 100644
+--- a/controller/src/beerocks/cli/beerocks_cli_bml.cpp
++++ b/controller/src/beerocks/cli/beerocks_cli_bml.cpp
+@@ -44,7 +44,9 @@ static void fill_conn_map_node(
+ 
+     if (node->type != BML_NODE_TYPE_CLIENT) { // GW or IRE
+ 
+-        n->gw_ire.backhaul_mac = tlvf::mac_to_string(node->data.gw_ire.backhaul_mac);
++        n->gw_ire.backhaul_mac    = tlvf::mac_to_string(node->data.gw_ire.backhaul_mac);
++        n->gw_ire.primary_vlan_id = node->data.gw_ire.primary_vlan_id;
++        n->gw_ire.guest_vlan_id   = node->data.gw_ire.guest_vlan_id;
+ 
+         // RADIO
+         int radio_length = sizeof(node->data.gw_ire.radio) / sizeof(node->data.gw_ire.radio[0]);
+@@ -183,6 +185,13 @@ static void bml_utils_dump_conn_map(
+                << ", ipv4: " << node->ip_v4
+                << ", Status: " << (node->status ? "Inactive" : "Active") << std::endl;
+ 
++            // TRAFFIC SEPARATION
++            ss << ind_str << "Traffic separation: "
++               << (node->gw_ire.primary_vlan_id ? "Enabled" : "Disabled")
++               << ", primary vlanid: " << std::to_string(node->gw_ire.primary_vlan_id)
++               << ", secondary vlanid: " << std::to_string(node->gw_ire.guest_vlan_id)
++               << std::endl;
++
+             // ETHERNET
+             // generate eth address from bridge address
+             auto eth_sw_mac_binary =
+diff --git a/controller/src/beerocks/cli/beerocks_cli_bml.h b/controller/src/beerocks/cli/beerocks_cli_bml.h
+index c9ddc71e0..91f88ebb0 100644
+--- a/controller/src/beerocks/cli/beerocks_cli_bml.h
++++ b/controller/src/beerocks/cli/beerocks_cli_bml.h
+@@ -40,6 +40,8 @@ public:
+         struct gw_ire_t {
+ 
+             std::string backhaul_mac;
++            uint16_t primary_vlan_id;
++            uint16_t guest_vlan_id;
+ 
+             struct radio_t {
+                 uint8_t channel;
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 8d44fb774..cb2d448d1 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -6362,6 +6362,80 @@ wireless_utils::s8021QSettings db::get_default_8021q_setting(const sMacAddr &al_
+     return wireless_utils::s8021QSettings();
+ }
+ 
++uint16_t db::get_traffic_separation_primary_vid(const sMacAddr &al_mac)
++{
++    auto default_8021q_config = get_default_8021q_setting(al_mac);
++    if (default_8021q_config.primary_vlan_id != 0) {
++        return default_8021q_config.primary_vlan_id;
++    }
++
++    // No explicit Default 802.1Q setting - check the per-SSID traffic separation policy
++    // (if any) for a non-guest SSID's VLAN ID.
++    for (const auto &ts_ssid : get_traffic_separation_configuration(al_mac)) {
++        for (const auto &bss_info : get_bss_info_configuration(al_mac)) {
++            if (bss_info.ssid == ts_ssid.ssid && bss_info.vap_type != eVapType::GUEST) {
++                return ts_ssid.vlan_id;
++            }
++        }
++    }
++
++    // Still nothing known - fall back to the controller's configured PrivateVID, matching
++    // the custom traffic separation fallback used when generating the outgoing TLV (see
++    // agent_monitoring_task::add_traffic_separation_policy_tlv).
++    bool is_custom_ts_enabled = false;
++    if (!bpl::cfg_get_is_traffic_separation_enabled(is_custom_ts_enabled) ||
++        !is_custom_ts_enabled) {
++        return 0;
++    }
++
++    // Valid VLAN ID range for traffic separation.
++    constexpr int MIN_TS_VID = 1;
++    constexpr int MAX_TS_VID = 4094;
++
++    int private_vid = bpl::DEFAULT_PRIVATE_VLAN_ID;
++    if (!bpl::cfg_get_traffic_separation_private_vid(private_vid) || private_vid < MIN_TS_VID ||
++        private_vid > MAX_TS_VID) {
++        private_vid = bpl::DEFAULT_PRIVATE_VLAN_ID;
++    }
++
++    return static_cast<uint16_t>(private_vid);
++}
++
++uint16_t db::get_traffic_separation_guest_vid(const sMacAddr &al_mac)
++{
++    // Check the per-SSID traffic separation policy (if any) for a GUEST SSID's VLAN ID.
++    for (const auto &ts_ssid : get_traffic_separation_configuration(al_mac)) {
++        for (const auto &bss_info : get_bss_info_configuration(al_mac)) {
++            if (bss_info.ssid == ts_ssid.ssid && bss_info.vap_type == eVapType::GUEST) {
++                return ts_ssid.vlan_id;
++            }
++        }
++    }
++
++    // No real per-SSID policy - fall back to the controller's configured GuestVID, only if
++    // custom traffic separation is actually enabled.
++    bool is_custom_ts_enabled = false;
++    if (!bpl::cfg_get_is_traffic_separation_enabled(is_custom_ts_enabled) ||
++        !is_custom_ts_enabled) {
++        return 0;
++    }
++
++    int guest_vid = 0;
++    if (!bpl::cfg_get_traffic_separation_guest_vid(guest_vid)) {
++        return 0;
++    }
++
++    // Valid VLAN ID range for traffic separation.
++    constexpr int MIN_TS_VID = 1;
++    constexpr int MAX_TS_VID = 4094;
++
++    if (guest_vid < MIN_TS_VID || guest_vid > MAX_TS_VID) {
++        return 0;
++    }
++
++    return static_cast<uint16_t>(guest_vid);
++}
++
+ void db::clear_traffic_separation_configurations()
+ {
+     traffic_separation_policy_configurations.clear();
+diff --git a/controller/src/beerocks/master/db/db.h b/controller/src/beerocks/master/db/db.h
+index 3b7e0c368..c8d710ac9 100644
+--- a/controller/src/beerocks/master/db/db.h
++++ b/controller/src/beerocks/master/db/db.h
+@@ -2329,6 +2329,28 @@ public:
+      */
+     wireless_utils::s8021QSettings get_default_8021q_setting(const sMacAddr &al_mac);
+ 
++    /**
++     * @brief Get the effective primary (private) VLAN ID for an agent, whether it comes from
++     * an explicit Default 802.1Q setting, a per-SSID traffic separation policy, or (as a last
++     * resort) the controller's configured PrivateVID fallback for custom traffic separation.
++     *
++     * @param[in] al_mac AL MAC address of agent.
++     *
++     * @return Primary VLAN ID, or 0 if traffic separation is not enabled for this agent.
++     */
++    uint16_t get_traffic_separation_primary_vid(const sMacAddr &al_mac);
++
++    /**
++     * @brief Get the effective guest VLAN ID for an agent, whether it comes from a per-SSID
++     * traffic separation policy (matched by GUEST vap_type), or (as a last resort) the
++     * controller's configured GuestVID fallback for custom traffic separation.
++     *
++     * @param[in] al_mac AL MAC address of agent.
++     *
++     * @return Guest VLAN ID, or 0 if not configured.
++     */
++    uint16_t get_traffic_separation_guest_vid(const sMacAddr &al_mac);
++
+     /**
+      * @brief Clear all known traffic separation configurations.
+      */
+diff --git a/controller/src/beerocks/master/db/network_map.cpp b/controller/src/beerocks/master/db/network_map.cpp
+index f653a753e..92c5d88c0 100644
+--- a/controller/src/beerocks/master/db/network_map.cpp
++++ b/controller/src/beerocks/master/db/network_map.cpp
+@@ -413,6 +413,9 @@ std::ptrdiff_t network_map::fill_bml_agent_data(db &database, std::shared_ptr<Ag
+     network_utils::ipv4_from_string(node->ip_v4, agent->ipv4);
+     string_utils::copy_string(node->name, agent->name.c_str(), sizeof(node->name));
+ 
++    node->data.gw_ire.primary_vlan_id = database.get_traffic_separation_primary_vid(agent->al_mac);
++    node->data.gw_ire.guest_vlan_id   = database.get_traffic_separation_guest_vid(agent->al_mac);
++
+     size_t i = 0;
+     for (const auto &radio : agent->radios) {
+         if (i >= beerocks::utils::array_length(node->data.gw_ire.radio)) {
+-- 
+2.34.1
+
