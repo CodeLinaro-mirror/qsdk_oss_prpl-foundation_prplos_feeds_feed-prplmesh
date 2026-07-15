@@ -1,0 +1,267 @@
+From 81305acd5c618bd1ff5b1a821c0fd15d24062401 Mon Sep 17 00:00:00 2001
+From: Sudharsan Eswaran <eswaran@qti.qualcomm.com>
+Date: Mon, 13 Jul 2026 14:34:37 +0530
+Subject: [PATCH] Intimate the dynamic puncturing info to prpl controller
+
+ 1. read the started channel switch event and retrieve the puncture pattern
+ 2. pass the PP to ap manager and populate it in eht operation TLV
+ 3. add eht operational TLV in operating channel report message
+ 4. add eht operational TLV while responding to empty channel selection request
+
+Signed-off-by: Sudharsan Eswaran <eswaran@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 |  3 +++
+ agent/src/beerocks/slave/son_slave_thread.cpp | 22 +++++++++++++++++++
+ .../slave/tasks/channel_selection_task.cpp    | 17 +++++++++++---
+ common/beerocks/bwl/include/bwl/ap_wlan_hal.h |  1 +
+ .../bwl/include/bwl/base_wlan_hal_types.h     |  3 ++-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 22 +++++++++++++++++++
+ .../beerocks/tlvf/beerocks_message_common.h   |  3 +++
+ .../tlvf/beerocks_message_common.yaml         |  1 +
+ controller/src/beerocks/master/controller.cpp |  9 +++++++-
+ controller/src/beerocks/master/db/agent.h     |  2 +-
+ controller/src/beerocks/master/db/db.cpp      |  2 +-
+ 11 files changed, 78 insertions(+), 7 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index da86db0c9..56a7a1cfe 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -3018,6 +3018,9 @@ void ApManager::fill_cs_params(beerocks_message::sApChannelSwitch &params)
+     params.vht_center_frequency      = ap_wlan_hal->get_radio_info().vht_center_freq;
+     params.switch_reason             = uint8_t(ap_wlan_hal->get_radio_info().last_csa_sw_reason);
+     params.is_dfs_channel            = ap_wlan_hal->get_radio_info().is_dfs_channel;
++    params.puncturing_bitmap         = ap_wlan_hal->get_radio_info().puncturing_bitmap;
++    LOG(DEBUG) << "fill_cs_params: channel=" << int(params.channel)
++               << " puncturing_bitmap=0x" << std::hex << params.puncturing_bitmap << std::dec;
+ }
+ 
+ void ApManager::fill_sr_params(beerocks_message::sSpatialReuseParams &params)
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 789d2b415..ee16109ca 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -7191,6 +7191,14 @@ bool slave_thread::send_operating_channel_report(const std::string &fronthaul_if
+         LOG(ERROR) << "Failed adding Operating Channel Report TLV";
+         return false;
+     }
++
++    // Append EHT Operations TLV so the controller receives an up-to-date
++    // DisabledSubchannelBitmap (e.g. after a driver-triggered puncturing CSA).
++    if (!add_eht_operations_tlv(cmdu_tx)) {
++        LOG(ERROR) << "Failed adding EHT Operations TLV to Operating Channel Report";
++        return false;
++    }
++
+     return send_cmdu_to_controller(fronthaul_iface, cmdu_tx);
+ }
+ 
+@@ -7284,6 +7292,20 @@ void slave_thread::save_channel_params_to_db(const std::string &fronthaul_iface,
+                    << " does not the same as wifi channel's channel_ext_above_primary"
+                    << radio->wifi_channel.get_ext_above_primary();
+     }
++
++    // Update EHT disabled_subchannel_bitmap for all BSS entries of this radio so that
++    // the next Operating Channel Report carries the correct puncturing pattern.
++    // disabled_subchannel_valid is always set to 1: bitmap=0 is a valid pattern meaning
++    // no subchannels are disabled (un-puncturing), and the controller must write it too.
++    LOG(DEBUG) << "save_channel_params_to_db: updating disabled_subchannel_bitmap=0x"
++               << std::hex << params.puncturing_bitmap << std::dec
++               << " for iface=" << fronthaul_iface;
++    for (auto &bss : radio->front.bssids) {
++        auto eht_ops =
++            reinterpret_cast<beerocks::net::sEHTOperations *>(&bss.eht_operations);
++        eht_ops->operation_informations.disabled_subchannel_bitmap = params.puncturing_bitmap;
++        eht_ops->operation_parameters.disabled_subchannel_valid    = 1;
++    }
+ }
+ 
+ void slave_thread::save_cac_capabilities_params_to_db(const std::string &fronthaul_iface)
+diff --git a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+index 2241f6275..163a92225 100644
+--- a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+@@ -10,6 +10,7 @@
+ #include "../agent_db.h"
+ #include "../backhaul_manager/backhaul_manager.h"
+ #include "../cac_status_database.h"
++#include "../son_slave_thread.h"
+ #include "../tlvf_utils.h"
+ 
+ #include <beerocks/tlvf/beerocks_message_1905_vs.h>
+@@ -2927,9 +2928,19 @@ bool ChannelSelectionTask::send_operating_channel_report(const sMacAddr &radio_m
+             return false;
+         }
+ 
+-        if (m_pending_selection.requests.find(radio) != m_pending_selection.requests.end()) {
+-            add_eht_operations_tlv(m_cmdu_tx, radio,
+-                                   m_pending_selection.requests[radio].eht_operation, true);
++        auto it = m_pending_selection.requests.find(radio);
++        if (it != m_pending_selection.requests.end() &&
++            (it->second.eht_operation.eht_params.eht_operation_information_valid ||
++             it->second.eht_operation.eht_params.disabled_subchannel_valid)) {
++            // Controller-initiated CSA with EHT params: use the request's EHT operation.
++            add_eht_operations_tlv(m_cmdu_tx, radio, it->second.eht_operation, true);
++        } else {
++            // No pending EHT params in the request (empty channel selection, ACS, or
++            // driver-initiated CSA). Use the current DB state so the controller receives
++            // an up-to-date DisabledSubchannelBitmap (including un-puncturing to 0).
++            LOG(DEBUG) << "OCR: no EHT params in request for radio " << radio
++                       << ", adding EHT Operations TLV from DB";
++            slave_thread::add_eht_operations_tlv(m_cmdu_tx);
+         }
+     }
+ 
+diff --git a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+index 0a1f7bab8..d27400d11 100644
+--- a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+@@ -63,6 +63,7 @@ public:
+         ACS_Failed,
+ 
+         CSA_Finished,
++        CSA_Started,
+         CTRL_Channel_Switch,
+ 
+         BSS_TM_Query,
+diff --git a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+index ad3ecc979..3923f20f4 100644
+--- a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
++++ b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+@@ -237,7 +237,8 @@ struct RadioInfo {
+     bool wps_pushbutton_configured = false;
+     std::string radio_id;
+ 
+-    ChanSwReason last_csa_sw_reason = ChanSwReason::Unknown;
++    ChanSwReason last_csa_sw_reason  = ChanSwReason::Unknown;
++    uint16_t puncturing_bitmap       = 0; ///< EHT per-channel puncturing bitmap from driver
+     // Key = channel
+     std::map<uint8_t, sChannelInfo> channels_list;
+     std::unordered_map<int, VAPElement> available_vaps; // key = vap_id
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index eb97da230..330e64fa8 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -105,6 +105,8 @@ static ap_wlan_hal::Event nl80211_to_bwl_event(const std::string &opcode)
+         return ap_wlan_hal::Event::ACS_Failed;
+     } else if (opcode == "AP-CSA-FINISHED") {
+         return ap_wlan_hal::Event::CSA_Finished;
++    } else if (opcode == "CTRL-EVENT-STARTED-CHANNEL-SWITCH") {
++        return ap_wlan_hal::Event::CSA_Started;
+     } else if (opcode == "DFS-RADAR-DETECTED") {
+ 	return ap_wlan_hal::Event::DFS_RADAR_Detected;
+     } else if (opcode == "DFS-CAC-START") {
+@@ -4049,6 +4051,26 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+ 	event_queue_push(event);
+ 	} break;
+ 
++    case Event::CSA_Started: {
++        // CTRL-EVENT-STARTED-CHANNEL-SWITCH is the pre-switch announcement from hostapd.
++        // It reliably carries puncturing_bitmap for EHT channels, arriving before
++        // AP-CSA-FINISHED. Store it in m_radio_info so fill_cs_params() picks it up.
++        // If the bitmap changed after a CSA_Finished already fired (race condition in MLD
++        // setups), re-fire CSA_Finished so ap_manager sends a corrected notification.
++        // This also handles un-puncturing: bitmap returns to 0 after ~30 min and a
++        // corrected CSA notification must be sent to clear the DisabledSubchannelBitmap.
++        const std::string &punct_str = parsed_obj["puncturing_bitmap"];
++        const uint16_t new_bitmap =
++            punct_str.empty() ? 0
++                              : static_cast<uint16_t>(std::stoul(punct_str, nullptr, 0));
++        if (new_bitmap != m_radio_info.puncturing_bitmap) {
++            m_radio_info.puncturing_bitmap = new_bitmap;
++            LOG(DEBUG) << "CSA_Started: puncturing_bitmap changed, firing CSA_Finished"
++                       << " for iface=" << m_radio_info.iface_name;
++            event_queue_push(Event::CSA_Finished);
++        }
++    } break;
++
+     case Event::AWGN_Detected: {
+         // Parse AWGN event: INTERFERENCE-DETECTED type=AWGN
+         std::string interference_type = parsed_obj["type"];
+diff --git a/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_common.h b/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_common.h
+index bb65e08e1..022fed929 100644
+--- a/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_common.h
++++ b/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_common.h
+@@ -147,11 +147,14 @@ typedef struct sApChannelSwitch {
+     uint16_t vht_center_frequency;
+     int8_t tx_power;
+     uint8_t csa_count;
++    uint16_t puncturing_bitmap;
+     void struct_swap(){
+         tlvf_swap(16, reinterpret_cast<uint8_t*>(&vht_center_frequency));
++        tlvf_swap(16, reinterpret_cast<uint8_t*>(&puncturing_bitmap));
+     }
+     void struct_init(){
+         csa_count = 0x5;
++        puncturing_bitmap = 0x0;
+     }
+ } __attribute__((packed)) sApChannelSwitch;
+ 
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_common.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_common.yaml
+index b22c8226d..a98efe3d1 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_common.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_common.yaml
+@@ -115,6 +115,7 @@ sApChannelSwitch:
+   csa_count:
+     _type: uint8_t
+     _value: 5
++  puncturing_bitmap: uint16_t
+ 
+ sDfsCacCompleted:
+   _type: struct
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 1fd79d50b..448783278 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -2545,7 +2545,8 @@ bool Controller::handle_tlv_eht_operations(ieee1905_1::CmduMessageRx &cmdu_rx,
+ {
+     auto eht_operations_tlv = cmdu_rx.getClass<wfa_map::tlvEHTOperations>();
+     if (!eht_operations_tlv) {
+-        LOG(DEBUG) << "Cound't find EHT Operations TLV";
++        LOG(DEBUG) << "handle_tlv_eht_operations: no EHT Operations TLV in message, al_mac="
++                   << al_mac;
+         return true;
+     }
+ 
+@@ -3041,6 +3042,12 @@ bool Controller::handle_cmdu_1905_operating_channel_report(const sMacAddr &src_m
+         LOG(ERROR) << "Failed to process EHT Operations TLV in Operating Channel Report";
+     }
+ 
++    // Process EHT Operations TLV if present (carries DisabledSubchannelBitmap for puncturing).
++    // src_mac is the agent AL MAC for 1905.1 messages.
++    if (!handle_tlv_eht_operations(cmdu_rx, src_mac)) {
++        LOG(ERROR) << "Failed processing EHT Operations TLV from OCR, src_mac=" << src_mac;
++    }
++
+     // send ACK_MESSAGE back to the Agent
+     if (!cmdu_tx.create(mid, ieee1905_1::eMessageType::ACK_MESSAGE)) {
+         LOG(ERROR) << "cmdu creation of type ACK_MESSAGE, has failed";
+diff --git a/controller/src/beerocks/master/db/agent.h b/controller/src/beerocks/master/db/agent.h
+index e120834af..32ccaeb47 100644
+--- a/controller/src/beerocks/master/db/agent.h
++++ b/controller/src/beerocks/master/db/agent.h
+@@ -498,7 +498,7 @@ public:
+                 } eht_operation_informations;
+ 
+                 struct sSubChannelBitmap {
+-                    uint8_t disabled_subchannel_bitmap;
++                    uint16_t disabled_subchannel_bitmap;
+                     bool valid = false;
+                 } sub_channel_bitmap;
+ 
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 8d44fb774..7ca90fa53 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -2015,7 +2015,7 @@ void db::set_internal_eht_operations(wfa_map::cBssEntry &eht_operations_bss,
+ 
+     if (eht_operations.sub_channel_bitmap.valid) {
+         eht_operations.sub_channel_bitmap.disabled_subchannel_bitmap =
+-            static_cast<uint8_t>(eht_operations_bss.disabled_subchannel_bitmap());
++            static_cast<uint16_t>(eht_operations_bss.disabled_subchannel_bitmap());
+     }
+ }
+ 
+-- 
+2.34.1
+
