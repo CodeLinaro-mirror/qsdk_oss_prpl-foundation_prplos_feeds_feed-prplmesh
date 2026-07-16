@@ -1,0 +1,608 @@
+From b53ab44ec901cb5d882a9cd218fc18816e90a83f Mon Sep 17 00:00:00 2001
+From: Manoj Sekar <sekar@qti.qualcomm.com>
+Date: Thu, 23 Jul 2026 13:29:35 +0530
+Subject: [PATCH] [Channel Selection]Changes to enable Channel Selection with
+ active ACS
+
+Active ACS Channel Selection: Introduces a new agent config
+flag "active_acs_chansel_enable" that, when set together with the existing
+"enable_auto_chansel_handling", makes the Airties/third-party controller
+handling path actually drive the QCA driver ACS on nl80211 (QMESH OpenWrt)
+instead of the previous no-op stub.
+
+Behaviour:
+- enable_auto_chansel_handling=1, active_acs_chansel_enable=0
+    -> unchanged. build_acs_list() collects the controller's non-operable
+       (preference==0) exclude channels and start_platform_acs() on nl80211
+       remains the historical stub (returns false).
+- enable_auto_chansel_handling=1, active_acs_chansel_enable=1
+    -> On CHANNEL_SELECTION_REQUEST with a preferred channel list:
+       build_acs_list() computes the block list as "all channels of the
+       radio (radio->channels_list) minus the preferred set" (preferred =
+       controller preference != 0; empty operable op-class lists expand to
+       all channels of the op-class), keyed per 20MHz operating class.
+       nl80211 start_platform_acs() then drives the driver ACS on the base
+       radio interface over wpa_ctrl:
+         acs clear_block_chan_list
+         acs set_block_chan_list <non-preferred channels>
+         acs invoke 0            (DynamicACS + CSA)
+       The driver selects a channel from the remaining (preferred, non-
+       blocked) set and performs the CSA. The existing AP-CSA-FINISHED ->
+       CSA_Finished -> CSA notification -> Operating Channel Report flow is
+       reused unchanged.
+- enable_auto_chansel_handling=0
+    -> active_acs_chansel_enable is ignored (FLAG=0 internal scoring stays).
+
+The flag is propagated to the bwl HAL via hal_conf_t (bwl does not include
+AgentDB), set in ap_manager::create_ap_wlan_hal().
+
+Exhaustive [ACTIVE_ACS]-tagged debug logs are added across the flow: config
+values at startup and at HAL creation, the full parsed controller preference
+map, the computed preferred set (+count), the full radio channel list
+(+count), the computed block list (per op-class, flattened, total), and every
+acs clear/set/invoke command issued to the driver (with success/failure and a
+block-list read-back).
+
+Signed-off-by: Manoj Sekar <sekar@qti.qualcomm.com>
+---
+ agent/config/beerocks_agent.conf.in           |   7 +
+ .../ap_manager/ap_manager.cpp                 |   8 +
+ agent/src/beerocks/slave/agent_db.h           |   5 +
+ .../beerocks/slave/beerocks_agent_main.cpp    |   9 +
+ .../slave/tasks/channel_selection_task.cpp    | 219 +++++++++++++++++-
+ .../bcl/include/bcl/beerocks_config_file.h    |   4 +
+ .../bcl/source/beerocks_config_file.cpp       |   1 +
+ .../bwl/include/bwl/base_wlan_hal_types.h     |   5 +
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 169 +++++++++++++-
+ 9 files changed, 421 insertions(+), 6 deletions(-)
+
+diff --git a/agent/config/beerocks_agent.conf.in b/agent/config/beerocks_agent.conf.in
+index 0323537..9254dfe 100644
+--- a/agent/config/beerocks_agent.conf.in
++++ b/agent/config/beerocks_agent.conf.in
+@@ -17,6 +17,13 @@ bridge_iface=@BEEROCKS_BRIDGE_IFACE@
+ enable_system_hang_test=0 # 0 - disabled
+ monitor_polling_rate_msec=@BEEROCKS_MONITOR_POLLING_RATE_MSEC@
+ enable_auto_chansel_handling=0 # 0 - disabled
++# active_acs_chansel_enable: Active ACS channel selection.
++# Effective ONLY when enable_auto_chansel_handling=1.
++# 0 - disabled (existing exclude-list behaviour / stubbed platform ACS)
++# 1 - enabled  (build_acs_list blocks all-radio-channels-minus-preferred, and nl80211
++#               start_platform_acs drives the driver: acs clear_block_chan_list +
++#               acs set_block_chan_list <block> + acs invoke 0)
++active_acs_chansel_enable=0 # 0 - disabled, 1 - enabled
+ enable_smd=0 # 0 - disabled, 1 - enabled (SMD - Seamless Mobility Domain)
+ 
+ # This variable is a workaround that turn on the profile_x_disallow flag when configuring the
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index a2beb3f..0fa4b53 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -406,6 +406,14 @@ bool ApManager::create_ap_wlan_hal()
+     hal_conf.ap_acs_enabled     = acs_enabled;
+     hal_conf.certification_mode = certification_mode;
+     hal_conf.multi_ap_profile   = multi_ap_profile;
++    // Active ACS channel selection : propagate the AgentDB flag into the bwl HAL so that
++    // nl80211 start_platform_acs() can decide to drive the driver ACS (acs clear/set_block_chan_list
++    // + acs invoke 0) instead of the stubbed no-op.
++    hal_conf.active_acs_chansel_enable =
++        beerocks::AgentDB::get()->device_conf.active_acs_chansel_enable;
++    LOG(DEBUG) << "[ACTIVE_ACS] create_ap_wlan_hal: iface=" << m_iface
++               << " active_acs_chansel_enable=" << hal_conf.active_acs_chansel_enable
++               << " ap_acs_enabled=" << hal_conf.ap_acs_enabled;
+ 
+ #ifdef USE_PRPLMESH_NLHAL
+     if (m_if_ref_of_phy_id.empty()) {
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 9e10b76..5c40ea5 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -188,6 +188,11 @@ public:
+         uint8_t ap_maximum_links     = 0;
+         uint8_t bsta_maximum_links   = 0;
+         bool enable_auto_chansel_handling;
++        // Active ACS channel selection. Effective only when enable_auto_chansel_handling
++        // is also true. When set, build_acs_list() blocks (all radio channels - preferred) and
++        // nl80211 start_platform_acs() drives the driver ACS: acs clear_block_chan_list +
++        // acs set_block_chan_list <block> + acs invoke 0.
++        bool active_acs_chansel_enable              = false;
+         bool enable_smd                             = false;
+         int8_t num_of_bands = 0;
+         uint8_t beacon_11k_default_measurement_mode = 2; ///< Beacon measurement mode for regular (fronthaul) STAs. Default: TABLE (2).
+diff --git a/agent/src/beerocks/slave/beerocks_agent_main.cpp b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+index 31c743f..b4723af 100644
+--- a/agent/src/beerocks/slave/beerocks_agent_main.cpp
++++ b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+@@ -607,6 +607,15 @@ static int run_beerocks_slave(beerocks::config_file::sConfigSlave &beerocks_slav
+ 
+         db->device_conf.enable_auto_chansel_handling =
+             beerocks_slave_conf.enable_auto_chansel_handling == "1";
++        // Active ACS channel selection. Only effective when enable_auto_chansel_handling
++        // is also enabled.
++        db->device_conf.active_acs_chansel_enable =
++            beerocks_slave_conf.active_acs_chansel_enable == "1";
++        LOG(DEBUG) << "[ACTIVE_ACS] Config: enable_auto_chansel_handling="
++                   << db->device_conf.enable_auto_chansel_handling
++                   << " active_acs_chansel_enable=" << db->device_conf.active_acs_chansel_enable
++                   << " (raw active_acs_chansel_enable='"
++                   << beerocks_slave_conf.active_acs_chansel_enable << "')";
+         db->device_conf.enable_smd = beerocks_slave_conf.enable_smd == "1";
+ 
+         // Register SMD TLVs based on configuration (agent role)
+diff --git a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+index 163a922..9058762 100644
+--- a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+@@ -521,11 +521,30 @@ void ChannelSelectionTask::handle_channel_selection_request(ieee1905_1::CmduMess
+         }
+ 
+         if (db->device_conf.enable_auto_chansel_handling) {
+-            if (radio_mac == m_acs_list.first) {
+-                if (!send_acs_list_to_platform(radio_mac)) {
+-                    LOG(ERROR) << "Failed to send ACS list";
+-                    return;
++            // [ACTIVE_ACS] : only drive the platform/driver ACS (clear/set block list +
++            // acs invoke 0) when active_acs_chansel_enable is set. The flag is read here on the
++            // backhaul side (AgentDB is valid here). The ap_manager/nl80211 side runs in a
++            // different process where this AgentDB flag is NOT populated, so the decision must be
++            // made here; start_platform_acs() on nl80211 unconditionally drives the driver when
++            // reached.
++            if (db->device_conf.active_acs_chansel_enable) {
++                if (radio_mac == m_acs_list.first) {
++                    LOG(DEBUG) << "[ACTIVE_ACS] active_acs_chansel_enable=1 -> sending platform ACS"
++                                  " (block-list + acs invoke 0) for radio "
++                               << radio_mac;
++                    if (!send_acs_list_to_platform(radio_mac)) {
++                        LOG(ERROR) << "Failed to send ACS list";
++                        return;
++                    }
++                    // Wait for the driver ACS CSA (AP-CSA-FINISHED) before sending the Operating
++                    // Channel Report, reusing the existing CSA-notification flow.
++                    request.chan_sel_state            = eRadioChanSwitchState::ACS_SENT;
++                    m_pending_selection.last_chan_sel = std::chrono::steady_clock::now();
+                 }
++            } else {
++                LOG(DEBUG) << "[ACTIVE_ACS] active_acs_chansel_enable=0 -> keeping existing behaviour"
++                              " (platform ACS not driven) for radio "
++                           << radio_mac;
+             }
+             continue;
+         }
+@@ -2964,6 +2983,163 @@ bool ChannelSelectionTask::build_acs_list(const sMacAddr &radio_mac,
+     m_acs_list.first = radio_mac;
+     m_acs_list.second.clear();
+ 
++    auto db = AgentDB::get();
++    const bool active_acs = db->device_conf.active_acs_chansel_enable;
++
++    // [ACTIVE_ACS] Dump the controller's parsed preference map first so we can correlate what the
++    // Controller sent (per op-class, preference value + channel list) with what build_acs_list
++    // actually collects into the ACS (block/exclude) list.
++    {
++        std::stringstream ss_ctrl;
++        ss_ctrl << "[ACTIVE_ACS] build_acs_list: radio=" << radio_mac
++                << " active_acs_chansel_enable=" << active_acs
++                << " controller_preferences dump (" << radio_request.controller_preferences.size()
++                << " op-class entries):" << std::endl;
++        for (const auto &preference : radio_request.controller_preferences) {
++            ss_ctrl << "  op-class=" << int(preference.first.operating_class)
++                    << " preference=" << int(preference.first.flags.preference)
++                    << " reason=" << int(preference.first.flags.reason_code) << " channels={ ";
++            for (const auto ch : preference.second) {
++                ss_ctrl << int(ch) << " ";
++            }
++            ss_ctrl << "}" << std::endl;
++        }
++        LOG(DEBUG) << ss_ctrl.str();
++    }
++
++    if (active_acs) {
++        // ================= ACTIVE ACS branch =================
++        // Requirement P0.R3: build the ACS (block) list as "all channels of the radio that are
++        // NOT part of the preferred list". Preferred = channels reported by the Controller with
++        // preference != 0 (operable). If a preferred op-class has an empty channel list, expand it
++        // to all channels of that op-class (from the operating_classes_list table).
++
++        // (1) Build the PREFERRED channel set from controller_preferences (preference != 0).
++        std::set<uint8_t> preferred_channels;
++        {
++            std::stringstream ss_pref;
++            ss_pref << "[ACTIVE_ACS] build_acs_list: building PREFERRED set (preference != 0):"
++                    << std::endl;
++            for (const auto &preference : radio_request.controller_preferences) {
++                const auto &operating_class_info          = preference.first;
++                const auto &operating_class_channels_list = preference.second;
++                const auto opclass                        = operating_class_info.operating_class;
++                if (operating_class_info.flags.preference == 0) {
++                    continue; // non-operable -> not preferred
++                }
++                if (operating_class_channels_list.empty()) {
++                    // Empty channel list under an operable op-class means "all channels of the
++                    // op-class are preferred".
++                    auto opclass_it = son::wireless_utils::operating_classes_list.find(opclass);
++                    if (opclass_it == son::wireless_utils::operating_classes_list.end()) {
++                        LOG(WARNING) << "[ACTIVE_ACS] build_acs_list: op-class=" << int(opclass)
++                                     << " (preferred, empty list) not found in operating_classes_list"
++                                     << " - skipping expansion";
++                        continue;
++                    }
++                    ss_pref << "  op-class=" << int(opclass)
++                            << " (pref=" << int(operating_class_info.flags.preference)
++                            << ", EMPTY list) -> add ALL op-class channels: { ";
++                    for (const auto ch : opclass_it->second.channels) {
++                        preferred_channels.insert(ch);
++                        ss_pref << int(ch) << " ";
++                    }
++                    ss_pref << "}" << std::endl;
++                } else {
++                    ss_pref << "  op-class=" << int(opclass)
++                            << " (pref=" << int(operating_class_info.flags.preference)
++                            << ") -> add channels: { ";
++                    for (const auto ch : operating_class_channels_list) {
++                        preferred_channels.insert(ch);
++                        ss_pref << int(ch) << " ";
++                    }
++                    ss_pref << "}" << std::endl;
++                }
++            }
++            LOG(DEBUG) << ss_pref.str();
++        }
++
++        // Log the preferred set summary + count (answers requirement R3.a: how many preferred).
++        {
++            std::stringstream ss;
++            ss << "[ACTIVE_ACS] build_acs_list: PREFERRED channel set (count="
++               << preferred_channels.size() << "): { ";
++            for (const auto ch : preferred_channels) {
++                ss << int(ch) << " ";
++            }
++            ss << "}";
++            LOG(DEBUG) << ss.str();
++        }
++
++        // (2) Enumerate ALL channels available on the radio (radio->channels_list).
++        {
++            std::stringstream ss_all;
++            ss_all << "[ACTIVE_ACS] build_acs_list: ALL radio channels available (count="
++                   << radio->channels_list.size() << "): { ";
++            for (const auto &ch_it : radio->channels_list) {
++                ss_all << int(ch_it.first) << " ";
++            }
++            ss_all << "}";
++            LOG(DEBUG) << ss_all.str();
++        }
++
++        // (3) Compute BLOCK set = all radio channels that are NOT in the preferred set, and put
++        // them into m_acs_list keyed by each channel's 20MHz operating class (so the existing
++        // send_acs_list_to_platform packing still works, and the nl80211 HAL can flatten it).
++        auto freq_type = radio->wifi_channel.get_freq_type();
++        if (radio->wifi_channel.is_empty()) {
++            LOG(WARNING) << "[ACTIVE_ACS] build_acs_list: radio wifi_channel is empty, assuming 5G"
++                            " for op-class derivation";
++            freq_type = beerocks::eFreqType::FREQ_5G;
++        }
++
++        std::set<uint8_t> block_channels; // for logging summary
++        for (const auto &ch_it : radio->channels_list) {
++            const auto channel = ch_it.first;
++            if (preferred_channels.find(channel) != preferred_channels.end()) {
++                // This channel is preferred -> do NOT block it.
++                continue;
++            }
++            // Derive the 20MHz operating class for this channel.
++            auto opclass = son::wireless_utils::get_operating_class_by_channel(
++                beerocks::WifiChannel(channel, freq_type, beerocks::eWiFiBandwidth::BANDWIDTH_20));
++            if (opclass == 0) {
++                LOG(WARNING) << "[ACTIVE_ACS] build_acs_list: could not derive op-class for channel="
++                             << int(channel) << " freq_type="
++                             << beerocks::utils::convert_frequency_type_to_string(freq_type)
++                             << " - blocking under op-class 0";
++            }
++            m_acs_list.second[opclass].push_back(channel);
++            block_channels.insert(channel);
++        }
++
++        // (4) Exhaustive result print of the computed block (exclude) list.
++        {
++            std::stringstream ss_blk;
++            ss_blk << "[ACTIVE_ACS] build_acs_list: RESULT BLOCK list = (all radio channels - "
++                      "preferred) for radio=" << m_acs_list.first << " ("
++                   << m_acs_list.second.size() << " op-class entries, "
++                   << block_channels.size() << " total channels to block):" << std::endl;
++            for (const auto &entry : m_acs_list.second) {
++                ss_blk << "  op-class=" << int(entry.first) << " block_channels={ ";
++                for (const auto ch : entry.second) {
++                    ss_blk << int(ch) << " ";
++                }
++                ss_blk << "}" << std::endl;
++            }
++            std::stringstream ss_flat;
++            ss_flat << "  flat block channel list: { ";
++            for (const auto ch : block_channels) {
++                ss_flat << int(ch) << " ";
++            }
++            ss_flat << "}";
++            LOG(DEBUG) << ss_blk.str() << ss_flat.str();
++        }
++
++        return true;
++    }
++
++    // ================= Existing (non-active-acs) exclude-list logic =================
+     for (const auto &preference : radio_request.controller_preferences) {
+         const auto &operating_class_info          = preference.first;
+         const auto &operating_class_channels_list = preference.second;
+@@ -2977,12 +3153,47 @@ bool ChannelSelectionTask::build_acs_list(const sMacAddr &radio_mac,
+                 }
+                 std::copy(opclass_it->second.channels.begin(), opclass_it->second.channels.end(),
+                           std::back_inserter(m_acs_list.second[opclass]));
++                // [ACTIVE_ACS]
++                LOG(DEBUG) << "[ACTIVE_ACS] build_acs_list: op-class=" << int(opclass)
++                           << " has preference=0 with EMPTY channel list -> excluding ALL "
++                           << opclass_it->second.channels.size()
++                           << " channels of this op-class";
+             } else {
+                 std::copy(operating_class_channels_list.begin(),
+                           operating_class_channels_list.end(),
+                           std::back_inserter(m_acs_list.second[opclass]));
++                // [ACTIVE_ACS]
++                LOG(DEBUG) << "[ACTIVE_ACS] build_acs_list: op-class=" << int(opclass)
++                           << " has preference=0 with " << operating_class_channels_list.size()
++                           << " explicit channel(s) -> excluding those channels";
++            }
++        } else {
++            // [ACTIVE_ACS] Controller-operable (preferred) op-class: NOT added to the ACS exclude
++            // list in the default (non-active-acs) flow.
++            LOG(DEBUG) << "[ACTIVE_ACS] build_acs_list: op-class=" << int(opclass)
++                       << " has preference=" << int(operating_class_info.flags.preference)
++                       << " (operable/preferred) -> NOT added to ACS exclude list ("
++                       << operating_class_channels_list.size() << " channel(s))";
++        }
++    }
++
++    // [ACTIVE_ACS] Final ACS (exclude) list that will be sent to the platform/driver.
++    {
++        std::stringstream ss_acs;
++        ss_acs << "[ACTIVE_ACS] build_acs_list: RESULT m_acs_list (exclude list) for radio="
++               << m_acs_list.first << " (" << m_acs_list.second.size() << " op-class entries):"
++               << std::endl;
++        size_t total_excluded = 0;
++        for (const auto &entry : m_acs_list.second) {
++            ss_acs << "  op-class=" << int(entry.first) << " exclude_channels={ ";
++            for (const auto ch : entry.second) {
++                ss_acs << int(ch) << " ";
++                ++total_excluded;
+             }
++            ss_acs << "}" << std::endl;
+         }
++        ss_acs << "  total_excluded_channels=" << total_excluded;
++        LOG(DEBUG) << ss_acs.str();
+     }
+ 
+     return true;
+diff --git a/common/beerocks/bcl/include/bcl/beerocks_config_file.h b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+index 76c621d..5ab7446 100644
+--- a/common/beerocks/bcl/include/bcl/beerocks_config_file.h
++++ b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+@@ -118,6 +118,10 @@ public:
+         std::string on_boot_scan;
+         std::string dwell_time;
+         std::string enable_auto_chansel_handling;
++        // Active ACS channel selection : when set to "1" AND enable_auto_chansel_handling
++        // is "1", build_acs_list() blocks all-radio-channels-minus-preferred and nl80211
++        // start_platform_acs() drives the driver ACS (acs clear/set_block_chan_list + acs invoke 0).
++        std::string active_acs_chansel_enable;
+         std::string enable_smd;
+         std::string clients_unicast_measurements;
+         std::string send_btm_to_non_11v_sta;
+diff --git a/common/beerocks/bcl/source/beerocks_config_file.cpp b/common/beerocks/bcl/source/beerocks_config_file.cpp
+index 839c893..21b7dcb 100644
+--- a/common/beerocks/bcl/source/beerocks_config_file.cpp
++++ b/common/beerocks/bcl/source/beerocks_config_file.cpp
+@@ -183,6 +183,7 @@ bool config_file::read_slave_config_file(const std::string &config_file_path, sC
+             std::make_tuple("on_boot_scan=", &conf.on_boot_scan, 0),
+             std::make_tuple("dwell_time=", &conf.dwell_time, 0),
+             std::make_tuple("enable_auto_chansel_handling=", &conf.enable_auto_chansel_handling, 0),
++            std::make_tuple("active_acs_chansel_enable=", &conf.active_acs_chansel_enable, 0),
+             std::make_tuple("enable_smd=", &conf.enable_smd, 0),
+             std::make_tuple("clients_unicast_measurements=", &conf.clients_unicast_measurements, 0),
+             std::make_tuple("send_btm_to_non_11v_sta=", &conf.send_btm_to_non_11v_sta, 0),
+diff --git a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+index c1959ee..b7597fc 100644
+--- a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
++++ b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+@@ -267,6 +267,11 @@ struct RadioInfo {
+ 
+ struct hal_conf_t {
+     bool ap_acs_enabled = false;
++    // Active ACS channel selection. Propagated from
++    // AgentDB::device_conf.active_acs_chansel_enable via ap_manager::create_ap_wlan_hal().
++    // When true, nl80211 start_platform_acs() drives the driver ACS:
++    //   acs clear_block_chan_list + acs set_block_chan_list <block> + acs invoke 0.
++    bool active_acs_chansel_enable = false;
+     std::string wpa_ctrl_path;
+     std::set<std::string> monitored_BSSs;
+     bool is_repeater         = false;
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 2fe4f68..6704dc6 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -5756,8 +5756,173 @@ bool ap_wlan_hal_nl80211::get_spatial_reuse_config(
+ bool ap_wlan_hal_nl80211::start_platform_acs(
+     const std::shared_ptr<airties::cACSChannelList> &acs_list)
+ {
+-    LOG(TRACE) << __func__ << " - NOT IMPLEMENTED!";
+-    return false;
++    // Active ACS channel selection.
++    //
++    // NOTE on gating: the active_acs_chansel_enable decision is made on the BACKHAUL side
++    // (ChannelSelectionTask), which reads AgentDB and only sends ACTION_BACKHAUL_PLATFORM_ACS ->
++    // ACTION_APMANAGER_PLATFORM_ACS -> start_platform_acs() when the flag is set. The ap_manager
++    // runs in a SEPARATE process whose AgentDB/hal_conf copy of the flag is NOT populated, so we
++    // must NOT gate here on get_hal_conf().active_acs_chansel_enable (it would read false and
++    // skip the driver programming). Reaching this function already implies the flag is enabled.
++
++    // The QCA ACS control commands are driven over the hostapd control interface via
++    // wpa_ctrl_send_msg (the standard prplMesh mechanism). They must be sent on the BASE radio
++    // hostapd control socket (e.g. /var/run/hostapd/wlan2), which is what `hostapd_cli -i wlan2
++    // acs ...` targets on-board. They are NOT available on the per-link socket (wlan2_link0).
++    //
++    // hostapd control-interface commands are UPPERCASE: hostapd_cli's `acs <sub>` maps to the raw
++    // control command "ACS <sub>". Sending lowercase "acs ..." over the socket returns
++    // "UNKNOWN COMMAND"; the correct raw command is "ACS <sub>".
++    //
++    // m_radio_info.iface_name is the link iface (e.g. "wlan2_link0"); derive the base iface
++    // ("wlan2") and make sure its wpa_ctrl socket is registered before sending.
++    const std::string link_iface = m_radio_info.iface_name;
++    std::string radio_iface;
++    extractLinkBaseInterface(link_iface, radio_iface);
++    if (radio_iface.empty()) {
++        radio_iface = link_iface;
++    }
++    LOG(INFO) << "[ACTIVE_ACS] start_platform_acs: ENABLED, link_iface=" << link_iface
++              << " -> base radio_iface=" << radio_iface;
++
++    // Ensure the base radio interface wpa_ctrl socket is registered/connected. add_interface() is
++    // idempotent (returns early if already present) and connects the cmd+event sockets so that
++    // wpa_ctrl_send_msg(cmd, radio_iface) reaches /var/run/hostapd/<radio_iface>.
++    if (!is_wpa_ctrl_interface_registered(radio_iface)) {
++        LOG(DEBUG) << "[ACTIVE_ACS] start_platform_acs: base radio iface " << radio_iface
++                   << " not registered yet, registering its wpa_ctrl socket";
++        if (add_interface(radio_iface) < 0) {
++            LOG(WARNING) << "[ACTIVE_ACS] start_platform_acs: add_interface(" << radio_iface
++                         << ") failed; will still attempt to send on it";
++        }
++    }
++
++    if (!acs_list) {
++        LOG(ERROR) << "[ACTIVE_ACS] start_platform_acs: acs_list (cACSChannelList) is null";
++        return false;
++    }
++
++    // Helper: send an ACS control command over the hostapd control socket of the base radio iface
++    // using the standard wpa_ctrl_send_msg mechanism. The subcommand is passed in hostapd_cli
++    // syntax (e.g. "clear_block_chan_list"); we prefix the uppercase "ACS " control verb.
++    auto run_acs_cmd = [&](const std::string &acs_subcmd, std::string &reply_out) -> bool {
++        const std::string cmd = "ACS " + acs_subcmd;
++        char *reply           = nullptr;
++        reply_out.clear();
++        if (!wpa_ctrl_send_msg(cmd, &reply, radio_iface)) {
++            if (reply) {
++                reply_out = reply;
++            }
++            return false;
++        }
++        if (reply) {
++            reply_out = reply;
++        }
++        return true;
++    };
++
++    // (1) Flatten the incoming cACSChannelList (per-opclass exclude_channels) into a de-duplicated,
++    //     ordered flat list of channel numbers to block.
++    std::set<uint8_t> block_set;
++    {
++        std::stringstream ss;
++        const uint8_t n_opclass = acs_list->acs_list_length();
++        ss << "[ACTIVE_ACS] start_platform_acs: received cACSChannelList with "
++           << int(n_opclass) << " op-class entries:" << std::endl;
++        for (uint8_t oc = 0; oc < n_opclass; ++oc) {
++            auto entry_tuple = acs_list->acs_list(oc);
++            if (!std::get<0>(entry_tuple)) {
++                LOG(WARNING) << "[ACTIVE_ACS] start_platform_acs: failed to get acs_list entry "
++                             << int(oc);
++                continue;
++            }
++            auto &entry              = std::get<1>(entry_tuple);
++            const uint8_t opclass    = entry.opclass();
++            const uint8_t n_channels = entry.exclude_channels_length();
++            ss << "  op-class=" << int(opclass) << " exclude_channels(" << int(n_channels)
++               << ")={ ";
++            for (uint8_t ci = 0; ci < n_channels; ++ci) {
++                uint8_t *ch_ptr = entry.exclude_channels(ci);
++                if (!ch_ptr) {
++                    continue;
++                }
++                block_set.insert(*ch_ptr);
++                ss << int(*ch_ptr) << " ";
++            }
++            ss << "}" << std::endl;
++        }
++        LOG(DEBUG) << ss.str();
++    }
++
++    // (2) Flush the existing ACS block list: `ACS clear_block_chan_list`.
++    {
++        const std::string acs_subcmd = "clear_block_chan_list";
++        LOG(INFO) << "[ACTIVE_ACS] start_platform_acs: FLUSH block list on iface=" << radio_iface
++                  << " cmd='ACS " << acs_subcmd << "'";
++        std::string reply;
++        if (!run_acs_cmd(acs_subcmd, reply)) {
++            LOG(ERROR) << "[ACTIVE_ACS] start_platform_acs: 'ACS " << acs_subcmd
++                       << "' failed on iface=" << radio_iface << " reply='" << reply << "'";
++            return false;
++        }
++        LOG(DEBUG) << "[ACTIVE_ACS] start_platform_acs: 'ACS " << acs_subcmd << "' OK reply='"
++                   << reply << "'";
++    }
++
++    // (3) Program the block list: `acs set_block_chan_list <c1> <c2> ...` (only if non-empty).
++    if (block_set.empty()) {
++        LOG(WARNING) << "[ACTIVE_ACS] start_platform_acs: computed block list is EMPTY - nothing to"
++                        " block; ACS will consider all channels. Proceeding to invoke anyway.";
++    } else {
++        std::stringstream cmd_ss;
++        cmd_ss << "set_block_chan_list";
++        for (const auto ch : block_set) {
++            cmd_ss << " " << int(ch);
++        }
++        const std::string acs_subcmd = cmd_ss.str();
++        LOG(INFO) << "[ACTIVE_ACS] start_platform_acs: SET block list (" << block_set.size()
++                  << " channels) on iface=" << radio_iface << " cmd='ACS " << acs_subcmd << "'";
++        std::string reply;
++        if (!run_acs_cmd(acs_subcmd, reply)) {
++            LOG(ERROR) << "[ACTIVE_ACS] start_platform_acs: 'ACS " << acs_subcmd
++                       << "' failed on iface=" << radio_iface << " reply='" << reply << "'";
++            return false;
++        }
++        LOG(DEBUG) << "[ACTIVE_ACS] start_platform_acs: 'ACS " << acs_subcmd << "' OK reply='"
++                   << reply << "'";
++
++        // Optional verification read-back of the block list.
++        {
++            std::string get_reply;
++            const std::string get_subcmd = "get_block_chan_list";
++            if (run_acs_cmd(get_subcmd, get_reply)) {
++                LOG(DEBUG) << "[ACTIVE_ACS] start_platform_acs: 'ACS " << get_subcmd
++                           << "' reply: " << get_reply;
++            } else {
++                LOG(DEBUG) << "[ACTIVE_ACS] start_platform_acs: 'ACS " << get_subcmd
++                           << "' read-back not available (non-fatal) reply='" << get_reply << "'";
++            }
++        }
++    }
++
++    // (4) Trigger the driver ACS (DynamicACS + CSA): `ACS invoke 0`.
++    {
++        const std::string acs_subcmd = "invoke 0";
++        LOG(INFO) << "[ACTIVE_ACS] start_platform_acs: INVOKE ACS on iface=" << radio_iface
++                  << " cmd='ACS " << acs_subcmd << "' (driver will pick a channel from the "
++                     "non-blocked/preferred set and perform CSA)";
++        std::string reply;
++        if (!run_acs_cmd(acs_subcmd, reply)) {
++            LOG(ERROR) << "[ACTIVE_ACS] start_platform_acs: 'ACS " << acs_subcmd
++                       << "' failed on iface=" << radio_iface << " reply='" << reply << "'";
++            return false;
++        }
++        LOG(DEBUG) << "[ACTIVE_ACS] start_platform_acs: 'ACS " << acs_subcmd << "' OK reply='"
++                   << reply << "' - waiting for driver CSA (AP-CSA-FINISHED) to proceed with OCR";
++    }
++
++    LOG(INFO) << "[ACTIVE_ACS] start_platform_acs: completed successfully on iface=" << radio_iface;
++    return true;
+ }
+ 
+ bool ap_wlan_hal_nl80211::change_radio_mode_config(
+-- 
+2.34.1
+
