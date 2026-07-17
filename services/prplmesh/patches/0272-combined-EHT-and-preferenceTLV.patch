@@ -1,0 +1,181 @@
+From e302736442f35ca9c607f4ec32ffed8d982ae48c Mon Sep 17 00:00:00 2001
+From: Sudharsan Eswaran <eswaran@qti.qualcomm.com>
+Date: Wed, 15 Jul 2026 10:08:50 +0530
+Subject: [PATCH] NBAPI modification to send EHT operation TLV
+
+send EHT operation TLV in channel selection request NBAPI. In
+single NBAPI both channel preference TLV for selecting channel and
+EHT operational TLV to update the puncturing pattern is sent
+
+Signed-off-by: Sudharsan Eswaran <eswaran@qti.qualcomm.com>
+---
+ controller/nbapi/odl/radio.odl.in             | 13 ++++-
+ controller/nbapi/on_action.cpp                | 23 +++++++-
+ controller/src/beerocks/master/controller.cpp | 55 ++++++++++++++++++-
+ controller/src/beerocks/master/controller.h   |  5 +-
+ 4 files changed, 90 insertions(+), 6 deletions(-)
+
+diff --git a/controller/nbapi/odl/radio.odl.in b/controller/nbapi/odl/radio.odl.in
+index 347b17f1e..f85b1bb5a 100644
+--- a/controller/nbapi/odl/radio.odl.in
++++ b/controller/nbapi/odl/radio.odl.in
+@@ -112,16 +112,23 @@
+ 
+         /**
+         * Request the channel selection procedure. This assembles a
+-        * ChannelSelectionRequest CMDU with CHannel Preference TLVs and sends
+-        * it from the Controller to a given Agent.
++        * ChannelSelectionRequest CMDU with a Channel Preference TLV and an
++        * EHT Operations TLV (applied radio-wide) and sends it from the
++        * Controller to a given Agent.
+         *
+         * The input structure is as follows:
+         *   Class.{i}.OpClass - uint32, 0..255
+         *   Class.{i}.Channel.{j}.Channel - uint32, 0.255
+         *   Class.{i}.Channel.{j}.Preference - uint32, 0.15
++        *   EHTOperations - htable, full EHT Operations TLV fields (see BSS.EHTOperation
++        *     for field descriptions). Only DisabledSubchannelBitmapValid /
++        *     DisabledSubchannelBitmap are currently consumed by the Controller; set
++        *     DisabledSubchannelBitmapValid=true and DisabledSubchannelBitmap=0 to
++        *     clear any existing puncturing.
+         */
+         %instance bool ChannelSelectionRequest(
+-            %in htable Class
++            %in htable Class,
++            %in htable EHTOperations
+         );
+ 
+         object Capabilities;
+diff --git a/controller/nbapi/on_action.cpp b/controller/nbapi/on_action.cpp
+index c4f22fe07..7267e82b9 100644
+--- a/controller/nbapi/on_action.cpp
++++ b/controller/nbapi/on_action.cpp
+@@ -1939,7 +1939,28 @@ amxd_status_t channel_selection_request(amxd_object_t *object, amxd_function_t *
+         preferences.push_back(channel_preference);
+     }
+ 
+-    if (!controller_ctx->trigger_channel_selection_request(radio_uid, preferences)) {
++    /* Parse the EHTOperations structure. Only DisabledSubchannelBitmap is currently
++     * consumed by the Controller; the other fields are accepted on the wire (TR-181
++     * aligned with bss.odl.in's EHTOperation object) for forward compatibility but
++     * not yet applied. DisabledSubchannelBitmapValid tells "present but zero" (clear
++     * puncturing) apart from "field absent" (nothing to do). */
++    uint16_t disabled_subchannel_bitmap = 0;
++    const amxc_var_t *eht_operations = GET_ARG(args, "EHTOperations");
++    if (eht_operations) {
++        amxc_var_t *disabled_subchannel_valid_var =
++            GET_ARG(eht_operations, "DisabledSubchannelBitmapValid");
++        bool disabled_subchannel_valid =
++            disabled_subchannel_valid_var ? amxc_var_dyncast(bool, disabled_subchannel_valid_var)
++                                           : false;
++
++        if (disabled_subchannel_valid) {
++            disabled_subchannel_bitmap =
++                amxc_var_dyncast(uint16_t, GET_ARG(eht_operations, "DisabledSubchannelBitmap"));
++        }
++    }
++
++    if (!controller_ctx->trigger_channel_selection_request(radio_uid, preferences,
++                                                            disabled_subchannel_bitmap)) {
+         LOG(ERROR) << "Failed to set channel selection parameters";
+         return amxd_status_unknown_error;
+     }
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 448783278..94168c53a 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -5970,7 +5970,8 @@ bool Controller::trigger_channel_selection_request(
+                                                        uint8_t /* preference */
+                                                        ,
+                                                        std::vector<uint8_t> /* channels */
+-                                                       >> &channel_preferences)
++                                                       >> &channel_preferences,
++    uint16_t disabled_subchannel_bitmap)
+ {
+     LOG(DEBUG) << "Channel selection request:";
+ 
+@@ -6020,6 +6021,58 @@ bool Controller::trigger_channel_selection_request(
+         }
+     }
+ 
++    /* Always attach the EHT Operations TLV alongside the Channel Preference TLV.
++     * disabled_subchannel_bitmap == 0 is a legitimate value meaning "no
++     * puncturing" (e.g. to clear a previously punctured pattern) and must
++     * still be signaled to the agent, not treated as "not applicable". */
++    {
++        auto agent_mac = database.get_radio_parent_agent(ruid);
++        auto agent     = database.get_agent(agent_mac);
++        auto radio     = agent ? agent->radios.get(ruid) : nullptr;
++
++        if (!radio || radio->bsses.empty()) {
++            LOG(WARNING) << "No BSSes found for radio " << ruid
++                         << ", skipping EHT Operations TLV";
++        } else {
++            auto eht_operation_tlv = cmdu_tx.addClass<wfa_map::tlvEHTOperations>();
++            if (!eht_operation_tlv) {
++                LOG(ERROR) << "addClass wfa_map::tlvEHTOperations has failed";
++                return false;
++            }
++
++            auto eht_operations_radio = eht_operation_tlv->create_radio_entries();
++            if (!eht_operations_radio) {
++                LOG(ERROR) << "Failed creating eht_operations_radio";
++                return false;
++            }
++            eht_operations_radio->ruid() = ruid;
++
++            for (const auto &bss : radio->bsses) {
++                auto eht_operations_bss = eht_operations_radio->create_bss_entries();
++                if (!eht_operations_bss) {
++                    LOG(ERROR) << "Failed creating eht_operations_bss";
++                    return false;
++                }
++
++                eht_operations_bss->bssid()                                 = bss.first;
++                eht_operations_bss->flags().eht_operation_information_valid = 0;
++                eht_operations_bss->flags().disabled_subchannel_valid       = 1;
++                eht_operations_bss->disabled_subchannel_bitmap() = disabled_subchannel_bitmap;
++
++                if (!eht_operations_radio->add_bss_entries(std::move(eht_operations_bss))) {
++                    LOG(ERROR) << "Failed adding BSS entry in eht operation TLV for bssid "
++                               << bss.first;
++                    return false;
++                }
++            }
++
++            if (!eht_operation_tlv->add_radio_entries(std::move(eht_operations_radio))) {
++                LOG(ERROR) << "Failed adding Radio entry in eht operation TLV for mac " << ruid;
++                return false;
++            }
++        }
++    }
++
+     for (const auto &agent : database.get_all_connected_agents()) {
+         son_actions::send_cmdu_to_agent(agent->al_mac, cmdu_tx, database);
+         LOG(DEBUG) << "send CHANNEL_SELECTION_REQUEST_MESSAGE with channel"
+diff --git a/controller/src/beerocks/master/controller.h b/controller/src/beerocks/master/controller.h
+index 4d0e487db..a3aa95929 100644
+--- a/controller/src/beerocks/master/controller.h
++++ b/controller/src/beerocks/master/controller.h
+@@ -195,6 +195,8 @@ public:
+      *
+      * @param ruid ruid of radio for wich channel selection requested.
+      * @param channel_preferences List of channel preferences.
++     * @param disabled_subchannel_bitmap The bitmap of disabled channels, applied radio-wide:
++     * lowest bit means lowest channel to be disabled. 0 clears any existing puncturing.
+      * @return True if channel selection request tiggered, false otherwise.
+      */
+     bool trigger_channel_selection_request(
+@@ -203,7 +205,8 @@ public:
+                                                            uint8_t /* preference */
+                                                            ,
+                                                            std::vector<uint8_t> /* channels */
+-                                                           >> &channel_preferences);
++                                                           >> &channel_preferences,
++        uint16_t disabled_subchannel_bitmap);
+ 
+     /**
+      * @brief Triggers VBSS creation for the given VBSSID on the given radio/agent
+-- 
+2.34.1
+
