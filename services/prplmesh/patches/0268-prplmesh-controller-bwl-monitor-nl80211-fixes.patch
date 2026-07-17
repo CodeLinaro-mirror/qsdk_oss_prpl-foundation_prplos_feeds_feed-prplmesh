@@ -1,0 +1,548 @@
+From f3830d3f3b1c33a19988828d4ddf81bd7801d89a Mon Sep 17 00:00:00 2001
+From: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+Date: Thu, 16 Jul 2026 19:34:13 +0530
+Subject: [PATCH] prplmesh: controller/bwl/monitor/nl80211 fixes for stability
+ and correctness
+
+controller/bwl/monitor: preserve STA DM stats and ClientCapabilities on restart
+- After prplmesh stop/start while STAs are associated, re-query
+  ClientCapabilities, preserve uplink RCPI / link metrics stats, and
+  re-trigger connected-clients events so the DM is fully populated
+  without waiting for the next association frame
+
+bwl/nl80211: skip associated STAs in unassoc RSSI measurement
+- add_peer_neighbor() rejects STAs currently associated on the radio
+  with EEXIST; skip them so the ROC scan proceeds with only truly
+  unassociated STAs and valid RCPI results are returned
+
+nl80211: MLO STA_Connected assoc frame fallback
+- STA_Connected uses the MLD MAC as src_mac but m_latest_assoc_frame
+  is keyed by the link MAC; scan by BSSID match when direct lookup
+  fails so the association frame is found and ClientCapabilities are
+  correctly populated for MLO clients
+
+Signed-off-by: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+---
+ .../fronthaul_manager/monitor/monitor.cpp     |  18 ++
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 155 +++++++++++++++++-
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      |  42 ++++-
+ .../bwl/nl80211/mon_wlan_hal_nl80211.h        |   2 +-
+ controller/src/beerocks/master/db/db.cpp      |  34 +++-
+ controller/src/beerocks/master/db/db.h        |   6 +-
+ .../beerocks/master/tasks/topology_task.cpp   |  55 ++++++-
+ 7 files changed, 285 insertions(+), 27 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+index d3075ea72..8d989cbb2 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+@@ -1220,6 +1220,12 @@ bool Monitor::update_ap_stats()
+             }
+             auto radio_node = mon_db.get_radio_node();
+             radio_node->set_iface(updated_iface);
++            // Re-trigger connected-clients discovery so sta_nodes are repopulated
++            // after the db was cleared due to interface change.
++            m_generate_connected_clients_events = true;
++            if (!mon_wlan_hal->pre_generate_connected_clients_events()) {
++                LOG(WARNING) << "Failed to prepare for generate of clients connected events after iface change";
++            }
+         }
+ #else
+         return false;
+@@ -1957,6 +1963,12 @@ void Monitor::handle_cmdu_vs_message(ieee1905_1::CmduMessageRx &cmdu_rx)
+                     }
+                 }
+             }
++            // Re-trigger connected-clients discovery so sta_nodes are repopulated
++            // after the db was cleared due to interface change.
++            m_generate_connected_clients_events = true;
++            if (!mon_wlan_hal->pre_generate_connected_clients_events()) {
++                LOG(WARNING) << "Failed to prepare for generate of clients connected events after iface change";
++            }
+         } else {
+             LOG(ERROR) << "hostap_iface from config differs from base interface - check prplmesh config for any changes in base iface";
+ 
+@@ -2008,6 +2020,12 @@ void Monitor::handle_cmdu_vs_message(ieee1905_1::CmduMessageRx &cmdu_rx)
+             }
+             auto radio_node = mon_db.get_radio_node();
+             radio_node->set_iface(updated_iface);
++            // Re-trigger connected-clients discovery so sta_nodes are repopulated
++            // after the db was cleared due to interface change.
++            m_generate_connected_clients_events = true;
++            if (!mon_wlan_hal->pre_generate_connected_clients_events()) {
++                LOG(WARNING) << "Failed to prepare for generate of clients connected events after iface change";
++            }
+         }
+         break;
+     }
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index fa5310889..afc67f649 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -16,6 +16,9 @@
+ #include <bpl/bpl_cfg.h>
+ #include <bwl/key_value_parser.h>
+ #include <cmath>
++#include <cstdio>
++#include <iomanip>
++#include <sstream>
+ #include <easylogging++.h>
+ #include <linux/nl80211.h>
+ #include <netlink/genl/ctrl.h>
+@@ -399,6 +402,97 @@ static int remove_mld_entry_by_ifname(const std::string &ifname)
+     return removed ? 0 : -1;
+ }
+ 
++// Path of the single file that persists all STA association frames across agent restarts.
++// Format: one line per STA — "<sta_mac> <frame_hex>\n"
++static const std::string ASSOC_FRAMES_DB = "/tmp/beerocks/sta_assoc_frames.txt";
++
++// Persist or update the association frame for one STA in the shared DB file.
++static void persist_assoc_frame(const std::string &sta_mac,
++                                 const std::vector<uint8_t> &frame)
++{
++    // Build hex string from raw frame bytes
++    std::ostringstream hex;
++    for (uint8_t b : frame) {
++        hex << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
++    }
++    std::string new_hex = hex.str();
++
++    // Read existing lines, replacing any entry for this sta_mac
++    std::vector<std::string> lines;
++    std::ifstream ifs(ASSOC_FRAMES_DB);
++    if (ifs) {
++        std::string line;
++        while (std::getline(ifs, line)) {
++            if (line.empty()) continue;
++            std::istringstream ss(line);
++            std::string mac;
++            ss >> mac;
++            if (mac == sta_mac) continue; // will be replaced
++            lines.push_back(line);
++        }
++    }
++    lines.push_back(sta_mac + " " + new_hex);
++
++    std::ofstream ofs(ASSOC_FRAMES_DB, std::ios::trunc);
++    if (ofs) {
++        for (const auto &l : lines) ofs << l << "\n";
++        LOG(DEBUG) << "Persisted assoc frame for " << sta_mac
++                   << " (" << frame.size() << " bytes) to " << ASSOC_FRAMES_DB;
++    }
++}
++
++// Restore the association frame for one STA from the shared DB file.
++// Returns empty vector if not found.
++static std::vector<uint8_t> restore_assoc_frame(const std::string &sta_mac)
++{
++    std::ifstream ifs(ASSOC_FRAMES_DB);
++    if (!ifs) return {};
++
++    std::string line;
++    while (std::getline(ifs, line)) {
++        if (line.empty()) continue;
++        std::istringstream ss(line);
++        std::string mac, hex_str;
++        ss >> mac >> hex_str;
++        if (mac != sta_mac) continue;
++        // Decode hex string back to bytes
++        std::vector<uint8_t> frame;
++        for (size_t i = 0; i + 1 < hex_str.size(); i += 2) {
++            frame.push_back(static_cast<uint8_t>(std::stoi(hex_str.substr(i, 2), nullptr, 16)));
++        }
++        return frame;
++    }
++    return {};
++}
++
++// Remove the entry for a given sta_mac from the shared DB file.
++static void remove_assoc_frame(const std::string &sta_mac)
++{
++    std::ifstream ifs(ASSOC_FRAMES_DB);
++    if (!ifs) return;
++
++    std::vector<std::string> lines;
++    std::string line;
++    bool removed = false;
++    while (std::getline(ifs, line)) {
++        if (line.empty()) continue;
++        std::istringstream ss(line);
++        std::string mac;
++        ss >> mac;
++        if (mac == sta_mac) { removed = true; continue; }
++        lines.push_back(line);
++    }
++    ifs.close();
++
++    if (!removed) return;
++    std::ofstream ofs(ASSOC_FRAMES_DB, std::ios::trunc);
++    if (ofs) {
++        for (const auto &l : lines) ofs << l << "\n";
++        LOG(DEBUG) << "Removed persisted assoc frame for " << sta_mac
++                   << " from " << ASSOC_FRAMES_DB;
++    }
++}
++
+ 
+ // Builds the assocresp_elements hexdump for the Multi-AP backhaul vendor IE.
+ // @param hop_count  0x00 = local agent (gateway), 0x01 = standalone extender, 0xFF = unreachable.
+@@ -3457,9 +3551,22 @@ bool ap_wlan_hal_nl80211::generate_connected_clients_events(
+             }
+ 
+             if (it == m_latest_assoc_frame.end()) {
+-                LOG(WARNING) << "STA-CONNECTED without previously receiving a (re-)association frame!"
+-                             << " client_mac=" << client_mac;
+-                msg->params.association_frame_length = 0;
++                // Agent restarted while STA was associated — no over-the-air frame in cache.
++                // Try to restore from the shared assoc frame DB persisted at first association.
++                auto frame_bytes = restore_assoc_frame(client_mac);
++                if (!frame_bytes.empty() &&
++                    frame_bytes.size() <= sizeof(msg->params.association_frame)) {
++                    std::copy(frame_bytes.begin(), frame_bytes.end(),
++                              msg->params.association_frame);
++                    msg->params.association_frame_length = frame_bytes.size();
++                    assoc_frame_type = assoc_frame::AssocReqFrame::ASSOCIATION_REQUEST;
++                    LOG(DEBUG) << "Restored persisted assoc frame for " << client_mac
++                               << " (" << frame_bytes.size() << " bytes)";
++                } else {
++                    LOG(WARNING) << "STA-CONNECTED without previously receiving a (re-)association frame!"
++                                 << " client_mac=" << client_mac;
++                    msg->params.association_frame_length = 0;
++                }
+             } else {
+                 // Add the latest association frame
+                 // PPM-1718: parse the association frame and make sure it belongs to the right MAC address.
+@@ -3651,6 +3758,8 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+                 std::string src_mac           = tlvf::mac_to_string(mgmt_frame->mac);
+                 m_latest_assoc_frame[src_mac] = mgmt_frame;
+                 LOG(DEBUG) << "Saved assoc frame";
++                // Persist to the shared DB so the frame survives agent restart.
++                persist_assoc_frame(src_mac, mgmt_frame->data);
+             }
+         }
+ 
+@@ -3687,13 +3796,40 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+ 
+         auto assoc_frame_type = assoc_frame::AssocReqFrame::UNKNOWN;
+ 
+-        if (m_latest_assoc_frame.find(src_mac) == m_latest_assoc_frame.end()) {
+-            LOG(WARNING) << "STA-CONNECTED without previously receiving a (re-)association frame!";
++        auto it_sta = m_latest_assoc_frame.find(src_mac);
++
++        /* MLO fallback: STA_Connected uses the MLD MAC as src_mac, but
++         * m_latest_assoc_frame is keyed by the link MAC (affiliated STA MAC)
++         * from the AP_MGMT_FRAME_RECEIVED event.  When the direct lookup fails,
++         * scan for a frame whose BSSID matches the current VAP's BSS MAC — this
++         * uniquely identifies the link-specific assoc frame for this MLO client.
++         *
++         * This mirrors the same fallback already present in the STA-FIRST/STA-NEXT
++         * path (see above) and fixes the case where STA_Connected arrives with the
++         * MLD MAC before the link MAC → MLD MAC mapping is established. */
++        if (it_sta == m_latest_assoc_frame.end()) {
++            /* In process_nl80211_event() the VAP is identified by vap_id, not a loop variable.
++             * Use m_radio_info.available_vaps[vap_id].bss to get the BSS interface name. */
++            const std::string &cur_bss = m_radio_info.available_vaps[vap_id].bss;
++            for (auto &kv : m_latest_assoc_frame) {
++                if (tlvf::mac_to_string(kv.second->bssid) == cur_bss) {
++                    it_sta = m_latest_assoc_frame.find(kv.first);
++                    LOG(DEBUG) << "MLO STA_Connected assoc frame fallback: MLD_MAC=" << src_mac
++                               << " → link_MAC=" << kv.first
++                               << " (BSS=" << cur_bss << ")";
++                    break;
++                }
++            }
++        }
++
++        if (it_sta == m_latest_assoc_frame.end()) {
++            LOG(WARNING) << "STA-CONNECTED without previously receiving a (re-)association frame!"
++                         << " client_mac=" << src_mac;
+             msg->params.association_frame_length = 0;
+         } else {
+             // Add the latest association frame
+             // PPM-1718: parse the association frame and make sure it belongs to the right MAC address.
+-            auto &frame_info  = m_latest_assoc_frame[src_mac];
++            auto &frame_info  = it_sta->second;
+             msg->params.bssid = frame_info->bssid;
+             auto &frame_body  = frame_info->data;
+             // Add the latest association frame
+@@ -3859,7 +3995,12 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+         // Add the message to the queue
+         event_queue_push(Event::STA_Disconnected, msg_buff);
+ 
+-        m_latest_assoc_frame.erase(parsed_obj[bwl::EVENT_KEYLESS_PARAM_MAC]);
++        {
++            const std::string &sta_mac = parsed_obj[bwl::EVENT_KEYLESS_PARAM_MAC];
++            m_latest_assoc_frame.erase(sta_mac);
++            // Remove the entry from the shared assoc frame DB.
++            remove_assoc_frame(sta_mac);
++        }
+ 
+     } break;
+ 
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 1c348c73a..8958df1cd 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -1083,7 +1083,7 @@ bool mon_wlan_hal_nl80211::read_debugfs_file(const std::string &path, std::strin
+ 
+  * @brief Adds an unassociated STA to the ath12k driver's peer neighbor list.
+  */
+-bool mon_wlan_hal_nl80211::add_peer_neighbor(const std::string &mac_address)
++bool mon_wlan_hal_nl80211::add_peer_neighbor(const std::string &mac_address, bool *already_exists)
+ {
+     // Compose correct debugfs path based on phy_name and hw index
+     std::string phy_name = m_radio_info.phy_name;
+@@ -1105,14 +1105,30 @@ bool mon_wlan_hal_nl80211::add_peer_neighbor(const std::string &mac_address)
+         << " debugfs_path=" << debugfs_path
+         << " command=" << command;
+ 
+-    // Use write_debugfs_file to write the command
+-    if (!write_debugfs_file(debugfs_path, command)) {
+-        LOG(ERROR) << "Failed to add peer neighbor: " << mac_address;
++    std::string sys_cmd = "echo \"" + command + "\" > " + debugfs_path;
++    int ret = system(sys_cmd.c_str());
++
++    if (ret == 0) {
++        LOG(INFO) << "Successfully added neighbor " << mac_address << " via " << debugfs_path;
++        if (already_exists) { *already_exists = false; }
++        return true;
++    }
++
++    /* Return code 256 (shell exit 1) maps to the kernel's EEXIST —
++     * "cannot add existing neighbor peer" — meaning this STA is currently
++     * associated on this radio.  Treat as a soft skip: the driver cannot
++     * measure an associated peer via the unassoc ROC path. */
++    if (ret == 256) {
++        LOG(INFO) << "add_peer_neighbor: " << mac_address
++                  << " is already/associated on this radio (EEXIST) — skipping unassoc measurement";
++        if (already_exists) { *already_exists = true; }
+         return false;
+     }
+ 
+-    LOG(INFO) << "Successfully added neighbor " << mac_address << " via " << debugfs_path;
+-    return true;
++    LOG(ERROR) << "Failed to add peer neighbor: " << mac_address
++               << " Return code: " << ret;
++    if (already_exists) { *already_exists = false; }
++    return false;
+ }
+ 
+ 
+@@ -1407,8 +1423,18 @@ bool mon_wlan_hal_nl80211::sta_unassoc_rssi_measurement(
+         }
+ 
+         // Add STA to the driver's debugfs list for monitoring
+-        if (!add_peer_neighbor(mac_address)) {
+-            LOG(ERROR) << "Failed to add peer neighbor: " << mac_address;
++        bool already_exists = false;
++        if (!add_peer_neighbor(mac_address, &already_exists)) {
++            if (already_exists) {
++                /* STA is currently associated on this radio — driver cannot
++                 * measure it as an unassociated peer via ROC scan.  Skip it
++                 * silently; the unassoc query for this STA will return RCPI=0
++                 * (noise floor) which the steering app treats as no-measurement. */
++                LOG(INFO) << "sta_unassoc_rssi_measurement: skipping " << mac_address
++                          << " (associated peer on this radio)";
++            } else {
++                LOG(ERROR) << "Failed to add peer neighbor: " << mac_address;
++            }
+             continue;
+         }
+ 
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
+index 5139e3ad6..f01ee67b0 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
+@@ -116,7 +116,7 @@ private:
+      // Helper functions for unassociated STA measurements
+      bool write_debugfs_file(const std::string &path, const std::string &data);
+      bool read_debugfs_file(const std::string &path, std::string &output);
+-     bool add_peer_neighbor(const std::string &mac_address);
++     bool add_peer_neighbor(const std::string &mac_address, bool *already_exists = nullptr);
+      bool remove_peer_neighbor(const std::string &mac_address);
+      bool read_peer_neighbor_rssi(const std::string &mac_address, int8_t &rssi);
+      bool trigger_roc_scan(uint8_t channel, uint32_t duration_ms);
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 8d44fb774..689a85352 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -645,7 +645,7 @@ bool db::add_radio(const sMacAddr &mac, const sMacAddr &parent_mac)
+ }
+ 
+ std::shared_ptr<Station> db::add_station(const sMacAddr &al_mac, const sMacAddr &mac,
+-                                         const sMacAddr &parent_mac)
++                                         const sMacAddr &parent_mac, bool *dm_reused)
+ {
+     if (mac == network_utils::ZERO_MAC) {
+         LOG(ERROR) << "mac supplied for add_station is zero_mac";
+@@ -672,7 +672,7 @@ std::shared_ptr<Station> db::add_station(const sMacAddr &al_mac, const sMacAddr
+ 
+     // Add STA to the controller data model via m_ambiorix_datamodel
+     // for connected station (WiFi client)
+-    if (!dm_add_sta_element(al_mac, parent_mac, *station)) {
++    if (!dm_add_sta_element(al_mac, parent_mac, *station, dm_reused)) {
+         LOG(ERROR) << "Failed to add station datamodel, mac: " << station->mac;
+     }
+ 
+@@ -6984,7 +6984,8 @@ bool db::dm_set_device_multi_ap_capabilities(const std::string &device_mac)
+     return return_val;
+ }
+ 
+-bool db::dm_add_sta_element(const sMacAddr &al_mac, const sMacAddr &bssid, Station &station)
++bool db::dm_add_sta_element(const sMacAddr &al_mac, const sMacAddr &bssid, Station &station,
++                             bool *dm_reused)
+ {
+ 
+     auto bss = get_bss(bssid, al_mac);
+@@ -7024,11 +7025,30 @@ bool db::dm_add_sta_element(const sMacAddr &al_mac, const sMacAddr &bssid, Stati
+ 
+         const std::string path_to_sta = bss->dm_path + ".STA";
+ 
+-        station.dm_path = m_ambiorix_datamodel->add_instance(path_to_sta);
++        // Before creating a new STA instance, check if one already exists in the DM
++        // with a matching MACAddress.  This happens when prplmesh restarts while a
++        // client is still associated: the in-memory Station object loses its dm_path,
++        // but the DM object was never removed.  Reusing the existing instance avoids
++        // resetting all stats to zero on every controller restart.
++        {
++            auto existing_index = m_ambiorix_datamodel->get_instance_index(
++                path_to_sta + ".[MACAddress == '%s'].",
++                tlvf::mac_to_string(station.mac));
++            if (existing_index) {
++                station.dm_path = path_to_sta + "." + std::to_string(existing_index) + ".";
++                LOG(DEBUG) << "dm_add_sta_element: reusing existing DM STA entry "
++                           << station.dm_path << " for " << station.mac << " (re-onboard)";
++                if (dm_reused) { *dm_reused = true; }
++            }
++        }
++
+         if (station.dm_path.empty()) {
+-            LOG(ERROR) << "Failed to add sta instance " << path_to_sta
+-                       << ". STA mac: " << station.mac;
+-            return false;
++            station.dm_path = m_ambiorix_datamodel->add_instance(path_to_sta);
++            if (station.dm_path.empty()) {
++                LOG(ERROR) << "Failed to add sta instance " << path_to_sta
++                           << ". STA mac: " << station.mac;
++                return false;
++            }
+         }
+ 
+         dm_restore_sta_steering_event(station);
+diff --git a/controller/src/beerocks/master/db/db.h b/controller/src/beerocks/master/db/db.h
+index 3b7e0c368..8d7e3aa12 100644
+--- a/controller/src/beerocks/master/db/db.h
++++ b/controller/src/beerocks/master/db/db.h
+@@ -718,7 +718,8 @@ public:
+      */
+     std::shared_ptr<Station>
+     add_station(const sMacAddr &al_mac, const sMacAddr &mac,
+-                const sMacAddr &parent_mac = beerocks::net::network_utils::ZERO_MAC);
++                const sMacAddr &parent_mac = beerocks::net::network_utils::ZERO_MAC,
++                bool *dm_reused = nullptr);
+     void set_station_bss(std::shared_ptr<Station> station,
+                          std::shared_ptr<Agent::sRadio::sBss> bss);
+ 
+@@ -3700,7 +3701,8 @@ private:
+      * @param station Station object
+      * @return True on success, false otherwise.
+      */
+-    bool dm_add_sta_element(const sMacAddr &al_mac, const sMacAddr &bssid, Station &station);
++    bool dm_add_sta_element(const sMacAddr &al_mac, const sMacAddr &bssid, Station &station,
++                             bool *dm_reused = nullptr);
+ 
+     /**
+      * @brief Set clients (device) multi ap capabilities
+diff --git a/controller/src/beerocks/master/tasks/topology_task.cpp b/controller/src/beerocks/master/tasks/topology_task.cpp
+index 42255fdd9..3a698134f 100644
+--- a/controller/src/beerocks/master/tasks/topology_task.cpp
++++ b/controller/src/beerocks/master/tasks/topology_task.cpp
+@@ -26,6 +26,7 @@
+ #include <tlvf/wfa_map/tlvAssociatedClients.h>
+ #include <tlvf/wfa_map/tlvAssociatedStaMldConfigurationReport.h>
+ #include <tlvf/wfa_map/tlvClientAssociationEvent.h>
++#include <tlvf/wfa_map/tlvClientInfo.h>
+ #include <tlvf/wfa_map/tlvProfile2ReasonCode.h>
+ #include <tlvf/wfa_map/tlvSupportedService.h>
+ 
+@@ -1047,7 +1048,8 @@ bool topology_task::handle_topology_notification(const sMacAddr &src_mac,
+ 
+     if (client_connected) {
+         //add or update node parent
+-        auto client = database.add_station(src_mac, client_mac, bssid);
++        bool dm_reused = false;
++        auto client = database.add_station(src_mac, client_mac, bssid, &dm_reused);
+         if (!client) {
+             LOG(ERROR) << "client " << client_mac << " not created";
+             return false;
+@@ -1124,9 +1126,36 @@ bool topology_task::handle_topology_notification(const sMacAddr &src_mac,
+ 
+         // Note: The Database node stats and the Datamodels' stats are not the same.
+         // Therefore, client information in data model and in node DB might differ.
++        // Snapshot the last known RCPI before clearing in-memory stats so we can
++        // restore it into the DM for the reconnect case (avoids a 20-40 s zero
++        // window when the controller restarts while the STA stays associated and
++        // the DM was wiped — dm_reused is false but we still have prior RCPI).
++        const uint8_t prev_rcpi = client->last_assoc_sta_link_metrics_uplink_rcpi;
++
+         database.clear_sta_stats_info(client_mac);
+         client->clear_cross_rssi();
+-        database.dm_clear_sta_stats(tlvf::mac_from_string(client_mac_str));
++        // Only zero the DM stats for a genuinely new association — not when reusing
++        // an existing DM entry after prplmesh restart (dm_reused == true).
++        // Clearing on re-onboard causes the DM to show 0 for SignalStrength,
++        // LastDataDownlinkRate, BytesSent, etc. until the agent sends fresh metrics.
++        if (!dm_reused) {
++            database.dm_clear_sta_stats(tlvf::mac_from_string(client_mac_str));
++            // DM was freshly created (controller + DM both restarted). If we have a
++            // valid prior RCPI from the previous session, restore it immediately so
++            // SignalStrength is never zero for an already-connected STA.
++            // Rates are set to 0 and will be updated by the first
++            // AssocStaLinkMetrics response (arrives within ~3 s).
++            if (prev_rcpi != 0) {
++                LOG(DEBUG) << "topology: restoring SignalStrength=" << unsigned(prev_rcpi)
++                           << " for " << client_mac_str
++                           << " after reconnect (controller restart, last known RCPI)";
++                database.dm_set_sta_link_metrics(tlvf::mac_from_string(client_mac_str),
++                                                 0, 0, prev_rcpi);
++            }
++        } else {
++            LOG(DEBUG) << "topology: skipping dm_clear_sta_stats for " << client_mac_str
++                       << " (re-onboard, preserving existing DM stats)";
++        }
+ 
+         database.set_sta_backhaul_iface_type(client_mac, beerocks::IFACE_TYPE_WIFI_UNSPECIFIED);
+ 
+@@ -1135,6 +1164,28 @@ bool topology_task::handle_topology_notification(const sMacAddr &src_mac,
+             database.set_sta_capabilities(client_mac_str, vs_tlv->capabilities());
+         }
+ 
++        // If the association frame is absent (controller restarted — m_assoc_frame was
++        // lost), send a CLIENT_CAPABILITY_QUERY_MESSAGE so the agent re-delivers the
++        // frame and ClientCapabilities is populated within 1-2 s instead of waiting
++        // for the next genuine re-association.  Skip for bSTAs: they have no assoc
++        // frame and the agent would reject the query.
++        if (!client->is_bSta() && database.get_association_frame_by_sta_mac(client_mac).empty()) {
++            LOG(DEBUG) << "topology: ClientCapabilities missing for " << client_mac_str
++                       << " — sending CLIENT_CAPABILITY_QUERY_MESSAGE to restore";
++            if (cmdu_tx.create(0, ieee1905_1::eMessageType::CLIENT_CAPABILITY_QUERY_MESSAGE)) {
++                auto client_info_tlv = cmdu_tx.addClass<wfa_map::tlvClientInfo>();
++                if (client_info_tlv) {
++                    client_info_tlv->client_mac() = client_mac;
++                    client_info_tlv->bssid()      = bssid;
++                    son_actions::send_cmdu_to_agent(src_mac, cmdu_tx, database);
++                } else {
++                    LOG(ERROR) << "topology: addClass tlvClientInfo failed for cap query";
++                }
++            } else {
++                LOG(ERROR) << "topology: cmdu create CLIENT_CAPABILITY_QUERY_MESSAGE failed";
++            }
++        }
++
+         // Notify existing steering task of completed connection
+         // Check if task is running before pushing the event
+         if (tasks.is_task_running(client->steering_task_id)) {
+-- 
+2.34.1
+
