@@ -57,7 +57,7 @@ wlan_ready_poll()
         if [ -z "$ifaces" ]; then
             logger -t "${NAME}" -p daemon.warn \
                 "All hostap_iface entries are dummy_ap, skipping WLAN readiness check"
-            return 1
+            return 0
         fi
 
         start_time="$(date -u +%s)"
@@ -107,23 +107,26 @@ get_prim_ifname() {
 
 # Check if idx was found
     if [ -z "$idx" ]; then
-        echo "No matching frequency found."
+        echo "No matching frequency found." >&2
         exit 1
     fi
 
 # Step 2: Build config file path
     conf_file="/var/run/hostapd-phy00.$idx.conf"
 
-# Check if file exists
+# If hostapd hasn't started yet (no runtime conf for this radio), fall back to
+# the dummy_ap placeholder instead of failing, so radio config can still be applied.
     if [ ! -f "$conf_file" ]; then
-        echo "Config file not found: $conf_file"
-        exit 1
+        echo "Config file not found: $conf_file, defaulting ifname to dummy_ap" >&2
+        echo "$idx dummy_ap"
+        return 0
     fi
 # Step 3: Extract the interface line
     interface_line=$(grep "^interface=" "$conf_file")
 
 # Print only the interface value (after '=')
     ifname="${interface_line#interface=}"
+    [ -z "$ifname" ] && ifname="dummy_ap"
 
     # Output: key=value pairs
     echo "$idx $ifname"
@@ -136,6 +139,34 @@ FREQ_2G=2402
 FREQ_5GL=5170
 FREQ_6G=5945
 FREQ_5GH=5490
+
+derive_radio_macaddr() {
+    local idx="$1"        # numeric phy sub-index, e.g. 0/1/2
+    local section="$2"    # e.g. radio0
+
+    local phy_name="phy00.${idx}"
+    uci set "prplmesh.${section}.phy_name=${phy_name}"
+
+    # Keep the MAC stable across restarts/reboots: only derive it once.
+    if [ -n "$(uci -q get "prplmesh.${section}.macaddr")" ]; then
+        return 0
+    fi
+
+    local mac
+    mac="$(
+        . /lib/functions.sh
+        . /lib/netifd/wireless/mac80211.sh
+        export macidx=0
+        mac80211_generate_mac "phy00:${idx}" ap
+    )"
+
+    if [ -n "$mac" ]; then
+        uci set "prplmesh.${section}.macaddr=${mac}"
+    else
+        logger -t "${NAME}" -p daemon.warn \
+            "derive_radio_macaddr: failed to derive macaddr for ${section} (phy00:${idx})"
+    fi
+}
 
 update_radio_hostap_iface() {
 
@@ -168,36 +199,62 @@ update_radio_hostap_iface() {
 
         echo "radio${i}_ifname = $ifname (Frequency: $freq)"
 
-        case "$ifname" in
-            *wlan*)
-                #Check if prplmesh.radioX section exists
-                if [ -z "$(uci show "prplmesh.radio${i}" 2>/dev/null)" ]; then
-                    echo "Creating prplmesh.radio${i} section"
-                    uci set prplmesh.radio${i}=wifi-device
+        #Check if prplmesh.radioX section exists
+        if [ -z "$(uci show "prplmesh.radio${i}" 2>/dev/null)" ]; then
+            echo "Creating prplmesh.radio${i} section"
+            uci set prplmesh.radio${i}=wifi-device
 
-                # Add default options for new section
-                uci set prplmesh.radio${i}.hostap_iface="$ifname"
-                uci set prplmesh.radio${i}.sta_iface="dummy_sta"
-                uci set prplmesh.radio${i}.dcs_enable="0"
-                uci set prplmesh.radio${i}.dcs_interval_sec="15"
-                uci set prplmesh.radio${i}.dcs_dwell_msec="40"
-                uci set prplmesh.radio${i}.dcs_refresh_sec="86400"
-
-                # Set channel pool based on band (example logic)
-                case $i in
-                    "$prplmesh_radio_2g") uci set prplmesh.radio${i}.dcs_channel_pool="1,6,11" ;;
-                    "$prplmesh_radio_5g"|"$prplmesh_radio_5gh") uci set prplmesh.radio${i}.dcs_channel_pool="36-48,149-165" ;;
-                    "$prplmesh_radio_6g") uci set prplmesh.radio${i}.dcs_channel_pool="2-233" ;;
-                esac
-            fi
-
+            # Add default options for new section
             uci set prplmesh.radio${i}.hostap_iface="$ifname"
-            uci set prplmesh.radio${i}.radio_id="$radio_id"
-            ;;
-        *)
-            echo "Interface $ifname does not contain 'wlan', skipping configuration for radio${i}"
-            ;;
+            uci set prplmesh.radio${i}.sta_iface="dummy_sta"
+            uci set prplmesh.radio${i}.dcs_enable="0"
+            uci set prplmesh.radio${i}.dcs_interval_sec="15"
+            uci set prplmesh.radio${i}.dcs_dwell_msec="40"
+            uci set prplmesh.radio${i}.dcs_refresh_sec="86400"
+        fi
+
+        # radio_disable reflects whether hostapd currently has a valid interface for
+        # this radio: get_prim_ifname() already returns "dummy_ap" whenever the
+        # hostapd-phy00.$idx.conf file is missing or has no usable interface= line.
+        # Re-evaluated every run so it tracks hostapd's live state.
+        case "$ifname" in
+            dummy_ap) uci set prplmesh.radio${i}.radio_disable="1" ;;
+            *)        uci set prplmesh.radio${i}.radio_disable="0" ;;
         esac
+
+        # Set channel pool, freq_band, channel and bandwidth based on band (example logic).
+        # Applied every run (not just on section creation) so pre-existing sections
+        # created before these options existed still get backfilled.
+        case $i in
+            "$prplmesh_radio_2g")
+                uci set prplmesh.radio${i}.dcs_channel_pool="1,6,11"
+                uci set prplmesh.radio${i}.freq_band="2g"
+                uci set prplmesh.radio${i}.channel="1"
+                uci set prplmesh.radio${i}.bandwidth="20MHz"
+                ;;
+            "$prplmesh_radio_5g")
+                uci set prplmesh.radio${i}.dcs_channel_pool="36-48,149-165"
+                uci set prplmesh.radio${i}.freq_band="5g"
+                uci set prplmesh.radio${i}.channel="36"
+                uci set prplmesh.radio${i}.bandwidth="80MHz"
+                ;;
+            "$prplmesh_radio_5gh")
+                uci set prplmesh.radio${i}.dcs_channel_pool="36-48,149-165"
+                uci set prplmesh.radio${i}.freq_band="5g"
+                uci set prplmesh.radio${i}.channel="149"
+                uci set prplmesh.radio${i}.bandwidth="80MHz"
+                ;;
+            "$prplmesh_radio_6g")
+                uci set prplmesh.radio${i}.dcs_channel_pool="2-233"
+                uci set prplmesh.radio${i}.freq_band="6g"
+                uci set prplmesh.radio${i}.channel="1"
+                uci set prplmesh.radio${i}.bandwidth="80MHz"
+                ;;
+        esac
+
+        uci set prplmesh.radio${i}.hostap_iface="$ifname"
+        uci set prplmesh.radio${i}.radio_id="$radio_id"
+        derive_radio_macaddr "$radio_id" "radio${i}"
 
         i=$((i+1))
     done
