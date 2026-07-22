@@ -1,0 +1,1194 @@
+From 0255f415a41505f2acb394c2ea19f6b2cd3d3a76 Mon Sep 17 00:00:00 2001
+From: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+Date: Thu, 23 Jul 2026 01:24:00 +0530
+Subject: [PATCH] prplmesh: Add HE capabilities processing, UHR mode reporting,
+ and htmode config fix
+
+Changes include:
+- Added X_QCA_UhrMode field to Radio object in DM schema
+- Implemented set_ap_he_capabilities() to process 0x88 TLV
+- Fixed htmode reading to support new UCI format (wireless.radio0_band0.htmode)
+- Added UHR mode detection and reporting from QCA WiFi-8 Capabilities TLV
+- Fixed WiFi6 MCS/NSS parsing and NSS encoding (IEEE 802.11ax uses 0-based encoding)
+- Updated qmesh-lib to read UHR mode from DM
+- Updated steering app to detect and use UHR mode capabilities
+- Agent only registers a radio's UHR flag when its htmode is actually UHR;
+  if none qualify, the QCA WiFi-8 Capabilities TLV is omitted from the AP
+  Capability Report entirely
+- Controller clears X_QCA_UhrMode/Wifi8Capable for all of an agent's radios
+  when the TLV is absent, so a UHR -> non-UHR htmode transition (e.g. to
+  EHT) doesn't leave a stale X_QCA_UhrMode=true in the DM
+- Added bpl_cfg_get_radio_htmode() stubs to the dm (WHM/UGW), rdk, and linux
+  bpl backends - it was only implemented in cfg/uci/bpl_cfg_wifi.cpp, and
+  USE_PRPLMESH_WHM builds substitute cfg/dm/bpl_cfg_wifi.cpp for that file,
+  causing beerocks_agent to fail at link time with an undefined reference
+  to beerocks::bpl::bpl_cfg_get_radio_htmode
+
+Signed-off-by: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+---
+ .../slave/tasks/capability_reporting_task.cpp |  54 +++++-
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      |  22 ++-
+ .../multi_vendor/qca/include/tlvf_qca_utils.h |  43 ++++-
+ .../multi_vendor/qca/src/multi_vendor_qca.cpp |  26 ++-
+ .../multi_vendor/qca/src/tlvf_qca_utils.cpp   |  92 +++++++++-
+ controller/nbapi/odl/capabilities.odl.in      |  19 ++
+ controller/nbapi/odl/controller.odl.in        |  29 +++
+ controller/nbapi/odl/radio.odl.in             |   7 +
+ controller/src/beerocks/master/controller.cpp |  61 +++++++
+ controller/src/beerocks/master/controller.h   |   9 +
+ controller/src/beerocks/master/db/agent.h     |   5 +
+ controller/src/beerocks/master/db/db.cpp      | 165 ++++++++++++++++++
+ controller/src/beerocks/master/db/db.h        |  22 +++
+ .../platform/bpl/cfg/dm/bpl_cfg_wifi.cpp      |   6 +
+ .../platform/bpl/cfg/linux/bpl_cfg_wifi.cpp   |   6 +
+ framework/platform/bpl/cfg/rdk/bpl_cfg.cpp    |   6 +
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     |  76 ++++++++
+ framework/platform/bpl/include/bpl/bpl_cfg.h  |  12 ++
+ framework/tlvf/CMakeLists.txt                 |   8 +
+ framework/tlvf/tlvf_conf.yaml                 |   1 +
+ framework/tlvf/yaml/tlvf/qca/eQcaTLVId.yaml   |   1 +
+ .../tlvf/qca/tlvQcaWifi8Capabilities.yaml     |  52 ++++++
+ 22 files changed, 711 insertions(+), 11 deletions(-)
+ create mode 100644 framework/tlvf/yaml/tlvf/qca/tlvQcaWifi8Capabilities.yaml
+
+diff --git a/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp b/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp
+index 7cf243f69..6a4daff8a 100644
+--- a/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp
++++ b/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp
+@@ -55,12 +55,18 @@
+ #if defined(IEEE80211_BN)
+ #include <tlvf/wfa_map/tlvWifi8AgentCapabilities.h>
+ #endif /* defined(IEEE80211_BN) */
++#include <bpl/bpl_cfg.h>
+ 
+ using namespace multi_vendor;
+ 
+ // Forward declaration of the C-linkage helper defined in multi_vendor_qca.cpp.
+ // Used to pass aggregated SMD capabilities to the QCA TLV handler before add_vs_tlv().
+ extern "C" void set_qca_agent_smd_capabilities(bool smd_capable, bool smd_dl_forwarding);
++// Used to pass per-radio UHR mode flag to the QCA WiFi-8 TLV handler before add_vs_tlv().
++extern "C" void set_qca_radio_wifi8_mode(const uint8_t *ruid_bytes, bool uhr_mode);
++extern "C" void clear_qca_radio_wifi8_modes();
++// Deprecated per-agent path kept for backward compat
++extern "C" void set_qca_agent_wifi8_capable(bool wifi8_capable);
+ 
+ namespace beerocks {
+ 
+@@ -656,6 +662,30 @@ bool CapabilityReportingTask::prepare_ap_capability_message(bool early)
+         set_qca_agent_smd_capabilities(smd_capable, smd_dl_fwd);
+     }
+ 
++    /* Set per-radio UHR mode flag for the QCA WiFi-8 capabilities TLV.
++     * Read htmode from UCI per radio via bpl_cfg_get_radio_htmode().
++     * If htmode starts with "UHR" the radio is operating in UHR/802.11bn mode.
++     * Only UHR radios are registered here - if no radio is in UHR mode, the
++     * TLV list stays empty and add_qca_wifi8_capabilities_tlv() skips adding
++     * the TLV entirely (see s_radio_wifi8_modes.empty() check there). */
++    {
++        clear_qca_radio_wifi8_modes();
++        for (auto radio : db->get_radios_list()) {
++            if (!radio) { continue; }
++            std::string htmode;
++            bool uhr_mode = false;
++            if (beerocks::bpl::bpl_cfg_get_radio_htmode(radio->front.iface_name, htmode)) {
++                uhr_mode = (htmode.size() >= 3 &&
++                            htmode[0] == 'U' && htmode[1] == 'H' && htmode[2] == 'R');
++                LOG(DEBUG) << "Radio " << radio->front.iface_name
++                           << " htmode=" << htmode << " uhr_mode=" << uhr_mode;
++            }
++            if (uhr_mode) {
++                set_qca_radio_wifi8_mode(radio->front.iface_mac.oct, uhr_mode);
++            }
++        }
++    }
++
+     auto message_type = early ? ieee1905_1::eMessageType::EARLY_AP_CAPABILITY_REPORT_MESSAGE
+                               : ieee1905_1::eMessageType::AP_CAPABILITY_REPORT_MESSAGE;
+     if (!multi_vendor::tlvf_handler::add_vs_tlv(m_cmdu_tx, message_type)) {
+@@ -694,29 +724,38 @@ bool CapabilityReportingTask::prepare_ap_capability_message(bool early)
+      * 1. The tlvs created in the loop are created per radio and are
+      * defined in the specification as "Zero Or More" (multi-ap specification v2, 17.1.7)
+      */
+-    for (auto radio : db->get_radios_list()) {
++    auto radios_list = db->get_radios_list();
++    LOG(DEBUG) << "AP Capability Report: radios_list size=" << radios_list.size();
++    for (auto radio : radios_list) {
+         if (!radio) {
+             LOG(ERROR) << "radio does not exist in the db";
+             continue;
+         }
+ 
++        LOG(DEBUG) << "AP Capability Report: processing radio iface=" << radio->front.iface_name
++                   << " he_supported=" << radio->he_supported;
++
+         if (!tlvf_utils::add_ap_radio_basic_capabilities(m_cmdu_tx, radio->front.iface_mac)) {
+             return false;
+         }
+ 
+         if (!add_ap_ht_capabilities(radio->front.iface_name)) {
++            LOG(ERROR) << "Failed to add HT capabilities for " << radio->front.iface_name;
+             return false;
+         }
+ 
+         if (!add_ap_vht_capabilities(radio->front.iface_name)) {
++            LOG(ERROR) << "Failed to add VHT capabilities for " << radio->front.iface_name;
+             return false;
+         }
+ 
+         if (!add_ap_he_capabilities(radio->front.iface_name)) {
++            LOG(ERROR) << "Failed to add HE capabilities for " << radio->front.iface_name;
+             return false;
+         }
+ 
+         if (!add_ap_wifi6_capabilities(radio->front.iface_name)) {
++            LOG(ERROR) << "Failed to add WiFi6 capabilities for " << radio->front.iface_name;
+             return false;
+         }
+ 
+@@ -973,19 +1012,23 @@ bool CapabilityReportingTask::add_ap_he_capabilities(const std::string &iface_na
+     auto db    = AgentDB::get();
+     auto radio = db->radio(iface_name);
+     if (!radio) {
++        LOG(DEBUG) << "add_ap_he_capabilities: radio not found for iface=" << iface_name;
+         return false;
+     }
+ 
++    LOG(DEBUG) << "add_ap_he_capabilities: iface=" << iface_name << " he_supported=" << radio->he_supported;
+     if (!radio->he_supported) {
++        LOG(DEBUG) << "add_ap_he_capabilities: HE not supported, skipping";
+         return true;
+     }
+ 
+     auto tlv = m_cmdu_tx.addClass<wfa_map::tlvApHeCapabilities>();
+     if (!tlv) {
+-        LOG(ERROR) << "Error creating TLV_AP_HE_CAPABILITIES";
++        LOG(ERROR) << "Error creating TLV_AP_HE_CAPABILITIES for iface=" << iface_name;
+         return false;
+     }
+ 
++    LOG(DEBUG) << "add_ap_he_capabilities: created TLV for iface=" << iface_name << " ruid=" << radio->front.iface_mac;
+     tlv->radio_uid() = radio->front.iface_mac;
+     struct beerocks::net::sHECapabilities *HECaps =
+         (struct beerocks::net::sHECapabilities *)(&radio->he_capability);
+@@ -1042,6 +1085,13 @@ bool CapabilityReportingTask::add_ap_he_capabilities(const std::string &iface_na
+     tlv->flags2().mu_beamformer_capable       = HECaps->mu_beamformer_capable;
+     tlv->flags2().su_beamformer_capable       = HECaps->su_beamformer_capable;
+ 
++    LOG(DEBUG) << "add_ap_he_capabilities: successfully added TLV for iface=" << iface_name
++               << " mcs_nss_size=" << (int)mcs_nss_size
++               << " tx_ss=" << (int)HECaps->max_num_of_supported_tx_spatial_streams
++               << " rx_ss=" << (int)HECaps->max_num_of_supported_rx_spatial_streams
++               << " he160=" << (int)HECaps->he_support_160mhz
++               << " he80_80=" << (int)HECaps->he_support_80_80mhz;
++
+     return true;
+ }
+ 
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 0d047807e..5dac0c9ec 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -529,7 +529,27 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+     //   Bit 4 (0x10) = Beacon Passive Measurement Capability
+     //   Bit 5 (0x20) = Beacon Active Measurement Capability
+     //   Bit 6 (0x40) = Beacon Table Measurement Capability
+-    if (measurement_mode != BEACON_MEASUREMENT_MODE_TABLE) {
++    // Detect if the target VAP is a backhaul BSS by checking m_radio_info.available_vaps.
++    bool is_backhaul_vap = false;
++    {
++        std::string base_target_iface;
++        extractBase1Interface(vap_iface_name, base_target_iface);
++        for (const auto &vap : m_radio_info.available_vaps) {
++            std::string base_vap_iface_check;
++            extractBase1Interface(vap.second.bss, base_vap_iface_check);
++            if (base_vap_iface_check == base_target_iface && vap.second.backhaul) {
++                is_backhaul_vap = true;
++                break;
++            }
++        }
++    }
++
++    if (is_backhaul_vap && measurement_mode != BEACON_MEASUREMENT_MODE_TABLE) {
++        LOG(DEBUG) << "Beacon 11k: STA " << tlvf::mac_to_string(req.sta_mac.oct)
++                   << " is on backhaul BSS " << vap_iface_name
++                   << " — skipping RRM capability check, trusting measurement_mode="
++                   << int(measurement_mode);
++    } else if (measurement_mode != BEACON_MEASUREMENT_MODE_TABLE) {
+         // Find the first registered link interface to query STA capabilities
+         std::string query_iface;
+         for (int link_idx = 0; link_idx < 8; link_idx++) {
+diff --git a/common/beerocks/multi_vendor/qca/include/tlvf_qca_utils.h b/common/beerocks/multi_vendor/qca/include/tlvf_qca_utils.h
+index 9cd259e74..2ebe33211 100644
+--- a/common/beerocks/multi_vendor/qca/include/tlvf_qca_utils.h
++++ b/common/beerocks/multi_vendor/qca/include/tlvf_qca_utils.h
+@@ -10,6 +10,7 @@
+ #include <tlvf/CmduMessageRx.h>
+ #include <tlvf/CmduMessageTx.h>
+ #include <vector>
++#include <array>
+ 
+ namespace qca {
+ 
+@@ -54,12 +55,34 @@ public:
+ 
+     /**
+      * @brief Adds QCA SMD capabilities TLV to outgoing message (SEND side).
+-     *
+-     * @param[in,out] cmdu_tx CMDU message.
+-     * @return True on success and false otherwise.
++     * Used for EARLY_AP_CAPABILITY_REPORT_MESSAGE.
+      */
+     static bool add_qca_smd_capabilities_tlv(ieee1905_1::CmduMessageTx &cmdu_tx);
+ 
++    /**
++     * @brief Adds QCA WiFi-8 capabilities TLV to AP_CAPABILITY_REPORT_MESSAGE.
++     *
++     * Adds one per-radio entry for each radio whose htmode starts with "UHR".
++     * No TLV is added if no radio is in UHR mode.
++     */
++    static bool add_qca_wifi8_capabilities_tlv(ieee1905_1::CmduMessageTx &cmdu_tx);
++
++    /**
++     * @brief Register a per-radio UHR mode flag before add_vs_tlv().
++     *
++     * Called from capability_reporting_task for each radio after reading
++     * htmode from UCI. reset via clear_radio_wifi8_modes() after use.
++     *
++     * @param ruid_bytes  Radio MAC address (6 bytes)
++     * @param uhr_mode    true if htmode starts with "UHR"
++     */
++    static void set_radio_wifi8_mode(const uint8_t *ruid_bytes, bool uhr_mode);
++
++    /**
++     * @brief Clear the per-radio UHR mode map (called after add_vs_tlv()).
++     */
++    static void clear_radio_wifi8_modes();
++
+     /**
+      * @brief Adds QCA SMD policy config TLV to outgoing message (SEND side).
+      *
+@@ -122,6 +145,14 @@ private:
+     // (then reset) inside add_qca_smd_policy_config_tlv().
+     static sQcaSmdCapabilities s_current_agent_smd_caps;
+ 
++    // Per-radio UHR mode map: populated by set_radio_wifi8_mode() before add_vs_tlv(),
++    // consumed and cleared by add_qca_wifi8_capabilities_tlv().
++    struct sRadioWifi8Mode {
++        std::array<uint8_t, 6> ruid;
++        bool uhr_mode;
++    };
++    static std::vector<sRadioWifi8Mode> s_radio_wifi8_modes;
++
+     /**
+      * @brief Parses QCA version info TLV (specific parser).
+      *
+@@ -140,6 +171,12 @@ private:
+     static std::shared_ptr<BaseClass>
+     parse_qca_smd_capabilities_tlv(ieee1905_1::CmduMessageRx &cmdu_rx);
+ 
++    /**
++     * @brief Parses QCA WiFi-8 capabilities TLV (specific parser).
++     */
++    static std::shared_ptr<BaseClass>
++    parse_qca_wifi8_capabilities_tlv(ieee1905_1::CmduMessageRx &cmdu_rx);
++
+     /**
+      * @brief Parses QCA SMD policy config TLV (specific parser).
+      *
+diff --git a/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp b/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp
+index 5acd07a54..a46ab0a25 100644
+--- a/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp
++++ b/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp
+@@ -44,10 +44,19 @@ public:
+             eMessageType::AP_AUTOCONFIGURATION_SEARCH_MESSAGE, add_qca_version_info_tlv);
+ 
+         // Register RECEIVE parser for AP_AUTOCONFIGURATION_SEARCH_MESSAGE
+-        // The parser (parse_qca_vs_tlv) checks OUI internally and returns nullptr if not QCA
+         multi_vendor::tlvf_handler::register_parser(
+             eMessageType::AP_AUTOCONFIGURATION_SEARCH_MESSAGE, parse_qca_vs_tlv);
+ 
++        // Register SEND handler for AP_CAPABILITY_REPORT_MESSAGE (WiFi-8 capabilities TLV)
++        // Agent sends this TLV when any radio has UHR/802.11bn hardware support.
++        // No guard needed — the TLV is gated by s_agent_wifi8_capable at send time.
++        multi_vendor::tlvf_handler::register_handler(
++            eMessageType::AP_CAPABILITY_REPORT_MESSAGE, add_qca_wifi8_capabilities_tlv);
++
++        // Register RECEIVE parser for AP_CAPABILITY_REPORT_MESSAGE (controller side)
++        multi_vendor::tlvf_handler::register_parser(
++            eMessageType::AP_CAPABILITY_REPORT_MESSAGE, parse_qca_vs_tlv);
++
+         // Note: SMD TLVs are registered via register_smd_tlvs() based on enable_smd config
+     }
+ 
+@@ -126,3 +135,18 @@ extern "C" void set_qca_agent_smd_capabilities(bool smd_capable, bool smd_dl_for
+     caps.smd_dl_forwarding = smd_dl_forwarding;
+     qca::tlvf_qca_utils::set_current_agent_smd_capabilities(caps);
+ }
++
++extern "C" void set_qca_agent_wifi8_capable(bool /*wifi8_capable*/)
++{
++    /* Deprecated — use set_qca_radio_wifi8_mode() per radio instead. */
++}
++
++extern "C" void set_qca_radio_wifi8_mode(const uint8_t *ruid_bytes, bool uhr_mode)
++{
++    qca::tlvf_qca_utils::set_radio_wifi8_mode(ruid_bytes, uhr_mode);
++}
++
++extern "C" void clear_qca_radio_wifi8_modes()
++{
++    qca::tlvf_qca_utils::clear_radio_wifi8_modes();
++}
+diff --git a/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp b/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
+index a0b39becd..89245add3 100644
+--- a/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
++++ b/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
+@@ -11,7 +11,9 @@
+ #include <tlvf/qca/tlvQcaSmdCapabilities.h>
+ #include <tlvf/qca/tlvQcaSmdPolicyConfig.h>
+ #include <tlvf/qca/tlvQcaVersionInfo.h>
++#include <tlvf/qca/tlvQcaWifi8Capabilities.h>
+ #include <tlvf/wfa_map/tlvApRadioBasicCapabilities.h>
++#include <tlvf/tlvftypes.h>
+ 
+ using namespace qca;
+ 
+@@ -22,6 +24,9 @@ static std::vector<qca::sQcaSmdPolicyProfile> s_smd_profiles;
+ // (then reset) inside add_qca_smd_policy_config_tlv().
+ qca::sQcaSmdCapabilities tlvf_qca_utils::s_current_agent_smd_caps = {};
+ 
++// Per-invocation WiFi-8 per-radio UHR mode map.
++std::vector<qca::tlvf_qca_utils::sRadioWifi8Mode> tlvf_qca_utils::s_radio_wifi8_modes;
++
+ void tlvf_qca_utils::set_smd_profiles(const std::vector<sQcaSmdPolicyProfile> &profiles)
+ {
+     s_smd_profiles = profiles;
+@@ -217,9 +222,8 @@ std::shared_ptr<BaseClass> tlvf_qca_utils::parse_qca_vs_tlv(ieee1905_1::CmduMess
+     case qca::eQcaTlVId::QCA_SMD_POLICY_CONFIG:
+         return parse_qca_smd_policy_config_tlv(cmdu_rx);
+ 
+-        // Future: Add more cases for other QCA TLVs
+-        // case qca::eQcaTlVId::QCA_DEVICE_INFO:
+-        //     return parse_qca_device_info_tlv(cmdu_rx);
++    case qca::eQcaTlVId::QCA_WIFI8_CAPABILITIES:
++        return parse_qca_wifi8_capabilities_tlv(cmdu_rx);
+ 
+     default:
+         LOG(WARNING) << "Unknown QCA TLV ID: 0x" << std::hex << tlv_id;
+@@ -296,4 +300,84 @@ tlvf_qca_utils::parse_qca_smd_policy_config_tlv(ieee1905_1::CmduMessageRx &cmdu_
+               << ", defaultDlDrainTime=" << static_cast<int>(smd_default_dl_drain_time);
+ 
+     return tlv;
+-}
+\ No newline at end of file
++}
++// SEND side: Add QCA WiFi-8 capabilities TLV (per-radio UHR mode).
++// One entry per radio registered via set_radio_wifi8_mode().
++// No TLV is added if no radio reported UHR mode.
++bool tlvf_qca_utils::add_qca_wifi8_capabilities_tlv(ieee1905_1::CmduMessageTx &cmdu_tx)
++{
++    LOG(INFO) << "add_qca_wifi8_capabilities_tlv: gelumala";
++    if (s_radio_wifi8_modes.empty()) {
++        LOG(DEBUG) << "Skipping QCA WiFi-8 TLV: no radios registered";
++        return true;
++    }
++
++    auto tlv = cmdu_tx.addClass<qca::tlvQcaWifi8Capabilities>();
++    if (!tlv) {
++        LOG(ERROR) << "Failed to add QCA WiFi-8 capabilities TLV";
++        s_radio_wifi8_modes.clear();
++        return false;
++    }
++
++    tlv->vendor_oui() = sVendorOUI(qca::qcaVendorOUI::OUI_QCA);
++    tlv->tlv_id()     = static_cast<uint16_t>(qca::eQcaTlVId::QCA_WIFI8_CAPABILITIES);
++
++    for (const auto &entry : s_radio_wifi8_modes) {
++        auto radio_entry = tlv->create_radio_list();
++        if (!radio_entry) {
++            LOG(ERROR) << "Failed to create radio_list entry";
++            s_radio_wifi8_modes.clear();
++            return false;
++        }
++        std::copy(entry.ruid.begin(), entry.ruid.end(), radio_entry->ruid().oct);
++        radio_entry->flags() = entry.uhr_mode ? 0x80 : 0x00; /* bit 7: uhr_mode */
++        if (!tlv->add_radio_list(radio_entry)) {
++            LOG(ERROR) << "Failed to add radio_list entry";
++            s_radio_wifi8_modes.clear();
++            return false;
++        }
++        LOG(INFO) << "QCA WiFi-8 TLV: RUID=" << tlvf::mac_to_string(radio_entry->ruid())
++                  << " uhr_mode=" << (entry.uhr_mode ? "true" : "false");
++    }
++
++    LOG(INFO) << "Added QCA WiFi-8 capabilities TLV: " << s_radio_wifi8_modes.size() << " radio(s)";
++    s_radio_wifi8_modes.clear();
++    return true;
++}
++
++void tlvf_qca_utils::set_radio_wifi8_mode(const uint8_t *ruid_bytes, bool uhr_mode)
++{
++    if (!ruid_bytes) return;
++    sRadioWifi8Mode entry;
++    std::copy(ruid_bytes, ruid_bytes + 6, entry.ruid.begin());
++    entry.uhr_mode = uhr_mode;
++    LOG(INFO) << "set_radio_wifi8_mode: gelumala";
++    s_radio_wifi8_modes.push_back(entry);
++}
++
++void tlvf_qca_utils::clear_radio_wifi8_modes()
++{
++    s_radio_wifi8_modes.clear();
++}
++
++// RECEIVE side: Parse QCA WiFi-8 capabilities TLV (per-radio).
++std::shared_ptr<BaseClass>
++tlvf_qca_utils::parse_qca_wifi8_capabilities_tlv(ieee1905_1::CmduMessageRx &cmdu_rx)
++{
++    auto tlv = cmdu_rx.addVendorClass<qca::tlvQcaWifi8Capabilities>();
++    if (!tlv) {
++        LOG(ERROR) << "Failed to parse QCA WiFi-8 capabilities TLV";
++        return nullptr;
++    }
++    LOG(INFO) << "Parsed QCA WiFi-8 capabilities TLV: " << tlv->num_radio() << " radio(s)";
++    for (size_t i = 0; i < tlv->num_radio(); i++) {
++        auto result = tlv->radio_list(i);
++        if (std::get<0>(result)) {
++            cQcaWifi8RadioEntry &entry = std::get<1>(result);
++            bool uhr = (entry.flags() & 0x80) != 0;
++            LOG(DEBUG) << "  RUID=" << tlvf::mac_to_string(entry.ruid())
++                       << " uhr_mode=" << (uhr ? "true" : "false");
++        }
++    }
++    return tlv;
++}
+diff --git a/controller/nbapi/odl/capabilities.odl.in b/controller/nbapi/odl/capabilities.odl.in
+index 46769d535..7deb44feb 100644
+--- a/controller/nbapi/odl/capabilities.odl.in
++++ b/controller/nbapi/odl/capabilities.odl.in
+@@ -19,6 +19,7 @@
+         extend using mib HTCapabilities;
+         extend using mib VHTCapabilities;
+         extend using mib WiFi6Capabilities;
++        extend using mib EHTCapabilities;
+ 
+         /* Authentication and Key Management (AKM) Suite (security mode) capabilities for the fronthaul BSS. */
+         %read-only object AKMFrontHaul [] {
+@@ -74,6 +75,15 @@
+                 %read-only uint32 MCSNSSSet;            /* Individual MCS and NSS set*/
+             }
+ 
++            %read-only uint32 MCSNSSTxSet = 0;          /* HE Tx MCS/NSS set (<=80MHz), 2 bits per NSS stream. */
++            %read-only uint32 MCSNSSRxSet = 0;          /* HE Rx MCS/NSS set (<=80MHz), 2 bits per NSS stream. */
++            %read-only uint32 MaxNumberOfTxSpatialStreams = 0 {
++                on action validate call check_range [0, 8];
++            }
++            %read-only uint32 MaxNumberOfRxSpatialStreams = 0 {
++                on action validate call check_range [0, 8];
++            }
++
+             %read-only bool SUBeamformer;               /* Single-user beamformer support. */
+             %read-only bool SUBeamformee;               /* Single-user beamformee support. */
+             %read-only bool MUBeamformer;               /* Multi-user beamformer support. */
+@@ -121,6 +131,15 @@
+                 %read-only uint32 MCSNSSSet;            /* Individual MCS and NSS set*/
+             }
+ 
++            %read-only uint32 MCSNSSTxSet = 0;          /* HE Tx MCS/NSS set (<=80MHz), 2 bits per NSS stream. */
++            %read-only uint32 MCSNSSRxSet = 0;          /* HE Rx MCS/NSS set (<=80MHz), 2 bits per NSS stream. */
++            %read-only uint32 MaxNumberOfTxSpatialStreams = 0 {
++                on action validate call check_range [0, 8];
++            }
++            %read-only uint32 MaxNumberOfRxSpatialStreams = 0 {
++                on action validate call check_range [0, 8];
++            }
++
+             %read-only bool SUBeamformer;               /* Single-user beamformer support. */
+             %read-only bool SUBeamformee;               /* Single-user beamformee support. */
+             %read-only bool MUBeamformer;               /* Multi-user beamformer support. */
+diff --git a/controller/nbapi/odl/controller.odl.in b/controller/nbapi/odl/controller.odl.in
+index 9fa7aac99..64bd316e7 100644
+--- a/controller/nbapi/odl/controller.odl.in
++++ b/controller/nbapi/odl/controller.odl.in
+@@ -56,6 +56,35 @@
+     }
+ }
+ 
++%define {
++    mib EHTCapabilities {
++        /* Describes the EHT (Wi-Fi 7 / 802.11be) capabilities for a radio. */
++        object EHTCapabilities {
++            %read-only uint32 MCSNSSTxSet = 0 {
++                on action validate call check_range [0, 65536];
++            }
++            %read-only uint32 MCSNSSRxSet = 0 {
++                on action validate call check_range [0, 65536];
++            }
++            /* Maximum number of supported Tx spatial streams */
++            %read-only uint32 MaxNumberOfTxSpatialStreams = 0 {
++                on action validate call check_range [0, 8];
++            }
++            /* Maximum number of supported Rx spatial streams */
++            %read-only uint32 MaxNumberOfRxSpatialStreams = 0 {
++                on action validate call check_range [0, 8];
++            }
++            %read-only bool EHT80;                      /* EHT 80 MHz bandwidth support. */
++            %read-only bool EHT160;                     /* EHT 160 MHz bandwidth support. */
++            %read-only bool EHT320;                     /* EHT 320 MHz bandwidth support. */
++            %read-only bool SUBeamformer;                /* Single-user beamformer support. */
++            %read-only bool MUBeamformer;                /* Multi-user beamformer support. */
++            %read-only bool ULMUMIMOSupport;             /* UL MU-MIMO support. */
++            %read-only bool ULOFDMASupport;              /* UL OFDMA support. */
++        }
++    }
++}
++
+ %define {
+     mib WiFi6Capabilities {
+ 
+diff --git a/controller/nbapi/odl/radio.odl.in b/controller/nbapi/odl/radio.odl.in
+index f85b1bb5a..7728c2893 100644
+--- a/controller/nbapi/odl/radio.odl.in
++++ b/controller/nbapi/odl/radio.odl.in
+@@ -61,6 +61,13 @@
+         bool AssociatedSTALinkMetricsInclusionPolicy;
+         bool APMetricsWiFi6;
+ 
++        /**
++        * Indicates whether this radio supports Ultra High Rate (UHR) mode.
++        * UHR mode is indicated by the QCA WiFi-8 Capabilities TLV from the agent.
++        * @version 2.19.1
++        */
++        bool X_QCA_UhrMode = false;
++
+         uint32 SteeringPolicy {
+             on action validate call check_range [0, 2];
+         }
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 63c9d25f2..2b91c1ae3 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -123,6 +123,11 @@ extern "C" void set_qca_current_agent_smd_capabilities(const qca::sQcaSmdCapabil
+ #include <tlvf/wfa_map/tlvTunnelledSourceInfo.h>
+ #include <tlvf/wfa_map/tlvUnassociatedStaLinkMetricsQuery.h>
+ #include <tlvf/wfa_map/tlvWifi7AgentCapabilities.h>
++#if defined(IEEE80211_BN)
++#include <tlvf/wfa_map/tlvWifi8AgentCapabilities.h>
++#endif /* defined(IEEE80211_BN) */
++#include <tlvf/qca/tlvQcaWifi8Capabilities.h>
++using qca::cQcaWifi8RadioEntry;
+ 
+ #include <net/if.h> // if_nametoindex
+ 
+@@ -2778,6 +2783,22 @@ bool Controller::handle_tlv_ap_wifi6_capabilities(ieee1905_1::CmduMessageRx &cmd
+     return ret_val;
+ }
+ 
++bool Controller::handle_tlv_ap_he_capabilities(ieee1905_1::CmduMessageRx &cmdu_rx)
++{
++    bool ret_val = true;
++
++    LOG(DEBUG) << "handle_tlv_ap_he_capabilities: processing AP HE Capabilities TLVs";
++    for (const auto &he_caps_tlv : cmdu_rx.getClassList<wfa_map::tlvApHeCapabilities>()) {
++        LOG(DEBUG) << "handle_tlv_ap_he_capabilities: found TLV for ruid=" << he_caps_tlv->radio_uid();
++        if (!database.set_ap_he_capabilities(*he_caps_tlv)) {
++            LOG(ERROR) << "Couldn't set values for AP HE Capabilities in Controller Data Model.";
++            ret_val = false;
++        }
++    }
++
++    return ret_val;
++}
++
+ bool Controller::handle_tlv_wifi7_agent_capabilities(ieee1905_1::CmduMessageRx &cmdu_rx,
+                                                      std::shared_ptr<Agent> agent)
+ {
+@@ -7256,6 +7277,10 @@ bool Controller::handle_ap_capability_report(const sMacAddr &src_mac,
+         LOG(ERROR) << "Couldn't handle TLV AP WIFI6Capabilities";
+         return false;
+     }
++    if (!handle_tlv_ap_he_capabilities(cmdu_rx)) {
++        LOG(ERROR) << "Couldn't handle TLV AP HE Capabilities";
++        return false;
++    }
+ 
+     if (!handle_tlv_wifi7_agent_capabilities(cmdu_rx, agent)) {
+         LOG(DEBUG) << "Couldn't handle TLV WIFI7AgentCapabilities";
+@@ -7336,6 +7361,40 @@ bool Controller::handle_ap_capability_report(const sMacAddr &src_mac,
+                    << agent->al_mac;
+     }
+ 
++    /* Parse QCA WiFi-8 Capabilities TLV (vendor-specific, QCA OUI, ID 0x0005).
++     * Per-radio UHR mode indicator derived from UCI htmode on the agent.
++     * Write X_QCA_UhrMode per radio to DM and Wifi8Capable per agent.
++     * The agent only includes a radio entry when that radio is in UHR mode, and
++     * omits the TLV entirely when none of its radios are in UHR mode. If the TLV
++     * is absent, explicitly clear X_QCA_UhrMode for all of the agent's radios so
++     * a UHR -> non-UHR transition (e.g. switching htmode to EHT) doesn't leave a
++     * stale X_QCA_UhrMode=true behind in the DM. */
++    {
++        auto wifi8_tlv = cmdu_rx.getClass<qca::tlvQcaWifi8Capabilities>();
++        if (wifi8_tlv) {
++            bool any_uhr = false;
++            for (size_t i = 0; i < wifi8_tlv->num_radio(); i++) {
++                auto result = wifi8_tlv->radio_list(i);
++                if (!std::get<0>(result)) { continue; }
++                cQcaWifi8RadioEntry &entry = std::get<1>(result);
++                bool uhr_mode = (entry.flags() & 0x80) != 0;
++                if (uhr_mode) { any_uhr = true; }
++                database.dm_set_radio_uhr_mode(entry.ruid(), uhr_mode);
++                LOG(INFO) << "AP_CAP_REPORT: Radio "
++                          << tlvf::mac_to_string(entry.ruid())
++                          << " X_QCA_UhrMode=" << (uhr_mode ? "true" : "false");
++            }
++            agent->wifi8_capable = any_uhr;
++            database.dm_set_agent_wifi8_capable(src_mac, any_uhr);
++        } else {
++            for (const auto &radio : agent->radios) {
++                database.dm_set_radio_uhr_mode(radio.first, false);
++            }
++            agent->wifi8_capable = false;
++            database.dm_set_agent_wifi8_capable(src_mac, false);
++        }
++    }
++
+     return all_radio_capabilities_saved_successfully;
+ }
+ 
+@@ -7372,6 +7431,8 @@ bool Controller::handle_cmdu_1905_early_ap_capability_report_message(
+         LOG(DEBUG) << "No QCA SMD Capabilities TLV in Early AP Cap from " << src_mac
+                    << ", agent is not SMD capable";
+     }
++    /* Write smd_capable into DM (reuse wifi8 DM field for compatibility) */
++    database.dm_set_agent_wifi8_capable(src_mac, agent->smd_capable);
+ 
+     return true;
+ }
+diff --git a/controller/src/beerocks/master/controller.h b/controller/src/beerocks/master/controller.h
+index c5e90ba10..3052b32bb 100644
+--- a/controller/src/beerocks/master/controller.h
++++ b/controller/src/beerocks/master/controller.h
+@@ -587,6 +587,15 @@ private:
+     */
+     bool handle_tlv_ap_wifi6_capabilities(ieee1905_1::CmduMessageRx &cmdu_rx);
+ 
++    /**
++     * @brief Get info from 'AP HE Capabilities' TLV,
++     * set data to WiFi6 AP Role Capabilities data element.
++     *
++     * @param cmdu_rx AP Capability Report message.
++     * @return True on success, false otherwise.
++    */
++    bool handle_tlv_ap_he_capabilities(ieee1905_1::CmduMessageRx &cmdu_rx);
++
+     /**
+      * @brief Get info from 'WIFI7 Agent Capabilities' TLV,
+      * set data to WiFi7 Agent Capabilities data element.
+diff --git a/controller/src/beerocks/master/db/agent.h b/controller/src/beerocks/master/db/agent.h
+index 32ccaeb47..b9f24b686 100644
+--- a/controller/src/beerocks/master/db/agent.h
++++ b/controller/src/beerocks/master/db/agent.h
+@@ -100,6 +100,11 @@ public:
+     // smd_dl_forwarding: Bit 6 of the capabilities byte.
+     bool smd_capable       = false;
+     bool smd_dl_forwarding = false;
++
++    // wifi8_capable: set when the agent sends the QCA WiFi-8 Capabilities TLV
++    // (QCA_WIFI8_CAPABILITIES, ID 0x0005) in AP_CAPABILITY_REPORT_MESSAGE.
++    // True means at least one radio on this agent has UHR/802.11bn hardware support.
++    bool wifi8_capable = false;
+     /**
+      * @brief Max Total Number of unique VLAN identifiers the Multi-AP Agent supports.
+      *
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 8500e55c8..9e4209a1e 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -1651,6 +1651,39 @@ bool db::set_ap_wifi6_capabilities(wfa_map::tlvApWifi6Capabilities &wifi6_caps_t
+             (agent_role_first_bit == 0x0 ? "WiFi6APRole" : "WiFi6bSTARole");
+ 
+         //TODO: Need to set the value for MCS_NSS and OFDMA (PPM-2288)
++        // Fix PPM-2288: write MCS/NSS and spatial stream counts from mcs_nss_80().
++        // mcs_nss_80 is a 4-byte HE MCS/NSS set (≤80MHz): 2 bits per NSS stream,
++        // 0b00=MCS0-7, 0b01=MCS0-9, 0b10=MCS0-11, 0b11=not supported.
++        // Bytes 0-1 = Rx set, bytes 2-3 = Tx set (per IEEE 802.11ax Table 9-344).
++        // Agent sends via htonl() (big-endian), must convert back to host byte order.
++        {
++            uint16_t mcs_nss_rx = 0, mcs_nss_tx = 0;
++            uint8_t max_tx_nss = 0, max_rx_nss = 0;
++            uint8_t *raw = role.mcs_nss_80();
++            if (raw) {
++                // The 4 bytes are: [RX_byte0][RX_byte1][TX_byte0][TX_byte1]
++                // Extract as little-endian 16-bit values
++                mcs_nss_rx = static_cast<uint16_t>(raw[0]) |
++                             (static_cast<uint16_t>(raw[1]) << 8);
++                mcs_nss_tx = static_cast<uint16_t>(raw[2]) |
++                             (static_cast<uint16_t>(raw[3]) << 8);
++                /* Count highest NSS where the 2-bit field != 0b11 (not-supported) */
++                for (uint8_t nss = 1; nss <= 8; nss++) {
++                    uint8_t rx_val = (mcs_nss_rx >> ((nss - 1) * 2)) & 0x03;
++                    uint8_t tx_val = (mcs_nss_tx >> ((nss - 1) * 2)) & 0x03;
++                    if (rx_val != 0x03) max_rx_nss = nss;
++                    if (tx_val != 0x03) max_tx_nss = nss;
++                }
++            }
++            ret_val &= m_ambiorix_datamodel->set(path_to_obj, "MCSNSSTxSet",
++                                                 static_cast<uint16_t>(mcs_nss_tx));
++            ret_val &= m_ambiorix_datamodel->set(path_to_obj, "MCSNSSRxSet",
++                                                 static_cast<uint16_t>(mcs_nss_rx));
++            ret_val &= m_ambiorix_datamodel->set(path_to_obj, "MaxNumberOfTxSpatialStreams",
++                                                 static_cast<uint8_t>(max_tx_nss));
++            ret_val &= m_ambiorix_datamodel->set(path_to_obj, "MaxNumberOfRxSpatialStreams",
++                                                 static_cast<uint8_t>(max_rx_nss));
++        }
+         ret_val &= m_ambiorix_datamodel->set(path_to_obj, "HE160",
+                                              static_cast<bool>(flags1.he_support_160mhz));
+         ret_val &= m_ambiorix_datamodel->set(path_to_obj, "HE8080",
+@@ -1701,6 +1734,101 @@ bool db::set_ap_wifi6_capabilities(wfa_map::tlvApWifi6Capabilities &wifi6_caps_t
+     return ret_val;
+ }
+ 
++bool db::set_ap_he_capabilities(wfa_map::tlvApHeCapabilities &he_caps_tlv)
++{
++    auto radio = get_radio_by_uid(he_caps_tlv.radio_uid());
++    if (!radio) {
++        LOG(ERROR) << "Failed to get radio with RUID: " << he_caps_tlv.radio_uid();
++        return false;
++    }
++
++    LOG(DEBUG) << "set_ap_he_capabilities: processing HE capabilities for ruid=" << he_caps_tlv.radio_uid()
++               << " dm_path=" << radio->dm_path;
++
++    if (radio->dm_path.empty()) {
++        LOG(DEBUG) << "set_ap_he_capabilities: dm_path is empty, skipping";
++        return true;
++    }
++
++    bool ret_val = true;
++
++    // Extract MCS/NSS data from supported_he_mcs array
++    uint8_t mcs_length = he_caps_tlv.supported_he_mcs_length();
++    uint8_t *mcs_data = he_caps_tlv.supported_he_mcs(0);
++
++    LOG(DEBUG) << "set_ap_he_capabilities: mcs_length=" << (int)mcs_length;
++    if (mcs_data) {
++        LOG(DEBUG) << "set_ap_he_capabilities: mcs_data[0]=" << std::hex << (int)mcs_data[0]
++                   << " mcs_data[1]=" << (int)(mcs_length > 1 ? mcs_data[1] : 0) << std::dec;
++    }
++
++    if (mcs_data && mcs_length > 0) {
++        // Extract RX MCS/NSS (bytes 0-1)
++        uint16_t mcs_nss_rx = 0;
++        if (mcs_length >= 1) {
++            mcs_nss_rx = static_cast<uint16_t>(mcs_data[0]);
++        }
++        if (mcs_length >= 2) {
++            mcs_nss_rx |= (static_cast<uint16_t>(mcs_data[1]) << 8);
++        }
++        LOG(DEBUG) << "set_ap_he_capabilities: setting MCSNSSRxSet=" << std::hex << mcs_nss_rx << std::dec;
++        ret_val &= m_ambiorix_datamodel->set(radio->dm_path + ".Capabilities.WiFi6APRole",
++                                             "MCSNSSRxSet", mcs_nss_rx);
++
++        // Extract TX MCS/NSS (bytes 2-3)
++        uint16_t mcs_nss_tx = 0;
++        if (mcs_length >= 3) {
++            mcs_nss_tx = static_cast<uint16_t>(mcs_data[2]);
++        }
++        if (mcs_length >= 4) {
++            mcs_nss_tx |= (static_cast<uint16_t>(mcs_data[3]) << 8);
++        }
++        LOG(DEBUG) << "set_ap_he_capabilities: setting MCSNSSTxSet=" << std::hex << mcs_nss_tx << std::dec;
++        ret_val &= m_ambiorix_datamodel->set(radio->dm_path + ".Capabilities.WiFi6APRole",
++                                             "MCSNSSTxSet", mcs_nss_tx);
++    } else {
++        LOG(DEBUG) << "set_ap_he_capabilities: no MCS data to set";
++    }
++
++    // Extract flags1 bit-fields
++    auto &flags1 = he_caps_tlv.flags1();
++    uint8_t tx_ss = static_cast<uint8_t>(flags1.max_num_of_supported_tx_spatial_streams) + 1;
++    uint8_t rx_ss = static_cast<uint8_t>(flags1.max_num_of_supported_rx_spatial_streams) + 1;
++    LOG(DEBUG) << "set_ap_he_capabilities: flags1 tx_ss=" << (int)tx_ss
++               << " rx_ss=" << (int)rx_ss
++               << " he160=" << (int)flags1.he_support_160mhz
++               << " he80_80=" << (int)flags1.he_support_80_80mhz;
++    ret_val &= m_ambiorix_datamodel->set(radio->dm_path + ".Capabilities.WiFi6APRole",
++                                         "MaxNumberOfTxSpatialStreams", tx_ss);
++    ret_val &= m_ambiorix_datamodel->set(radio->dm_path + ".Capabilities.WiFi6APRole",
++                                         "MaxNumberOfRxSpatialStreams", rx_ss);
++    ret_val &= m_ambiorix_datamodel->set(radio->dm_path + ".Capabilities.WiFi6APRole",
++                                         "HE160", static_cast<bool>(flags1.he_support_160mhz));
++    ret_val &= m_ambiorix_datamodel->set(radio->dm_path + ".Capabilities.WiFi6APRole",
++                                         "HE8080", static_cast<bool>(flags1.he_support_80_80mhz));
++
++    // Extract flags2 bit-fields
++    auto &flags2 = he_caps_tlv.flags2();
++    LOG(DEBUG) << "set_ap_he_capabilities: flags2 su_bf=" << (int)flags2.su_beamformer_capable
++               << " mu_bf=" << (int)flags2.mu_beamformer_capable
++               << " ul_mimo=" << (int)flags2.ul_mu_mimo_capable
++               << " ul_ofdma=" << (int)flags2.ul_ofdm_capable
++               << " dl_ofdma=" << (int)flags2.dl_ofdm_capable;
++    ret_val &= m_ambiorix_datamodel->set(radio->dm_path + ".Capabilities.WiFi6APRole",
++                                         "SUBeamformer", static_cast<bool>(flags2.su_beamformer_capable));
++    ret_val &= m_ambiorix_datamodel->set(radio->dm_path + ".Capabilities.WiFi6APRole",
++                                         "MUBeamformer", static_cast<bool>(flags2.mu_beamformer_capable));
++    ret_val &= m_ambiorix_datamodel->set(radio->dm_path + ".Capabilities.WiFi6APRole",
++                                         "ULMUMIMO", static_cast<bool>(flags2.ul_mu_mimo_capable));
++    ret_val &= m_ambiorix_datamodel->set(radio->dm_path + ".Capabilities.WiFi6APRole",
++                                         "ULOFDMA", static_cast<bool>(flags2.ul_ofdm_capable));
++    ret_val &= m_ambiorix_datamodel->set(radio->dm_path + ".Capabilities.WiFi6APRole",
++                                         "DLOFDMA", static_cast<bool>(flags2.dl_ofdm_capable));
++
++    LOG(DEBUG) << "set_ap_he_capabilities: completed with ret_val=" << ret_val;
++    return ret_val;
++}
++
+ bool db::set_internal_wifi7_radio_capabilities(
+     wfa_map::cRadioWifi7Capabilities &radio_wifi7_capabilities, Agent::sRadio &radio, bool is_bsta)
+ {
+@@ -10171,6 +10299,43 @@ bool db::dm_set_ap_eht_caps(const Agent::sRadio &radio)
+     return ret_val;
+ }
+ 
++bool db::dm_set_agent_wifi8_capable(const sMacAddr &al_mac, bool wifi8_capable)
++{
++    auto agent = m_agents.get(al_mac);
++    if (!agent || agent->dm_path.empty()) {
++        LOG(DEBUG) << "dm_set_agent_wifi8_capable: no DM path for agent " << al_mac;
++        return false;
++    }
++    const std::string path = agent->dm_path + ".MultiAPDevice";
++    if (!m_ambiorix_datamodel->set(path, "Wifi8Capable", wifi8_capable)) {
++        LOG(ERROR) << "Failed to set " << path << ".Wifi8Capable";
++        return false;
++    }
++    LOG(DEBUG) << "Set " << path << ".Wifi8Capable=" << (wifi8_capable ? "true" : "false");
++    return true;
++}
++
++bool db::dm_set_radio_uhr_mode(const sMacAddr &radio_uid, bool uhr_mode)
++{
++    auto radio = get_radio_by_uid(radio_uid);
++    if (!radio || radio->dm_path.empty()) {
++        return false;
++    }
++    /* DM path: Radio.{j}.X_QCA_UhrMode (vendor-specific parameter on Radio object) */
++    std::string path = radio->dm_path;
++
++    /* Remove trailing dot if present to get the Radio object path */
++    if (!path.empty() && path.back() == '.') {
++        path.pop_back();
++    }
++
++    if (!m_ambiorix_datamodel->set(path, "X_QCA_UhrMode", uhr_mode)) {
++        LOG(ERROR) << "Failed to set " << path << ".X_QCA_UhrMode";
++        return false;
++    }
++    return true;
++}
++
+ bool db::dm_set_isbsta(const sMacAddr &sta_mld_mac)
+ {
+     std::shared_ptr<Agent::sAPMLD::sStaMLD> sta_mld = nullptr;
+diff --git a/controller/src/beerocks/master/db/db.h b/controller/src/beerocks/master/db/db.h
+index b887d1674..aab5b5a6b 100644
+--- a/controller/src/beerocks/master/db/db.h
++++ b/controller/src/beerocks/master/db/db.h
+@@ -1270,6 +1270,15 @@ public:
+      */
+     bool set_ap_wifi6_capabilities(wfa_map::tlvApWifi6Capabilities &wifi6_caps_tlv);
+ 
++    /**
++     * @brief Set AP HE Capabilities data element from TLV.
++     *
++     * @param he_caps_tlv AP HE Capabilities TLV.
++     * @return True if sub-object was successfully added
++     * and values for its parameters set, false otherwise.
++     */
++    bool set_ap_he_capabilities(wfa_map::tlvApHeCapabilities &he_caps_tlv);
++
+     /**
+      * @brief Add optional sub-object of WIFI7 Agent Capabilities data element,
+      * set values for its parameters.
+@@ -3233,6 +3242,19 @@ public:
+      */
+     bool dm_set_ap_eht_caps(const Agent::sRadio &radio);
+ 
++    /**
++     * @brief Write Wifi8Capable flag into DM under Device.{i}.MultiAPDevice.Wifi8Capable
++     * Called after parsing the QCA WiFi-8 Capabilities TLV (ID 0x0005) from
++     * AP_CAPABILITY_REPORT_MESSAGE.
++     */
++    bool dm_set_agent_wifi8_capable(const sMacAddr &al_mac, bool wifi8_capable);
++
++    /**
++     * @brief Write X_QCA_UhrMode flag into DM under Radio.{j}.Capabilities.X_QCA_UhrMode
++     * Called per-radio after parsing the QCA WiFi-8 Capabilities TLV.
++     */
++    bool dm_set_radio_uhr_mode(const sMacAddr &radio_uid, bool uhr_mode);
++
+     /**
+      * @brief Add or update instance of "APMLD" data element, set values for its parameters.
+      *
+diff --git a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+index 43ab38bce..898b685fd 100644
+--- a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+@@ -651,6 +651,12 @@ bool bpl_cfg_get_bandwidth_by_phy(const std::string & /*phy_name*/,
+     return false;
+ }
+ 
++bool bpl_cfg_get_radio_htmode(const std::string & /*iface*/, std::string & /*htmode*/)
++{
++    LOG(DEBUG) << "bpl_cfg_get_radio_htmode: not implemented for DM platform";
++    return false;
++}
++
+ bool bpl_cfg_get_radio_disable_by_phy(const std::string & /*phy_name*/, bool & /*radio_disable*/)
+ {
+     return false;
+diff --git a/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
+index b86e22ae7..54f0a341c 100644
+--- a/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
+@@ -323,6 +323,12 @@ bool bpl_cfg_get_bandwidth_by_phy(const std::string & /*phy_name*/,
+     return false;
+ }
+ 
++bool bpl_cfg_get_radio_htmode(const std::string & /*iface*/, std::string & /*htmode*/)
++{
++    LOG(DEBUG) << "bpl_cfg_get_radio_htmode: not implemented for linux platform";
++    return false;
++}
++
+ bool bpl_cfg_get_radio_disable_by_phy(const std::string & /*phy_name*/, bool & /*radio_disable*/)
+ {
+     return false;
+diff --git a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+index cfe3e2ed5..7fa3d4276 100644
+--- a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+@@ -810,6 +810,12 @@ bool bpl_cfg_get_bandwidth_by_phy(const std::string & /*phy_name*/,
+     return false;
+ }
+ 
++bool bpl_cfg_get_radio_htmode(const std::string & /*iface*/, std::string & /*htmode*/)
++{
++    LOG(DEBUG) << "bpl_cfg_get_radio_htmode: not implemented for RDK platform";
++    return false;
++}
++
+ bool bpl_cfg_get_radio_disable_by_phy(const std::string & /*phy_name*/, bool & /*radio_disable*/)
+ {
+     return false;
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index 521abc02d..d3bb6c4cd 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -1744,6 +1744,82 @@ bool bpl_cfg_get_wpa_supplicant_ctrl_path(const std::string &iface, std::string
+     return true;
+ }
+ 
++bool bpl_cfg_get_radio_htmode(const std::string &iface, std::string &htmode)
++{
++    htmode.clear();
++
++    LOG(DEBUG) << "bpl_cfg_get_radio_htmode: gelumala iface=" << iface;
++
++    /* Build lookup candidates: try full name first, then strip MLD link suffix
++     * (e.g. "wlan1_link0" → "wlan1") to match the wifi-iface ifname. */
++    std::vector<std::string> candidates = {iface};
++    auto pos = iface.rfind("_link");
++    if (pos != std::string::npos) {
++        candidates.push_back(iface.substr(0, pos));
++    }
++
++    /* Also try mapping phy00.X to radio0_bandX format for new UCI structure */
++    if (iface.find("phy00.") == 0) {
++        std::string band_num = iface.substr(6); // Extract the band number after "phy00."
++        candidates.push_back("radio0_band" + band_num);
++        LOG(DEBUG) << "bpl_cfg_get_radio_htmode: added band candidate=radio0_band" << band_num;
++    }
++
++    for (const auto &candidate : candidates) {
++        LOG(DEBUG) << "bpl_cfg_get_radio_htmode: trying candidate=" << candidate;
++
++        /* First, try to read htmode directly from band section (new format: wireless.radio0_band0.htmode) */
++        if (uci_get_option("wireless", "", candidate, "htmode", htmode)) {
++            LOG(DEBUG) << "bpl_cfg_get_radio_htmode: iface=" << iface
++                       << " matched=" << candidate
++                       << " htmode=" << htmode << " (from band section)";
++            return true;
++        }
++
++        /* Step 1: find wireless.wifi-iface section whose ifname == candidate */
++        std::string iface_section;
++        if (!uci_find_section_by_option("wireless", "wifi-iface", "ifname",
++                                         candidate, iface_section) || iface_section.empty()) {
++            LOG(DEBUG) << "bpl_cfg_get_radio_htmode: no wifi-iface for ifname=" << candidate;
++            continue;
++        }
++        LOG(DEBUG) << "bpl_cfg_get_radio_htmode: found iface_section=" << iface_section;
++
++        /* Step 2: get the device (wifi-device section name) from that wifi-iface */
++        std::string device_section;
++        if (!uci_get_option("wireless", "wifi-iface", iface_section, "device",
++                             device_section) || device_section.empty()) {
++            LOG(DEBUG) << "bpl_cfg_get_radio_htmode: no device in section " << iface_section;
++            continue;
++        }
++        LOG(DEBUG) << "bpl_cfg_get_radio_htmode: found device_section=" << device_section;
++
++        /* Step 3: Try to read htmode from wireless.radio0_band0.htmode format first
++         * (band-specific htmode, e.g., wireless.radio0_band0.htmode) */
++        std::string band_section = device_section;
++        if (!band_section.empty()) {
++            if (uci_get_option("wireless", "", band_section, "htmode", htmode)) {
++                LOG(DEBUG) << "bpl_cfg_get_radio_htmode: iface=" << iface
++                           << " matched=" << candidate << " band_section=" << band_section
++                           << " htmode=" << htmode << " (from band section)";
++                return true;
++            }
++        }
++
++        /* Step 4: Fallback - read htmode from wireless.wifi-device.<device> */
++        if (!uci_get_option("wireless", "wifi-device", device_section, "htmode", htmode)) {
++            LOG(DEBUG) << "bpl_cfg_get_radio_htmode: no htmode for device " << device_section;
++            continue;
++        }
++        LOG(DEBUG) << "bpl_cfg_get_radio_htmode: iface=" << iface
++                   << " matched=" << candidate << " device=" << device_section
++                   << " htmode=" << htmode << " (from wifi-device)";
++        return true;
++    }
++    LOG(DEBUG) << "bpl_cfg_get_radio_htmode: failed to find htmode for iface=" << iface;
++    return false;
++}
++
+ bool bpl_cfg_get_hostapd_ctrl_path(const std::string &iface, std::string &hostapd_ctrl_path)
+ {
+     const char *path{"/var/run/hostapd/"};
+diff --git a/framework/platform/bpl/include/bpl/bpl_cfg.h b/framework/platform/bpl/include/bpl/bpl_cfg.h
+index 26779daa8..485815799 100644
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -922,6 +922,18 @@ bool bpl_cfg_get_wpa_supplicant_ctrl_path(const std::string &iface, std::string
+  */
+ bool bpl_cfg_get_hostapd_ctrl_path(const std::string &iface, std::string &hostapd_ctrl_path);
+ 
++/**
++ * @brief Get the configured htmode for a radio interface from UCI.
++ *
++ * Looks up the prplmesh.wifi-device section whose hostap_iface matches @a iface,
++ * then reads wireless.wifi-device.<section>.htmode.
++ *
++ * @param[in]  iface   Front radio interface name (e.g. "wlan0")
++ * @param[out] htmode  htmode string (e.g. "UHR80", "EHT160", "HE40"), empty if not found
++ * @return true on success (htmode may still be empty if option not set), false on error
++ */
++bool bpl_cfg_get_radio_htmode(const std::string &iface, std::string &htmode);
++
+ /**
+  * @brief Returns the radio MAC address stored in the prplmesh UCI wifi-device section for the
+  * given phy name. Only available in UCI-based platforms; returns false on all others.
+diff --git a/framework/tlvf/CMakeLists.txt b/framework/tlvf/CMakeLists.txt
+index a347e2832..948a41af1 100644
+--- a/framework/tlvf/CMakeLists.txt
++++ b/framework/tlvf/CMakeLists.txt
+@@ -45,6 +45,14 @@ add_custom_command(
+ )
+ 
+ file(GLOB_RECURSE TLVF_SOURCES ${TLVF_DIR}/src/src/*.c*)
++
++# Explicitly include QCA WiFi-8 TLV generated source so it is compiled even
++# before the tlvf.py generator reruns and adds it to TLVF_OUTPUTS.
++list(APPEND TLVF_OUTPUTS
++    ${TLVF_OUT}/src/tlvf/qca/tlvQcaWifi8Capabilities.cpp
++    ${TLVF_OUT}/include/tlvf/qca/tlvQcaWifi8Capabilities.h
++    ${TLVF_OUT}/include/tlvf/qca/eQcaTLVId.h
++)
+ add_library(tlvf ${TLVF_OUTPUTS} ${TLVF_SOURCES})
+ set_target_properties(tlvf PROPERTIES VERSION ${prplmesh_VERSION} SOVERSION ${prplmesh_VERSION_MAJOR})
+ set_target_properties(${PROJECT_NAME} PROPERTIES COMPILE_FLAGS "-fno-schedule-insns")
+diff --git a/framework/tlvf/tlvf_conf.yaml b/framework/tlvf/tlvf_conf.yaml
+index 6bc646f38..2bb04a223 100644
+--- a/framework/tlvf/tlvf_conf.yaml
++++ b/framework/tlvf/tlvf_conf.yaml
+@@ -174,6 +174,7 @@ include_yaml_path: {
+     "tlvf/qca/tlvQcaSmdCapabilities.yaml",
+     "tlvf/qca/tlvQcaSmdPolicyConfig.yaml",
+     "tlvf/qca/tlvQcaNeighborInformation.yaml",
++    "tlvf/qca/tlvQcaWifi8Capabilities.yaml",
+ }
+ 
+ # Relative to tlvf.py src_path variable
+diff --git a/framework/tlvf/yaml/tlvf/qca/eQcaTLVId.yaml b/framework/tlvf/yaml/tlvf/qca/eQcaTLVId.yaml
+index ddc283d1d..4f79110f1 100644
+--- a/framework/tlvf/yaml/tlvf/qca/eQcaTLVId.yaml
++++ b/framework/tlvf/yaml/tlvf/qca/eQcaTLVId.yaml
+@@ -9,3 +9,4 @@ eQcaTlVId:
+   QCA_SMD_CAPABILITIES: 0x0002
+   QCA_SMD_POLICY_CONFIG: 0x0003
+   QCA_NEIGHBOR_INFORMATION: 0x0004
++  QCA_WIFI8_CAPABILITIES: 0x0005
+diff --git a/framework/tlvf/yaml/tlvf/qca/tlvQcaWifi8Capabilities.yaml b/framework/tlvf/yaml/tlvf/qca/tlvQcaWifi8Capabilities.yaml
+new file mode 100644
+index 000000000..199744a3e
+--- /dev/null
++++ b/framework/tlvf/yaml/tlvf/qca/tlvQcaWifi8Capabilities.yaml
+@@ -0,0 +1,52 @@
++#
++---
++
++_namespace: qca
++_include:
++  {
++    tlvf/ieee_1905_1/sVendorOUI.h,
++    tlvf/qca/eQcaTlvTypeMap.h,
++    tlvf/common/sMacAddr.h,
++  }
++
++# Vendor Specific QCA WiFi-8 / UHR Operating Mode TLV
++# Sent by the agent in AP_CAPABILITY_REPORT_MESSAGE.
++# Carries a per-radio UHR mode indicator derived from the configured
++# htmode UCI option (wireless.radioN.htmode starts with "UHR").
++# The controller writes Radio.{i}.X_QCA_UhrMode per radio to the DM.
++#
++# Wire format (tlvValue):
++#   - vendor_oui      : 3 octets  - Qualcomm OUI
++#   - tlv_id          : 2 octets  - QCA_WIFI8_CAPABILITIES (0x0005)
++#   - num_radio       : 1 octet   - Number of per-radio entries
++#   - [per radio, repeated num_radio times]:
++#       - ruid        : 6 octets  - Radio Unique Identifier
++#       - flags       : 1 octet   - Bit 7: uhr_mode, Bits 6-0: reserved
++
++tlvQcaWifi8Capabilities:
++  _type: class
++  _is_tlv_class: True
++  type:
++    _type: eQcaTlvTypeMap
++    _value_const: TLV_VENDOR_SPECIFIC
++  length: uint16_t
++  vendor_oui:
++    _type: sVendorOUI
++  tlv_id:
++    _type: uint16_t
++  num_radio:
++    _type: uint8_t
++    _length_var: True
++    _comment: "Number of per-radio entries"
++  radio_list:
++    _type: cQcaWifi8RadioEntry
++    _length: [ num_radio ]
++
++cQcaWifi8RadioEntry:
++  _type: class
++  ruid:
++    _type: sMacAddr
++    _comment: "Radio Unique Identifier"
++  flags:
++    _type: uint8_t
++    _comment: "Bit 7: uhr_mode (htmode starts with UHR), Bits 6-0: reserved"
+-- 
+2.34.1
+
