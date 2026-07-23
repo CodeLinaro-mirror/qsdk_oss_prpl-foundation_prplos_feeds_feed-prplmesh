@@ -1,0 +1,225 @@
+From 1a8b12f06fe843220553aa78932ac588387927c7 Mon Sep 17 00:00:00 2001
+From: Aryan Khare <aryakhar@qti.qualcomm.com>
+Date: Thu, 23 Jul 2026 11:15:20 +0530
+Subject: [PATCH] Fix nl80211 radio airtime reporting for Airties transmission
+ test
+
+Airties test_transmission failure where rxTimeInRadio stayed zero during
+upstream traffic because nl80211 Radio Metrics TLV did not populate ReceiveSelf
+in AP Metrics Response message
+
+Signed-off-by: Aryan Khare <aryakhar@qti.qualcomm.com>
+---
+ .../beerocks/bwl/include/bwl/nl80211_client.h |   5 +
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 130 +++++++++++++++++-
+ .../bwl/nl80211/mon_wlan_hal_nl80211.h        |   9 +-
+ .../bwl/shared/nl80211_client_impl.cpp        |   7 +
+ 4 files changed, 143 insertions(+), 8 deletions(-)
+
+diff --git a/common/beerocks/bwl/include/bwl/nl80211_client.h b/common/beerocks/bwl/include/bwl/nl80211_client.h
+index cd7740bb7..54982bf3b 100644
+--- a/common/beerocks/bwl/include/bwl/nl80211_client.h
++++ b/common/beerocks/bwl/include/bwl/nl80211_client.h
+@@ -445,6 +445,11 @@ public:
+          */
+         uint64_t time_rx_ms = 0;
+ 
++        /**
++         * Amount of time (in ms) the radio spent receiving frames destined to the local BSS.
++         */
++        uint64_t time_bss_rx_ms = 0;
++
+         /**
+          * Amount of time (in ms) the radio spent transmitting data (on channel or globally).
+          */
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 0d047807e..03a572b74 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -155,7 +155,7 @@ void extractBase1Interface(const std::string& interface_name, std::string& base_
+ bool mon_wlan_hal_nl80211::update_radio_stats(SRadioStats &radio_stats)
+ {
+     beerocks::net::sInterfaceStats iface_stats;
+-    
++
+     //TODO: [NLHAL] Currently removed _link from get_iface_name and used base interface name for getting iface stats
+     std::string interface_name = get_iface_name();
+     std::string base_interface;
+@@ -175,12 +175,132 @@ bool mon_wlan_hal_nl80211::update_radio_stats(SRadioStats &radio_stats)
+     radio_stats.errors_received = iface_stats.rx_errors;
+     radio_stats.noise           = 0;
+ 
+-    // Populate channel utilization for AP Metrics TLV (IEEE 1905.1 0x94)
+-    if (!get_channel_utilization(radio_stats.utilization)) {
+-        LOG(WARNING) << "Failed to get channel utilization, defaulting to 0";
+-        radio_stats.utilization = 0;
++    nl80211_client::SurveyInfo survey_info;
++    if (!m_nl80211_client->get_survey_info(get_iface_name(), survey_info)) {
++        LOG(WARNING) << "Failed to get survey information for interface " << get_iface_name()
++                     << ", defaulting radio airtime metrics to 0";
++        radio_stats.utilization   = 0;
++        radio_stats.transmit      = 0;
++        radio_stats.receive_self  = 0;
++        radio_stats.receive_other = 0;
++        return true;
++    }
++
++    uint32_t radio_freq_mhz = 0;
++    if (m_radio_info.channel > 0 &&
++        m_radio_info.frequency_band != beerocks::eFreqType::FREQ_UNKNOWN) {
++        radio_freq_mhz = static_cast<uint32_t>(
++            son::wireless_utils::channel_to_freq(m_radio_info.channel, m_radio_info.frequency_band));
++    }
++
++    const nl80211_client::sChannelSurveyInfo *survey_entry = nullptr;
++    if (radio_freq_mhz > 0) {
++        for (const auto &entry : survey_info.data) {
++            if (entry.frequency_mhz == radio_freq_mhz) {
++                survey_entry = &entry;
++                break;
++            }
++        }
++    }
++
++    if (!survey_entry) {
++        for (const auto &entry : survey_info.data) {
++            if (entry.in_use) {
++                survey_entry = &entry;
++                break;
++            }
++        }
++    }
++
++    if (!survey_entry) {
++        LOG(WARNING) << "Survey information contains no matching channel for interface "
++                     << get_iface_name() << " (radio_freq=" << radio_freq_mhz
++                     << "), defaulting radio airtime metrics to 0";
++        radio_stats.utilization   = 0;
++        radio_stats.transmit      = 0;
++        radio_stats.receive_self  = 0;
++        radio_stats.receive_other = 0;
++        return true;
+     }
+ 
++    auto delta_counter = [](uint64_t current, uint64_t previous) {
++        return (current >= previous) ? (current - previous) : current;
++    };
++
++    if (m_prev_survey_info_valid && m_prev_survey_info.frequency_mhz == survey_entry->frequency_mhz) {
++        uint64_t delta_time_on   = delta_counter(survey_entry->time_on_ms, m_prev_survey_info.time_on_ms);
++        uint64_t delta_time_busy = delta_counter(survey_entry->time_busy_ms, m_prev_survey_info.time_busy_ms);
++        uint64_t delta_time_tx   = delta_counter(survey_entry->time_tx_ms, m_prev_survey_info.time_tx_ms);
++        uint64_t delta_time_rx   = delta_counter(survey_entry->time_rx_ms, m_prev_survey_info.time_rx_ms);
++        uint64_t delta_time_bss_rx =
++            delta_counter(survey_entry->time_bss_rx_ms, m_prev_survey_info.time_bss_rx_ms);
++
++        if (delta_time_busy > delta_time_on) {
++            delta_time_busy = delta_time_on;
++        }
++        if (delta_time_tx > delta_time_on) {
++            delta_time_tx = delta_time_on;
++        }
++        if (delta_time_rx > delta_time_on) {
++            delta_time_rx = delta_time_on;
++        }
++        if (delta_time_bss_rx > delta_time_rx) {
++            delta_time_bss_rx = delta_time_rx;
++        }
++
++        /*
++         * Some nl80211/driver combinations do not expose NL80211_SURVEY_INFO_TIME_BSS_RX.
++         * In that case time_bss_rx_ms remains zero even while TIME_RX is increasing.  Do not
++         * report all RX airtime as OBSS/other-BSS airtime, because EasyMesh RadioStats
++         * rxTimeInRadio is derived from receive_self and the certification traffic is received
++         * by this AP/BSS.  Fall back to total RX airtime as receive_self when the BSS-RX counter
++         * is unavailable.
++         */
++        if (delta_time_bss_rx == 0 && survey_entry->time_bss_rx_ms == 0 &&
++            m_prev_survey_info.time_bss_rx_ms == 0 && delta_time_rx > 0) {
++            delta_time_bss_rx = delta_time_rx;
++        }
++
++        if (delta_time_on > 0) {
++            uint64_t delta_time_other_rx = delta_time_rx - delta_time_bss_rx;
++
++            radio_stats.utilization =
++                static_cast<uint8_t>((delta_time_busy * UINT8_MAX) / delta_time_on);
++            radio_stats.transmit =
++                static_cast<uint8_t>((delta_time_tx * UINT8_MAX) / delta_time_on);
++            radio_stats.receive_self =
++                static_cast<uint8_t>((delta_time_bss_rx * UINT8_MAX) / delta_time_on);
++            radio_stats.receive_other =
++                static_cast<uint8_t>((delta_time_other_rx * UINT8_MAX) / delta_time_on);
++
++            LOG(DEBUG) << "update_radio_stats airtime: iface=" << get_iface_name()
++                       << " freq=" << survey_entry->frequency_mhz
++                       << " delta_on=" << delta_time_on
++                       << " delta_busy=" << delta_time_busy
++                       << " delta_tx=" << delta_time_tx
++                       << " delta_rx=" << delta_time_rx
++                       << " delta_bss_rx=" << delta_time_bss_rx
++                       << " util=" << int(radio_stats.utilization)
++                       << " tx=" << int(radio_stats.transmit)
++                       << " rx_self=" << int(radio_stats.receive_self)
++                       << " rx_other=" << int(radio_stats.receive_other);
++        } else {
++            LOG(WARNING) << "Survey delta time_on_ms is 0 for interface " << get_iface_name();
++            radio_stats.utilization   = 0;
++            radio_stats.transmit      = 0;
++            radio_stats.receive_self  = 0;
++            radio_stats.receive_other = 0;
++        }
++    } else {
++        radio_stats.utilization   = 0;
++        radio_stats.transmit      = 0;
++        radio_stats.receive_self  = 0;
++        radio_stats.receive_other = 0;
++    }
++
++    m_prev_survey_info       = *survey_entry;
++    m_prev_survey_info_valid = true;
++
+     return true;
+ }
+ 
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
+index f01ee67b0..5bd62bcc9 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
+@@ -102,9 +102,12 @@ protected:
+     bool sta_unassoc_rssi_measurement(
+         std::unordered_map<std::string, sUnassocStaParams> &new_list) final;
+ 
+-    // Private data-members:
+-private:
+-  // Unassociated STA measurement context
++     // Private data-members:
++ private:
++     nl80211_client::sChannelSurveyInfo m_prev_survey_info = {};
++     bool m_prev_survey_info_valid                         = false;
++
++   // Unassociated STA measurement context
+      struct UnassocMeasurementContext {
+          std::string mac_address;
+          uint8_t channel;
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.cpp b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+index ee2e8dcec..c275cc9ff 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -1413,6 +1413,13 @@ bool nl80211_client_impl::get_survey_info(const std::string &interface_name,
+                     nla_get_u64(sinfo[NL80211_SURVEY_INFO_CHANNEL_TIME_RX]);
+             }
+ 
++#ifdef NL80211_SURVEY_INFO_TIME_BSS_RX
++            if (sinfo[NL80211_SURVEY_INFO_TIME_BSS_RX]) {
++                channel_survey_info.time_bss_rx_ms =
++                    nla_get_u64(sinfo[NL80211_SURVEY_INFO_TIME_BSS_RX]);
++            }
++#endif
++
+             if (sinfo[NL80211_SURVEY_INFO_CHANNEL_TIME_TX]) {
+                 channel_survey_info.time_tx_ms =
+                     nla_get_u64(sinfo[NL80211_SURVEY_INFO_CHANNEL_TIME_TX]);
+-- 
+2.34.1
+
