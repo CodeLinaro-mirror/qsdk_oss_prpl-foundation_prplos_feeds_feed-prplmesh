@@ -1,0 +1,1423 @@
+From 69a2973b6d3f1306fedf27a83bad39bbfd1b9314 Mon Sep 17 00:00:00 2001
+From: Sonali Naresh <sonanare@qti.qualcomm.com>
+Date: Thu, 23 Jul 2026 15:19:01 +0530
+Subject: [PATCH] MAP R6.1 MRSNO Enablement on PrplOS
+
+Signed-off-by: Sonali Naresh <sonanare@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 |  53 +++-
+ .../bwl/include/bwl/base_wlan_hal_types.h     |   6 +
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  27 ++
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   | 256 ++++++++++++++++-
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.h     |   9 +
+ controller/nbapi/odl/access_point.odl.in      |   4 +-
+ .../nbapi/odl/failed_connection_event.odl.in  |  13 +-
+ controller/nbapi/on_action.cpp                | 130 ++++++++-
+ controller/src/beerocks/master/controller.cpp | 268 ++++++++++++++++--
+ controller/src/beerocks/master/db/agent.h     |  20 ++
+ controller/src/beerocks/master/db/db.cpp      |  31 +-
+ controller/src/beerocks/master/db/db.h        |  27 +-
+ .../platform/bpl/cfg/dm/bpl_cfg_wifi.cpp      | 127 +++++++++
+ framework/platform/wbapi/wbapi_utils.cpp      |   6 +
+ .../tlvf/yaml/tlvf/wfa_map/eTlvTypeMap.yaml   |  10 +-
+ .../tlvf/wfa_map/tlvRsnDiagnosticReport.yaml  |  44 ++-
+ 16 files changed, 964 insertions(+), 67 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 8f2156f..70ac320 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -4219,33 +4219,58 @@ bool ApManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+         profile2_reason_code_tlv->reason_code() =
+             static_cast<wfa_map::tlvProfile2ReasonCode::eReasonCode>(sta_conn_fail->reason);
+ 
+-        // Per EasyMesh R6.1 §17.2.106: include an RSN Diagnostic Report TLV when the radio
+-        // supports RSN Overriding.
+-        if (ap_wlan_hal->get_radio_info().rsn_override_support &&
++        // Per EasyMesh R6.1 §8/§17.2.106: only include the RSN Diagnostic Report TLV for
++        // RSNA BSSes (bss_uses_rsna, set by the HAL) with a classified RSN error.
++        if (sta_conn_fail->bss_uses_rsna &&
+             sta_conn_fail->rsn_error != bwl::eRsnError::NONE) {
+             auto rsn_diag_tlv = cmdu_tx.addClass<wfa_map::tlvRsnDiagnosticReport>();
+             if (!rsn_diag_tlv) {
+                 LOG(ERROR) << "addClass wfa_map::tlvRsnDiagnosticReport failed!";
+                 // Non-fatal: continue sending the message without the RSN Diagnostic TLV.
+             } else {
+-                // Per EasyMesh R6.1 §17.2.106 Table 129: on-wire RSN Error = 0x01
+-                // ("failure during (Re)Association/authentication"); all other values reserved.
+-                constexpr uint8_t RSN_ERROR_ASSOC_OR_AUTH_FAILURE = 0x01;
+-                rsn_diag_tlv->rsn_error() =
+-                    (sta_conn_fail->rsn_error != bwl::eRsnError::NONE)
+-                        ? RSN_ERROR_ASSOC_OR_AUTH_FAILURE
+-                        : static_cast<uint8_t>(bwl::eRsnError::NONE);
+-
+-                // Copy the failing frame body if available.
++                // Map internal bwl::eRsnError to the on-wire phase enum (Table 129).
++                auto to_wire_phase = [](bwl::eRsnError e) -> uint8_t {
++                    using wfa_map::tlvRsnDiagnosticReport;
++                    switch (e) {
++                    case bwl::eRsnError::AUTH_FAILURE:
++                    case bwl::eRsnError::PSK_MISMATCH:
++                    case bwl::eRsnError::TIMEOUT:
++                        return static_cast<uint8_t>(
++                            wfa_map::eRsnErrorPhase::AUTHENTICATION_FRAME); // 0x01
++                    case bwl::eRsnError::ASSOC_FAILURE:
++                        return static_cast<uint8_t>(
++                            wfa_map::eRsnErrorPhase::ASSOCIATION_FRAME); // 0x02
++                    case bwl::eRsnError::NONE:
++                    default:
++                        return static_cast<uint8_t>(
++                            wfa_map::eRsnErrorPhase::RESERVED_0); // 0x00
++                    }
++                };
++                rsn_diag_tlv->rsn_error() = to_wire_phase(sta_conn_fail->rsn_error);
++
++                // Reserved (3 octets) — must be 0 on transmit (Table 129).
++                constexpr uint8_t kReservedZeroes[3] = {0, 0, 0};
++                if (!rsn_diag_tlv->set_reserved(kReservedZeroes, sizeof(kReservedZeroes))) {
++                    LOG(WARNING) << "Failed to set reserved field in RSN Diagnostic Report TLV";
++                }
++
++                // FrameBody + explicit FrameBody Length (Table 129 wire layout).
+                 if (!sta_conn_fail->frame_body.empty()) {
+                     if (!rsn_diag_tlv->set_frame_body(sta_conn_fail->frame_body.data(),
+                                                       sta_conn_fail->frame_body.size())) {
+                         LOG(WARNING) << "Failed to set frame_body in RSN Diagnostic Report TLV";
++                        rsn_diag_tlv->frame_body_length() = 0;
++                    } else {
++                        rsn_diag_tlv->frame_body_length() =
++                            static_cast<uint16_t>(sta_conn_fail->frame_body.size());
+                     }
++                } else {
++                    rsn_diag_tlv->frame_body_length() = 0;
+                 }
+ 
+-                LOG(DEBUG) << "Added RSN Diagnostic Report TLV: rsn_error=0x" << std::hex
+-                           << int(sta_conn_fail->rsn_error) << std::dec
++                LOG(DEBUG) << "Added RSN Diagnostic Report TLV: rsn_error_phase=0x" << std::hex
++                           << int(rsn_diag_tlv->rsn_error()) << std::dec
++                           << " (internal=" << int(sta_conn_fail->rsn_error) << ")"
+                            << " frame_body_length=" << sta_conn_fail->frame_body.size()
+                            << " sta=" << sta_conn_fail->sta_mac
+                            << " bssid=" << sta_conn_fail->bssid;
+diff --git a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+index af680fb..de759b7 100644
+--- a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
++++ b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+@@ -593,6 +593,12 @@ struct sStaConnectionFail {
+      * Empty when not available. Used to populate the RSN Diagnostic Report TLV frame_body field.
+      */
+     std::vector<uint8_t> frame_body;
++    /**
++     * True when the BSS uses RSNA authentication (WPA2/WPA3/SAE/WPA3-Personal-Compatibility).
++     * EasyMesh R6.1 §8 gates the RSN Diagnostic Report TLV on this; defaults to false so an
++     * unaware HAL will not emit the TLV.
++     */
++    bool bss_uses_rsna = false;
+ };
+ 
+ /**
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 75318c6..bff426e 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -4915,12 +4915,39 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+                 beerocks::string_utils::hex_to_bytes<std::vector<uint8_t>>(frame_body_it->second);
+         }
+ 
++        // EasyMesh R6.1 §8: the RSN Diagnostic Report TLV is only sent for RSNA BSSes.
++        // Determine RSNA from the hostapd "wpa" bitfield for this VAP: bit1 (0x2) is
++        // dot11RSNAEnabled (WPA2/WPA3/SAE); bit0-only (WPA1) or unset is not RSNA.
++        msg->bss_uses_rsna = false;
++        {
++            const std::string bssid_str = tlvf::mac_to_string(msg->bssid);
++            prplmesh::hostapd::Configuration hapd_conf =
++                load_hostapd_config(m_radio_info.iface_name, "");
++            if (hapd_conf) {
++                const std::string conn_fail_vap_id = hapd_conf.get_vap_by_bssid(bssid_str);
++                if (!conn_fail_vap_id.empty()) {
++                    const std::string wpa_str = hapd_conf.get_vap_value(conn_fail_vap_id, "wpa");
++                    const int wpa_bits = wpa_str.empty() ? 0 : beerocks::string_utils::stoi(wpa_str);
++                    msg->bss_uses_rsna = (wpa_bits & 0x2) != 0;
++                    LOG(DEBUG) << "STA connection failure: VAP=" << conn_fail_vap_id << " wpa="
++                               << wpa_str << " -> bss_uses_rsna=" << msg->bss_uses_rsna;
++                } else {
++                    LOG(DEBUG) << "STA connection failure: BSSID=" << bssid_str
++                               << " not found in hostapd config; assuming non-RSNA";
++                }
++            } else {
++                LOG(DEBUG) << "STA connection failure: failed to load hostapd config for "
++                           << m_radio_info.iface_name << "; assuming non-RSNA";
++            }
++        }
++
+         LOG(DEBUG) << "CTRL-EVENT-CONNECTION-FAIL:"
+                    << " sta_mac=" << msg->sta_mac
+                    << " bssid=" << msg->bssid
+                    << " status=" << msg->status
+                    << " reason=" << msg->reason
+                    << " rsn_error=" << int(msg->rsn_error)
++                   << " bss_uses_rsna=" << msg->bss_uses_rsna
+                    << " frame_body_len=" << msg->frame_body.size();
+ 
+         event_queue_push(Event::STA_Connection_Fail, msg_buff);
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index cea903e..69f622f 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -524,6 +524,129 @@ bool ap_wlan_hal_whm::update_bss_hidden_ssid(const sMacAddr &bssid, bool ssid_ad
+     return true;
+ }
+ 
++namespace {
++// Map a 4-byte 00-0F-AC:xx AKM suite selector to a hostapd/pWHM key_mgmt token.
++std::string rsn_akm_selector_to_token(const uint8_t *sel)
++{
++    if (sel[0] != 0x00 || sel[1] != 0x0F || sel[2] != 0xAC) {
++        return {};
++    }
++    switch (sel[3]) {
++    case 0x02: return "WPA-PSK";
++    case 0x08: return "SAE";
++    case 0x18: return "SAE-EXT-KEY";
++    default:   return {};
++    }
++}
++
++// Map a 4-byte 00-0F-AC:xx cipher suite selector to a hostapd/pWHM pairwise token.
++std::string rsn_pairwise_selector_to_token(const uint8_t *sel)
++{
++    if (sel[0] != 0x00 || sel[1] != 0x0F || sel[2] != 0xAC) {
++        return {};
++    }
++    switch (sel[3]) {
++    case 0x04: return "CCMP";
++    case 0x09: return "GCMP-256";
++    case 0x08: return "GCMP";
++    case 0x0A: return "CCMP-256";
++    default:   return {};
++    }
++}
++
++// Extract the AKM and pairwise tokens from one RSN Override vendor element body
++// (the bytes AFTER the WFA OUI + OUI type). Layout mirrors append_rsn_override_element():
++//   Version(2) GroupData(4) PWCount(2) PW(4) AKMCount(2) AKM(4) RSNCaps(2) ...
++bool parse_rsn_override_body(const uint8_t *body, size_t len, std::string &akm_token,
++                             std::string &pairwise_token, std::string &mfp_token)
++{
++    // Need at least up to the RSN Capabilities low byte (offset 24).
++    if (len < 26) {
++        return false;
++    }
++    // Pairwise Cipher Suite selector at offset 6..9, AKM Suite selector at offset 14..17.
++    pairwise_token = rsn_pairwise_selector_to_token(body + 6);
++    akm_token      = rsn_akm_selector_to_token(body + 14);
++    // RSN Capabilities low byte at offset 20 carries MFPC (bit7=0x80) / MFPR (bit6=0x40).
++    const uint8_t caps_low = body[20];
++    if (caps_low & 0x40) {
++        mfp_token = "2"; // MFP required
++    } else if (caps_low & 0x80) {
++        mfp_token = "1"; // MFP capable/optional
++    } else {
++        mfp_token = "0"; // MFP disabled
++    }
++    return !akm_token.empty() && !pairwise_token.empty();
++}
++} // namespace
++
++bool ap_wlan_hal_whm::update_bss_rsn_override(const sMacAddr &bssid,
++                                              const std::vector<uint8_t> &security_ies)
++{
++    LOG(DEBUG) << "update_bss_rsn_override: bssid=" << bssid
++               << " security_ies_len=" << security_ies.size();
++
++    // Resolve VAP by BSSID.
++    int vap_id = get_vap_id_with_mac(tlvf::mac_to_string(bssid));
++    if (!check_vap_id(vap_id)) {
++        LOG(ERROR) << "update_bss_rsn_override: no VAP found for bssid=" << bssid;
++        return false;
++    }
++    const auto &vap_info = m_radio_info.available_vaps[vap_id];
++    auto vap_it          = m_vapsExtInfo.find(vap_info.bss);
++    if (vap_it == m_vapsExtInfo.end()) {
++        LOG(ERROR) << "update_bss_rsn_override: VAP ext info not found for " << vap_info.bss;
++        return false;
++    }
++
++    // Decode the RSNOE(0x29) -> override-1 and RSNO2E(0x2A) -> override-2 tokens from the blob.
++    std::string o1_km, o1_pw, o1_mfp, o2_km, o2_pw, o2_mfp;
++    bool have_o1 = false, have_o2 = false;
++    size_t i = 0;
++    while (i + 2 <= security_ies.size()) {
++        const uint8_t eid = security_ies[i];
++        const uint8_t len = security_ies[i + 1];
++        if (i + 2 + static_cast<size_t>(len) > security_ies.size()) {
++            break; // malformed / truncated
++        }
++        const uint8_t *body = &security_ies[i + 2];
++        if (eid == 0xDD && len >= 4 && body[0] == 0x50 && body[1] == 0x6F && body[2] == 0x9A) {
++            const uint8_t oui_type = body[3];
++            const uint8_t *ov      = body + 4;
++            const size_t ov_len    = static_cast<size_t>(len) - 4;
++            if (oui_type == 0x29) { // RSNOE -> override 1
++                have_o1 = parse_rsn_override_body(ov, ov_len, o1_km, o1_pw, o1_mfp);
++            } else if (oui_type == 0x2A) { // RSNO2E -> override 2
++                have_o2 = parse_rsn_override_body(ov, ov_len, o2_km, o2_pw, o2_mfp);
++            }
++        }
++        i += 2 + static_cast<size_t>(len);
++    }
++
++    // Write the six RSN-override parameters into the pWHM Security object. Empty strings
++    // clear the corresponding override (matches nl80211 clear_rsn_override_parameters()).
++    std::string wifi_ap_sec_path = vap_it->second.path + "Security.";
++    AmbiorixVariant new_obj(AMXC_VAR_ID_HTABLE);
++    new_obj.set_type(AMXC_VAR_ID_HTABLE);
++    new_obj.add_child("RSNOverrideKeyMgmt", have_o1 ? o1_km : std::string());
++    new_obj.add_child("RSNOverridePairwise", have_o1 ? o1_pw : std::string());
++    new_obj.add_child("RSNOverrideMFP", have_o1 ? o1_mfp : std::string());
++    new_obj.add_child("RSNOverrideKeyMgmt2", have_o2 ? o2_km : std::string());
++    new_obj.add_child("RSNOverridePairwise2", have_o2 ? o2_pw : std::string());
++    new_obj.add_child("RSNOverrideMFP2", have_o2 ? o2_mfp : std::string());
++
++    if (!m_ambiorix_cl.update_object(wifi_ap_sec_path, new_obj)) {
++        LOG(ERROR) << "update_bss_rsn_override: failed to set RSN Override params for "
++                   << vap_info.bss << " at " << wifi_ap_sec_path;
++        return false;
++    }
++
++    LOG(INFO) << "update_bss_rsn_override: bssid=" << bssid << " vap=" << vap_info.bss
++              << " override1{km=" << o1_km << " pw=" << o1_pw << " mfp=" << o1_mfp
++              << "} override2{km=" << o2_km << " pw=" << o2_pw << " mfp=" << o2_mfp << "}";
++    return true;
++}
++
+ bool ap_wlan_hal_whm::update_vap_credentials(
+     std::list<son::wireless_utils::sBssInfoConf> &bss_info_conf_list,
+     const std::string &backhaul_wps_ssid, const std::string &backhaul_wps_passphrase,
+@@ -737,12 +860,56 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+             expected_ssid_adv = false;
+         }
+ 
++        // Compute the intended ModeEnabled string BEFORE the change-detection comparison.
++        //
++        // WPA3-PCM (MRSNO, R6.1 §17.2.105): security_mode_to_string() collapses the AKM8/AKM24/
++        // both variants into the single union string "WPA3-Personal-Compatibility" because the
++        // three variants share one additional_auth flag (WPA3_PERSONAL_COMPATIBILITY); the AKM
++        // subset lives only in bss_info_conf.security_ies (RSNOE=0x29=AKM8, RSNO2E=0x2A=AKM24).
++        // Refine the string here so it becomes "-8" / "-24" for a single-AKM selection.
++        //
++        // This MUST happen before the "No changes detected" check below: otherwise a dynamic
++        // change that only flips the AKM subset (e.g. "WPA3-Personal-Compatibility" -> "...-8",
++        // where SSID / passphrase / MLD / SSIDAdvertisement are all unchanged) would compare the
++        // current pWHM ModeEnabled against the un-refined union string, wrongly conclude "no
++        // change", skip the write, and leave the Agent stuck on the old ModeEnabled.
++        std::string security_mode = wbapi_utils::security_mode_to_string(
++            bss_info_conf.authentication_type, bss_info_conf.additional_auth, bss_info_conf.freq_band);
++
++        if (security_mode == "WPA3-Personal-Compatibility" &&
++            !bss_info_conf.security_ies.empty()) {
++            bool has_akm8 = false, has_akm24 = false;
++            const auto &ies = bss_info_conf.security_ies;
++            size_t i        = 0;
++            while (i + 2 <= ies.size()) {
++                const uint8_t eid = ies[i];
++                const uint8_t len = ies[i + 1];
++                if (i + 2 + static_cast<size_t>(len) > ies.size()) {
++                    break;
++                }
++                if (eid == 0xDD && len >= 4 && ies[i + 2] == 0x50 && ies[i + 3] == 0x6F &&
++                    ies[i + 4] == 0x9A) {
++                    const uint8_t oui_type = ies[i + 5];
++                    if (oui_type == 0x29) {
++                        has_akm8 = true;
++                    } else if (oui_type == 0x2A) {
++                        has_akm24 = true;
++                    }
++                }
++                i += 2 + static_cast<size_t>(len);
++            }
++            if (has_akm8 && !has_akm24) {
++                security_mode = "WPA3-Personal-Compatibility-8";
++            } else if (!has_akm8 && has_akm24) {
++                security_mode = "WPA3-Personal-Compatibility-24";
++            } // else keep the union string (both overrides present)
++            LOG(DEBUG) << "WPA3-PCM AKM refine from security_ies: has_akm8=" << has_akm8
++                       << " has_akm24=" << has_akm24 << " -> ModeEnabled=" << security_mode;
++        }
++
+         if (params_retrieved &&
+             current_ssid == bss_info_conf.ssid && current_password == bss_info_conf.network_key &&
+-            current_mode ==
+-                wbapi_utils::security_mode_to_string(bss_info_conf.authentication_type,
+-                                                     bss_info_conf.additional_auth,
+-                                                     bss_info_conf.freq_band) &&
++            current_mode == security_mode &&
+                 current_mldID == mld_unit &&
+                 current_ssid_adv == expected_ssid_adv) {
+             LOG(DEBUG) << "No changes detected for " << ifname
+@@ -762,8 +929,6 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+             continue;
+         }
+ 
+-        std::string security_mode = wbapi_utils::security_mode_to_string(
+-            bss_info_conf.authentication_type, bss_info_conf.additional_auth, bss_info_conf.freq_band);  
+         LOG(DEBUG) << "Security Mode:" << security_mode << " Encryption Mode:" << encryption_mode;
+ 
+         std::string wifi_ap_sec_path = wifi_vap_path + "Security.";
+@@ -791,6 +956,30 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+             LOG(ERROR) << "Failed to update Security object " << wifi_ap_sec_path;
+             continue;
+         }
++
++        // Apply the RSN Override (MRSNO, R6.1 §17.2.105) params carried in security_ies, after
++        // the base Security ModeEnabled write. Skip for a freshly-created VAP (wildcard bssid /
++        // ifname=="new_interface") since the pWHM instance doesn't exist yet; it is (re)applied
++        // later at AP_ENABLED from the stashed security_ies.
++        const bool bssid_is_wildcard =
++            (bssid == beerocks::net::network_utils::WILD_MAC_STRING);
++        if ((bss_info_conf.additional_auth ==
++                 son::wireless_utils::eAdditionalAuth::WPA3_PERSONAL_COMPATIBILITY ||
++             !bss_info_conf.security_ies.empty()) &&
++            ifname != "new_interface" && !bssid_is_wildcard) {
++            if (!update_bss_rsn_override(bss_info_conf.bssid, bss_info_conf.security_ies)) {
++                LOG(WARNING) << "update_vap_credentials: failed to apply RSN Override for "
++                             << bss_info_conf.bssid << " (ssid=" << bss_info_conf.ssid << ")";
++            }
++        } else if ((bss_info_conf.additional_auth ==
++                        son::wireless_utils::eAdditionalAuth::WPA3_PERSONAL_COMPATIBILITY ||
++                    !bss_info_conf.security_ies.empty())) {
++            LOG(DEBUG) << "update_vap_credentials: deferring RSN Override for new/unresolved VAP "
++                       << "(ssid=" << bss_info_conf.ssid << " bssid=" << bss_info_conf.bssid
++                       << " ifname=" << ifname
++                       << "); will be applied at AP_ENABLED from stashed security_ies";
++        }
++
+         if (ifname == "new_interface") {
+             // skip update of vap_info, new instance in vap_info will be added asynchronously on a pwhm event
+             continue;
+@@ -2360,6 +2549,61 @@ bool ap_wlan_hal_whm::process_wpa_ctrl_event(const beerocks::wbapi::AmbiorixVari
+         msg->reason = beerocks::string_utils::stoi(reason_str);
+         LOG(DEBUG) << "STA connection failure: status=" << msg->status << " reason=" << msg->reason;
+ 
++        // EasyMesh R6.1 §8: the RSN Diagnostic Report TLV is only sent for RSNA BSSes.
++        // Determine RSNA from the VAP's pWHM Security ModeEnabled.
++        msg->bss_uses_rsna = false;
++        std::string conn_fail_vap_ifname;
++        if (check_vap_id(vap_id)) {
++            const auto &vap_info_rsna = m_radio_info.available_vaps[vap_id];
++            conn_fail_vap_ifname      = vap_info_rsna.bss;
++            auto vap_ext_it           = m_vapsExtInfo.find(vap_info_rsna.bss);
++            if (vap_ext_it != m_vapsExtInfo.end()) {
++                std::string mode_enabled;
++                if (m_ambiorix_cl.get_param(mode_enabled, vap_ext_it->second.path + "Security.",
++                                            "ModeEnabled") &&
++                    !mode_enabled.empty()) {
++                    // RSNA modes: WPA2*/WPA3*/SAE. "None"/"WPA-Personal" (WPA1) are not RSNA.
++                    const bool is_rsna =
++                        (mode_enabled.find("WPA2") != std::string::npos) ||
++                        (mode_enabled.find("WPA3") != std::string::npos) ||
++                        (mode_enabled.find("SAE") != std::string::npos);
++                    msg->bss_uses_rsna = is_rsna;
++                    LOG(DEBUG) << "STA connection failure: BSS " << vap_info_rsna.bss
++                               << " ModeEnabled='" << mode_enabled
++                               << "' -> bss_uses_rsna=" << is_rsna;
++                } else {
++                    LOG(DEBUG) << "STA connection failure: could not read ModeEnabled for "
++                               << vap_info_rsna.bss << "; assuming non-RSNA";
++                }
++            }
++        }
++
++        // FrameBody must carry the last 802.11 frame from the STA (R6.1 §8). pWHM exposes the
++        // last (Re)Assoc Request via getLastAssocReq; EAP/4-way-handshake failures may not have
++        // one, in which case frame_body stays empty (spec-permissible).
++        if (msg->bss_uses_rsna && !conn_fail_vap_ifname.empty() &&
++            msg->sta_mac != net::network_utils::ZERO_MAC) {
++            const std::string sta_mac_str = tlvf::mac_to_string(msg->sta_mac);
++            auto answer                   = get_last_assoc_frame(conn_fail_vap_ifname, sta_mac_str);
++            std::string frame_body_str;
++            if (answer && answer->read_child(frame_body_str, "frame") && !frame_body_str.empty()) {
++                auto management_frame = create_mgmt_frame_notification(frame_body_str.c_str());
++                if (management_frame && !management_frame->data.empty()) {
++                    msg->frame_body.assign(management_frame->data.begin(),
++                                           management_frame->data.end());
++                    LOG(DEBUG) << "STA connection failure: captured " << msg->frame_body.size()
++                               << " frame_body byte(s) for RSN Diagnostic Report (sta="
++                               << sta_mac_str << " vap=" << conn_fail_vap_ifname << ")";
++                } else {
++                    LOG(DEBUG) << "STA connection failure: could not decode last frame for "
++                               << sta_mac_str << "; frame_body left empty";
++                }
++            } else {
++                LOG(DEBUG) << "STA connection failure: no last frame available for " << sta_mac_str
++                           << " on " << conn_fail_vap_ifname << "; frame_body left empty";
++            }
++        }
++
+         // Add the message to the queue
+         event_queue_push(event, msg_buff);
+         break;
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
+index 168911a..857d5d6 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
+@@ -53,6 +53,15 @@ public:
+     virtual bool sta_deauth(int8_t vap_id, const std::string &mac, uint32_t reason = 0) override;
+     virtual bool sta_bss_steer(const sBtmRequestParams &params) override;
+     virtual bool update_bss_hidden_ssid(const sMacAddr &bssid, bool ssid_advertisement) override;
++
++    /**
++     * @brief Apply RSN Override (MRSNO, R6.1 §17.2.105) parameters.
++     *
++     * Decodes RSNE + RSNOE(0x29)/RSNO2E(0x2A) + RSNXOE into the pWHM Security-object
++     * RSN-override params so hostapd emits rsn_override_*. Empty vector clears the override.
++     */
++    virtual bool update_bss_rsn_override(const sMacAddr &bssid,
++                                         const std::vector<uint8_t> &security_ies) override;
+     virtual bool
+     update_vap_credentials(std::list<son::wireless_utils::sBssInfoConf> &bss_info_conf_list,
+                            const std::string &backhaul_wps_ssid,
+diff --git a/controller/nbapi/odl/access_point.odl.in b/controller/nbapi/odl/access_point.odl.in
+index ddbeb8a..c0cf4a0 100644
+--- a/controller/nbapi/odl/access_point.odl.in
++++ b/controller/nbapi/odl/access_point.odl.in
+@@ -21,7 +21,9 @@
+                     "WPA2-Personal",
+                     "WPA3-Personal",
+                     "WPA3-Personal-Transition",
+-                    "WPA3-Personal-Compatibility"
++                    "WPA3-Personal-Compatibility",
++                    "WPA3-Personal-Compatibility-8",
++                    "WPA3-Personal-Compatibility-24"
+                 ];
+             }
+         }
+diff --git a/controller/nbapi/odl/failed_connection_event.odl.in b/controller/nbapi/odl/failed_connection_event.odl.in
+index 78fef94..5f4cdee 100644
+--- a/controller/nbapi/odl/failed_connection_event.odl.in
++++ b/controller/nbapi/odl/failed_connection_event.odl.in
+@@ -1,4 +1,3 @@
+-
+ /* SPDX-License-Identifier: BSD-2-Clause-Patent
+  *
+  * SPDX-FileCopyrightText: 2021 the prplMesh contributors (see AUTHORS.md)
+@@ -23,7 +22,17 @@
+                 %read-only string TimeStamp = "2020-08-31T11:22:39Z";
+                 %read-only uint16 StatusCode = "0x1"; /* Default: 'Unspecified reason' */
+                 %read-only uint16 ReasonCode = "0x1"; /* Default: 'Unspecified failure' */
++
++                /*
++                 * RSN Diagnostic Report TLV persistence (Wi-Fi EasyMesh R6.1 §17.2.106).
++                 * RSNErrorPresent is the discriminator: RSNError/FrameBodyLength/FrameBody are
++                 * only meaningful when it is 1. FrameBody is hex-encoded (uppercase, no seps).
++                 */
++                %read-only uint8 RSNErrorPresent = 0;
++                %read-only uint8 RSNError = 0;
++                %read-only uint16 FrameBodyLength = 0;
++                %read-only string FrameBody = "";
+             }
+         }
+     }
+-}
++}
+\ No newline at end of file
+diff --git a/controller/nbapi/on_action.cpp b/controller/nbapi/on_action.cpp
+index 7267e82..4c3a345 100644
+--- a/controller/nbapi/on_action.cpp
++++ b/controller/nbapi/on_action.cpp
+@@ -36,6 +36,118 @@ namespace actions {
+ 
+ son::db *g_database = nullptr;
+ 
++// Controller-side RSN SecurityIEs synthesizer for WPA3 Personal Compatibility Mode
++// (MRSNO, R6.1 §17.2.105). The three WPA3-Personal-Compatibility DM variants map to:
++//   "...-8"    -> RSNE(SAE) + RSNOE(AKM8)               + RSNXOE
++//   "...-24"   -> RSNE(SAE) + RSNO2E(AKM24)              + RSNXOE
++//   "..." (no suffix) -> RSNE(SAE) + RSNOE(AKM8) + RSNO2E(AKM24) + RSNXOE  (union)
++// additional_auth stays a single WPA3_PERSONAL_COMPATIBILITY flag; the AKM choice lives
++// only in the wire IEs. Mirrors the UCI-side builder in bpl_cfg_wifi.cpp byte-for-byte.
++
++// RSN Capabilities low byte for MFPC + MFPR (WPA3-PCM baseline).
++static constexpr uint8_t kRsnCapsMfpRequired = 0xC0;
++
++// Append one RSN Override vendor-specific element (RSNOE 0x29 / RSNO2E 0x2A)
++// carrying a single-AKM, single-pairwise RSN body with MFPC+MFPR.
++static void append_rsn_override_element(std::vector<uint8_t> &out, uint8_t oui_type,
++                                        uint8_t akm, uint8_t pairwise)
++{
++    // Vendor payload = WFA OUI(3) + OUI type(1) + RSN body(26) = 30 (0x1E).
++    out.push_back(0xDD);        // Element ID: Vendor-Specific
++    out.push_back(0x1E);        // Length = 30
++    out.push_back(0x50);        // WFA OUI
++    out.push_back(0x6F);
++    out.push_back(0x9A);
++    out.push_back(oui_type);    // 0x29 (RSNOE) or 0x2A (RSNO2E)
++    out.push_back(0x01);        // Version
++    out.push_back(0x00);
++    out.push_back(0x00);        // Group Data Cipher Suite = 00-0F-AC-04 (CCMP)
++    out.push_back(0x0F);
++    out.push_back(0xAC);
++    out.push_back(0x04);
++    out.push_back(0x01);        // Pairwise Cipher Suite Count = 1
++    out.push_back(0x00);
++    out.push_back(0x00);        // Pairwise Cipher Suite = 00-0F-AC-<pairwise>
++    out.push_back(0x0F);
++    out.push_back(0xAC);
++    out.push_back(pairwise);
++    out.push_back(0x01);        // AKM Suite Count = 1
++    out.push_back(0x00);
++    out.push_back(0x00);        // AKM Suite = 00-0F-AC-<akm>
++    out.push_back(0x0F);
++    out.push_back(0xAC);
++    out.push_back(akm);
++    out.push_back(kRsnCapsMfpRequired); // RSN Capabilities (low byte carries MFPC/MFPR)
++    out.push_back(0x00);        // RSN Capabilities (high byte)
++    out.push_back(0x00);        // PMKID Count = 0
++    out.push_back(0x00);
++    out.push_back(0x00);        // Group Management Cipher Suite = 00-0F-AC-06 (BIP-CMAC-128)
++    out.push_back(0x0F);
++    out.push_back(0xAC);
++    out.push_back(0x06);
++}
++
++// Builds the WPA3-PCM SecurityIEs blob: primary RSNE, then RSNOE/RSNO2E per include_akm8/24,
++// then trailing RSNXOE. Returns empty if neither flag is set.
++static std::vector<uint8_t>
++build_wpa3_pcm_security_ies(bool include_akm8, bool include_akm24)
++{
++    std::vector<uint8_t> out;
++    if (!include_akm8 && !include_akm24) {
++        return out;
++    }
++
++    // Primary RSNE: WPA3-PCM baseline (SAE / CCMP / MFP required).
++    out.push_back(0x30);        // Element ID: RSNE
++    out.push_back(0x1A);        // Length = 26
++    out.push_back(0x01);        // Version
++    out.push_back(0x00);
++    out.push_back(0x00);        // Group Data Cipher Suite = 00-0F-AC-04 (CCMP)
++    out.push_back(0x0F);
++    out.push_back(0xAC);
++    out.push_back(0x04);
++    out.push_back(0x01);        // Pairwise Cipher Suite Count = 1
++    out.push_back(0x00);
++    out.push_back(0x00);        // Pairwise Cipher Suite = 00-0F-AC-04 (CCMP)
++    out.push_back(0x0F);
++    out.push_back(0xAC);
++    out.push_back(0x04);
++    out.push_back(0x01);        // AKM Suite Count = 1
++    out.push_back(0x00);
++    out.push_back(0x00);        // AKM Suite = 00-0F-AC-08 (SAE)
++    out.push_back(0x0F);
++    out.push_back(0xAC);
++    out.push_back(0x08);
++    out.push_back(kRsnCapsMfpRequired); // RSN Capabilities low byte = MFPC+MFPR
++    out.push_back(0x00);        // RSN Capabilities high byte
++    out.push_back(0x00);        // PMKID Count = 0
++    out.push_back(0x00);
++    out.push_back(0x00);        // Group Management Cipher Suite = 00-0F-AC-06
++    out.push_back(0x0F);
++    out.push_back(0xAC);
++    out.push_back(0x06);
++
++    if (include_akm8) {
++        // RSNOE (0x29): AKM = SAE (0x08), pairwise = CCMP (0x04).
++        append_rsn_override_element(out, 0x29, /*akm=*/0x08, /*pairwise=*/0x04);
++    }
++    if (include_akm24) {
++        // RSNO2E (0x2A): AKM = SAE-EXT-KEY (0x18), pairwise = GCMP-256 (0x09).
++        append_rsn_override_element(out, 0x2A, /*akm=*/0x18, /*pairwise=*/0x09);
++    }
++
++    // Trailing RSNXOE (0x2B): SAE-H2E capability (Extended RSN Capabilities byte 0x20).
++    out.push_back(0xDD);
++    out.push_back(0x05);        // Length = 5
++    out.push_back(0x50);
++    out.push_back(0x6F);
++    out.push_back(0x9A);
++    out.push_back(0x2B);        // OUI type: RSNXOE
++    out.push_back(0x20);        // Extended RSN Capabilities: SAE-H2E
++
++    return out;
++}
++
+ /*
+ ** Set the number of seconds since this Associated Device was last attempted to be steered.
+ */
+@@ -396,15 +508,31 @@ amxd_status_t access_point_commit(amxd_object_t *object, amxd_function_t *func,
+                 }
+                 bss_info.authentication_type = WSC::eWscAuth::WSC_AUTH_WPA2PSK;
+                 bss_info.encryption_type     = WSC::eWscEncr::WSC_ENCR_AES;
+-            } else if (mode_enabled == "WPA3-Personal-Compatibility") {
++            } else if (mode_enabled == "WPA3-Personal-Compatibility" ||
++                       mode_enabled == "WPA3-Personal-Compatibility-8" ||
++                       mode_enabled == "WPA3-Personal-Compatibility-24") {
+                 bss_info.network_key = get_param_string(security_inst, "KeyPassphrase");
+                 if (bss_info.network_key.empty()) {
+                     bss_info.network_key = get_param_string(security_inst, "SAEPassphrase");
+                 }
+                 bss_info.authentication_type = WSC::eWscAuth::WSC_AUTH_RSN;
+                 bss_info.encryption_type     = WSC::eWscEncr::WSC_ENCR_AES;
++                // WPA3-PCM (MRSNO): AKM8/AKM24 selection is encoded in security_ies, not
++                // additional_auth (single flag for all three DM variants).
+                 bss_info.additional_auth =
+                     son::wireless_utils::eAdditionalAuth::WPA3_PERSONAL_COMPATIBILITY;
++
++                const bool include_akm8 =
++                    (mode_enabled == "WPA3-Personal-Compatibility" ||
++                     mode_enabled == "WPA3-Personal-Compatibility-8");
++                const bool include_akm24 =
++                    (mode_enabled == "WPA3-Personal-Compatibility" ||
++                     mode_enabled == "WPA3-Personal-Compatibility-24");
++
++                bss_info.security_ies = build_wpa3_pcm_security_ies(include_akm8, include_akm24);
++                LOG(DEBUG) << "WPA3-PCM mode '" << mode_enabled << "' -> AKM8=" << include_akm8
++                           << " AKM24=" << include_akm24
++                           << " security_ies=" << bss_info.security_ies.size() << " bytes";
+             } else {
+                 bss_info.authentication_type = WSC::eWscAuth::WSC_AUTH_OPEN;
+                 bss_info.encryption_type     = WSC::eWscEncr::WSC_ENCR_NONE;
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 63c9d25..df6267c 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -1366,10 +1366,116 @@ static bool select_rsn_security_ies(const son::wireless_utils::sBssInfoConf &bss
+     return false;
+ }
+ 
++/**
++ * @brief Warn (does not block) if the SecurityIEs blob about to be pushed to an Agent
++ * references AKM/cipher suites it did not advertise in its AKM Suite Capabilities /
++ * Supported Cipher Suites TLVs. Warning-only so cert flows testing unsupported selectors
++ * still work; pre-R6.1 agents (akm_valid/cipher_valid == false) are treated as unconstrained.
++ */
++static void validate_rsn_security_ies_against_agent_capabilities(
++    const prplmesh::controller::db::Agent &agent, const sMacAddr &ruid, uint8_t bss_index,
++    const uint8_t *ies, size_t ies_len)
++{
++    if (ies == nullptr || ies_len == 0) {
++        return;
++    }
++    const auto &caps = agent.security_capabilities;
++    if (!caps.akm_valid && !caps.cipher_valid) {
++        // Pre-R6.1 agent (or capability TLVs not yet received) — treat as "unconstrained".
++        return;
++    }
++
++    // Collect referenced AKM suite types and pairwise cipher suite types from the IE blob.
++    std::set<uint8_t> ref_akm_types;
++    std::set<uint8_t> ref_cipher_types;
++
++    auto scan_akm_and_cipher = [&](const uint8_t *body, size_t body_len, bool is_primary_rsne) {
++        // Shallow scan: both AKM and cipher selectors use the 00-0F-AC:xx pattern, so
++        // without a strict RSNE parse we can't disambiguate — feed into both sets.
++        (void)is_primary_rsne;
++        for (size_t k = 0; k + 4 <= body_len; ++k) {
++            if (body[k] == 0x00 && body[k + 1] == 0x0F && body[k + 2] == 0xAC) {
++                ref_akm_types.insert(body[k + 3]);
++                ref_cipher_types.insert(body[k + 3]);
++            }
++        }
++    };
++
++    size_t i = 0;
++    while (i + 2 <= ies_len) {
++        const uint8_t eid = ies[i];
++        const uint8_t len = ies[i + 1];
++        if (i + 2 + static_cast<size_t>(len) > ies_len) {
++            break; // malformed / truncated
++        }
++        const uint8_t *body = &ies[i + 2];
++        if (eid == 48 /* RSNE */) {
++            scan_akm_and_cipher(body, len, /*is_primary_rsne=*/true);
++        } else if (eid == 221 /* Vendor-Specific */ && len >= 4 && body[0] == 0x50 &&
++                   body[1] == 0x6F && body[2] == 0x9A) {
++            const uint8_t oui_type = body[3];
++            if (oui_type == 0x29 /* RSNOE */ || oui_type == 0x2A /* RSNO2E */) {
++                scan_akm_and_cipher(body + 4, static_cast<size_t>(len) - 4,
++                                    /*is_primary_rsne=*/false);
++            }
++        }
++        i += 2 + static_cast<size_t>(len);
++    }
++
++    if (ref_akm_types.empty() && ref_cipher_types.empty()) {
++        return;
++    }
++
++    // Compare against the Agent's advertised FH sets (RSN Parameters Configuration TLV
++    // targets fronthaul BSSes). Any selector that is present in the IE blob but absent
++    // from BOTH the fh AKM and fh cipher advertised sets is flagged.
++    auto is_advertised = [](uint8_t suite_type,
++                            const std::vector<wfa_map::tlvAkmSuiteCapabilities::sBssAkmSuiteSelector>
++                                &akm,
++                            const std::vector<wfa_map::tlvSupportedCipherSuites::sBssCipherSuiteSelector>
++                                &cipher) -> bool {
++        for (const auto &s : akm) {
++            if (s.akm_suite_type == suite_type) {
++                return true;
++            }
++        }
++        for (const auto &s : cipher) {
++            if (s.cipher_suite_type == suite_type) {
++                return true;
++            }
++        }
++        return false;
++    };
++
++    for (uint8_t t : ref_akm_types) {
++        // Skip the union check when the corresponding capability set was never advertised —
++        // an unconstrained side cannot generate a mismatch.
++        const bool akm_side_constrained    = caps.akm_valid && !caps.fh_akm_selectors.empty();
++        const bool cipher_side_constrained = caps.cipher_valid && !caps.fh_cipher_selectors.empty();
++        if (!akm_side_constrained && !cipher_side_constrained) {
++            continue;
++        }
++        if (!is_advertised(t, caps.fh_akm_selectors, caps.fh_cipher_selectors)) {
++            LOG(WARNING)
++                << "RSN Parameters Configuration TLV: agent " << agent.al_mac << " (ruid=" << ruid
++                << " bss_index=" << int(bss_index)
++                << ") is being pushed a SecurityIEs blob that references 00-0F-AC:"
++                << std::hex << int(t) << std::dec
++                << " which the Agent did NOT advertise in its AKM Suite Capabilities / Supported "
++                   "Cipher Suites TLVs — Agent may reject or silently downgrade the RSN Override "
++                   "configuration for this BSS";
++        }
++    }
++}
++
+ static bool add_rsn_parameters_configuration_tlv(
+     db &database, ieee1905_1::CmduMessageTx &cmdu_tx, const sMacAddr &agt_mac, const sMacAddr ruid,
+     const std::list<son::wireless_utils::sBssInfoConf> &bss_info_confs, beerocks::eFreqType band)
+ {
++    // Fetch once for validate_rsn_security_ies_against_agent_capabilities() below;
++    // unknown agent -> skip validation but still emit the TLV.
++    auto target_agent = database.m_agents.get(agt_mac);
++
+     // In easymesh 6.1, it will be the new way to configure security mode.
+     // For now just send RSN Parameters Configuration TLV for WPA3-PCM security mode.
+     // we implement for now only in ap wsc configuration so one is sent per radio, to rework if same function used for another message
+@@ -1399,6 +1505,10 @@ static bool add_rsn_parameters_configuration_tlv(
+                 LOG(DEBUG) << "Setting SecurityIEs (" << ies_len << " bytes) for BSS "
+                            << int(bss_info_conf.bss_index)
+                            << " (additional_auth=" << int(bss_info_conf.additional_auth) << ")";
++                if (target_agent) {
++                    validate_rsn_security_ies_against_agent_capabilities(
++                        *target_agent, ruid, bss_info_conf.bss_index, ies_data, ies_len);
++                }
+                 rsn_parameters_bss->set_security_ies(ies_data, ies_len);
+             } else {
+                 LOG(ERROR) << "Unhandled RSN type for BSS " << int(bss_info_conf.bss_index)
+@@ -3599,22 +3709,51 @@ bool Controller::handle_cmdu_1905_failed_connection_message(const sMacAddr &src_
+     if (profile2_reason_code_tlv) {
+         reason_code = profile2_reason_code_tlv->reason_code();
+     }
++
++    // Parse the optional RSN Diagnostic Report TLV (R6.1 §17.2.106) before persisting the
++    // event so RSN context lands in the same FailedConnectionEventData instance.
++    bool rsn_error_present         = false;
++    uint8_t rsn_error              = 0;
++    const uint8_t *rsn_frame_body  = nullptr;
++    uint16_t rsn_frame_body_length = 0;
++    auto rsn_diagnostic_report_tlv = cmdu_rx.getClass<wfa_map::tlvRsnDiagnosticReport>();
++
++    if (rsn_diagnostic_report_tlv) {
++        rsn_error_present     = true;
++        rsn_error             = rsn_diagnostic_report_tlv->rsn_error();
++        rsn_frame_body_length = rsn_diagnostic_report_tlv->frame_body_length();
++        // frame_body() may be nullptr with length 0 (not captured) or non-zero (captured);
++        // the DM helper handles both shapes.
++        if (rsn_frame_body_length > 0) {
++            rsn_frame_body = rsn_diagnostic_report_tlv->frame_body();
++        }
++        LOG(INFO) << "RSN Diagnostic Report for STA " << sta_mac_tlv->sta_mac() << " on BSS "
++                  << bssid_tlv->bssid() << ": rsn_error=0x" << std::hex
++                  << static_cast<int>(rsn_error) << std::dec
++                  << " frame_body_length=" << rsn_frame_body_length
++                  << " frame_body_ptr=" << (rsn_frame_body != nullptr ? "non-null" : "null");
++    }
++
+     if (status_code != 0) {
+         if (!database.dm_add_failed_connection_event(bssid_tlv->bssid(), sta_mac_tlv->sta_mac(),
+-                                                     reason_code, status_code)) {
++                                                     reason_code, status_code, rsn_error_present,
++                                                     rsn_error, rsn_frame_body,
++                                                     rsn_frame_body_length)) {
+             LOG(ERROR) << "Failed to add FailedConnectionEvent.";
+             return false;
+         }
+-    }
+-
+-    // Per EasyMesh R6.1 §17.2.106: parse the optional RSN Diagnostic Report TLV for diagnostics.
+-    auto rsn_diagnostic_report_tlv = cmdu_rx.getClass<wfa_map::tlvRsnDiagnosticReport>();
+-    if (rsn_diagnostic_report_tlv) {
+-        LOG(INFO) << "RSN Diagnostic Report for STA " << sta_mac_tlv->sta_mac()
+-                  << " on BSS " << bssid_tlv->bssid()
+-                  << ": rsn_error=0x" << std::hex << int(rsn_diagnostic_report_tlv->rsn_error())
+-                  << std::dec << " frame_body_length="
+-                  << rsn_diagnostic_report_tlv->frame_body_length();
++    } else if (rsn_error_present) {
++        // status_code == 0 but the Agent still flagged an RSN error phase — persist it anyway
++        // so NBAPI consumers don't silently miss the event.
++        LOG(INFO) << "Persisting RSN Diagnostic Report even though status_code == 0 for STA "
++                  << sta_mac_tlv->sta_mac() << " on BSS " << bssid_tlv->bssid();
++        if (!database.dm_add_failed_connection_event(bssid_tlv->bssid(), sta_mac_tlv->sta_mac(),
++                                                     reason_code, status_code, rsn_error_present,
++                                                     rsn_error, rsn_frame_body,
++                                                     rsn_frame_body_length)) {
++            LOG(ERROR) << "Failed to add FailedConnectionEvent (RSN-only path).";
++            return false;
++        }
+     }
+ 
+     return true;
+@@ -5821,6 +5960,10 @@ bool Controller::reconfig_apmld(const sMacAddr &al_mac, const sMacAddr &mld_mac,
+                     // BSSID is known for a configured AP MLD link; BSS_Index is ignored per spec.
+                     rsn_bss->bssid()     = e.bssid;
+                     rsn_bss->bss_index() = 0;
++                    // Warn on AKM/cipher selectors this Agent didn't advertise.
++                    validate_rsn_security_ies_against_agent_capabilities(
++                        *agent, e.ruid, /*bss_index=*/0, e.ies_data, e.ies_len);
++
+                     if (!rsn_bss->set_security_ies(e.ies_data, e.ies_len)) {
+                         LOG(ERROR)
+                             << "Failed setting SecurityIEs in RSN Parameters Configuration TLV";
+@@ -7069,12 +7212,26 @@ bool Controller::handle_tlv_profile3_akm_suite_capabilities(Agent &agent,
+         fronthaul_bss_selectors.push_back(selector);
+     }
+ 
+-    /* TODO: Establish a accordance between radio and given AKM Suite сapabilities (PPM-2332).
+-    if (!database.dm_add_radio_akm_suite_capabilities(radio, fronthaul_bss_selectors, backhaul_bss_selectors) {
+-        LOG(ERROR) << "Failed to add AKM Suite Capabilities for radio=" << radio->radio_uid;
+-        return false;
++    // The AKM Suite Capabilities TLV is agent-level (no radio_uid); persist it on the Agent
++    // and mirror it into every radio's DM node below (used later by
++    // validate_rsn_security_ies_against_agent_capabilities()).
++    agent.security_capabilities.fh_akm_selectors = std::move(fronthaul_bss_selectors);
++    agent.security_capabilities.bh_akm_selectors = std::move(backhaul_bss_selectors);
++    agent.security_capabilities.akm_valid        = true;
++
++    for (auto &radio_entry : agent.radios) {
++        if (!radio_entry.second) {
++            continue;
++        }
++        if (!database.dm_add_radio_akm_suite_capabilities(
++                *radio_entry.second, agent.security_capabilities.fh_akm_selectors,
++                agent.security_capabilities.bh_akm_selectors)) {
++            LOG(ERROR) << "Failed to add AKM Suite Capabilities for radio="
++                       << radio_entry.second->radio_uid;
++            // Continue with the remaining radios — a DM write failure on one radio must not
++            // abort the whole TLV handling.
++        }
+     }
+-    */
+ 
+     return true;
+ }
+@@ -7290,9 +7447,12 @@ bool Controller::handle_ap_capability_report(const sMacAddr &src_mac,
+                    << src_mac << " with profile enum " << agent->profile;
+     }
+ 
+-    // Per Wi-Fi EasyMesh R6.1 §17.2.94: parse the Supported Cipher Suites TLV.
+-    // Today we only log the received selectors.
++    // Parse the Supported Cipher Suites TLV (R6.1 §17.2.94) and persist the advertised BH/FH
++    // selectors on the Agent for validate_rsn_security_ies_against_agent_capabilities().
+     if (auto supported_cipher_suites_tlv = cmdu_rx.getClass<wfa_map::tlvSupportedCipherSuites>()) {
++        agent->security_capabilities.bh_cipher_selectors.clear();
++        agent->security_capabilities.fh_cipher_selectors.clear();
++
+         std::stringstream ss;
+         ss << "Supported Cipher Suites TLV from Agent " << src_mac << ":" << std::endl
+            << "  backhaul-BSS selectors ("
+@@ -7304,6 +7464,7 @@ bool Controller::handle_ap_capability_report(const sMacAddr &src_mac,
+                 continue;
+             }
+             auto &selector = std::get<1>(entry);
++            agent->security_capabilities.bh_cipher_selectors.push_back(selector);
+             ss << " {oui=0x" << std::hex << uint32_t(selector.oui) << std::dec
+                << ", type=" << int(selector.cipher_suite_type) << "}";
+         }
+@@ -7317,12 +7478,16 @@ bool Controller::handle_ap_capability_report(const sMacAddr &src_mac,
+                 continue;
+             }
+             auto &selector = std::get<1>(entry);
++            agent->security_capabilities.fh_cipher_selectors.push_back(selector);
+             ss << " {oui=0x" << std::hex << uint32_t(selector.oui) << std::dec
+                << ", type=" << int(selector.cipher_suite_type) << "}";
+         }
++        agent->security_capabilities.cipher_valid = true;
+         LOG(DEBUG) << ss.str();
+     } else {
+-        // Pre-R6 agents legitimately omit this TLV.
++        // Pre-R6 agents legitimately omit this TLV; keep cipher_valid = false so the
++        // RSN-IE validator treats the agent as unconstrained, not "advertises nothing".
++        agent->security_capabilities.cipher_valid = false;
+         LOG(INFO) << "No Supported Cipher Suites TLV in AP Capability Report from Agent "
+                   << src_mac;
+     }
+@@ -7603,6 +7768,66 @@ bool Controller::handle_cmdu_1905_ap_mld_configuration_response_message(
+         LOG(DEBUG) << "AP_MLD_CONFIGURATION_RESPONSE does not contain BSS Advanced Configuration TLV";
+     }
+ 
++    // R6.1 §17.1.49/§17.2.107: the Agent echoes back an RSN Parameters Configuration TLV
++    // confirming the SecurityIEs programmed per affiliated-AP BSS; parse it to detect a
++    // silently-dropped RSN Override (reported length == 0).
++    auto rsn_params_config = cmdu_rx.getClass<wfa_map::tlvRsnParametersConfiguration>();
++    if (rsn_params_config) {
++        LOG(DEBUG) << "AP_MLD_CONFIGURATION_RESPONSE RSN Parameters Configuration Report with "
++                   << int(rsn_params_config->num_radio()) << " radio(s)";
++
++        for (auto radio_idx = 0; radio_idx < rsn_params_config->num_radio(); ++radio_idx) {
++            auto rsn_radio_tuple = rsn_params_config->radios(radio_idx);
++            bool valid           = std::get<0>(rsn_radio_tuple);
++            auto &rsn_radio      = std::get<1>(rsn_radio_tuple);
++
++            if (!valid) {
++                LOG(ERROR) << "Failed to get RSN radio entry " << radio_idx
++                           << " from RSN Parameters Configuration TLV in AP MLD Config Response";
++                continue;
++            }
++
++            LOG(DEBUG) << "AP MLD Config Response RSN Parameters Config: ruid=" << rsn_radio.ruid()
++                       << " num_bss=" << int(rsn_radio.num_bss());
++
++            for (auto bss_idx = 0; bss_idx < rsn_radio.num_bss(); ++bss_idx) {
++                auto rsn_bss_tuple = rsn_radio.bsss(bss_idx);
++                bool bss_valid     = std::get<0>(rsn_bss_tuple);
++                auto &rsn_bss      = std::get<1>(rsn_bss_tuple);
++
++                if (!bss_valid) {
++                    LOG(ERROR) << "Failed to get RSN BSS entry " << bss_idx
++                               << " from RSN Parameters Configuration TLV in AP MLD Config "
++                                  "Response";
++                    continue;
++                }
++
++                const size_t reported_ies_len = rsn_bss.security_ies_length();
++                LOG(INFO) << "AP MLD Config Response RSN Parameters Config: ruid="
++                          << rsn_radio.ruid() << " bssid=" << rsn_bss.bssid()
++                          << " bss_index=" << int(rsn_bss.bss_index())
++                          << " security_ies_length=" << reported_ies_len;
++
++                // Empty payload means the RSN Override wasn't applied (or was cleared).
++                if (reported_ies_len == 0) {
++                    LOG(WARNING) << "AP MLD Config Response RSN Parameters Config: agent "
++                                 << src_mac << " reported empty SecurityIEs for BSS "
++                                 << rsn_bss.bssid() << " on radio " << rsn_radio.ruid()
++                                 << " — RSN Override may not have been applied on the affiliated "
++                                    "AP MLD link";
++                } else {
++                    LOG(DEBUG) << "AP MLD Config Response RSN Parameters Config: agent " << src_mac
++                               << " confirmed SecurityIEs (" << reported_ies_len
++                               << " bytes) for BSS " << rsn_bss.bssid();
++                }
++            }
++        }
++    } else {
++        // Not necessarily an error: the Agent omits this TLV when the Request carried none.
++        LOG(DEBUG) << "AP_MLD_CONFIGURATION_RESPONSE does not contain RSN Parameters "
++                      "Configuration TLV";
++    }
++
+     return true;
+ }
+ 
+@@ -7773,6 +7998,11 @@ bool Controller::send_bss_configuration_extended_request_batch(
+                 }
+                 rsn_bss->bssid()     = bss.bssid;
+                 rsn_bss->bss_index() = 0;
++                // Batch path: warn on selector-set mismatch before we serialise the blob.
++                validate_rsn_security_ies_against_agent_capabilities(
++                    *agent, ruid, /*bss_index=*/0, bss.security_ies.data(),
++                    bss.security_ies.size());
++
+                 if (has_ies) {
+                     // SET path: emit the caller-supplied SecurityIEs blob verbatim.
+                     if (!rsn_bss->set_security_ies(bss.security_ies.data(),
+diff --git a/controller/src/beerocks/master/db/agent.h b/controller/src/beerocks/master/db/agent.h
+index 32ccaeb..4ef2f67 100644
+--- a/controller/src/beerocks/master/db/agent.h
++++ b/controller/src/beerocks/master/db/agent.h
+@@ -24,11 +24,13 @@
+ #include <tlvf/common/sMacAddr.h>
+ #include <tlvf/ieee_1905_1/eMediaType.h>
+ #include <tlvf/tlvftypes.h>
++#include <tlvf/wfa_map/tlvAkmSuiteCapabilities.h>
+ #include <tlvf/wfa_map/tlvChannelScanCapabilities.h>
+ #include <tlvf/wfa_map/tlvProfile2ApCapability.h>
+ #include <tlvf/wfa_map/tlvProfile2MultiApProfile.h>
+ #include <tlvf/wfa_map/tlvServicePrioritizationRule.h>
+ #include <tlvf/wfa_map/tlvSteeringPolicy.h>
++#include <tlvf/wfa_map/tlvSupportedCipherSuites.h>
+ 
+ // Forward declaration of son::node
+ namespace son {
+@@ -94,6 +96,24 @@ public:
+     // RSN Overriding support
+     bool rsn_overriding_supported = false;
+ 
++    /**
++     * @brief Agent-level AKM/cipher selectors advertised via the R6.1 AKM Suite Capabilities
++     * and Supported Cipher Suites TLVs (no radio_uid, so stored here rather than per-radio).
++     * Used to mirror AKM selectors into each radio's DM node, and to warn (not block) when
++     * an RSN Parameters Configuration TLV push references a selector the Agent never
++     * advertised. @c *_valid is false until the Agent actually sends the TLV — treat such
++     * agents as unconstrained, not as advertising nothing.
++     */
++    struct sSecurityCapabilities {
++        std::vector<wfa_map::tlvAkmSuiteCapabilities::sBssAkmSuiteSelector> fh_akm_selectors;
++        std::vector<wfa_map::tlvAkmSuiteCapabilities::sBssAkmSuiteSelector> bh_akm_selectors;
++        bool akm_valid = false;
++
++        std::vector<wfa_map::tlvSupportedCipherSuites::sBssCipherSuiteSelector> fh_cipher_selectors;
++        std::vector<wfa_map::tlvSupportedCipherSuites::sBssCipherSuiteSelector> bh_cipher_selectors;
++        bool cipher_valid = false;
++    } security_capabilities;
++
+     // SMD (Seamless Mobility Domain) capabilities, set from QCA SMD Capabilities TLV
+     // received in EARLY_AP_CAPABILITY_REPORT_MESSAGE.
+     // smd_capable: Bit 7 of the capabilities byte.
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 8500e55..9055678 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -7283,7 +7283,9 @@ void db::dm_fire_steer_summary_stats_event(const Station &station)
+ }
+ 
+ bool db::dm_add_failed_connection_event(const sMacAddr &bssid, const sMacAddr &sta_mac,
+-                                        const uint16_t reason_code, const uint16_t status_code)
++                                        const uint16_t reason_code, const uint16_t status_code,
++                                        bool rsn_error_present, uint8_t rsn_error,
++                                        const uint8_t *frame_body, uint16_t frame_body_length)
+ {
+     std::string event_path =
+         DATAELEMENTS_ROOT_DM ".FailedConnectionEvent.FailedConnectionEventData";
+@@ -7301,6 +7303,33 @@ bool db::dm_add_failed_connection_event(const sMacAddr &bssid, const sMacAddr &s
+     ret_val &= m_ambiorix_datamodel->set(event_path, "MACAddress", sta_mac);
+     ret_val &= m_ambiorix_datamodel->set(event_path, "StatusCode", status_code);
+     ret_val &= m_ambiorix_datamodel->set(event_path, "ReasonCode", reason_code);
++
++    // RSN Diagnostic Report TLV persistence (R6.1 §17.2.106). RSNErrorPresent is the
++    // discriminator; FrameBody is hex-encoded since Ambiorix/UBUS has no raw byte type.
++    ret_val &= m_ambiorix_datamodel->set(event_path, "RSNErrorPresent",
++                                         static_cast<uint8_t>(rsn_error_present ? 1 : 0));
++    if (rsn_error_present) {
++        ret_val &= m_ambiorix_datamodel->set(event_path, "RSNError", rsn_error);
++        ret_val &= m_ambiorix_datamodel->set(event_path, "FrameBodyLength", frame_body_length);
++        if (frame_body != nullptr && frame_body_length > 0) {
++            static const char hex_digits[] = "0123456789ABCDEF";
++            std::string frame_body_hex;
++            frame_body_hex.reserve(static_cast<size_t>(frame_body_length) * 2);
++            for (uint16_t i = 0; i < frame_body_length; ++i) {
++                const uint8_t byte = frame_body[i];
++                frame_body_hex.push_back(hex_digits[(byte >> 4) & 0x0F]);
++                frame_body_hex.push_back(hex_digits[byte & 0x0F]);
++            }
++            ret_val &= m_ambiorix_datamodel->set(event_path, "FrameBody", frame_body_hex);
++        } else {
++            // Clear FrameBody so a re-used DM instance doesn't retain a stale value.
++            ret_val &= m_ambiorix_datamodel->set(event_path, "FrameBody", std::string{});
++        }
++        LOG(DEBUG) << "dm_add_failed_connection_event: RSN diagnostic persisted "
++                   << "(rsn_error=0x" << std::hex << static_cast<int>(rsn_error) << std::dec
++                   << " frame_body_length=" << frame_body_length
++                   << " frame_body_ptr=" << (frame_body != nullptr ? "non-null" : "null") << ")";
++    }
+     return ret_val;
+ }
+ 
+diff --git a/controller/src/beerocks/master/db/db.h b/controller/src/beerocks/master/db/db.h
+index b887d16..d5e63f2 100644
+--- a/controller/src/beerocks/master/db/db.h
++++ b/controller/src/beerocks/master/db/db.h
+@@ -1183,14 +1183,31 @@ public:
+      * Data model path example:
+      * "Device.WiFi.DataElements.FailedConnectionEvent.FailedConnectionEventData"
+      *
+-     * @param bssid BSSID of the interface where connection failure happened.
+-     * @param sta_mac Client mac address.
+-     * @param reason_code Reason code of clients failed association.
+-     * @param status_code Status code of clients failed association.
++     * Optional RSN Diagnostic Report (R6.1 §17.2.106) fields are gated on @p rsn_error_present:
++     * when false (default), RSNErrorPresent is written 0 and the RSN fields stay at their ODL
++     * default; when true, RSNError/FrameBodyLength are written and @p frame_body is hex-encoded
++     * (uppercase, no separators) into FrameBody. A null @p frame_body with nonzero length is
++     * "length known, body unavailable" and leaves FrameBody empty.
++     *
++     * @param bssid                BSSID of the interface where connection failure happened.
++     * @param sta_mac              Client mac address.
++     * @param reason_code          Reason code of clients failed association.
++     * @param status_code          Status code of clients failed association.
++     * @param rsn_error_present    True when an RSN Diagnostic Report TLV was parsed for this
++     *                             event.
++     * @param rsn_error            RSN error phase byte (only used when @p rsn_error_present).
++     * @param frame_body           Offending 802.11 frame body, or nullptr (only used when
++     *                             @p rsn_error_present).
++     * @param frame_body_length    Length in bytes of @p frame_body (only used when
++     *                             @p rsn_error_present).
+      * @return True on success, false otherwise.
+      */
+     bool dm_add_failed_connection_event(const sMacAddr &bssid, const sMacAddr &sta_mac,
+-                                        const uint16_t reason_code, const uint16_t status_code);
++                                        const uint16_t reason_code, const uint16_t status_code,
++                                        bool rsn_error_present         = false,
++                                        uint8_t rsn_error              = 0,
++                                        const uint8_t *frame_body      = nullptr,
++                                        uint16_t frame_body_length     = 0);
+ 
+     /**
+      * @brief Adds station capabilities sub-objects into data model
+diff --git a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+index 896f77c..9df659d 100644
+--- a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+@@ -39,6 +39,116 @@ eFreqType string_to_freq_type(const std::string &freq_str)
+     auto it = freq_map.find(freq_str);
+     return it != freq_map.end() ? it->second : FREQ_UNKNOWN;
+ }
++
++// WPA3-PCM (MRSNO, R6.1 §17.2.105) SecurityIEs synthesizer for the pWHM/DM backend.
++// Maps the three ModeEnabled variants to eAdditionalAuth::WPA3_PERSONAL_COMPATIBILITY plus
++// the AKM-specific SecurityIEs blob (RSNE + RSNOE/RSNO2E + RSNXOE), mirroring the UCI
++// backend's build_rsn_security_ies_from_uci() byte-for-byte:
++//   "...-8"  -> RSNE(SAE) + RSNOE(AKM8)                + RSNXOE
++//   "...-24" -> RSNE(SAE) + RSNO2E(AKM24)               + RSNXOE
++//   "..."    -> RSNE(SAE) + RSNOE(AKM8) + RSNO2E(AKM24) + RSNXOE
++
++// RSN Capabilities low byte for MFPC + MFPR (WPA3-PCM baseline).
++constexpr uint8_t kRsnCapsMfpRequired = 0xC0;
++
++// Append one RSN Override vendor-specific element (RSNOE 0x29 / RSNO2E 0x2A)
++// carrying a single-AKM, single-pairwise RSN body with MFPC+MFPR.
++void append_rsn_override_element(std::vector<uint8_t> &out, uint8_t oui_type, uint8_t akm,
++                                 uint8_t pairwise)
++{
++    // Vendor payload = WFA OUI(3) + OUI type(1) + RSN body(26) = 30 (0x1E).
++    out.push_back(0xDD);        // Element ID: Vendor-Specific
++    out.push_back(0x1E);        // Length = 30
++    out.push_back(0x50);        // WFA OUI
++    out.push_back(0x6F);
++    out.push_back(0x9A);
++    out.push_back(oui_type);    // 0x29 (RSNOE) or 0x2A (RSNO2E)
++    out.push_back(0x01);        // Version
++    out.push_back(0x00);
++    out.push_back(0x00);        // Group Data Cipher Suite = 00-0F-AC-04 (CCMP)
++    out.push_back(0x0F);
++    out.push_back(0xAC);
++    out.push_back(0x04);
++    out.push_back(0x01);        // Pairwise Cipher Suite Count = 1
++    out.push_back(0x00);
++    out.push_back(0x00);        // Pairwise Cipher Suite = 00-0F-AC-<pairwise>
++    out.push_back(0x0F);
++    out.push_back(0xAC);
++    out.push_back(pairwise);
++    out.push_back(0x01);        // AKM Suite Count = 1
++    out.push_back(0x00);
++    out.push_back(0x00);        // AKM Suite = 00-0F-AC-<akm>
++    out.push_back(0x0F);
++    out.push_back(0xAC);
++    out.push_back(akm);
++    out.push_back(kRsnCapsMfpRequired); // RSN Capabilities (low byte carries MFPC/MFPR)
++    out.push_back(0x00);        // RSN Capabilities (high byte)
++    out.push_back(0x00);        // PMKID Count = 0
++    out.push_back(0x00);
++    out.push_back(0x00);        // Group Management Cipher Suite = 00-0F-AC-06 (BIP-CMAC-128)
++    out.push_back(0x0F);
++    out.push_back(0xAC);
++    out.push_back(0x06);
++}
++
++// Build the spec-compliant WPA3-PCM SecurityIEs blob for a given AKM combination.
++std::vector<uint8_t> build_wpa3_pcm_security_ies(bool include_akm8, bool include_akm24)
++{
++    std::vector<uint8_t> out;
++    if (!include_akm8 && !include_akm24) {
++        return out;
++    }
++
++    // Primary RSNE: WPA3-PCM baseline (SAE / CCMP / MFP required).
++    out.push_back(0x30);        // Element ID: RSNE
++    out.push_back(0x1A);        // Length = 26
++    out.push_back(0x01);        // Version
++    out.push_back(0x00);
++    out.push_back(0x00);        // Group Data Cipher Suite = 00-0F-AC-04 (CCMP)
++    out.push_back(0x0F);
++    out.push_back(0xAC);
++    out.push_back(0x04);
++    out.push_back(0x01);        // Pairwise Cipher Suite Count = 1
++    out.push_back(0x00);
++    out.push_back(0x00);        // Pairwise Cipher Suite = 00-0F-AC-04 (CCMP)
++    out.push_back(0x0F);
++    out.push_back(0xAC);
++    out.push_back(0x04);
++    out.push_back(0x01);        // AKM Suite Count = 1
++    out.push_back(0x00);
++    out.push_back(0x00);        // AKM Suite = 00-0F-AC-08 (SAE)
++    out.push_back(0x0F);
++    out.push_back(0xAC);
++    out.push_back(0x08);
++    out.push_back(kRsnCapsMfpRequired); // RSN Capabilities low byte = MFPC+MFPR
++    out.push_back(0x00);        // RSN Capabilities high byte
++    out.push_back(0x00);        // PMKID Count = 0
++    out.push_back(0x00);
++    out.push_back(0x00);        // Group Management Cipher Suite = 00-0F-AC-06
++    out.push_back(0x0F);
++    out.push_back(0xAC);
++    out.push_back(0x06);
++
++    if (include_akm8) {
++        // RSNOE (0x29): AKM = SAE (0x08), pairwise = CCMP (0x04).
++        append_rsn_override_element(out, 0x29, /*akm=*/0x08, /*pairwise=*/0x04);
++    }
++    if (include_akm24) {
++        // RSNO2E (0x2A): AKM = SAE-EXT-KEY (0x18), pairwise = GCMP-256 (0x09).
++        append_rsn_override_element(out, 0x2A, /*akm=*/0x18, /*pairwise=*/0x09);
++    }
++
++    // Trailing RSNXOE (0x2B): SAE-H2E capability (Extended RSN Capabilities byte 0x20).
++    out.push_back(0xDD);
++    out.push_back(0x05);        // Length = 5
++    out.push_back(0x50);
++    out.push_back(0x6F);
++    out.push_back(0x9A);
++    out.push_back(0x2B);        // OUI type: RSNXOE
++    out.push_back(0x20);        // Extended RSN Capabilities: SAE-H2E
++
++    return out;
++}
+ } // namespace
+ 
+ namespace beerocks {
+@@ -316,6 +426,23 @@ bool bpl_cfg_get_wifi_credentials(const std::string &iface,
+     if (sec_obj->read_child(mode_enabled, "ModeEnabled")) {
+         configuration.authentication_type = wbapi_utils::security_mode_from_string(mode_enabled);
+         configuration.additional_auth = wbapi_utils::security_rsn_mode_from_string(mode_enabled);
++
++        // WPA3-PCM (MRSNO): synthesize the SecurityIEs blob so the RSN Parameters
++        // Configuration TLV isn't empty (else the Agent can't derive the AKM set).
++        if (configuration.additional_auth ==
++            son::wireless_utils::eAdditionalAuth::WPA3_PERSONAL_COMPATIBILITY) {
++            const bool include_akm8 =
++                (mode_enabled == "WPA3-Personal-Compatibility" ||
++                 mode_enabled == "WPA3-Personal-Compatibility-8");
++            const bool include_akm24 =
++                (mode_enabled == "WPA3-Personal-Compatibility" ||
++                 mode_enabled == "WPA3-Personal-Compatibility-24");
++
++            configuration.security_ies = build_wpa3_pcm_security_ies(include_akm8, include_akm24);
++            LOG(DEBUG) << "WPA3-PCM ModeEnabled='" << mode_enabled << "' on iface " << iface
++                       << " -> AKM8=" << include_akm8 << " AKM24=" << include_akm24
++                       << " security_ies=" << configuration.security_ies.size() << " bytes";
++        }
+     }
+ 
+     std::string encryption_mode;
+diff --git a/framework/platform/wbapi/wbapi_utils.cpp b/framework/platform/wbapi/wbapi_utils.cpp
+index 3c3d74c..87c61c7 100644
+--- a/framework/platform/wbapi/wbapi_utils.cpp
++++ b/framework/platform/wbapi/wbapi_utils.cpp
+@@ -103,6 +103,12 @@ const std::map<std::string, std::vector<son::wireless_utils::eAdditionalAuth>>
+         {"None", {son::wireless_utils::eAdditionalAuth::NONE}},
+         {"WPA3-Personal-Compatibility",
+          {son::wireless_utils::eAdditionalAuth::WPA3_PERSONAL_COMPATIBILITY}},
++        // WPA3-PCM (MRSNO) AKM8/AKM24 variants also map to the single
++        // WPA3_PERSONAL_COMPATIBILITY flag; the AKM choice lives in SecurityIEs, not here.
++        {"WPA3-Personal-Compatibility-8",
++         {son::wireless_utils::eAdditionalAuth::WPA3_PERSONAL_COMPATIBILITY}},
++        {"WPA3-Personal-Compatibility-24",
++         {son::wireless_utils::eAdditionalAuth::WPA3_PERSONAL_COMPATIBILITY}},
+ };
+ 
+ std::string
+diff --git a/framework/tlvf/yaml/tlvf/wfa_map/eTlvTypeMap.yaml b/framework/tlvf/yaml/tlvf/wfa_map/eTlvTypeMap.yaml
+index e49dac9..ae26f44 100644
+--- a/framework/tlvf/yaml/tlvf/wfa_map/eTlvTypeMap.yaml
++++ b/framework/tlvf/yaml/tlvf/wfa_map/eTlvTypeMap.yaml
+@@ -111,14 +111,16 @@ eTlvTypeMap:
+   TLV_EHT_OPERATIONS: 0xE7
+   TLV_AVAILABLE_SPECTRUM_INQUIRY_REQUEST: 0xE8
+   TLV_AVAILABLE_SPECTRUM_INQUIRY_RESPONSE: 0xE9
+-  TLV_WIFI8_NEIGHBOR_INFORMATION_REPORTING_POLICY: 0xEA
++  # R6.1 §17.2 spec values 0xEA-0xED; the non-R6.1 Wi-Fi 8 placeholders below are
++  # relocated to 0xEE/0xEF so they no longer squat on them.
++  TLV_RSN_DIAGNOSTIC_REPORT: 0xEA
+   TLV_RSN_PARAMETERS_CONFIGURATION: 0xEB
+   TLV_BSS_ADVANCED_CONFIGURATION: 0xEC
+-  TLV_SUPPORTED_CIPHER_SUITES: 0xEE
+-  TLV_RSN_DIAGNOSTIC_REPORT: 0xEF
++  TLV_SUPPORTED_CIPHER_SUITES: 0xED
++  TLV_WIFI8_NEIGHBOR_INFORMATION_REPORTING_POLICY: 0xEE
+ 
+   # Wi-Fi 8 (IEEE 802.11bn) starts here
+-  TLV_WIFI_8_AGENT_CAPABILITIES: 0xED
++  TLV_WIFI_8_AGENT_CAPABILITIES: 0xEF
+ 
+   # Profile 3 starts here
+   TLV_AP_WIFI_6_CAPABILITIES: 0xAA
+diff --git a/framework/tlvf/yaml/tlvf/wfa_map/tlvRsnDiagnosticReport.yaml b/framework/tlvf/yaml/tlvf/wfa_map/tlvRsnDiagnosticReport.yaml
+index b3cb4a7..0248489 100644
+--- a/framework/tlvf/yaml/tlvf/wfa_map/tlvRsnDiagnosticReport.yaml
++++ b/framework/tlvf/yaml/tlvf/wfa_map/tlvRsnDiagnosticReport.yaml
+@@ -1,11 +1,25 @@
+-#
+ ---
+ _namespace: wfa_map
+ 
+-# Wi-Fi EasyMesh R6.1 - section 17.2.106, Table 129 - RSN Diagnostic Report TLV
+-# Sent by the Agent inside a Failed Connection message (§17.1.44) to report the RSN context
+-# of a client authentication/association failure. Carries an RSN Error code identifying the
+-# phase of the failure and the raw 802.11 frame body that triggered it.
++# Wi-Fi EasyMesh R6.1 §17.2.106, Table 129 - RSN Diagnostic Report TLV. Sent by the Agent
++# inside a Failed Connection message (§17.1.44) to report the RSN context of a client
++# authentication/association failure: RSN Error(1) + Reserved(3) + FrameBody Length(2) +
++# FrameBody(variable, 0..2304).
++
++# RSN Error phase enumeration per Table 129: indicates the frame in which the RSN
++# procedure failed.
++eRsnErrorPhase:
++  _type: enum
++  _enum_storage: uint8_t
++  RESERVED_0: 0x00                 # 0: Reserved
++  AUTHENTICATION_FRAME: 0x01       # 1: Authentication frame
++  ASSOCIATION_FRAME: 0x02          # 2: Association frame
++  EAPOL_MESSAGE_2: 0x03            # 3: EAPOL Message 2
++  EAPOL_MESSAGE_4: 0x04            # 4: EAPOL Message 4
++  FILS: 0x05                       # 5: FILS
++  PASN: 0x06                       # 6: PASN
++  STA_INITIATED_DEAUTH: 0x07       # 7: STA Initiated De-Auth
++  # 8~255: Reserved
+ 
+ tlvRsnDiagnosticReport:
+   _type: class
+@@ -16,14 +30,16 @@ tlvRsnDiagnosticReport:
+   length: uint16_t
+   rsn_error:
+     _type: uint8_t
+-    _comment: |
+-      RSN Error code describing the phase/cause of the failure. Per R6.1 §17.2.106:
+-        0x01 = failure occurred during (Re)Association / authentication.
+-      Other values are reserved for future use.
++    _comment: RSN Error phase per Table 129 (see eRsnErrorPhase).
++  reserved:
++    _type: uint8_t
++    _length: [3]
++    _comment: 3 reserved octets (Table 129). Must be 0 on transmit, ignored on receive.
++  frame_body_length:
++    _type: uint16_t
++    _length_var: True
++    _comment: Length in octets of the ensuing FrameBody field. 0 when none included.
+   frame_body:
+     _type: uint8_t
+-    _length: []
+-    _comment: |
+-      Raw bytes of the 802.11 frame body that triggered the failure. Length is derived
+-      from the enclosing TLV length (consumes the remainder of the TLV). May be zero
+-      bytes when the Agent cannot capture the frame body.
++    _length: [frame_body_length]
++    _comment: Raw 802.11 frame body bytes (0..2304), length given by frame_body_length.
+\ No newline at end of file
+-- 
+2.34.1
+
