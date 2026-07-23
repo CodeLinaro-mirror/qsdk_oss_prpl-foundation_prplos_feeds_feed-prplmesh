@@ -1,0 +1,139 @@
+From 7e243e8adfde258fa52d6afbd97caf6d3e067ded Mon Sep 17 00:00:00 2001
+From: amalganesh <amalgane@qti.qualcomm.com>
+Date: Mon, 22 Jun 2026 20:36:01 +0530
+Subject: [PATCH] Fix to incorrect agent client ip
+
+Signed-off-by: amalganesh <amalgane@qti.qualcomm.com>
+
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 4e80419..0b88735 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -2638,10 +2638,18 @@ bool Controller::handle_intel_slave_join(
+         database.set_sta_backhaul_iface_type(tlvf::mac_from_string(backhaul_mac),
+                                              backhaul_iface_type);
+ 
+-        database.set_sta_ipv4(backhaul_mac, bridge_ipv4);
+-        database.set_agent_ipv4(bridge_mac_str, bridge_ipv4);
++	// Only update IP if bridge_ipv4 is valid (non-empty, non-zero)
++        if (!bridge_ipv4.empty() && bridge_ipv4 != "0.0.0.0") {
++            database.set_sta_ipv4(backhaul_mac, bridge_ipv4);
++            database.set_agent_ipv4(bridge_mac_str, bridge_ipv4);
++        } else {
++            LOG(WARNING) << "Skipping set_sta_ipv4 for backhaul_mac="
++                         << backhaul_mac
++                         << " because bridge_ipv4 is empty/zero - preserving existing IP="
++                         << database.get_sta_ipv4(backhaul_mac);
++        }
+ 
+-        std::shared_ptr<Station> bh_sta = database.get_station(tlvf::mac_from_string(backhaul_mac));
++	std::shared_ptr<Station> bh_sta = database.get_station(tlvf::mac_from_string(backhaul_mac));
+         if (bh_sta) {
+             bh_sta->set_bSta(true);
+         }
+diff --git a/controller/src/beerocks/master/son_actions.cpp b/controller/src/beerocks/master/son_actions.cpp
+index 0f908eb..bc64560 100644
+--- a/controller/src/beerocks/master/son_actions.cpp
++++ b/controller/src/beerocks/master/son_actions.cpp
+@@ -328,8 +328,16 @@ void son_actions::handle_dead_station(std::string mac, bool reported_by_parent,
+     if (reported_by_parent) {
+         database.set_sta_state(mac, beerocks::STATE_DISCONNECTED);
+ 
+-        // Clear node ipv4
+-        database.set_sta_ipv4(mac, std::string());
++
++	// Clear node ipv4 only for regular clients.
++       // For bSTA nodes, preserve the IP since it is the IRE's bridge IP and does not change on disconnect/re-association.
++        if (!station->is_bSta()) {
++          database.set_sta_ipv4(mac, std::string());
++        } else {
++                LOG(DEBUG) << "Skipping IP clear for bSTA mac=" << mac
++                           << " - preserving IP=" << database.get_sta_ipv4(mac)
++                           << " for re-association";
++        }
+ 
+         // Notify steering task, if any, of disconnect.
+         int steering_task = station->steering_task_id;
+diff --git a/framework/platform/bpl/dhcp/luci_rpc/bpl_dhcp.cpp b/framework/platform/bpl/dhcp/luci_rpc/bpl_dhcp.cpp
+index 156bdf6..819fba2 100644
+--- a/framework/platform/bpl/dhcp/luci_rpc/bpl_dhcp.cpp
++++ b/framework/platform/bpl/dhcp/luci_rpc/bpl_dhcp.cpp
+@@ -13,6 +13,9 @@
+ #include <fcntl.h>
+ #include <netinet/in.h>
+ 
++#include <fstream>
++#include <sstream>
++
+ extern "C" {
+ // Ignore some warnings from libubus
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+@@ -395,15 +398,60 @@ bool dhcp_get_leases(leases_pair_t &leases_map)
+         return false;
+     }
+ 
+-    if (ubus_lookup_id(s_pUbusCtx, "luci-rpc", &id)) {
+-        LOG(ERROR) << "Failed to look up luci-rpc";
++    // Try luci-rpc via ubus first (preferred method).
++    if (ubus_lookup_id(s_pUbusCtx, "luci-rpc", &id) == 0) {
++        ret_val = ubus_invoke(s_pUbusCtx, id, "getDHCPLeases", nullptr, lease_data_handler,
++                              static_cast<void *>(&leases_map), UBUS_CALL_TIMEOUT_MS);
++        if (ret_val == 0) {
++            return true;
++        }
++        LOG(WARNING) << "luci-rpc getDHCPLeases failed (ret=" << ret_val
++                     << "), falling back to /tmp/dhcp.leases";
++    } else {
++        LOG(WARNING) << "luci-rpc not available on ubus, falling back to /tmp/dhcp.leases";
++    }
++
++    // Fallback: read /tmp/dhcp.leases directly (dnsmasq lease file format).
++    // Line format: <expiry_timestamp> <mac_address> <ip_address> <hostname> <client_id>
++
++    std::ifstream leases_file("/tmp/dhcp.leases");
++    if (!leases_file.is_open()) {
++        LOG(ERROR) << "Failed to open /tmp/dhcp.leases";
+         return false;
+     }
+ 
+-    ret_val = ubus_invoke(s_pUbusCtx, id, "getDHCPLeases", nullptr, lease_data_handler,
+-                          static_cast<void *>(&leases_map), UBUS_CALL_TIMEOUT_MS);
++    leases_map.first.clear();
++    leases_map.second.clear();
++
++    std::string line;
++    while (std::getline(leases_file, line)) {
++        if (line.empty()) {
++            continue;
++        }
++        std::istringstream iss(line);
++        std::string expiry, mac_str, ip_str, hostname_str;
++        if (!(iss >> expiry >> mac_str >> ip_str)) {
++            continue; // skip malformed lines (need at least 3 fields)
++        }
++        if (mac_str.empty() || ip_str.empty() || ip_str == "0.0.0.0") {
++            continue;
++        }
++        // Read optional hostname (dnsmasq uses "*" when hostname is unknown)
++        if (iss >> hostname_str && hostname_str == "*") {
++            hostname_str.clear();
++        }
++
++        sMacAddr mac    = tlvf::mac_from_string(mac_str);
++        sIPv4Lease lease;
++        lease.ip_address = ip_str;
++        lease.host_name  = hostname_str;
++        // validity left as default (zero) — not available in dnsmasq file format
++
++        leases_map.first[mac] = lease;
++        LOG(DEBUG) << "DHCP lease from /tmp/dhcp.leases: mac=" << mac_str << " ip=" << ip_str;
++    }
+ 
+-    return (ret_val == 0);
++    return !leases_map.first.empty();
+ }
+ 
+ } // namespace bpl
+-- 
+2.34.1
+
