@@ -1,0 +1,1413 @@
+From 70146ab82f1c34fa7ca58145e6a0f7cf89cdc391 Mon Sep 17 00:00:00 2001
+From: Nirmal Raj S <nirm@qti.qualcomm.com>
+Date: Tue, 21 Jul 2026 10:40:48 +0530
+Subject: [PATCH] NLHAL wifi compatability
+
+Signed-off-by: Nirmal Raj S <nirm@qti.qualcomm.com>
+---
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  29 +-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 907 +++++++++++++++++-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.h         |  36 +
+ .../platform/bpl/cfg/dm/bpl_cfg_wifi.cpp      |   9 +
+ .../platform/bpl/cfg/linux/bpl_cfg_wifi.cpp   |   9 +
+ framework/platform/bpl/cfg/rdk/bpl_cfg.cpp    |  12 +
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     | 227 +++++
+ framework/platform/bpl/include/bpl/bpl_cfg.h  |  27 +
+ 8 files changed, 1230 insertions(+), 26 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index ef02c6402..b3ad7c1eb 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -2189,27 +2189,6 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_wsc_renew(
+ 
+     db->statuses.controller_discovery_completed = false;
+ 
+-    // Clear the MLD pair entrant file before starting the new autoconfiguration round.
+-    // This file is used only by the NL80211 HAL to coordinate MLD group assignments
+-    // across the radio processes; stale entries from the previous round must be removed
+-    // so that the new round starts with a clean slate.  The clear is done here — once
+-    // per AP_AUTOCONFIG_RENEW message, before the FSM is moved — rather than inside
+-    // update_vap_credentials, to avoid the race that arises when all three radio
+-    // processes call update_vap_credentials simultaneously.
+-#ifdef USE_PRPLMESH_NLHAL
+-    {
+-        const char *mld_entrant_file = "/tmp/beerocks/mld_pair_entrant.txt";
+-        FILE *f = fopen(mld_entrant_file, "w");
+-        if (f) {
+-            fclose(f);
+-            LOG(INFO) << "handle_ap_autoconfiguration_wsc_renew: cleared " << mld_entrant_file;
+-        } else {
+-            LOG(WARNING) << "handle_ap_autoconfiguration_wsc_renew: failed to clear "
+-                         << mld_entrant_file;
+-        }
+-    }
+-#endif // USE_PRPLMESH_NLHAL
+-
+     for (const auto radio : db->get_radios_list()) {
+         if (!radio) {
+             return;
+@@ -3416,8 +3395,12 @@ bool ApAutoConfigurationTask::handle_agent_ap_mld_configuration_tlv(
+     };
+ 
+     // Process all radios for missing mld links
+-    for (auto radio : db->get_radios_list()) {
+-        process_missing_mld_links(radio->front.iface_name);
++    // Only needed for AP MLD Configuration Request flow (radio_iface is empty).
++    // In the handle_ap_autoconfiguration_wsc flow, missing link handling is not required.
++    if (radio_iface.empty()) {
++        for (auto radio : db->get_radios_list()) {
++            process_missing_mld_links(radio->front.iface_name);
++        }
+     }
+ 
+     // Trigger re-autoconfiguration for radios newly added to MLD configuration.
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 2fe4f68c7..d5cbb4bcb 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -2919,6 +2919,58 @@ void set_wifi_credentials_from_vap(const std::string &vap_id,
+     LOG(INFO) << "Lock released for VAP[" << vap_id << "] radio[" << radio_id << "]";
+ }
+ 
++/**
++ * @brief Wrapper around bpl_cfg_set_wifi_compat_mode_uci that serialises concurrent
++ *        calls from multiple radio FH processes using the same POSIX file lock as
++ *        set_wifi_credentials_from_vap().
++ *
++ * Three radio FH processes can invoke this simultaneously (one per band) during a
++ * wifi-compat-mode transition.  Without the lock, concurrent UCI reads/writes on
++ * the shared /etc/config/wireless file can corrupt the MLD section state.
++ */
++static void set_wifi_compat_mode_from_vap(const son::wireless_utils::sBssInfoConf &bss_conf,
++                                          const std::string &old_bss_name,
++                                          const std::string &new_bss_name,
++                                          const std::string &radio_id)
++{
++    int lock_fd = open("/var/lock/prplmesh-wireless.lock", O_CREAT | O_RDWR, 0644);
++    if (lock_fd < 0) {
++        LOG(ERROR) << "set_wifi_compat_mode_from_vap: open lock failed: " << strerror(errno);
++        return;
++    }
++
++    // Block until exclusive write-lock is acquired
++    struct flock lk{};
++    lk.l_type   = F_WRLCK;
++    lk.l_whence = SEEK_SET;
++    lk.l_start  = 0;
++    lk.l_len    = 0; // lock the whole file
++
++    if (fcntl(lock_fd, F_SETLKW, &lk) < 0) {
++        LOG(ERROR) << "set_wifi_compat_mode_from_vap: fcntl(F_SETLKW) failed: "
++                   << strerror(errno);
++        close(lock_fd);
++        return;
++    }
++    LOG(INFO) << "set_wifi_compat_mode_from_vap: lock acquired"
++              << " (ssid='" << bss_conf.ssid << "' radio=" << radio_id << ")";
++
++    beerocks::bpl::bpl_cfg_set_wifi_compat_mode_uci(bss_conf, old_bss_name, new_bss_name,
++                                                     radio_id);
++
++    lk.l_type = F_UNLCK;
++    if (fcntl(lock_fd, F_SETLK, &lk) < 0) {
++        LOG(WARNING) << "set_wifi_compat_mode_from_vap: fcntl(F_UNLCK) failed: "
++                     << strerror(errno);
++    }
++    if (close(lock_fd) < 0) {
++        LOG(WARNING) << "set_wifi_compat_mode_from_vap: close lock_fd failed: "
++                     << strerror(errno);
++    }
++    LOG(INFO) << "set_wifi_compat_mode_from_vap: lock released"
++              << " (ssid='" << bss_conf.ssid << "' radio=" << radio_id << ")";
++}
++
+ bool ap_wlan_hal_nl80211::update_bss_hidden_ssid(const sMacAddr &bssid, bool ssid_advertisement)
+ {
+     const std::string bssid_str = tlvf::mac_to_string(bssid);
+@@ -3127,6 +3179,823 @@ bool ap_wlan_hal_nl80211::update_bss_rsn_override(const sMacAddr &bssid,
+     return true;
+ }
+ 
++bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
++    const son::wireless_utils::sBssInfoConf &bss_conf, bool &conversion_performed,
++    bool &prpl_config_update)
++{
++    conversion_performed = false;
++
++    // If wifi_compat_mode is UNSET, nothing to do.
++    if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_UNSET) {
++        LOG(DEBUG) << "handle_wifi_compat_mode: wifi_compat_mode is UNSET for bssid="
++                   << tlvf::mac_to_string(bss_conf.bssid) << ", no action needed";
++        return true;
++    }
++
++    const std::string bssid_str = tlvf::mac_to_string(bss_conf.bssid);
++
++    // Resolve the BSS interface name from available_vaps using the BSSID.
++    // This mirrors the same lookup used by update_bss_hidden_ssid() and
++    // update_bss_rsn_override() to obtain the AP-manager-visible interface name
++    // (e.g. wlan0.1_link0 on MLO platforms) rather than relying on the caller
++    // to pass it in.
++    const auto vap_iter =
++        std::find_if(m_radio_info.available_vaps.begin(), m_radio_info.available_vaps.end(),
++                     [&bssid_str](const std::pair<int, bwl::VAPElement> &elem) {
++                         return elem.second.mac == bssid_str;
++                     });
++
++    if (vap_iter == m_radio_info.available_vaps.end()) {
++        LOG(ERROR) << "handle_wifi_compat_mode: BSSID=" << bssid_str
++                   << " not found in available_vaps";
++        return false;
++    }
++
++    const std::string &bss_iface = vap_iter->second.bss;
++    if (bss_iface.empty()) {
++        LOG(ERROR) << "handle_wifi_compat_mode: empty bss iface for BSSID=" << bssid_str;
++        return false;
++    }
++
++    LOG(INFO) << "handle_wifi_compat_mode: bssid=" << bssid_str
++              << " bss_iface=" << bss_iface
++              << " wifi_compat_mode=" << bss_conf.wifi_compat_mode;
++
++    // Query the live hostapd STATUS once here.  The result is reused for two purposes:
++    //   1. Early exit: check ieee80211be to determine if the BSS is already in the
++    //      correct mode.  This is more reliable than reading disable_11be from the
++    //      config file because disable_11be is optional and may not be present for
++    //      11ax VAPs that never had it set explicitly.
++    //   2. MLO detection (11AX path below): read num_links to decide between
++    //      LINK_REMOVE and REMOVE without issuing a second STATUS command.
++    parsed_obj_map_t bss_status;
++    bool bss_status_valid = wpa_ctrl_send_msg("STATUS", bss_status, bss_iface);
++    if (!bss_status_valid) {
++        LOG(WARNING) << "handle_wifi_compat_mode: STATUS command failed for bss_iface="
++                     << bss_iface << " -> skipping early-exit check, proceeding with mode change";
++    }
++
++    // Early exit: use ieee80211be from STATUS to check the actual runtime state.
++    //   WIFI_COMPAT_MODE_11AX → want ieee80211be=0 (EHT disabled)
++    //   WIFI_COMPAT_MODE_11BE → want ieee80211be=1 (EHT enabled)
++    if (bss_status_valid) {
++        auto it = bss_status.find("ieee80211be");
++        if (it != bss_status.end() && !it->second.empty()) {
++            const std::string &current_ieee80211be = it->second;
++            const std::string expected_ieee80211be =
++                (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11AX)
++                    ? "0"
++                    : "1";
++            if (current_ieee80211be == expected_ieee80211be) {
++                LOG(DEBUG) << "handle_wifi_compat_mode: ieee80211be already="
++                           << current_ieee80211be
++                           << " bssid=" << bssid_str
++                           << " (no change needed, returning early)";
++                return true;
++            }
++            LOG(DEBUG) << "handle_wifi_compat_mode: ieee80211be=" << current_ieee80211be
++                       << " but expected=" << expected_ieee80211be
++                       << " bssid=" << bssid_str
++                       << " -> proceeding with mode change";
++            // A mode change is needed regardless of whether it succeeds or fails.
++            conversion_performed = true;
++        } else {
++            LOG(DEBUG) << "handle_wifi_compat_mode: ieee80211be not found in STATUS"
++                       << " for bss_iface=" << bss_iface
++                       << " -> proceeding with mode change";
++            // ieee80211be status unknown — assume a mode change is needed.
++            conversion_performed = true;
++        }
++    }
++
++    // Translate wifi_compat_mode to the hostapd disable_11be value.
++    //   WIFI_COMPAT_MODE_11AX → disable_11be=1  (802.11ax / Wi-Fi 6 only, EHT disabled)
++    //   WIFI_COMPAT_MODE_11BE → disable_11be=0  (802.11be / Wi-Fi 7 enabled)
++    std::string disable_11be_val;
++    std::string mld_ap_val;
++    if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11AX) {
++        disable_11be_val = "1";
++        mld_ap_val = "0";
++        LOG(INFO) << "handle_wifi_compat_mode: wifi_compat_mode=11AX"
++                  << " -> disable_11be=1 (EHT disabled) for bssid=" << bssid_str;
++    } else if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11BE) {
++        disable_11be_val = "0";
++        mld_ap_val = "1";
++        LOG(INFO) << "handle_wifi_compat_mode: wifi_compat_mode=11BE"
++                  << " -> disable_11be=0 (EHT enabled) for bssid=" << bssid_str;
++    } else {
++        LOG(WARNING) << "handle_wifi_compat_mode: unrecognised wifi_compat_mode="
++                     << int(bss_conf.wifi_compat_mode) << " for bssid=" << bssid_str
++                     << ", skipping";
++        return true;
++    }
++
++    // Load the hostapd config for this radio.
++    prplmesh::hostapd::Configuration conf = load_hostapd_config(m_radio_info.iface_name, "");
++    if (!conf) {
++        LOG(ERROR) << "handle_wifi_compat_mode: failed to load hostapd config for radio "
++                   << m_radio_info.iface_name;
++        return false;
++    }
++
++    // Locate the VAP section by BSSID.
++    std::string vap_id = conf.get_vap_by_bssid(bssid_str);
++    if (vap_id.empty()) {
++        // The BSS may not yet be present in this conf file (e.g. during initial
++        // bring-up).  Return true so the caller is not blocked; the value will be
++        // applied on the next full credential update.
++        LOG(WARNING) << "handle_wifi_compat_mode: BSSID=" << bssid_str
++                     << " not found in hostapd.conf for radio " << m_radio_info.iface_name
++                     << ", skipping conf update";
++        return true;
++    }
++
++    // Write the disable_11be per-VAP option.
++    conf.set_create_vap_value(vap_id, "disable_11be", disable_11be_val);
++    conf.set_create_vap_value(vap_id, "mld_ap", mld_ap_val);
++
++    // Lambda: generate a free BSS interface name using the wlan<radio_num>_<index>
++    // scheme.  Must be called AFTER LINK_REMOVE/REMOVE so that the old interface has
++    // been released by the kernel and if_nametoindex() gives accurate results.
++    auto generate_new_bss_name = [&](std::string &out_name) -> bool {
++        int vap_index = static_cast<int>(m_radio_info.available_vaps.size());
++        std::string radio_num;
++        for (char ch : m_radio_info.radio_id) {
++            if (isdigit(static_cast<unsigned char>(ch))) {
++                radio_num += ch;
++            }
++        }
++        if (radio_num.empty()) {
++            radio_num = "0";
++        }
++        const std::string prefix = "wlan" + radio_num;
++        constexpr int kMaxTries  = 4096;
++        int tries = 0;
++        do {
++            out_name = prefix + "_" + std::to_string(vap_index);
++            const std::string wpa_ctrl_socket = "/var/run/hostapd/" + out_name;
++            const bool iface_exists = (if_nametoindex(out_name.c_str()) != 0);
++            const bool ctrl_skt_exists =
++                beerocks::os_utils::wpa_ctrl_skt_exists(wpa_ctrl_socket);
++            if (!iface_exists && !ctrl_skt_exists) {
++                break; // name is free and no ctrl socket exists
++            }
++            if (iface_exists) {
++                LOG(WARNING) << "handle_wifi_compat_mode: Interface " << out_name
++                             << " already exists, trying index " << (vap_index + 1);
++            } else {
++                LOG(WARNING) << "handle_wifi_compat_mode: WPA ctrl socket "
++                             << wpa_ctrl_socket << " already exists for " << out_name
++                             << ", trying index " << (vap_index + 1);
++            }
++            ++vap_index;
++            if (++tries >= kMaxTries) {
++                LOG(ERROR) << "handle_wifi_compat_mode: failed to find a free VAP name"
++                           << " after " << kMaxTries << " attempts (prefix: "
++                           << prefix << ")";
++                return false;
++            }
++        } while (true);
++        LOG(INFO) << "handle_wifi_compat_mode: new BSS name selected: " << out_name;
++        return true;
++    };
++
++    // Lambda: if the BSS being removed is the primary interface (bss[0]), promote
++    // the next BSS to be the primary by changing its bss= key to interface= and
++    // updating m_radio_info.iface_name.  Shared by both the 11AX and 11BE paths
++    // to avoid duplicating this logic.
++    auto promote_primary_bss = [&]() {
++        if (m_radio_info.iface_name != bss_iface) {
++            return;
++        }
++        LOG(INFO) << "promote_primary_bss: Removing first vap bss[0] in radio"
++                  << " - promoting next BSS to interface=";
++        auto remaining_vaps = conf.get_hostapd_bss_config();
++        for (auto &vap_pair : remaining_vaps) {
++            const std::string &next_vap_id = vap_pair.first;
++            std::string bss_val            = conf.get_vap_value(next_vap_id, "bss");
++            if (!bss_val.empty()) {
++                conf.set_create_vap_value(next_vap_id, "interface", bss_val);
++                conf.set_create_vap_value(next_vap_id, "bss", "");
++                LOG(INFO) << "promote_primary_bss: Promoted BSS " << next_vap_id
++                          << " from bss= to interface=";
++                std::string updated_iface_name = next_vap_id;
++                int8_t link_id                 = -1;
++                std::string bssid_val          = conf.get_vap_value(next_vap_id, "bssid");
++                if (!m_nl80211_client->get_bss_link_id(updated_iface_name, bssid_val,
++                                                       link_id)) {
++                    LOG(ERROR) << "promote_primary_bss: get_bss_link_id failed";
++                }
++                LOG(INFO) << "promote_primary_bss: Updated radio iface name: "
++                          << updated_iface_name;
++                m_radio_info.iface_name = updated_iface_name;
++                set_iface_name(m_radio_info.iface_name);
++                const std::string package_name = "prplmesh";
++                const std::string section_type = "wifi-device";
++                const std::string option_name  = "hostap_iface";
++                beerocks::bpl::cfg_update_prplmesh_option(package_name, section_type,
++                                                          option_name,
++                                                          m_radio_info.radio_id,
++                                                          next_vap_id);
++                prpl_config_update = true;
++                break;
++            }
++        }
++    };
++
++    // For 11AX compat mode: determine whether the BSS is currently in MLO or SLO
++    // by querying hostapd STATUS and parsing the num_links field.
++    //
++    //   num_links > 1  → MLO: the BSS is part of a multi-link group.
++    //                    The bss=/interface= name in hostapd.conf must be changed
++    //                    to the "<base_iface>_11ax" name before RELOAD_CONFIG so
++    //                    hostapd transitions the BSS from MLO to SLO correctly.
++    //                    RELOAD_CONFIG is still sent to the original bss_iface
++    //                    (the MLO link interface where the control socket lives).
++    //
++    //   num_links <= 1 → SLO: no name change needed (existing logic).
++    //
++    // NOTE: bss_conf.mld_id is -1 when 11AX compat mode is set by the controller,
++    // so STATUS num_links is the reliable runtime indicator for MLO vs SLO.
++
++    if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11AX) {
++        // Reuse the STATUS result already fetched above for the early-exit check
++        // to avoid issuing a second STATUS command to hostapd.
++        int num_links = 0;
++
++        if (bss_status_valid) {
++            auto it = bss_status.find("num_links");
++            if (it != bss_status.end() && !it->second.empty()) {
++                const std::string &num_links_str = it->second;
++                bool valid = std::all_of(num_links_str.begin(), num_links_str.end(), ::isdigit);
++                if (valid) {
++                    num_links = beerocks::string_utils::stoi(num_links_str);
++                    LOG(INFO) << "handle_wifi_compat_mode: STATUS num_links=" << num_links
++                              << " for bss_iface=" << bss_iface;
++                } else {
++                    LOG(WARNING) << "handle_wifi_compat_mode: num_links value is not a valid"
++                                 << " number: '" << num_links_str << "'";
++                }
++            } else {
++                LOG(DEBUG) << "handle_wifi_compat_mode: num_links not found in STATUS"
++                           << " for bss_iface=" << bss_iface << " (assuming SLO)";
++            }
++        } else {
++            LOG(WARNING) << "handle_wifi_compat_mode: STATUS not available for bss_iface="
++                         << bss_iface << " (assuming SLO)";
++        }
++
++        // Serialize concurrent LINK_REMOVE / REMOVE calls from multiple radio processes.
++        // Hostapd can only process one LINK_REMOVE at a time, so each radio must wait its
++        // turn before issuing the command.  The same lock file is used by the teardown path
++        // in update_vap_credentials() so all LINK_REMOVE callers are mutually exclusive.
++        int lr_lock_fd = open("/var/lock/prplmesh-link-remove.lock", O_CREAT | O_RDWR, 0644);
++        if (lr_lock_fd >= 0) {
++            struct flock lr_lk{};
++            lr_lk.l_type   = F_WRLCK;
++            lr_lk.l_whence = SEEK_SET;
++            lr_lk.l_start  = 0;
++            lr_lk.l_len    = 0;
++            if (fcntl(lr_lock_fd, F_SETLKW, &lr_lk) < 0) {
++                LOG(WARNING) << "handle_wifi_compat_mode: LINK_REMOVE lock acquire failed: "
++                             << strerror(errno);
++                close(lr_lock_fd);
++                lr_lock_fd = -1;
++            } else {
++                LOG(INFO) << "handle_wifi_compat_mode: LINK_REMOVE lock acquired for "
++                          << bss_iface;
++            }
++        } else {
++            LOG(WARNING) << "handle_wifi_compat_mode: open lock failed: " << strerror(errno);
++        }
++
++        // Re-check STATUS after acquiring the lock to get the current num_links.
++        // Another radio process may have already performed a LINK_REMOVE while this
++        // radio was waiting for the lock, reducing num_links from >1 to 1.  In that
++        // case we must use REMOVE instead of LINK_REMOVE to avoid a hostapd error.
++        int current_num_links = num_links; // fallback to the value read before the lock
++        {
++            parsed_obj_map_t recheck_status;
++            if (wpa_ctrl_send_msg("STATUS", recheck_status, bss_iface)) {
++                auto it = recheck_status.find("num_links");
++                if (it != recheck_status.end() && !it->second.empty()) {
++                    bool valid = std::all_of(it->second.begin(), it->second.end(), ::isdigit);
++                    if (valid) {
++                        current_num_links = beerocks::string_utils::stoi(it->second);
++                        LOG(INFO) << "handle_wifi_compat_mode: re-checked num_links="
++                                  << current_num_links << " (was " << num_links << ")"
++                                  << " for bss_iface=" << bss_iface;
++                    } else {
++                        LOG(WARNING) << "handle_wifi_compat_mode: num_links re-check value"
++                                     << " is not a valid number: '" << it->second << "'"
++                                     << ", using cached value=" << current_num_links;
++                    }
++                } else {
++                    LOG(DEBUG) << "handle_wifi_compat_mode: num_links not found in re-check"
++                               << " STATUS for bss_iface=" << bss_iface
++                               << ", using cached value=" << current_num_links;
++                }
++            } else {
++                LOG(WARNING) << "handle_wifi_compat_mode: STATUS re-check failed for "
++                             << bss_iface << ", using cached num_links=" << current_num_links;
++            }
++        }
++
++        if (current_num_links > 1) {
++            // MLO BSS: trigger LINK_REMOVE first, then ADD BSS with disable_11be=1, mld_ap=0.
++            // This follows the handle_mld_reconfig pattern for MLO→SLO transition.
++            // The new SLO interface name is derived using the same wlan<radio_num>_<index>
++            // logic as update_vap_credentials and handle_mld_reconfig (DISABLED_MLDUNIT path).
++            //
++            // IMPORTANT: LINK_REMOVE is performed BEFORE generating the new BSS name so that
++            // the old MLO link interface is torn down first.  After LINK_REMOVE the kernel
++            // releases the interface name, which means if_nametoindex() correctly reports the
++            // name as free and the new BSS name search finds the right slot.
++
++            LOG(INFO) << "handle_wifi_compat_mode: MLO BSS (num_links=" << current_num_links << ")"
++                      << " bss_iface=" << bss_iface
++                      << " -> performing LINK_REMOVE first, then generating new BSS name"
++                      << " (11AX/SLO transition, disable_11be=1, mld_ap=0)";
++
++            // Step 1: Trigger LINK_REMOVE command.
++            std::stringstream remove_cmd;
++            remove_cmd << "LINK_REMOVE " << HOST_MIN_ML_RECONF_COUNT;
++            LOG(DEBUG) << "handle_wifi_compat_mode: sending " << remove_cmd.str()
++                       << " to " << bss_iface;
++            if (!wpa_ctrl_send_msg(remove_cmd.str(), bss_iface)) {
++                LOG(ERROR) << "handle_wifi_compat_mode: LINK_REMOVE failed for " << bss_iface;
++                if (lr_lock_fd >= 0) {
++                    struct flock lr_ulk{};
++                    lr_ulk.l_type   = F_UNLCK;
++                    lr_ulk.l_whence = SEEK_SET;
++                    lr_ulk.l_start  = 0;
++                    lr_ulk.l_len    = 0;
++                    fcntl(lr_lock_fd, F_SETLK, &lr_ulk);
++                    close(lr_lock_fd);
++                }
++                return false;
++            }
++        } else {
++            // num_links == 1: only one link remains (or this is already SLO).
++            // Use REMOVE instead of LINK_REMOVE — hostapd rejects LINK_REMOVE when
++            // there is only one link left in the MLD.
++            std::stringstream remove_cmd;
++            std::string base_iface;
++            extractLinkBaseInterface(bss_iface, base_iface);
++
++            LOG(INFO) << "handle_wifi_compat_mode: SLO BSS (num_links=" << current_num_links << ")"
++                      << " bss_iface=" << bss_iface
++                      << " -> performing REMOVE (single link, cannot use LINK_REMOVE)";
++
++            remove_cmd << "REMOVE " << base_iface;
++
++            if (!wpa_ctrl_send_msg(remove_cmd.str(), global_iface)) {
++                LOG(ERROR) << "handle_wifi_compat_mode: REMOVE failed for iface: " << base_iface;
++                if (lr_lock_fd >= 0) {
++                    struct flock lr_ulk{};
++                    lr_ulk.l_type   = F_UNLCK;
++                    lr_ulk.l_whence = SEEK_SET;
++                    lr_ulk.l_start  = 0;
++                    lr_ulk.l_len    = 0;
++                    fcntl(lr_lock_fd, F_SETLK, &lr_ulk);
++                    close(lr_lock_fd);
++                }
++                return false;
++            }
++            // If the kernel interface still exists after the REMOVE command
++            // (e.g. hostapd did not tear it down), force-remove it via nl80211.
++            if (if_nametoindex(base_iface.c_str()) != 0) {
++                LOG(WARNING) << "handle_wifi_compat_mode: iface " << base_iface
++                             << " still exists after REMOVE, calling remove_vap_interface";
++                if (!m_nl80211_client->remove_vap_interface(base_iface)) {
++                    LOG(ERROR) << "handle_wifi_compat_mode: remove_vap_interface failed for "
++                               << base_iface;
++                }
++            }
++            // Interface fully removed via REMOVE: remove its entry from mld_pair_entrant.txt.
++            if (remove_mld_entry_by_ifname(base_iface) == 0) {
++                LOG(INFO) << "handle_wifi_compat_mode: removed mld_pair_entrant entry for "
++                          << base_iface;
++            } else {
++                LOG(DEBUG) << "handle_wifi_compat_mode: no mld_pair_entrant entry found for "
++                           << base_iface;
++            }
++        }
++
++        // Release the lock after the LINK_REMOVE or REMOVE operation completes.
++        if (lr_lock_fd >= 0) {
++            struct flock lr_ulk{};
++            lr_ulk.l_type   = F_UNLCK;
++            lr_ulk.l_whence = SEEK_SET;
++            lr_ulk.l_start  = 0;
++            lr_ulk.l_len    = 0;
++            if (fcntl(lr_lock_fd, F_SETLK, &lr_ulk) < 0) {
++                LOG(WARNING) << "handle_wifi_compat_mode: LINK_REMOVE lock release failed: "
++                             << strerror(errno);
++            } else {
++                LOG(INFO) << "handle_wifi_compat_mode: LINK_REMOVE lock released for "
++                          << bss_iface;
++            }
++            close(lr_lock_fd);
++        }
++
++         // Remove the control-socket fd for the old MLO link interface.
++         base_wlan_hal_nl80211::remove_interface(bss_iface);
++
++         // Step 2: Generate new BSS name AFTER LINK_REMOVE/REMOVE so that the old interface
++         // has been released by the kernel and if_nametoindex() gives accurate results.
++         std::string new_bss_name;
++         if (!generate_new_bss_name(new_bss_name)) {
++             return false;
++         }
++
++         // UCI persistence: update the wifi-iface section with new BSS name and compat mode.
++         // Called after generate_new_bss_name so the new interface name is available.
++         // Uses set_wifi_compat_mode_from_vap() to serialise concurrent calls from
++         // multiple radio FH processes via the shared prplmesh-wireless.lock file.
++         set_wifi_compat_mode_from_vap(bss_conf, vap_id, new_bss_name,
++                                       m_radio_info.radio_id);
++
++         // Apply the same BSSID pool logic as handle_mld_reconfig (DISABLED_MLDUNIT path):
++         // When the link MAC and the AP MLD MAC are the same, the BSSID is shared and
++         // must NOT be freed — it will be reused for the new SLO BSS.  When they differ,
++         // the link-specific MAC is no longer needed and should be returned to the pool.
++         const std::string &link_mac   = vap_iter->second.mac;
++         const std::string &ap_mld_mac = vap_iter->second.ap_mld_mac;
++         if ((ap_mld_mac == link_mac) && (num_links > 1)) {
++             LOG(INFO) << "handle_wifi_compat_mode: LINK MAC and AP_MLD_MAC are the same ("
++                       << link_mac << "), not marking BSSID as free in pool";
++         } else {
++             LOG(INFO) << "handle_wifi_compat_mode: LINK MAC (" << link_mac
++                       << ") differs from AP_MLD_MAC (" << ap_mld_mac
++                       << "), marking BSSID as free in pool";
++             m_radio_info.bssid_pool[link_mac] = false;
++         }
++
++         // Generate a new BSSID for the new SLO BSS (mirrors handle_mld_reconfig).
++         sMacAddr new_bssid;
++         if (!ap_wlan_hal_nl80211::generate_new_bssid(new_bssid)) {
++             LOG(ERROR) << "handle_wifi_compat_mode: failed to generate new BSSID for "
++                        << new_bss_name;
++             return false;
++         }
++         LOG(INFO) << "handle_wifi_compat_mode: new BSSID for SLO BSS " << new_bss_name
++                   << ": " << new_bssid;
++
++         // Step 2: Build new config file with disable_11be=1, mld_ap=0, new BSS name,
++         // and new BSSID.  The conf object already has disable_11be=1 and mld_ap=0
++         // applied via set_create_vap_value() above; get_hostapd_bss_config() returns
++         // the in-memory (modified) representation.
++         std::vector<std::pair<std::string, std::vector<std::string>>> bss_config =
++             conf.get_hostapd_bss_config(vap_id);
++
++         if (bss_config.empty()) {
++             LOG(ERROR) << "handle_wifi_compat_mode: failed to get BSS config for VAP="
++                        << vap_id;
++             return false;
++         }
++
++         // Remove the old BSS from the default config file (mirrors handle_mld_reconfig
++         // DISABLED_MLDUNIT path).  This must be done before creating the new conf file
++         // so that the default conf no longer references the removed MLO link interface.
++         conf.remove_bss_config(vap_id);
++
++         // If the removed BSS was the primary interface (bss[0]), promote the next one.
++         promote_primary_bss();
++
++         if (!conf.store(vap_id)) {
++             LOG(ERROR) << "handle_wifi_compat_mode: failed to update default config"
++                        << " after removing old BSS " << vap_id;
++             return false;
++         }
++         LOG(DEBUG) << "handle_wifi_compat_mode done:\n" << conf;
++         LOG(DEBUG) << "handle_wifi_compat_mode: removed old BSS " << vap_id
++                    << " from default config";
++
++         auto &new_vap                        = bss_config.front();
++         std::vector<std::string> &config_lines = new_vap.second;
++
++         // Update BSS name, BSSID, disable_11be and mld_ap in the config lines.
++         bool found_bss_key      = false;
++         bool found_bssid        = false;
++         bool found_disable_11be = false;
++         bool found_mld_ap       = false;
++         for (auto &line : config_lines) {
++             if (!found_bss_key &&
++                 (line.rfind("bss=", 0) == 0 || line.rfind("interface=", 0) == 0)) {
++                 line          = "interface=" + new_bss_name;
++                 found_bss_key = true;
++             } else if (!found_bssid && line.rfind("bssid=", 0) == 0) {
++                 line       = "bssid=" + tlvf::mac_to_string(new_bssid);
++                 found_bssid = true;
++             } else if (line.rfind("disable_11be=", 0) == 0) {
++                 line               = "disable_11be=1";
++                 found_disable_11be = true;
++             } else if (line.rfind("mld_ap=", 0) == 0) {
++                 line         = "mld_ap=0";
++                 found_mld_ap = true;
++             }
++         }
++         // Ensure the keys are present even if they were not in the original conf.
++         if (!found_disable_11be) {
++             config_lines.push_back("disable_11be=1");
++         }
++         if (!found_mld_ap) {
++             config_lines.push_back("mld_ap=0");
++         }
++
++         // Create a dedicated conf file for the new SLO BSS.
++         std::string new_conf_path =
++             std::string(bwl::nl80211::base_ctrl_path) + "hostapd-" +
++             m_radio_info.phy_name + "." + new_bss_name + ".conf";
++
++         prplmesh::hostapd::Configuration new_conf(new_conf_path);
++         new_conf.set_hostapd_radio_config(m_radio_info.hostapd_radio_config);
++         new_conf.add_new_vap_to_default_config(new_vap);
++
++         if (!new_conf.store(new_bss_name)) {
++             LOG(ERROR) << "handle_wifi_compat_mode: failed to save new hostapd config for "
++                        << new_bss_name;
++             return false;
++         }
++
++         // Step 3: Trigger ADD BSS config command (same as add_bss()).
++         std::stringstream add_cmd;
++         add_cmd << "ADD bss_config=" << m_radio_info.phy_name << ":" << new_conf_path;
++         LOG(DEBUG) << "handle_wifi_compat_mode: sending ADD BSS: " << add_cmd.str();
++         if (!wpa_ctrl_send_msg(add_cmd.str(), global_iface)) {
++             LOG(ERROR) << "handle_wifi_compat_mode: ADD BSS failed for " << new_bss_name;
++             return false;
++         }
++
++         // Register the new SLO interface control socket.
++         int fd = base_wlan_hal_nl80211::add_interface(new_bss_name);
++         if (fd < 0) {
++             LOG(WARNING) << "handle_wifi_compat_mode: failed to register new BSS interface "
++                          << new_bss_name;
++         }
++
++         // Update the default hostapd conf file to include the new BSS so that
++         // subsequent load_hostapd_config() calls find it (mirrors the pattern in
++         // update_vap_credentials after add_bss()).
++         m_radio_info.hostapd_new_bss_config = new_conf.get_hostapd_bss_config();
++         prplmesh::hostapd::Configuration updated_base_conf =
++             load_hostapd_config(m_radio_info.iface_name, "");
++         if (!m_radio_info.hostapd_new_bss_config.empty() && updated_base_conf) {
++             auto &upd_vap                          = m_radio_info.hostapd_new_bss_config.front();
++             std::vector<std::string> &upd_lines    = upd_vap.second;
++             for (auto &line : upd_lines) {
++                 if (line.rfind("interface=", 0) == 0) {
++                     // Use new_bss_name (e.g. "wlan0_4") instead of upd_vap.first
++                     // (which still holds the old VAP name e.g. "wlan7") so that
++                     // the default hostapd conf is updated with the correct new
++                     // interface name after the MLO->SLO transition.
++                     line = "bss=" + new_bss_name;
++                     break;
++                 }
++             }
++             updated_base_conf.add_new_vap_to_default_config(upd_vap);
++             m_radio_info.hostapd_new_bss_config.clear();
++             if (!updated_base_conf.append_new_bss_to_default_hostapd_conf()) {
++                 LOG(WARNING) << "handle_wifi_compat_mode: failed to update default "
++                              << "hostapd conf after ADD BSS for " << new_bss_name;
++             }
++             LOG(DEBUG) << "handle_wifi_compat_mode default conf updated:\n" << updated_base_conf;
++         }
++
++         LOG(INFO) << "handle_wifi_compat_mode: LINK_REMOVE + ADD BSS completed for "
++                   << bss_iface << " -> " << new_bss_name
++                   << " (disable_11be=1, mld_ap=0)";
++         // Return here — the RELOAD_CONFIG path below must not be taken for the
++         // MLO→SLO transition; the ADD BSS command already brought up the new BSS.
++         return true;
++    } else if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11BE) {
++        // For 11BE compat mode: check if there is an MLO interface registered for the
++        // corresponding mld_id in MLD_PAIR_ENTRANT_FILE.  If one exists, rename the BSS
++        // in hostapd.conf to that MLO interface name before triggering RELOAD_CONFIG so
++        // hostapd correctly transitions the BSS from SLO back to MLO.
++        // This is the reverse of the 11AX path (which renames the BSS to
++        // "<base_iface>_11ax" when going MLO→SLO).
++        if (!bss_conf.mld_id.empty() &&
++            bss_conf.mld_id != std::to_string(beerocks::DISABLED_MLDUNIT)) {
++            int mld_id_val = beerocks::string_utils::stoi(bss_conf.mld_id);
++
++            // Look up the MLO interface for this mld_id from MLD_PAIR_ENTRANT_FILE.
++            std::string mlo_iface;
++            std::string mld_grp_ssid;
++            fetch_mld_id_pair(mld_id_val, mlo_iface, mld_grp_ssid);
++
++            LOG(INFO) << "handle_wifi_compat_mode: 11BE - mld_id=" << mld_id_val
++                      << " mlo_iface='" << mlo_iface << "' (from MLD_PAIR_ENTRANT_FILE)"
++                      << " current bss_iface=" << bss_iface;
++
++            if (!mlo_iface.empty() && mlo_iface != bss_iface) {
++                // MLO interface found and it differs from the current BSS name:
++                // Call add_mld_link to transition the BSS from SLO back to MLO.
++                LOG(INFO) << "handle_wifi_compat_mode: 11BE mode - MLO interface found: "
++                          << mlo_iface << " for mld_id=" << mld_id_val
++                          << " -> calling add_mld_link (SLO->MLO transition)"
++                          << " current bss_iface=" << bss_iface;
++
++                // Get bridge value from the hostapd config section of the current BSS.
++                std::string bridge_val = conf.get_vap_value(vap_id, "bridge");
++                LOG(INFO) << "handle_wifi_compat_mode: 11BE - bridge=" << bridge_val
++                          << " for VAP=" << vap_id;
++
++                // Remove the old SLO BSS from the default hostapd config and persist
++                // the change before calling add_mld_link, mirroring the add_bss path.
++                conf.remove_bss_config(vap_id);
++
++                // If the removed BSS was the primary interface (bss[0]), promote the next one.
++                promote_primary_bss();
++
++                if (!conf.store(vap_id)) {
++                    LOG(ERROR) << "handle_wifi_compat_mode: failed to update default config"
++                               << " after removing old BSS " << vap_id
++                               << " before MLD_ADD_LINK";
++                    return false;
++                }
++                LOG(DEBUG) << "handle_wifi_compat_mode: removed old BSS " << vap_id
++                           << " from default config before MLD_ADD_LINK";
++
++                // add_mld_link takes non-const references; make local copies.
++                std::string mlo_iface_copy = mlo_iface;
++                std::string bss_iface_copy = bss_iface;
++                son::wireless_utils::sBssInfoConf bss_conf_copy = bss_conf;
++
++                // UCI persistence: update the wifi-iface section with new BSS name and compat mode.
++                // Called after generate_new_bss_name so the new interface name is available.
++                // Uses set_wifi_compat_mode_from_vap() to serialise concurrent calls from
++                // multiple radio FH processes via the shared prplmesh-wireless.lock file.
++                set_wifi_compat_mode_from_vap(bss_conf, vap_id, mlo_iface,
++                                              m_radio_info.radio_id);
++
++                if (!add_mld_link(mlo_iface_copy, bss_iface_copy, bss_conf_copy, bridge_val)) {
++                    LOG(ERROR) << "handle_wifi_compat_mode: add_mld_link failed for "
++                               << mlo_iface << " (prev=" << bss_iface << ")";
++                    return false;
++                }
++
++                LOG(INFO) << "handle_wifi_compat_mode: add_mld_link succeeded for "
++                          << mlo_iface << " (SLO->MLO transition complete)";
++
++                // The old SLO BSS was removed via REMOVE inside add_mld_link:
++                // remove its entry from mld_pair_entrant.txt.
++                if (remove_mld_entry_by_ifname(vap_id) == 0) {
++                    LOG(INFO) << "handle_wifi_compat_mode: removed mld_pair_entrant entry for "
++                              << vap_id;
++                } else {
++                    LOG(DEBUG) << "handle_wifi_compat_mode: no mld_pair_entrant entry found for "
++                               << vap_id;
++                }
++
++                // Add new bss configuration to default hostapd_config file.
++                // add_mld_link() preserves hostapd_new_bss_config (set by
++                // create_new_hostapd_conf_file) when number_of_vaps != 1, so the
++                // new BSS config is available here for the default conf update.
++                prplmesh::hostapd::Configuration updated_base_conf =
++                    load_hostapd_config(m_radio_info.iface_name, "");
++                if (!m_radio_info.hostapd_new_bss_config.empty()) {
++                    auto &new_vap = m_radio_info.hostapd_new_bss_config.front();
++                    std::vector<std::string> &config_lines = new_vap.second;
++                    for (auto &line : config_lines) {
++                        if (line.rfind("interface=", 0) == 0) {
++                            line = "bss=" + new_vap.first;
++                            break;
++                        }
++                    }
++                    if (updated_base_conf) {
++                        updated_base_conf.add_new_vap_to_default_config(new_vap);
++                        m_radio_info.hostapd_new_bss_config.clear();
++                        if (!updated_base_conf.append_new_bss_to_default_hostapd_conf()) {
++                            LOG(WARNING) << "handle_wifi_compat_mode: failed to update default"
++                                         << " hostapd conf after MLD_ADD_LINK for " << mlo_iface;
++                        }
++                        LOG(DEBUG) << "handle_wifi_compat_mode: default conf updated after"
++                                   << " MLD_ADD_LINK:\n" << updated_base_conf;
++                    } else {
++                        LOG(ERROR) << "handle_wifi_compat_mode: default config file is not"
++                                   << " updated after MLD_ADD_LINK for " << mlo_iface;
++                    }
++                }
++                return true;
++            } else if (mlo_iface.empty()) {
++                LOG(DEBUG) << "handle_wifi_compat_mode: 11BE mode - no MLO interface found"
++                           << " for mld_id=" << mld_id_val << " in MLD_PAIR_ENTRANT_FILE,"
++                           << " skipping BSS name change";
++            } else {
++                // mlo_iface == bss_iface: BSS is already using the MLO interface name.
++                LOG(DEBUG) << "handle_wifi_compat_mode: 11BE mode - MLO interface " << mlo_iface
++                           << " matches current bss_iface=" << bss_iface
++                           << ", no BSS name change needed";
++            }
++        } else {
++            LOG(DEBUG) << "handle_wifi_compat_mode: 11BE mode - no valid mld_id in bss_conf"
++                       << " (mld_id='" << bss_conf.mld_id << "'), Add new bss";
++            std::string base_iface;
++            std::stringstream remove_cmd;
++            extractLinkBaseInterface(bss_iface, base_iface);
++
++            remove_cmd << "REMOVE " << base_iface;
++
++            if (!wpa_ctrl_send_msg(remove_cmd.str(), global_iface)) {
++                LOG(ERROR) << "Failed to remove iface: " << base_iface;
++                return false;
++            }
++            // If the kernel interface still exists after the REMOVE command
++            // (e.g. hostapd did not tear it down), force-remove it via nl80211.
++            if (if_nametoindex(base_iface.c_str()) != 0) {
++                LOG(WARNING) << "handle_wifi_compat_mode: iface " << base_iface
++                             << " still exists after REMOVE, calling remove_vap_interface";
++                if (!m_nl80211_client->remove_vap_interface(base_iface)) {
++                    LOG(ERROR) << "handle_wifi_compat_mode: remove_vap_interface failed for "
++                               << base_iface;
++                }
++            }
++            // Interface fully removed via REMOVE: remove its entry from mld_pair_entrant.txt.
++            if (remove_mld_entry_by_ifname(base_iface) == 0) {
++                LOG(INFO) << "handle_wifi_compat_mode: removed mld_pair_entrant entry for "
++                          << base_iface;
++            } else {
++                LOG(DEBUG) << "handle_wifi_compat_mode: no mld_pair_entrant entry found for "
++                           << base_iface;
++            }
++            m_radio_info.hostapd_new_bss_config.clear();
++            // Get bridge value from the hostapd config section of the current BSS.
++            std::string bridge_val = conf.get_vap_value(vap_id, "bridge");
++
++            conf.remove_bss_config(vap_id);
++
++            // If the removed BSS was the primary interface (bss[0]), promote the next one.
++            promote_primary_bss();
++
++            if (!conf.store(vap_id)) {
++                LOG(ERROR) << "handle_wifi_compat_mode: failed to update default config"
++                           << " after removing old BSS " << vap_id;
++                return false;
++            }
++
++            std::string new_bss_name;
++            if (!generate_new_bss_name(new_bss_name)) {
++              return false;
++            }
++
++            // UCI persistence: update the wifi-iface section with new BSS name and compat mode.
++            // Called after generate_new_bss_name so the new interface name is available.
++            // Uses set_wifi_compat_mode_from_vap() to serialise concurrent calls from
++            // multiple radio FH processes via the shared prplmesh-wireless.lock file.
++            set_wifi_compat_mode_from_vap(bss_conf, vap_id, new_bss_name,
++                                          m_radio_info.radio_id);
++
++            son::wireless_utils::sBssInfoConf bss_conf_copy = bss_conf;
++            if (!add_bss(new_bss_name, bss_conf_copy, bridge_val, false)) {
++                LOG(ERROR) << "Failed to add iface: " << new_bss_name;
++            }
++
++            // If a valid mld_id is set, register the new BSS interface in
++            // mld_pair_entrant.txt so subsequent compat-mode transitions can
++            // look it up by mld_id.
++            if (!bss_conf.mld_id.empty() &&
++                bss_conf.mld_id != std::to_string(beerocks::DISABLED_MLDUNIT)) {
++                int mld_id_val = beerocks::string_utils::stoi(bss_conf.mld_id);
++                get_ifname_wrt_mld_grp(mld_id_val, new_bss_name, bss_conf.ssid);
++                LOG(INFO) << "handle_wifi_compat_mode: registered new BSS " << new_bss_name
++                          << " in mld_pair_entrant.txt for mld_id=" << mld_id_val;
++            }
++
++            prplmesh::hostapd::Configuration updated_base_conf = load_hostapd_config(m_radio_info.iface_name,"");
++            // Add new bss configuration to default hostapd_config file
++            if (!m_radio_info.hostapd_new_bss_config.empty()) {
++                auto& new_vap = m_radio_info.hostapd_new_bss_config.front();
++                std::vector<std::string>& config_lines = new_vap.second;
++
++                for (auto& line : config_lines) {
++                    if (line.rfind("interface=", 0) == 0) { // starts with "interface="
++                        line = "bss=" + new_vap.first;      // replace with "bss=<vap_name>"
++                        break;
++                    }
++                }
++                if (updated_base_conf) {
++                    updated_base_conf.add_new_vap_to_default_config(new_vap);
++                    m_radio_info.hostapd_new_bss_config.clear();
++                    // store the default config
++                    if (!updated_base_conf.append_new_bss_to_default_hostapd_conf()) {
++                        LOG(ERROR) << "Autoconfiguration: failed to add new bss in default config file!";
++                    }
++                } else {
++                    LOG(ERROR) << "Default config file is not updated!";
++                }
++            }
++        }
++    } else {
++        LOG(DEBUG) << "handle_wifi_compat_mode: disable_11be already=" << disable_11be_val
++                   << " in hostapd config for VAP=" << vap_id
++                   << " (no write or RELOAD_CONFIG needed)";
++    }
++
++    return true;
++}
++
+ bool ap_wlan_hal_nl80211::update_vap_credentials(
+     std::list<son::wireless_utils::sBssInfoConf> &bss_info_conf_list,
+     const std::string &backhaul_wps_ssid, const std::string &backhaul_wps_passphrase,
+@@ -3387,6 +4256,30 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+ 
+         } else {
+             LOG(DEBUG) << "Existing vap with bssid " << conf_bssid;
++            // Handle wifi_compat_mode if present in bss_conf.
++            // This separate API updates the hostapd per-VAP "disable_11be" option
++            // and triggers RELOAD_CONFIG when the mode is WIFI_COMPAT_MODE_11AX or
++            // WIFI_COMPAT_MODE_11BE.  It is a no-op when wifi_compat_mode is UNSET.
++            // Called after the main credential update so the fresh config load inside
++            // handle_wifi_compat_mode() sees the already-updated hostapd.conf.
++            LOG(DEBUG) << "Wifi compat mode: " << bss_it.wifi_compat_mode;
++            if (!bss_it.teardown &&
++                bss_it.wifi_compat_mode != WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_UNSET) {
++                LOG(DEBUG) << "update_vap_credentials: calling handle_wifi_compat_mode"
++                           << " for bssid=" << tlvf::mac_to_string(bss_it.bssid)
++                           << " wifi_compat_mode=" << bss_it.wifi_compat_mode;
++                bool compat_mode_converted = false;
++                handle_wifi_compat_mode(bss_it, compat_mode_converted, prpl_config_update);
++                if (compat_mode_converted) {
++                    // The BSS was torn down and recreated (11AX↔11BE transition).
++                    // The new BSS has a different interface name / BSSID; skip the
++                    // remaining credential-update processing for this BSS entry.
++                    LOG(INFO) << "update_vap_credentials: compat mode conversion performed"
++                              << " for bssid=" << tlvf::mac_to_string(bss_it.bssid)
++                              << ", skipping credential update for this BSS";
++                    continue;
++                }
++            }
+             // set bssid is already in use
+             std::string used_bssid = tlvf::mac_to_string(bss_it.bssid);
+             m_radio_info.bssid_pool[used_bssid] = true;
+@@ -3473,7 +4366,11 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                     << " encr_type: " << enc_type << " network_key: " << bss_it.network_key
+                     << " fronthaul: " << beerocks::string_utils::bool_str(bss_it.fronthaul)
+                     << " backhaul: " << beerocks::string_utils::bool_str(bss_it.backhaul);
+-                if (!ieee80211be_sprt.empty()) {
++                // Set mld_ap=1 only when ieee80211be is enabled AND the BSS is NOT in
++                // 11AX compact mode.  In WIFI_COMPAT_MODE_11AX the EHT/MLO capability
++                // is disabled (disable_11be=1), so mld_ap must not be set to 1.
++                if (!ieee80211be_sprt.empty() &&
++                    bss_it.wifi_compat_mode != WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11AX) {
+                     conf.set_create_vap_value(vap_id, "mld_ap","1");
+                 }
+ 
+@@ -3833,6 +4730,7 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                    }
+                 }
+                 LOG(DEBUG) << "Autoconfiguration: done:\n" << conf;
++
+             }
+ 
+             if (!bss_it.mld_id.empty() &&
+@@ -5498,7 +6396,6 @@ bool ap_wlan_hal_nl80211::add_mld_link(std::string &new_iface,std::string &prev_
+             LOG(ERROR) << "Failed to remove iface: " << base_iface;
+             return false;
+         }
+-        m_radio_info.hostapd_new_bss_config.clear();
+ 
+         if (prev_iface != m_radio_info.iface_name) {
+             if (!m_nl80211_client->remove_vap_interface(base_iface)) {
+@@ -6157,7 +7054,11 @@ bool ap_wlan_hal_nl80211::create_new_hostapd_conf_file(std::string &ifname, son:
+     auto ieee80211be_sprt = conf.get_head_value("ieee80211be");
+ 
+     LOG(INFO) << "ieee80211be_sprt: " << ieee80211be_sprt;
+-    if (!ieee80211be_sprt.empty()) {
++    // Set mld_ap=1 only when ieee80211be is enabled AND the BSS is NOT in
++    // 11AX compact mode.  In WIFI_COMPAT_MODE_11AX the EHT/MLO capability
++    // is disabled (disable_11be=1), so mld_ap must not be set to 1.
++    if (!ieee80211be_sprt.empty() &&
++        bss_conf.wifi_compat_mode != WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11AX) {
+         conf.set_create_vap_value(vap_id, "mld_ap","1");
+     }
+ 
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+index 130b30c65..4eaa22455 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+@@ -169,6 +169,42 @@ public:
+ 
+     void add_mld_entries(std::string mld_id, std::string mlo_iface);
+ 
++    /**
++     * @brief Handle wifi_compat_mode for a BSS configuration.
++     *
++     * Called from update_vap_credentials() for each existing BSS that carries a
++     * non-UNSET wifi_compat_mode value.  Translates the mode into the hostapd
++     * per-VAP "disable_11be" option and triggers RELOAD_CONFIG so the change
++     * takes effect immediately:
++     *
++     *   WIFI_COMPAT_MODE_11AX  →  disable_11be=1  (802.11ax / Wi-Fi 6 only)
++     *   WIFI_COMPAT_MODE_11BE  →  disable_11be=0  (802.11be / Wi-Fi 7 enabled)
++     *   WIFI_COMPAT_MODE_UNSET →  no-op (returns true immediately)
++     *
++     * The function loads the hostapd config for the radio, locates the VAP by
++     * BSSID, writes disable_11be, stores the config (only when the value
++     * actually changed), and sends RELOAD_CONFIG to the BSS interface resolved
++     * internally from m_radio_info.available_vaps using bss_conf.bssid.
++     *
++     * @param bss_conf  BSS configuration containing wifi_compat_mode and bssid.
++     * @return true on success or when no action is needed; false on error.
++     */
++    /**
++     * @param conversion_performed  Set to true when the BSS was actually torn down and
++     *                              recreated (11AX↔11BE transition).  The caller should
++     *                              skip the remaining credential-update processing for
++     *                              this BSS when this is true.  Unchanged (false) when
++     *                              no conversion was needed or on early exit.
++     * @param prpl_config_update    Set to true when the prplmesh config (hostap_iface) is
++     *                              updated inside this function (e.g. via promote_primary_bss
++     *                              during a BSS transition).  Allows the caller to skip a
++     *                              duplicate cfg_update_prplmesh_option call at the end of
++     *                              update_vap_credentials().
++     */
++    bool handle_wifi_compat_mode(const son::wireless_utils::sBssInfoConf &bss_conf,
++                                 bool &conversion_performed,
++                                 bool &prpl_config_update);
++
+     // Protected methods:
+ protected:
+     virtual bool process_nl80211_event(parsed_obj_map_t &parsed_obj) override;
+diff --git a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+index 898b685fd..694d1eb62 100644
+--- a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+@@ -602,6 +602,15 @@ bool bpl_cfg_set_wifi_iface_teardown(const std::string &iface, const std::string
+     return true;
+ }
+ 
++bool bpl_cfg_set_wifi_compat_mode_uci(const son::wireless_utils::sBssInfoConf & /*bss_conf*/,
++                                      const std::string & /*old_bss_name*/,
++                                      const std::string & /*new_bss_name*/,
++                                      const std::string & /*radio_id*/)
++{
++    LOG(DEBUG) << "bpl_cfg_set_wifi_compat_mode_uci: not implemented for DM platform";
++    return true;
++}
++
+ bool cfg_set_wireless_channel(const std::string &radio_id, int channel)
+ {
+     LOG(DEBUG) << "cfg_set_wireless_channel: not implemented for DM platform"
+diff --git a/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
+index 54f0a341c..0793aedfa 100644
+--- a/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
+@@ -269,6 +269,15 @@ bool bpl_cfg_set_wifi_iface_teardown(const std::string &iface, const std::string
+     return true;
+ }
+ 
++bool bpl_cfg_set_wifi_compat_mode_uci(const son::wireless_utils::sBssInfoConf & /*bss_conf*/,
++                                      const std::string & /*old_bss_name*/,
++                                      const std::string & /*new_bss_name*/,
++                                      const std::string & /*radio_id*/)
++{
++    LOG(DEBUG) << "bpl_cfg_set_wifi_compat_mode_uci: not implemented for linux platform";
++    return true;
++}
++
+ bool bpl_cfg_get_mld_id_by_iface(const std::string & /*iface*/, std::string & /*mld_id*/)
+ {
+     LOG(DEBUG) << "bpl_cfg_get_mld_id_by_iface: not implemented for linux platform";
+diff --git a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+index 7fa3d4276..ab96de7bb 100644
+--- a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+@@ -1559,6 +1559,18 @@ bool bpl_cfg_set_wifi_iface_teardown(const std::string &iface, const std::string
+     return true;
+ }
+ 
++bool bpl_cfg_set_wifi_compat_mode_uci(const son::wireless_utils::sBssInfoConf &bss_conf,
++                                      const std::string &old_bss_name,
++                                      const std::string &new_bss_name,
++                                      const std::string &radio_id)
++{
++    (void)bss_conf;
++    (void)old_bss_name;
++    (void)new_bss_name;
++    (void)radio_id;
++    return true;
++}
++
+ bool cfg_set_wifi_iface_multi_ap_vlanid(const std::string &iface_name, uint16_t vlanid)
+ {
+     return true;
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index 103cf0c89..4c1168fd2 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -3394,6 +3394,233 @@ bool cfg_set_wifi_iface_multi_ap_vlanid(const std::string &iface_name, uint16_t
+     return any_updated;
+ }
+ 
++bool bpl_cfg_set_wifi_compat_mode_uci(const son::wireless_utils::sBssInfoConf &bss_conf,
++                                      const std::string &old_bss_name,
++                                      const std::string &new_bss_name,
++                                      const std::string &radio_id)
++{
++    const std::string package_name = "wireless";
++    const std::string section_type = "wifi-iface";
++
++    LOG(INFO) << "bpl_cfg_set_wifi_compat_mode_uci: ssid='" << bss_conf.ssid
++              << "' old_bss='" << old_bss_name << "' new_bss='" << new_bss_name
++              << "' radio_id='" << radio_id
++              << "' wifi_compat_mode=" << int(bss_conf.wifi_compat_mode);
++
++    // Find the wifi-device section for this radio
++    std::string device_section;
++    if (!radio_id.empty() &&
++        uci_find_section_by_option("wireless", "wifi-device", "radio", radio_id,
++                                   device_section)) {
++        LOG(INFO) << "bpl_cfg_set_wifi_compat_mode_uci: found device section '"
++                  << device_section << "' for radio_id='" << radio_id << "'";
++    } else {
++        LOG(ERROR) << "bpl_cfg_set_wifi_compat_mode_uci: no wifi-device section found for"
++                   << " radio_id='" << radio_id << "'";
++        return false;
++    }
++
++    // Get all wifi-iface sections
++    std::vector<std::string> all_sections;
++    if (!uci_get_all_sections(package_name, section_type, all_sections)) {
++        LOG(ERROR) << "bpl_cfg_set_wifi_compat_mode_uci: failed to enumerate wifi-iface sections";
++        return false;
++    }
++
++    bool updated = false;
++    for (const auto &sec : all_sections) {
++        // Match by device (radio)
++        std::string device_val;
++        if (!uci_get_option(package_name, section_type, sec, "device", device_val) ||
++            device_val != device_section) {
++            continue;
++        }
++
++        // Match by SSID
++        std::string ssid_val;
++        if (!uci_get_option(package_name, section_type, sec, "ssid", ssid_val) ||
++            ssid_val != bss_conf.ssid) {
++            continue;
++        }
++
++        // Optionally narrow by old ifname (if provided)
++        if (!old_bss_name.empty()) {
++            std::string ifname_val;
++            if (uci_get_option(package_name, section_type, sec, "ifname", ifname_val) &&
++                !ifname_val.empty() && ifname_val != old_bss_name) {
++                LOG(DEBUG) << "bpl_cfg_set_wifi_compat_mode_uci: section=" << sec
++                           << " ifname='" << ifname_val << "' does not match old_bss='"
++                           << old_bss_name << "', skipping";
++                continue;
++            }
++        }
++
++        LOG(INFO) << "bpl_cfg_set_wifi_compat_mode_uci: matched section=" << sec
++                  << " (ssid='" << bss_conf.ssid << "' device='" << device_section << "')";
++
++        OptionsUnorderedMap options;
++        options["ifname"] = new_bss_name;
++
++        // For 11AX mode: capture the current mld value before clearing it so we can
++        // check afterwards whether this was the last link referencing that wifi-mld section.
++        std::string current_mld_val;
++
++        if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11AX) {
++            // MLO → SLO: set disable_11be=1, clear mld option
++            uci_get_option(package_name, section_type, sec, "mld", current_mld_val);
++            options["disable_11be"] = "1";
++            options["mld"]          = ""; // empty string removes the option
++            LOG(INFO) << "bpl_cfg_set_wifi_compat_mode_uci: 11AX mode -"
++                      << " setting disable_11be=1, clearing mld='" << current_mld_val
++                      << "', ifname='" << new_bss_name << "'";
++        } else if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11BE) {
++            // SLO → MLO: clear disable_11be, set mld option if mld_id is valid
++            options["disable_11be"] = ""; // empty string removes the option
++            if (!bss_conf.mld_id.empty() &&
++                bss_conf.mld_id != std::to_string(beerocks::DISABLED_MLDUNIT)) {
++                // Before using the mld_id from bss_conf, check if an existing wifi-mld
++                // section already carries the same SSID. If so, reuse that section's
++                // mld_id so we don't create a duplicate MLD group for the same network.
++                std::string effective_mld_id = bss_conf.mld_id;
++                const std::string mld_section_type = "wifi-mld";
++                std::vector<std::string> all_mld_sections;
++                if (uci_get_all_sections(package_name, mld_section_type, all_mld_sections)) {
++                    for (const auto &mld_sec : all_mld_sections) {
++                        std::string mld_ssid_val;
++                        if (!uci_get_option(package_name, mld_section_type, mld_sec,
++                                            "ssid", mld_ssid_val)) {
++                            continue;
++                        }
++                        if (mld_ssid_val == bss_conf.ssid) {
++                            // Found an existing wifi-mld section with matching SSID.
++                            // Extract the numeric suffix (e.g. "mld3" → "3").
++                            std::string mld_index_str;
++                            for (char ch : mld_sec) {
++                                if (isdigit(static_cast<unsigned char>(ch))) {
++                                    mld_index_str += ch;
++                                }
++                            }
++                            if (!mld_index_str.empty()) {
++                                effective_mld_id = mld_index_str;
++                                LOG(INFO) << "bpl_cfg_set_wifi_compat_mode_uci: found existing"
++                                          << " wifi-mld section '" << mld_sec
++                                          << "' with ssid='" << bss_conf.ssid
++                                          << "', reusing mld_id=" << effective_mld_id;
++                            }
++                            break;
++                        }
++                    }
++                }
++                options["mld"] = "mld" + effective_mld_id;
++                LOG(INFO) << "bpl_cfg_set_wifi_compat_mode_uci: 11BE mode -"
++                          << " clearing disable_11be, mld='mld" << effective_mld_id
++                          << "', ifname='" << new_bss_name << "'";
++            } else {
++                LOG(INFO) << "bpl_cfg_set_wifi_compat_mode_uci: 11BE mode -"
++                          << " clearing disable_11be, no valid mld_id, ifname='"
++                          << new_bss_name << "'";
++            }
++        } else {
++            LOG(WARNING) << "bpl_cfg_set_wifi_compat_mode_uci: unrecognised wifi_compat_mode="
++                         << int(bss_conf.wifi_compat_mode) << " for ssid='" << bss_conf.ssid
++                         << "', only updating ifname";
++        }
++
++        if (!uci_set_section(package_name, section_type, sec, options, true)) {
++            LOG(ERROR) << "bpl_cfg_set_wifi_compat_mode_uci: failed to update section=" << sec;
++        } else {
++            LOG(INFO) << "bpl_cfg_set_wifi_compat_mode_uci: updated section=" << sec
++                      << " ifname='" << new_bss_name << "'";
++            updated = true;
++
++            // For 11AX mode: if this was the last/only wifi-iface section referencing
++            // the wifi-mld section, set disabled=1 in the wifi-mld section so that
++            // hostapd/netifd stops advertising the MLD while the section is preserved.
++            if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11AX &&
++                !current_mld_val.empty()) {
++                // Count remaining wifi-iface sections that still reference this wifi-mld section.
++                // Note: the section we just updated (sec) no longer has the mld option, but
++                // all_sections was fetched before the commit so we skip sec explicitly.
++                int remaining_refs = 0;
++                for (const auto &other_sec : all_sections) {
++                    if (other_sec == sec) {
++                        continue; // skip the section we just updated
++                    }
++                    std::string other_mld_val;
++                    if (uci_get_option(package_name, section_type, other_sec, "mld",
++                                       other_mld_val) &&
++                        other_mld_val == current_mld_val) {
++                        remaining_refs++;
++                    }
++                }
++                if (remaining_refs == 0) {
++                    // This was the last/only link — disable the wifi-mld section.
++                    const std::string mld_section_type = "wifi-mld";
++                    if (uci_section_exists(package_name, mld_section_type, current_mld_val)) {
++                        OptionsUnorderedMap mld_disable_opts;
++                        mld_disable_opts["disabled"] = "1";
++                        if (!uci_set_section(package_name, mld_section_type, current_mld_val,
++                                             mld_disable_opts, true)) {
++                            LOG(ERROR) << "bpl_cfg_set_wifi_compat_mode_uci: failed to set"
++                                       << " disabled=1 in wifi-mld section '"
++                                       << current_mld_val << "'";
++                        } else {
++                            LOG(INFO) << "bpl_cfg_set_wifi_compat_mode_uci: set disabled=1 in"
++                                      << " wifi-mld section '" << current_mld_val
++                                      << "' (last link removed for ssid='"
++                                      << bss_conf.ssid << "')";
++                        }
++                    }
++                } else {
++                    LOG(DEBUG) << "bpl_cfg_set_wifi_compat_mode_uci: wifi-mld section '"
++                               << current_mld_val << "' still has " << remaining_refs
++                               << " other link(s), not disabling";
++                }
++            }
++
++            // For 11BE mode: if the corresponding wifi-mld section was previously
++            // disabled (disabled='1'), re-enable it (disabled='0') now that a link
++            // is being added back to the MLD group.
++            if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11BE) {
++                auto mld_it = options.find("mld");
++                if (mld_it != options.end() && !mld_it->second.empty()) {
++                    const std::string &mld_sec_name = mld_it->second;
++                    const std::string mld_section_type = "wifi-mld";
++                    if (uci_section_exists(package_name, mld_section_type, mld_sec_name)) {
++                        std::string mld_disabled_val;
++                        if (uci_get_option(package_name, mld_section_type, mld_sec_name,
++                                           "disabled", mld_disabled_val) &&
++                            mld_disabled_val == "1") {
++                            OptionsUnorderedMap mld_enable_opts;
++                            mld_enable_opts["disabled"] = "0";
++                            if (!uci_set_section(package_name, mld_section_type, mld_sec_name,
++                                                 mld_enable_opts, true)) {
++                                LOG(ERROR) << "bpl_cfg_set_wifi_compat_mode_uci: failed to set"
++                                           << " disabled=0 in wifi-mld section '"
++                                           << mld_sec_name << "'";
++                            } else {
++                                LOG(INFO) << "bpl_cfg_set_wifi_compat_mode_uci: set disabled=0 in"
++                                          << " wifi-mld section '" << mld_sec_name
++                                          << "' (link re-added for ssid='"
++                                          << bss_conf.ssid << "')";
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        // Update only the first matching section per radio
++        break;
++    }
++
++    if (!updated) {
++        LOG(WARNING) << "bpl_cfg_set_wifi_compat_mode_uci: no matching wifi-iface section found"
++                     << " for ssid='" << bss_conf.ssid << "' radio_id='" << radio_id << "'";
++    }
++
++    return updated;
++}
++
+ bool bpl_cfg_set_rsn_override(const std::string &iface_name, const std::string &o1_key_mgmt,
+                               const std::string &o1_pairwise, const std::string &o1_mfp,
+                               const std::string &o2_key_mgmt, const std::string &o2_pairwise,
+diff --git a/framework/platform/bpl/include/bpl/bpl_cfg.h b/framework/platform/bpl/include/bpl/bpl_cfg.h
+index 485815799..cecf76419 100644
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -1150,6 +1150,33 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+  */
+ bool bpl_cfg_set_wifi_iface_teardown(const std::string &iface, const std::string &radio_id, bool is_mlo = false);
+ 
++/**
++ * @brief Update the UCI wireless config for a wifi-compat-mode transition.
++ *
++ * Finds the wifi-iface section matching @p bss_conf.ssid and @p radio_id, then
++ * applies the following changes based on @p bss_conf.wifi_compat_mode:
++ *
++ *   WIFI_COMPAT_MODE_11AX (disable_11be=1, MLO → SLO):
++ *     - Sets   option disable_11be '1'
++ *     - Clears option mld          (removes the MLD group association)
++ *     - Sets   option ifname       to @p new_bss_name
++ *
++ *   WIFI_COMPAT_MODE_11BE (disable_11be=0, SLO → MLO):
++ *     - Clears option disable_11be (removes the option so hostapd defaults to EHT-enabled)
++ *     - Sets   option ifname       to @p new_bss_name
++ *     - Sets   option mld          to "mld<mld_id>" when bss_conf.mld_id is valid
++ *
++ * @param [in] bss_conf      BSS configuration carrying ssid, wifi_compat_mode and mld_id.
++ * @param [in] old_bss_name  Previous interface name (used to locate the section by ifname).
++ * @param [in] new_bss_name  New interface name to write into the ifname option.
++ * @param [in] radio_id      Radio identifier (e.g. "radio0") used to find the wifi-device section.
++ * @return true on success, false otherwise.
++ */
++bool bpl_cfg_set_wifi_compat_mode_uci(const son::wireless_utils::sBssInfoConf &bss_conf,
++                                      const std::string &old_bss_name,
++                                      const std::string &new_bss_name,
++                                      const std::string &radio_id);
++
+ /**
+  * @brief Updates only the UCI 'hidden' option for a given BSS interface.
+  *
+-- 
+2.34.1
+
