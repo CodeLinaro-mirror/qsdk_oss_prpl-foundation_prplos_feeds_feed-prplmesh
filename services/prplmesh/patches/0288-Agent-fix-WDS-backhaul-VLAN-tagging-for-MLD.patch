@@ -1,0 +1,784 @@
+From 265b4093d7a84a111091c5fbb2927015d0d9ab64 Mon Sep 17 00:00:00 2001
+From: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+Date: Fri, 24 Jul 2026 09:48:32 +0530
+Subject: [PATCH] Agent: fix WDS backhaul VLAN tagging for MLD radios and MLO
+ clients
+
+On MLD-capable radios, a downstream repeater's 4addr/WDS backhaul
+child interface (e.g. "wlan1_1.sta1") was never getting VLAN-tagged.
+Without the VLAN trunk, DHCP never completed on the repeater and
+onboarding/cloning stalled even though L2/backhaul association
+itself succeeded.
+
+Root causes fixed, in the order they occur along the association
+path:
+
+- The STA-role NL80211 HAL never handled hostapd's
+  WDS-STA-INTERFACE-ADDED event for MLD radios, because
+  get_vap_id_with_bss() only matches the bare radio name while
+  available_vaps is keyed by the link-specific name
+  ("<radio>_linkN"). Add a fallback that retries with each link
+  suffix and, on a match, fixes up the interface name to the
+  resolved link so downstream MLO detection uses the same name the
+  vap_id was actually resolved against.
+
+- WDS-iface-ready notifications were cached per client_mac only, so
+  an MLO client with multiple affiliated links had each new
+  notification overwrite the previous link's pending entry. Recache
+  per (client_mac, bssid) so each affiliated link keeps its own
+  pending notification until its association event releases it.
+
+- bss.enabled is computed once, synchronously, during the one-shot
+  autoconfig VAPS_LIST_UPDATE handshake, before an MLD/4addr backhaul
+  BSS interface is necessarily up. Once frozen false, nothing ever
+  re-evaluated it. Re-check it at client-association time and, if it
+  flips true, re-trigger traffic separation for that BSS.
+
+- For MLO clients, the association notification's top-level bssid is
+  the AP MLD MAC per EasyMesh 17.2.6, not a per-link BSSID, so
+  get_radio_by_mac() never finds it in AgentDB (which only stores
+  per-link BSSIDs). Fall back to resolving the radio via one of the
+  notification's affiliated-STA entries, which carry genuine per-link
+  BSSIDs, and use that resolved bssid consistently for all downstream
+  lookups (WDS cache release, bss.enabled re-check) since that's the
+  same bssid the WDS-iface-ready path caches against.
+
+- ap_manager can deliver the same association event twice (duplicate
+  nl80211/hostapd control-socket delivery). The legacy and MLO
+  association handlers unconditionally erased and re-emplaced the
+  client record on every delivery, so a duplicate arriving right
+  after the first would wipe a wds_iface_name that had just been set
+  by the WDS-cache release on the first delivery, with no pending
+  entry left to recover it. Skip the erase+re-emplace when the client
+  is already associated to the same bssid.
+
+Also included, found while tracing the traffic-separation path:
+
+- Controller: always add the TrafficSeparationPolicy TLV (with zero
+  SSIDs when disabled) instead of omitting it, so the Agent gets an
+  explicit disable signal per EasyMesh 19.1.3 rather than treating a
+  stale prior policy as still active.
+
+- Agent: when a TS reset() finds the config/ports unchanged and skips
+  the rebuild, still re-verify/persist bridge assignments, since a
+  BSS's vap_type (e.g. GUEST) can resolve after the last apply even
+  when nothing else about the TS config changed.
+
+Signed-off-by: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/son_slave_thread.cpp | 298 ++++++++++++------
+ agent/src/beerocks/slave/son_slave_thread.h   |  46 ++-
+ .../slave/tasks/traffic_separation_task.cpp   |  10 +
+ .../traffic_separation_manager.h              |  45 +--
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  23 ++
+ .../master/tasks/agent_monitoring_task.cpp    |  56 ++--
+ 6 files changed, 325 insertions(+), 153 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 35e6caa3c..4732f0380 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -23,6 +23,7 @@
+ #include "tasks/spectrum_inquiry_task.h"
+ #include "tasks/traffic_separation_task.h"
+ #include "tasks/vbss_task.h"
++#include "traffic_separation/traffic_separation_utils.h"
+ 
+ #include <bcl/beerocks_cmdu_client_factory_factory.h>
+ #include <bcl/beerocks_cmdu_server_factory.h>
+@@ -600,10 +601,7 @@ bool slave_thread::read_platform_configuration()
+ 
+         std::string base_radio_iface_name = fronthaul_iface;
+ #ifndef BEEROCKS_RDKB
+-        size_t link_pos = fronthaul_iface.find("_link");
+-        if (link_pos != std::string::npos) {
+-            base_radio_iface_name = fronthaul_iface.substr(0, link_pos);
+-        }
++        base_radio_iface_name = net::strip_link_suffix(fronthaul_iface);
+ #endif
+         LOG(INFO) << "Interface checking: " << base_radio_iface_name;
+ 
+@@ -2823,6 +2821,35 @@ bool slave_thread::process_client_association(
+             mld_info.affiliated_stas.push_back(affiliated_entry);
+         }
+ 
++        // Parse link_mac from the notification message
++        auto &link_mac = notification_in->link_mac();
++
++        auto radio = db->get_radio_by_mac(bssid, AgentDB::eMacType::BSSID);
++
++        // For MLO clients, bssid is the AP MLD MAC (EasyMesh 17.2.6), which never
++        // matches a per-link BSSID in AgentDB. Fall back to an affiliated-STA's
++        // per-link bssid instead, matching what the WDS-iface-ready cache uses.
++        // Must run before mld_info is moved below, or affiliated_stas is empty.
++        sMacAddr link_bssid = bssid;
++        if (!radio) {
++            for (const auto &affiliated_entry : mld_info.affiliated_stas) {
++                radio = db->get_radio_by_mac(affiliated_entry.bssid, AgentDB::eMacType::BSSID);
++                if (radio) {
++                    LOG(DEBUG) << "Radio not found via top-level bssid " << bssid
++                               << " (likely AP MLD MAC for MLO client); resolved via "
++                                  "affiliated-STA bssid "
++                               << affiliated_entry.bssid << " instead";
++                    link_bssid = affiliated_entry.bssid;
++                    break;
++                }
++            }
++        }
++
++        if (!radio) {
++            LOG(DEBUG) << "Radio containing bssid " << bssid << " not found";
++            return false;
++        }
++
+         if (!mld_info.affiliated_stas.empty()) {
+             LOG(INFO) << "Storing MLO client in associated_sta_mlds: STA MLD=" << client_mac
+                       << ", AP MLD=" << bssid
+@@ -2837,26 +2864,36 @@ bool slave_thread::process_client_association(
+             LOG(INFO) << "MLO client stored successfully (total in map: "
+                       << db->associated_sta_mlds.size() << ")";
+         }
+-        // Parse link_mac from the notification message
+-        auto &link_mac = notification_in->link_mac();
+ 
+-        auto radio = db->get_radio_by_mac(bssid, AgentDB::eMacType::BSSID);
+-        if (!radio) {
+-            LOG(DEBUG) << "Radio containing bssid " << bssid << " not found";
+-            return false;
+-        }
++        // ap_manager can deliver the same association event twice (duplicate
++        // nl80211/hostapd control-socket delivery). Skip the re-emplace on a
++        // re-delivery so it doesn't clobber a freshly-set wds_iface_name.
++        const auto existing_client_it = radio->associated_clients.find(client_mac);
++        const bool is_duplicate_notification =
++            existing_client_it != radio->associated_clients.end() &&
++            existing_client_it->second.bssid == link_bssid;
+ 
+-        radio->associated_clients.emplace(
+-            client_mac, AgentDB::sRadio::sClient{bssid, notification_in->association_frame_length(),
+-                                                 notification_in->association_frame(),
+-                                                 notification_in->capabilities().btm_supported,
+-                                                 link_mac,
+-                                                 static_cast<bool>(notification_in->is_mlo())});
++        if (is_duplicate_notification) {
++            LOG(DEBUG) << "Duplicate MLO client association notification for client_mac="
++                       << client_mac << " bssid=" << link_bssid
++                       << " - client already associated on this link, skipping re-emplace";
++        } else {
++            radio->associated_clients.emplace(
++                client_mac,
++                AgentDB::sRadio::sClient{link_bssid, notification_in->association_frame_length(),
++                                         notification_in->association_frame(),
++                                         notification_in->capabilities().btm_supported, link_mac,
++                                         static_cast<bool>(notification_in->is_mlo())});
+ 
+-        LOG(DEBUG) << "Client association stored (MLO): client_mac=" << client_mac
+-                   << " bssid=" << bssid << " link_mac=" << link_mac
+-                   << " is_mlo=" << static_cast<bool>(notification_in->is_mlo())
+-                   << " radio=" << radio->front.iface_name;
++            LOG(DEBUG) << "Client association stored (MLO): client_mac=" << client_mac
++                       << " bssid=" << link_bssid << " link_mac=" << link_mac
++                       << " is_mlo=" << static_cast<bool>(notification_in->is_mlo())
++                       << " radio=" << radio->front.iface_name;
++        }
++
++        // Re-check bss.enabled before releasing any cached WDS notification below;
++        // it may have been frozen false during the one-shot autoconfig snapshot.
++        refresh_backhaul_bss_enabled_and_retrigger_wds_ts(*radio, link_bssid);
+ 
+         // Release any cached WDS iface notification for this MLO client.
+         // The WDS-STA-INTERFACE-ADDED event can arrive before AP-STA-CONNECTED for MLO
+@@ -2864,20 +2901,20 @@ bool slave_thread::process_client_association(
+         // MLD entry is stored so TrafficSeparationTask can plumb the VLAN trunk.
+         auto pending_wds_it = m_pending_wds_iface_notifications.find(client_mac);
+         if (pending_wds_it != m_pending_wds_iface_notifications.end()) {
+-            if (pending_wds_it->second.bssid == bssid) {
++            auto &pending_links = pending_wds_it->second;
++            auto pending_link_it = pending_links.find(link_bssid);
++            if (pending_link_it != pending_links.end()) {
+                 LOG(DEBUG) << "Releasing cached WDS iface notification for MLO client "
+-                           << client_mac << " iface=" << pending_wds_it->second.iface_name;
++                           << client_mac << " iface=" << pending_link_it->second;
+                 // Use set_client_wds_iface so that client.wds_iface_name is set in the DB
+                 // before TS_NEW_WDS_IFACE is fired. Without this, fill_wds_trunk_from_db
+                 // cannot match the iface to any client and the WDS trunk is never plumbed.
+-                set_client_wds_iface(*radio, client_mac, bssid,
+-                                     pending_wds_it->second.iface_name);
++                set_client_wds_iface(*radio, client_mac, link_bssid, pending_link_it->second);
++                erase_pending_wds_notification(client_mac, link_bssid);
+             } else {
+-                LOG(DEBUG) << "Dropping cached WDS iface notification for MLO client "
+-                           << client_mac << ", cached_bssid=" << pending_wds_it->second.bssid
+-                           << ", association_bssid=" << bssid;
++                LOG(DEBUG) << "No pending WDS iface notification for MLO client " << client_mac
++                           << " on bssid " << link_bssid;
+             }
+-            m_pending_wds_iface_notifications.erase(pending_wds_it);
+         }
+ 
+         return true;
+@@ -2910,13 +2947,6 @@ bool slave_thread::process_client_association(
+                                      existing_client.wds_iface_name.c_str());
+         }
+ 
+-        // Erase client details to clear any previous association information.
+-        // This is needed during steering and roaming operations to ensure clean state.
+-        // Note: This erase operation is NOT applicable for MLO clients - we do not delete
+-        // MLO station entries from associated_sta_mlds when MLO station associates,
+-        // as MLO clients maintain their association across multiple links.
+-        db->erase_client(client_mac);
+-
+         // Parse link_mac from the notification message
+         auto &link_mac = notification_in->link_mac();
+ 
+@@ -2936,33 +2966,125 @@ bool slave_thread::process_client_association(
+         }
+ #endif
+ 
+-        radio->associated_clients.emplace(
+-            client_mac, AgentDB::sRadio::sClient{bssid, notification_in->association_frame_length(),
+-                                                 notification_in->association_frame(),
+-                                                 notification_in->capabilities().btm_supported,
+-                                                 link_mac,
+-                                                 static_cast<bool>(notification_in->is_mlo())});
++        // ap_manager can deliver the same association event twice (duplicate
++        // nl80211/hostapd control-socket delivery). Skip the erase+re-emplace on
++        // a re-delivery so it doesn't clobber a freshly-set wds_iface_name.
++        const auto existing_client_it = radio->associated_clients.find(client_mac);
++        const bool is_duplicate_notification =
++            existing_client_it != radio->associated_clients.end() &&
++            existing_client_it->second.bssid == bssid;
++
++        if (is_duplicate_notification) {
++            LOG(DEBUG) << "Duplicate legacy client association notification for client_mac="
++                       << client_mac << " bssid=" << bssid
++                       << " - client already associated, skipping erase+re-emplace";
++        } else {
++            // Erase client details to clear any previous association information.
++            // This is needed during steering and roaming operations to ensure clean state.
++            // Note: This erase operation is NOT applicable for MLO clients - we do not delete
++            // MLO station entries from associated_sta_mlds when MLO station associates,
++            // as MLO clients maintain their association across multiple links.
++            db->erase_client(client_mac);
++
++            radio->associated_clients.emplace(
++                client_mac, AgentDB::sRadio::sClient{bssid, notification_in->association_frame_length(),
++                                                     notification_in->association_frame(),
++                                                     notification_in->capabilities().btm_supported,
++                                                     link_mac,
++                                                     static_cast<bool>(notification_in->is_mlo())});
+ 
+-        LOG(DEBUG) << "Client association stored (legacy): client_mac=" << client_mac
+-                   << " bssid=" << bssid << " link_mac=" << link_mac
+-                   << " is_mlo=" << static_cast<bool>(notification_in->is_mlo())
+-                   << " radio=" << radio->front.iface_name;
++            LOG(DEBUG) << "Client association stored (legacy): client_mac=" << client_mac
++                       << " bssid=" << bssid << " link_mac=" << link_mac
++                       << " is_mlo=" << static_cast<bool>(notification_in->is_mlo())
++                       << " radio=" << radio->front.iface_name;
++        }
++
++        // Re-check bss.enabled before releasing any cached WDS notification below;
++        // see the matching comment in the MLO branch above.
++        refresh_backhaul_bss_enabled_and_retrigger_wds_ts(*radio, bssid);
+ 
+         auto pending_wds_it = m_pending_wds_iface_notifications.find(client_mac);
+         if (pending_wds_it != m_pending_wds_iface_notifications.end()) {
+-            if (pending_wds_it->second.bssid == bssid) {
+-                set_client_wds_iface(*radio, client_mac, bssid, pending_wds_it->second.iface_name);
++            auto &pending_links = pending_wds_it->second;
++            auto pending_link_it = pending_links.find(bssid);
++            if (pending_link_it != pending_links.end()) {
++                set_client_wds_iface(*radio, client_mac, bssid, pending_link_it->second);
++                erase_pending_wds_notification(client_mac, bssid);
+             } else {
+-                LOG(DEBUG) << "Dropping cached WDS iface notification for " << client_mac
+-                           << ", bssid=" << pending_wds_it->second.bssid
+-                           << ", association_bssid=" << bssid;
++                LOG(DEBUG) << "No pending WDS iface notification for " << client_mac
++                           << " on bssid " << bssid;
+             }
+-            m_pending_wds_iface_notifications.erase(pending_wds_it);
+         }
+         return true;
+     }
+ }
+ 
++void slave_thread::retrigger_wds_ts(AgentDB::sRadio &radio,
++                                    const AgentDB::sRadio::sFront::sBssid &bss,
++                                    const char *source)
++{
++    for (const auto &client_kv : radio.associated_clients) {
++        const auto &client = client_kv.second;
++        if (client.bssid != bss.mac || client.wds_iface_name.empty()) {
++            continue;
++        }
++
++        LOG(DEBUG) << "Trigger traffic separation on " << source
++                   << " disallow change for WDS iface=" << client.wds_iface_name
++                   << ", bss=" << bss.iface_name;
++        task_pool_try_send_event(eTaskType::TRAFFIC_SEPARATION,
++                                 TrafficSeparationTask::eEvent::TS_CLEAR_WDS_IFACE,
++                                 client.wds_iface_name.c_str());
++        task_pool_try_send_event(eTaskType::SERVICE_PRIORITIZATION,
++                                 ServicePrioritizationTask::eEvent::QOS_CLEAR_WDS_IFACE,
++                                 client.wds_iface_name.c_str());
++        task_pool_try_send_event(eTaskType::TRAFFIC_SEPARATION,
++                                 TrafficSeparationTask::eEvent::TS_NEW_WDS_IFACE,
++                                 client.wds_iface_name.c_str());
++        task_pool_try_send_event(eTaskType::SERVICE_PRIORITIZATION,
++                                 ServicePrioritizationTask::eEvent::QOS_NEW_WDS_IFACE,
++                                 client.wds_iface_name.c_str());
++    }
++}
++
++void slave_thread::refresh_backhaul_bss_enabled_and_retrigger_wds_ts(AgentDB::sRadio &radio,
++                                                                      const sMacAddr &bssid)
++{
++    for (auto &bss : radio.front.bssids) {
++        if (!bss.backhaul_bss || bss.mac != bssid) {
++            continue;
++        }
++
++        if (bss.enabled) {
++            // Common/fast path: the BSS was already enabled during VAPS_LIST_UPDATE,
++            // nothing to do.
++            return;
++        }
++
++        // bss.enabled was frozen false during the one-shot autoconfig snapshot
++        // (e.g. the MLD/4addr iface wasn't up yet). Re-check it now.
++#ifdef USE_PRPLMESH_NLHAL
++        std::string base_interface = net::strip_link_suffix(bss.iface_name);
++        const bool is_enabled_now = !bss.iface_name.empty() &&
++                                    network_utils::linux_iface_is_up_and_running(base_interface);
++#else
++        const bool is_enabled_now =
++            !bss.iface_name.empty() && network_utils::linux_iface_is_up_and_running(bss.iface_name);
++#endif
++        if (!is_enabled_now) {
++            return;
++        }
++
++        LOG(DEBUG) << "BSS " << bss.iface_name << ", bssid: " << bss.mac
++                   << " is now operationally up on client-association re-check, flipping "
++                      "bss.enabled false->true (was frozen disabled during VAPS_LIST_UPDATE)";
++        bss.enabled = true;
++
++        retrigger_wds_ts(radio, bss, "CLIENT_ASSOCIATED");
++        return;
++    }
++}
++
+ bool slave_thread::set_client_wds_iface(AgentDB::sRadio &radio, const sMacAddr &client_mac,
+                                         const sMacAddr &bssid, const std::string &wds_iface_name)
+ {
+@@ -3004,6 +3126,21 @@ bool slave_thread::set_client_wds_iface(AgentDB::sRadio &radio, const sMacAddr &
+     return true;
+ }
+ 
++void slave_thread::erase_pending_wds_notification(const sMacAddr &client_mac,
++                                                  const sMacAddr &bssid)
++{
++    auto pending_wds_it = m_pending_wds_iface_notifications.find(client_mac);
++    if (pending_wds_it == m_pending_wds_iface_notifications.end()) {
++        return;
++    }
++
++    auto &pending_links = pending_wds_it->second;
++    pending_links.erase(bssid);
++    if (pending_links.empty()) {
++        m_pending_wds_iface_notifications.erase(pending_wds_it);
++    }
++}
++
+ bool slave_thread::handle_client_wds_iface_notification(
+     const std::shared_ptr<beerocks_message::cACTION_APMANAGER_WDS_IFACE_NOTIFICATION>
+         notification_in)
+@@ -3020,11 +3157,7 @@ bool slave_thread::handle_client_wds_iface_notification(
+     const std::string wds_iface_name = notification_in->wds_iface_name_str();
+ 
+     if (wds_iface_name.empty()) {
+-        auto pending_wds_it = m_pending_wds_iface_notifications.find(client_mac);
+-        if (pending_wds_it != m_pending_wds_iface_notifications.end() &&
+-            pending_wds_it->second.bssid == bssid) {
+-            m_pending_wds_iface_notifications.erase(pending_wds_it);
+-        }
++        erase_pending_wds_notification(client_mac, bssid);
+ 
+         auto radio = db->get_radio_by_mac(bssid, AgentDB::eMacType::BSSID);
+         if (!radio) {
+@@ -3072,8 +3205,7 @@ bool slave_thread::handle_client_wds_iface_notification(
+     if (client_it == radio->associated_clients.end()) {
+         LOG(DEBUG) << "Caching WDS iface notification for " << client_mac
+                    << " until client association is processed";
+-        m_pending_wds_iface_notifications[client_mac] = {.bssid      = bssid,
+-                                                         .iface_name = wds_iface_name};
++        m_pending_wds_iface_notifications[client_mac][bssid] = wds_iface_name;
+         return true;
+     }
+ 
+@@ -3767,11 +3899,7 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+                                          wds_iface_name.c_str());
+             }
+         }
+-        auto pending_wds_it = m_pending_wds_iface_notifications.find(client_mac);
+-        if (pending_wds_it != m_pending_wds_iface_notifications.end() &&
+-            pending_wds_it->second.bssid == bssid) {
+-            m_pending_wds_iface_notifications.erase(pending_wds_it);
+-        }
++        erase_pending_wds_notification(client_mac, bssid);
+ 
+         // notify master
+         if (!link_to_controller()) {
+@@ -5773,13 +5901,7 @@ bool slave_thread::agent_fsm()
+                 }
+                 if (!radio_manager.fronthaul_started) {
+                     // Start the fronthaul process. Before starting, kill the existing one.
+-                    std::string base_interface="";
+-                    size_t pos = fronthaul_iface.find("_link");
+-                    if (pos != std::string::npos) {
+-                        base_interface = fronthaul_iface.substr(0, pos);
+-                    } else {
+-                        base_interface = fronthaul_iface;
+-                    }
++                    std::string base_interface = net::strip_link_suffix(fronthaul_iface);
+ 
+                     LOG(DEBUG) << "FRONTHAUL_IFACE - " << fronthaul_iface << " BASE: " << base_interface;
+ 
+@@ -7255,13 +7377,7 @@ bool slave_thread::update_vaps_info(const std::string &iface,
+         const auto previous_bssid        = bss.mac;
+         const std::string previous_iface_name = bss.iface_name;
+ #ifdef USE_PRPLMESH_NLHAL
+-        std::string base_interface = "";
+-        size_t pos = iface.find("_link");
+-        if (pos != std::string::npos) {
+-            base_interface = iface.substr(0, pos);
+-        } else {
+-            base_interface = iface;
+-        }
++        std::string base_interface = net::strip_link_suffix(iface);
+         const bool is_enabled = has_bssid && !iface_name.empty() &&
+                                 network_utils::linux_iface_is_up_and_running(base_interface);
+ #else
+@@ -7304,30 +7420,6 @@ bool slave_thread::update_vaps_info(const std::string &iface,
+             }
+         };
+ 
+-        const auto retrigger_wds_ts = [&](const char *source) {
+-            for (const auto &client_kv : radio->associated_clients) {
+-                const auto &client = client_kv.second;
+-                if (client.bssid != bss.mac || client.wds_iface_name.empty()) {
+-                    continue;
+-                }
+-
+-                LOG(DEBUG) << "Trigger traffic separation on " << source
+-                           << " disallow change for WDS iface=" << client.wds_iface_name
+-                           << ", bss=" << bss.iface_name;
+-                task_pool_try_send_event(eTaskType::TRAFFIC_SEPARATION,
+-                                         TrafficSeparationTask::eEvent::TS_CLEAR_WDS_IFACE,
+-                                         client.wds_iface_name.c_str());
+-                task_pool_try_send_event(eTaskType::SERVICE_PRIORITIZATION,
+-                                         ServicePrioritizationTask::eEvent::QOS_CLEAR_WDS_IFACE,
+-                                         client.wds_iface_name.c_str());
+-                task_pool_try_send_event(eTaskType::TRAFFIC_SEPARATION,
+-                                         TrafficSeparationTask::eEvent::TS_NEW_WDS_IFACE,
+-                                         client.wds_iface_name.c_str());
+-                task_pool_try_send_event(eTaskType::SERVICE_PRIORITIZATION,
+-                                         ServicePrioritizationTask::eEvent::QOS_NEW_WDS_IFACE,
+-                                         client.wds_iface_name.c_str());
+-            }
+-        };
+ 
+         // Keep BSS identity as soon as a MAC is reported. Some startup VAP
+         // snapshots reach us before SSID is populated, and AP_ENABLED later
+@@ -7403,7 +7495,7 @@ bool slave_thread::update_vaps_info(const std::string &iface,
+             (disallow_profile1_was != bss.backhaul_bss_disallow_profile1_agent_association ||
+              disallow_profile2_was != bss.backhaul_bss_disallow_profile2_agent_association);
+         if (disallow_changed) {
+-            retrigger_wds_ts("VAPS_LIST_UPDATE");
++            retrigger_wds_ts(*radio, bss, "VAPS_LIST_UPDATE");
+         }
+ 
+         for (auto &ap_mld_conf : db->ap_mld_configurations) {
+diff --git a/agent/src/beerocks/slave/son_slave_thread.h b/agent/src/beerocks/slave/son_slave_thread.h
+index fd3f228e7..f54b7a703 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.h
++++ b/agent/src/beerocks/slave/son_slave_thread.h
+@@ -549,12 +549,11 @@ private:
+ 
+     logging &logger;
+ 
+-    struct sPendingWdsIfaceNotification {
+-        sMacAddr bssid = net::network_utils::ZERO_MAC;
+-        std::string iface_name;
+-    };
+-
+-    std::unordered_map<sMacAddr, sPendingWdsIfaceNotification> m_pending_wds_iface_notifications;
++    // Outer key: client MAC. Inner key: bssid (affiliated link). Value: cached WDS iface name.
++    // Keying by (client_mac, bssid) allows MLO clients with multiple affiliated links to each
++    // have their own pending WDS iface notification without overwriting one another.
++    std::unordered_map<sMacAddr, std::unordered_map<sMacAddr, std::string>>
++        m_pending_wds_iface_notifications;
+ 
+     /**
+      * @brief Reset a Fronthaul by disconnecting a socket to one of its threads.
+@@ -657,6 +656,41 @@ private:
+             notification_in);
+     bool set_client_wds_iface(AgentDB::sRadio &radio, const sMacAddr &client_mac,
+                               const sMacAddr &bssid, const std::string &wds_iface_name);
++
++    /**
++     * @brief Erase the pending WDS iface notification for (client_mac, bssid), removing the
++     * outer map entry too if it becomes empty. No-op if no matching entry exists.
++     *
++     * @param client_mac Client MAC (outer map key).
++     * @param bssid BSSID / affiliated link (inner map key).
++     */
++    void erase_pending_wds_notification(const sMacAddr &client_mac, const sMacAddr &bssid);
++
++    /**
++     * @brief Re-trigger the WDS traffic separation flow (CLEAR then NEW WDS iface events)
++     * for every currently associated client whose bssid matches bss, so that
++     * fill_wds_trunk_from_db() re-evaluates the bss.enabled gate for their WDS ifaces.
++     *
++     * @param radio Radio containing the associated clients to scan.
++     * @param bss BSS whose associated clients should be re-triggered.
++     * @param source Short label identifying the caller, used only for logging.
++     */
++    void retrigger_wds_ts(AgentDB::sRadio &radio, const AgentDB::sRadio::sFront::sBssid &bss,
++                         const char *source);
++
++    /**
++     * @brief Re-check whether the backhaul BSS matching bssid is now operationally up,
++     * even though it was frozen as disabled during the one-shot VAPS_LIST_UPDATE
++     * autoconfiguration handshake (e.g. MLD/4addr backhaul BSS ifaces that come up late).
++     * If the BSS transitions from disabled to enabled, re-triggers the WDS traffic
++     * separation flow (via retrigger_wds_ts()) for all currently associated clients on
++     * that BSS.
++     *
++     * @param radio Radio containing the BSS to re-check.
++     * @param bssid BSSID of the BSS to re-check.
++     */
++    void refresh_backhaul_bss_enabled_and_retrigger_wds_ts(AgentDB::sRadio &radio,
++                                                           const sMacAddr &bssid);
+     bool handle_client_wds_iface_notification(
+         const std::shared_ptr<beerocks_message::cACTION_APMANAGER_WDS_IFACE_NOTIFICATION>
+             notification_in);
+diff --git a/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp b/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
+index 99088d39a..60052e0ce 100644
+--- a/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
++++ b/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
+@@ -345,6 +345,16 @@ bool TrafficSeparationTask::reset()
+     // traffic loss on the live trunk.
+     if (m_mgr->is_applied() && matches_last_applied(cfg, trunks)) {
+         LOG(DEBUG) << "TS config/ports unchanged since last apply, skipping rebuild";
++        // Config/ports didn't change, but a BSS's vap_type classification may
++        // have been resolved (e.g. GUEST) since the last apply - re-check
++        // bridge membership even though the VLAN/trunk rebuild is skipped.
++        if (db->device_conf.ts_bridge_mapping_enabled) {
++            m_mgr->verify_and_fix_bridge_assignments();
++        }
++
++        if (db->device_conf.ts_persistence_enabled) {
++            m_mgr->persist_bridge_assignments();
++        }
+         return true;
+     }
+ 
+diff --git a/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.h b/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.h
+index cba355467..d784ebf3e 100644
+--- a/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.h
++++ b/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.h
+@@ -127,16 +127,18 @@ public:
+     bool refresh_ports();
+ 
+     /**
+-     * @brief Return true when a TS configuration is loaded into the manager.
+-     */
+-    bool has_config() const { return m_state != eTsManagerState::NO_CONFIG; }
+-
+-    /**
+-     * @brief Return true when TS policies are currently applied on managed ports.
++     * @brief Verify that each active fronthaul-only BSS interface is in its correct bridge
++     * and fix the assignment if it is wrong or missing.
++     *
++     * Reads BSS info from AgentDB and uses bss.vap_type to determine the expected bridge:
++     *   eVapType::GUEST -> m_config.guest_bridge
++     *   all others      -> m_config.private_bridge
++     *
++     * Safe to call repeatedly/idempotently; no-op if the interface is already
++     * in its expected bridge.
+      */
+-    bool is_applied() const { return m_state == eTsManagerState::APPLIED; }
++    void verify_and_fix_bridge_assignments();
+ 
+-private:
+     /**
+      * @brief Persist the current bridge assignments to /etc/config/network via uci.
+      *
+@@ -144,10 +146,22 @@ private:
+      * section for the expected bridge and adds the interface to its ports list.
+      * Commits the network package after all additions.
+      *
+-     * Called from apply_policies() when ts_persistence_enabled is true.
++     * Called from apply_policies()/reapply_config() when ts_persistence_enabled
++     * is true.
+      */
+     void persist_bridge_assignments();
+ 
++    /**
++     * @brief Return true when a TS configuration is loaded into the manager.
++     */
++    bool has_config() const { return m_state != eTsManagerState::NO_CONFIG; }
++
++    /**
++     * @brief Return true when TS policies are currently applied on managed ports.
++     */
++    bool is_applied() const { return m_state == eTsManagerState::APPLIED; }
++
++private:
+     /**
+      * @brief Reset persisted bridge assignments in UCI wireless config.
+      *
+@@ -159,19 +173,6 @@ private:
+      */
+     void reset_persistence();
+ 
+-    /**
+-     * @brief Verify that each active fronthaul-only BSS interface is in its correct bridge
+-     * and fix the assignment if it is wrong or missing.
+-     *
+-     * Reads BSS info and the ts_bridge_mapping_enabled flag from AgentDB.
+-     * Uses bss.vap_type to determine the expected bridge:
+-     *   eVapType::GUEST -> m_config.guest_bridge
+-     *   all others      -> m_config.private_bridge
+-     *
+-     * Called from apply_policies() when ts_bridge_mapping_enabled is true.
+-     */
+-    void verify_and_fix_bridge_assignments();
+-
+ private:
+     bool has_any_ports() const
+     {
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 2fe4f68c7..7fddb5665 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -3333,6 +3333,13 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                     bss_it.vap_type = uci_config.vap_type;
+                     LOG(DEBUG) << "Read vap_type from UCI for " << new_vap_name
+                                << ": " << eVapType_str(bss_it.vap_type);
++                } else if (beerocks::bpl::bpl_cfg_get_wifi_credentials_by_ssid(bss_it.ssid,
++                                                                               uci_config)) {
++                    // Fallback: newly created interface has no UCI section yet, look up by SSID
++                    bss_it.vap_type = uci_config.vap_type;
++                    LOG(DEBUG) << "Read vap_type from UCI by SSID for " << new_vap_name
++                               << " (ssid=" << bss_it.ssid << "): "
++                               << eVapType_str(bss_it.vap_type);
+                 }
+             }
+ 
+@@ -4681,6 +4688,22 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+ 
+     auto vap_id    = get_vap_id_with_bss(interface);
+     auto iface_ids = beerocks::utils::get_ids_from_iface_string(interface);
++    if (vap_id < 0) {
++        // Fallback: for MLD radios, the event may arrive with the bare radio name
++        // (e.g. "wlan1mld1") or an MLD link pseudo-name, while available_vaps is keyed
++        // by the link-specific name (e.g. "wlan1mld1_link0"). Retry with the
++        // link-suffixed variants before giving up.
++        for (int link_idx = 0;
++             link_idx < static_cast<int>(beerocks::message::DEV_MAX_RADIOS) && vap_id < 0;
++             link_idx++) {
++            std::string candidate = interface + "_link" + std::to_string(link_idx);
++            vap_id                = get_vap_id_with_bss(candidate);
++            if (vap_id >= 0) {
++                interface = candidate;
++                break;
++            }
++        }
++    }
+     if ((vap_id < 0) && (iface_ids.vap_id != beerocks::IFACE_RADIO_ID)) {
+         LOG(DEBUG) << "Unknown vap_id " << vap_id;
+     }
+diff --git a/controller/src/beerocks/master/tasks/agent_monitoring_task.cpp b/controller/src/beerocks/master/tasks/agent_monitoring_task.cpp
+index 44d7cad3b..8e6ce9b24 100644
+--- a/controller/src/beerocks/master/tasks/agent_monitoring_task.cpp
++++ b/controller/src/beerocks/master/tasks/agent_monitoring_task.cpp
+@@ -895,6 +895,14 @@ bool agent_monitoring_task::add_traffic_separation_policy_tlv(db &database,
+         return false;
+     }
+ 
++    // If custom TS was turned off, drop any stale per-SSID VID mappings left over in the DB from
++    // a previous enabled period (e.g. auto-derived custom config below, or a UCC-injected TS
++    // policy) so the Agent receives an explicit disable signal below rather than a stale policy.
++    if (!is_custom_ts_enabled && !traffic_separation_configs.empty()) {
++        database.clear_traffic_separation_configurations(al_mac);
++        traffic_separation_configs.clear();
++    }
++
+     // if traffic_separation_configs is empty -> check custom configuration
+     if (traffic_separation_configs.empty() && is_custom_ts_enabled) {
+         int private_vid = bpl::DEFAULT_PRIVATE_VLAN_ID;
+@@ -934,31 +942,35 @@ bool agent_monitoring_task::add_traffic_separation_policy_tlv(db &database,
+         }
+     }
+ 
+-    // Make TrafficSeparationPolicy TLV
+-    if (!traffic_separation_configs.empty()) {
+-        auto tlv_traffic_policy = cmdu_tx.addClass<wfa_map::tlvProfile2TrafficSeparationPolicy>();
+-        if (!tlv_traffic_policy) {
+-            LOG(ERROR) << "Failed adding tlvProfile2TrafficSeparationPolicy";
++    // Make TrafficSeparationPolicy TLV.
++    // Per EasyMesh spec section 19.1.3, an Agent treats a TLV-absent Policy Config Request the
++    // same as one with the Number of SSIDs field set to zero ("not configured"). This Controller
++    // sends only one Policy Config Request per invocation of this function, so the TLV must
++    // always be included -- with zero SSIDs when TS is disabled/unconfigured -- to give the
++    // Agent an unambiguous, explicit signal to disable traffic separation and tear down any
++    // previously applied VLAN interfaces.
++    auto tlv_traffic_policy = cmdu_tx.addClass<wfa_map::tlvProfile2TrafficSeparationPolicy>();
++    if (!tlv_traffic_policy) {
++        LOG(ERROR) << "Failed adding tlvProfile2TrafficSeparationPolicy";
++        return false;
++    }
++    for (auto &config : traffic_separation_configs) {
++        auto ssid_vlan_id_entry = tlv_traffic_policy->create_ssids_vlan_id_list();
++        if (!ssid_vlan_id_entry) {
++            LOG(ERROR) << "Failed creating ssid_vlan_id entry";
+             return false;
+         }
+-        for (auto &config : traffic_separation_configs) {
+-            auto ssid_vlan_id_entry = tlv_traffic_policy->create_ssids_vlan_id_list();
+-            if (!ssid_vlan_id_entry) {
+-                LOG(ERROR) << "Failed creating ssid_vlan_id entry";
+-                return false;
+-            }
+-            if (!ssid_vlan_id_entry->set_ssid_name(config.ssid)) {
+-                LOG(ERROR) << "Failed setting ssid";
+-                return false;
+-            }
+-            ssid_vlan_id_entry->vlan_id() = config.vlan_id;
+-            if (!tlv_traffic_policy->add_ssids_vlan_id_list(ssid_vlan_id_entry)) {
+-                LOG(ERROR) << "Failed adding ssid_vlan_entry";
+-                return false;
+-            }
+-
+-            database.dm_set_device_ssid_to_vid_map(*agent, config);
++        if (!ssid_vlan_id_entry->set_ssid_name(config.ssid)) {
++            LOG(ERROR) << "Failed setting ssid";
++            return false;
+         }
++        ssid_vlan_id_entry->vlan_id() = config.vlan_id;
++        if (!tlv_traffic_policy->add_ssids_vlan_id_list(ssid_vlan_id_entry)) {
++            LOG(ERROR) << "Failed adding ssid_vlan_entry";
++            return false;
++        }
++
++        database.dm_set_device_ssid_to_vid_map(*agent, config);
+     }
+     return true;
+ }
+-- 
+2.34.1
+
