@@ -1,7 +1,7 @@
-From 0770ade29ab93052002df1becd66672206dbd1c0 Mon Sep 17 00:00:00 2001
+From b979b2d617b84eea2bb927653898ecf48f64bcaf Mon Sep 17 00:00:00 2001
 From: Manoj Sekar <sekar@qti.qualcomm.com>
-Date: Thu, 23 Jul 2026 14:09:05 +0530
-Subject: [PATCH] [Channel Selection]: Add CBS based channel selection with 
+Date: Sat, 25 Jul 2026 19:38:55 +0530
+Subject: [PATCH] [Channel Selection]: Add CBS based channel selection with
  preference-table cache
 
 Add CBS-rank-based channel selection: periodically trigger the QCA driver's Channel
@@ -133,17 +133,13 @@ Signed-off-by: Manoj Sekar <sekar@qti.qualcomm.com>
  .../bwl/include/bwl/base_wlan_hal_types.h     |  15 +
  .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 336 +++++++-
  .../bwl/nl80211/ap_wlan_hal_nl80211.h         |   2 +
- .../beerocks/bwl/whm/ap_wlan_hal_whm.h        |  11 +
  .../bwl/nl80211/base_wlan_hal_nl80211.cpp     |  41 +
  .../bwl/nl80211/base_wlan_hal_nl80211.h       |  18 +
- .../tlvf/beerocks_message_apmanager.h         |  19 +
- .../beerocks/tlvf/beerocks_message_backhaul.h |  19 +
- .../tlvf/beerocks_message_apmanager.cpp       |  56 ++
- .../tlvf/beerocks_message_backhaul.cpp        |  56 ++
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.h     |  11 +
  .../tlvf/beerocks_message_action.yaml         |   6 +-
  .../tlvf/beerocks_message_apmanager.yaml      |   6 +
  .../tlvf/beerocks_message_backhaul.yaml       |   7 +-
- 23 files changed, 1575 insertions(+), 11 deletions(-)
+ 19 files changed, 1425 insertions(+), 11 deletions(-)
 
 diff --git a/agent/config/beerocks_agent.conf.in b/agent/config/beerocks_agent.conf.in
 index 9254dfe..fd75f7c 100644
@@ -238,7 +234,7 @@ index 0fa4b53..d34ca9f 100644
 +            // refreshed IMMEDIATELY on CBS completion. Without this, the ranks only reach the
 +            // backhaul on the next explicit CHANNELS_LIST_REQUEST, so a CHANNEL_SELECTION_REQUEST
 +            // arriving right after CBS completes would run against a stale (rank-0) cache.
-+            {
++            if (ap_wlan_hal->get_hal_conf().cbs_based_chansel_enable) {
 +                auto channels_list_response = beerocks::message_com::create_vs_message<
 +                    beerocks_message::cACTION_APMANAGER_CHANNELS_LIST_RESPONSE>(cmdu_tx);
 +                if (!channels_list_response) {
@@ -389,7 +385,7 @@ index 1a68df9..5424a6b 100644
          auto &radio_mac = beerocks_header->actionhdr()->radio_mac();
          auto db         = AgentDB::get();
 diff --git a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
-index 9058762..d085a92 100644
+index 9058762..1e6d41d 100644
 --- a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
 +++ b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
 @@ -154,6 +154,511 @@ get_cumulative_preference(const AgentDB::sRadio *radio,
@@ -1368,18 +1364,24 @@ index 6704dc6..65ec8b6 100644
              for (auto bw : supported_channel_info.supported_bandwidths) {
 -                // Since bwl nl8011 does not support ranking, set all ranking to highest rank (1).
 -                channel_info.bw_info_list[bw] = 1;
-+                // Default/baseline rank = 0. For the CBS flow, read_acs_report() overwrites this
-+                // with the driver rank ("ACS show_report"): rank>=1 are the truly ranked/best
-+                // channels, rank 0 is operable-but-unranked (baseline). Using 0 (not 1) as the
-+                // default means an unranked channel is NOT mistaken for a real "rank 1 = best"
-+                // when the report doesn't mention it. For the non-CBS flows, all channels share
-+                // the same default rank so relative ordering / preference is unchanged.
-+                channel_info.bw_info_list[bw] = 0;
++                // GATING: keep the original pre-CBS baseline of 1 when CBS is disabled (default),
++                // so the reported multiap_preference / ranking is byte-for-byte identical to
++                // pre-CBS. Use the CBS baseline of 0 (operable-but-unranked) ONLY when enabled;
++                // read_acs_report() then overlays the driver ranks (>=1) on top of that baseline.
++                // (Non-CBS flows are therefore completely unaffected by this change.)
++                channel_info.bw_info_list[bw] =
++                    m_hal_conf.cbs_based_chansel_enable ? 0 : 1;
              }
          }
      } else {
-@@ -4231,10 +4236,327 @@ bool ap_wlan_hal_nl80211::read_acs_report()
+@@ -4231,10 +4236,333 @@ bool ap_wlan_hal_nl80211::read_acs_report()
  {
++    // GATING: CBS is the only consumer of "ACS show_report". When disabled (default), keep the
++    // original pre-CBS no-op so NOTHING runs here (not even the TRACE below) with all knobs off.
++    if (!m_hal_conf.cbs_based_chansel_enable) {
++        return true;
++    }
++
      LOG(TRACE) << __func__ << " for interface: " << get_radio_info().iface_name;
  
 -    // We're not going to support ACS in the NL80211 flavor of BWL.
@@ -1723,26 +1725,6 @@ index 130b30c..951bab9 100644
      virtual bool set_tx_power_limit(int tx_pow_limit) override;
  
      /**
-diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
-index 1111111..2222222 100644
---- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
-+++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
-@@ -110,4 +110,15 @@ public:
-     virtual bool read_acs_report() override;
-+    // CBS-based channel selection is only implemented for the nl80211 backend. The pWHM/whm
-+    // backend does not support the driver "ACS show_report"/"CBS enable 1" control commands, so
-+    // provide inert stub overrides here to keep ap_wlan_hal_whm concrete. Returning false means
-+    // "no CBS ranks available", which the backhaul treats as "fall back to the existing
-+    // controller+radio-preference selection" — i.e. the WHM behaviour is unchanged.
-+    virtual bool read_acs_ranks(std::vector<sAcsChannelRank> &out_ranks) override
-+    {
-+        out_ranks.clear();
-+        return false;
-+    }
-+    virtual bool trigger_cbs() override { return false; }
-     virtual bool set_tx_power_limit(int tx_pow_limit) override;
- 
-     // Stub implementations for pure virtual functions from base classes
 diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
 index 81692b1..e842e71 100644
 --- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
@@ -1824,196 +1806,28 @@ index 614e809..11799c4 100644
      bool wpa_ctrl_send_msg(const std::string &cmd, const std::string &ifname = {});
  
      /**
-diff --git a/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_apmanager.h b/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_apmanager.h
-index b6bcc75..ca786ba 100644
---- a/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_apmanager.h
-+++ b/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_apmanager.h
-@@ -1829,6 +1829,25 @@ class cACTION_APMANAGER_HOSTAP_AWGN_SIMULATE_RESPONSE : public BaseClass
-         uint8_t* m_success = nullptr;
- };
- 
-+class cACTION_APMANAGER_HOSTAP_TRIGGER_CBS : public BaseClass
-+{
-+    public:
-+        cACTION_APMANAGER_HOSTAP_TRIGGER_CBS(uint8_t* buff, size_t buff_len, bool parse = false);
-+        explicit cACTION_APMANAGER_HOSTAP_TRIGGER_CBS(std::shared_ptr<BaseClass> base, bool parse = false);
-+        ~cACTION_APMANAGER_HOSTAP_TRIGGER_CBS();
-+
-+        static eActionOp_APMANAGER get_action_op(){
-+            return (eActionOp_APMANAGER)(ACTION_APMANAGER_HOSTAP_TRIGGER_CBS);
-+        }
-+        void class_swap() override;
-+        bool finalize() override;
-+        static size_t get_initial_size();
-+
-+    private:
-+        bool init();
-+        eActionOp_APMANAGER* m_action_op = nullptr;
-+};
-+
- }; // close namespace: beerocks_message
- 
- #endif //_BEEROCKS/TLVF_BEEROCKS_MESSAGE_APMANAGER_H_
-diff --git a/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_backhaul.h b/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_backhaul.h
-index c2e96b0..33e3117 100644
---- a/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_backhaul.h
-+++ b/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_backhaul.h
-@@ -382,6 +382,25 @@ class cACTION_BACKHAUL_CHANNELS_LIST_REQUEST : public BaseClass
-         eActionOp_BACKHAUL* m_action_op = nullptr;
- };
- 
-+class cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS : public BaseClass
-+{
-+    public:
-+        cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS(uint8_t* buff, size_t buff_len, bool parse = false);
-+        explicit cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS(std::shared_ptr<BaseClass> base, bool parse = false);
-+        ~cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS();
-+
-+        static eActionOp_BACKHAUL get_action_op(){
-+            return (eActionOp_BACKHAUL)(ACTION_BACKHAUL_HOSTAP_TRIGGER_CBS);
-+        }
-+        void class_swap() override;
-+        bool finalize() override;
-+        static size_t get_initial_size();
-+
-+    private:
-+        bool init();
-+        eActionOp_BACKHAUL* m_action_op = nullptr;
-+};
-+
- class cACTION_BACKHAUL_CHANNELS_LIST_RESPONSE : public BaseClass
- {
-     public:
-diff --git a/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_apmanager.cpp b/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_apmanager.cpp
-index 400d03e..bb5c6ac 100644
---- a/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_apmanager.cpp
-+++ b/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_apmanager.cpp
-@@ -6699,4 +6699,60 @@ bool cACTION_APMANAGER_HOSTAP_AWGN_SIMULATE_RESPONSE::init()
-     return true;
- }
- 
-+cACTION_APMANAGER_HOSTAP_TRIGGER_CBS::cACTION_APMANAGER_HOSTAP_TRIGGER_CBS(uint8_t* buff, size_t buff_len, bool parse) :
-+    BaseClass(buff, buff_len, parse) {
-+    m_init_succeeded = init();
-+}
-+cACTION_APMANAGER_HOSTAP_TRIGGER_CBS::cACTION_APMANAGER_HOSTAP_TRIGGER_CBS(std::shared_ptr<BaseClass> base, bool parse) :
-+BaseClass(base->getBuffPtr(), base->getBuffRemainingBytes(), parse){
-+    m_init_succeeded = init();
-+}
-+cACTION_APMANAGER_HOSTAP_TRIGGER_CBS::~cACTION_APMANAGER_HOSTAP_TRIGGER_CBS() {
-+}
-+void cACTION_APMANAGER_HOSTAP_TRIGGER_CBS::class_swap()
-+{
-+    tlvf_swap(8*sizeof(eActionOp_APMANAGER), reinterpret_cast<uint8_t*>(m_action_op));
-+}
- 
-+bool cACTION_APMANAGER_HOSTAP_TRIGGER_CBS::finalize()
-+{
-+    if (m_parse__) {
-+        TLVF_LOG(DEBUG) << "finalize() called but m_parse__ is set";
-+        return true;
-+    }
-+    if (m_finalized__) {
-+        TLVF_LOG(DEBUG) << "finalize() called for already finalized class";
-+        return true;
-+    }
-+    if (!isPostInitSucceeded()) {
-+        TLVF_LOG(ERROR) << "post init check failed";
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
+index 168911a..5fa66ab 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
+@@ -116,6 +116,17 @@ public:
+      * @return true on success, fasle on failure
+      */
+     virtual bool read_acs_report() override;
++    // CBS-based channel selection is only implemented for the nl80211 backend. The pWHM/whm
++    // backend does not support the driver "ACS show_report"/"CBS enable 1" control commands, so
++    // provide inert stub overrides here to keep ap_wlan_hal_whm concrete. Returning false means
++    // "no CBS ranks available", which the backhaul treats as "fall back to the existing
++    // controller+radio-preference selection" — i.e. the WHM behaviour is unchanged.
++    virtual bool read_acs_ranks(std::vector<sAcsChannelRank> &out_ranks) override
++    {
++        out_ranks.clear();
 +        return false;
 +    }
-+    if (m_inner__) {
-+        if (!m_inner__->finalize()) {
-+            TLVF_LOG(ERROR) << "m_inner__->finalize() failed";
-+            return false;
-+        }
-+        auto tailroom = m_inner__->getMessageBuffLength() - m_inner__->getMessageLength();
-+        m_buff_ptr__ -= tailroom;
-+    }
-+    class_swap();
-+    m_finalized__ = true;
-+    return true;
-+}
-+
-+size_t cACTION_APMANAGER_HOSTAP_TRIGGER_CBS::get_initial_size()
-+{
-+    size_t class_size = 0;
-+    return class_size;
-+}
-+
-+bool cACTION_APMANAGER_HOSTAP_TRIGGER_CBS::init()
-+{
-+    if (getBuffRemainingBytes() < get_initial_size()) {
-+        TLVF_LOG(ERROR) << "Not enough available space on buffer. Class init failed";
-+        return false;
-+    }
-+    if (m_parse__) { class_swap(); }
-+    return true;
-+}
-diff --git a/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_backhaul.cpp b/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_backhaul.cpp
-index 181ae91..7e2f397 100644
---- a/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_backhaul.cpp
-+++ b/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_backhaul.cpp
-@@ -3906,4 +3906,60 @@ bool cACTION_BACKHAUL_SUPPLICANT_RESTART::init()
-     return true;
- }
++    virtual bool trigger_cbs() override { return false; }
+     virtual bool set_tx_power_limit(int tx_pow_limit) override;
  
-+cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS::cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS(uint8_t* buff, size_t buff_len, bool parse) :
-+    BaseClass(buff, buff_len, parse) {
-+    m_init_succeeded = init();
-+}
-+cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS::cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS(std::shared_ptr<BaseClass> base, bool parse) :
-+BaseClass(base->getBuffPtr(), base->getBuffRemainingBytes(), parse){
-+    m_init_succeeded = init();
-+}
-+cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS::~cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS() {
-+}
-+void cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS::class_swap()
-+{
-+    tlvf_swap(8*sizeof(eActionOp_BACKHAUL), reinterpret_cast<uint8_t*>(m_action_op));
-+}
- 
-+bool cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS::finalize()
-+{
-+    if (m_parse__) {
-+        TLVF_LOG(DEBUG) << "finalize() called but m_parse__ is set";
-+        return true;
-+    }
-+    if (m_finalized__) {
-+        TLVF_LOG(DEBUG) << "finalize() called for already finalized class";
-+        return true;
-+    }
-+    if (!isPostInitSucceeded()) {
-+        TLVF_LOG(ERROR) << "post init check failed";
-+        return false;
-+    }
-+    if (m_inner__) {
-+        if (!m_inner__->finalize()) {
-+            TLVF_LOG(ERROR) << "m_inner__->finalize() failed";
-+            return false;
-+        }
-+        auto tailroom = m_inner__->getMessageBuffLength() - m_inner__->getMessageLength();
-+        m_buff_ptr__ -= tailroom;
-+    }
-+    class_swap();
-+    m_finalized__ = true;
-+    return true;
-+}
-+
-+size_t cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS::get_initial_size()
-+{
-+    size_t class_size = 0;
-+    return class_size;
-+}
-+
-+bool cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS::init()
-+{
-+    if (getBuffRemainingBytes() < get_initial_size()) {
-+        TLVF_LOG(ERROR) << "Not enough available space on buffer. Class init failed";
-+        return false;
-+    }
-+    if (m_parse__) { class_swap(); }
-+    return true;
-+}
+     // Stub implementations for pure virtual functions from base classes
 diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
 index 58c9e09..fd74655 100755
 --- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
