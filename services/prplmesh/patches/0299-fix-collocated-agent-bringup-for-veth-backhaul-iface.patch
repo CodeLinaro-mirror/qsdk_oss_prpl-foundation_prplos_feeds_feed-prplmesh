@@ -1,0 +1,166 @@
+From 5f696b44aa3a8556a0cc943b4d89847b6bc4efad Mon Sep 17 00:00:00 2001
+From: Aryan Khare <aryakhar@qti.qualcomm.com>
+Date: Thu, 30 Jul 2026 12:11:30 +0530
+Subject: [PATCH] fix collocated agent bringup for veth backhaul iface
+
+For veth interfaces, wan_monitor and gateway ARP checks fail causing
+the FSM to select wireless. Add is_collocated_veth_wired_onboarding()
+to bypass these checks and use direct link-up detection instead.
+
+Signed-off-by: Aryan Khare <aryakhar@qti.qualcomm.com>
+---
+ .../backhaul_manager/backhaul_manager.cpp     | 87 +++++++++++++++++--
+ .../slave/backhaul_manager/backhaul_manager.h | 10 +++
+ 2 files changed, 88 insertions(+), 9 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 7a1db0ece..3b3131262 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -838,10 +838,15 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+             beerocks::net::network_utils::linux_get_iface_list_from_bridge(db->bridge.iface_name);
+ 
+         std::string selected_eth_iface;
+-        bool eth_gateway_reachable = select_gateway_reachable_eth_interface(selected_eth_iface);
+-        if(eth_gateway_reachable) {
++        bool eth_gateway_reachable   = select_gateway_reachable_eth_interface(selected_eth_iface);
++        bool assume_wired_onboarding = is_collocated_veth_wired_onboarding();
++        if (eth_gateway_reachable) {
+             db->ethernet.wan.iface_name = selected_eth_iface;
+-            LOG(DEBUG) << "Dynamically selected ETH interface " << db->ethernet.wan.iface_name << " for WIRED Backhaul";
++            LOG(DEBUG) << "Dynamically selected ETH interface " << db->ethernet.wan.iface_name
++                       << " for WIRED Backhaul";
++        } else if (assume_wired_onboarding) {
++            LOG(INFO) << "Collocated veth wired interface detected, assuming wired onboarding on "
++                      << db->ethernet.wan.iface_name << " without gateway reachability check";
+         } else {
+             LOG(WARNING) << "No ETH interface is gateway reachable for WIRED Backhaul";
+         }
+@@ -857,8 +862,16 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+             }
+         }
+ 
+-        // Only use wired backhaul if interface is UP AND gateway is reachable
+-        if ((wired_link_state == wan_monitor::ELinkState::eUp) && eth_gateway_reachable &&
++        // Normal wired backhaul requires the interface to be UP and gateway reachable.
++        // A configured collocated veth interface is a local transport to the colocated controller,
++        // so link-up is enough and gateway ARP reachability is intentionally bypassed.
++        const bool wired_link_available =
++            assume_wired_onboarding
++                ? beerocks::net::network_utils::linux_iface_is_up_and_running(
++                      db->ethernet.wan.iface_name)
++                : ((wired_link_state == wan_monitor::ELinkState::eUp) && eth_gateway_reachable);
++
++        if (wired_link_available &&
+             (m_selected_backhaul.empty() || m_selected_backhaul == DEV_SET_ETH)) {
+ 
+             auto it = std::find(ifaces.begin(), ifaces.end(), db->ethernet.wan.iface_name);
+@@ -941,10 +954,21 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+             if (db->ethernet.wan.iface_name.empty()) {
+                 LOG(WARNING) << "WAN interface is empty!";
+             }
+-            eth_link_poll_timer = std::chrono::steady_clock::now();
+-            m_eth_link_up       = beerocks::net::network_utils::linux_iface_is_up_and_running(db->ethernet.wan.iface_name)
+-                                    && is_gateway_reachable_via_interface(db->ethernet.wan.iface_name);
+-            LOG(DEBUG) << "WIRED_BACKHAUL_INTERFACE STATE:" << m_eth_link_up << " SELECTED BACKHAUL: " << db->backhaul.connection_type;
++            if (is_collocated_veth_wired_onboarding() &&
++                db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wired) {
++                m_eth_link_up = beerocks::net::network_utils::linux_iface_is_up_and_running(
++                    db->ethernet.wan.iface_name);
++                LOG(DEBUG) << "Skipping gateway reachability check for collocated veth wired "
++                              "onboarding, iface="
++                           << db->ethernet.wan.iface_name << ", link_up=" << m_eth_link_up;
++            } else {
++                eth_link_poll_timer = std::chrono::steady_clock::now();
++                m_eth_link_up = beerocks::net::network_utils::linux_iface_is_up_and_running(
++                                    db->ethernet.wan.iface_name) &&
++                                is_gateway_reachable_via_interface(db->ethernet.wan.iface_name);
++            }
++            LOG(DEBUG) << "WIRED_BACKHAUL_INTERFACE STATE:" << m_eth_link_up
++                       << " SELECTED BACKHAUL: " << db->backhaul.connection_type;
+         }
+ 
+         // Added logic to disconnect the STA interface when backhaul_wired_iface is UP:
+@@ -1038,6 +1062,11 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+         auto db = AgentDB::get();
+         if (db->device_conf.local_gw) break;
+ 
++        if (is_collocated_veth_wired_onboarding() &&
++            db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wired) {
++            break;
++        }
++
+         auto now = std::chrono::steady_clock::now();
+ 
+         int time_elapsed_ms =
+@@ -4631,6 +4660,46 @@ bool BackhaulManager::try_switch_to_wired_backhaul()
+     return true;
+ }
+ 
++bool BackhaulManager::is_collocated_veth_wired_onboarding() const
++{
++    auto db = AgentDB::get();
++
++    // Check 1: Configured wired backhaul interface must start with "veth".
++    if (db->ethernet.wan.iface_name.empty() ||
++        db->ethernet.wan.iface_name.rfind("veth", 0) != 0) {
++        return false;
++    }
++
++    const std::string &iface = db->ethernet.wan.iface_name;
++
++    // Check 2: Confirm this is a real veth pair using kernel sysfs.
++    // A real veth pair (ip link add veth0 type veth peer name veth1) has ifindex != iflink.
++    // A dummy interface (ip link add veth0 type dummy) has ifindex == iflink.
++    // This is the definitive kernel-level distinction between the two.
++    std::ifstream ifindex_file("/sys/class/net/" + iface + "/ifindex");
++    std::ifstream iflink_file("/sys/class/net/" + iface + "/iflink");
++
++    if (!ifindex_file.is_open() || !iflink_file.is_open()) {
++        LOG(WARNING) << "is_collocated_veth_wired_onboarding: cannot open sysfs for " << iface;
++        return false;
++    }
++
++    int ifindex = 0, iflink = 0;
++    ifindex_file >> ifindex;
++    iflink_file >> iflink;
++
++    if (ifindex == iflink) {
++        LOG(WARNING) << "is_collocated_veth_wired_onboarding: " << iface
++                     << " is a dummy interface (ifindex==iflink==" << ifindex
++                     << "), not a real veth pair";
++        return false;
++    }
++
++    LOG(INFO) << "is_collocated_veth_wired_onboarding: " << iface
++              << " is a real veth pair (ifindex=" << ifindex << ", iflink=" << iflink << ")";
++    return true;
++}
++
+ bool BackhaulManager::select_gateway_reachable_eth_interface(std::string &selected_iface)
+ {
+     auto db = AgentDB::get();
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+index 628451d6a..58e02bfaa 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+@@ -340,6 +340,16 @@ private:
+      */
+     bool select_gateway_reachable_eth_interface(std::string &selected_iface);
+ 
++    /**
++     * @brief Checks if this agent should assume wired onboarding over a collocated veth interface.
++     *
++     * This mode uses the configured veth wired backhaul interface as a local controller transport
++     * and intentionally does not require gateway ARP reachability.
++     *
++     * @return true if collocated veth wired onboarding should be assumed.
++     */
++    bool is_collocated_veth_wired_onboarding() const;
++
+     /**
+      * @brief Checks if ethernet is up and switches to wired backhaul if so.
+      *
+-- 
+2.34.1
+
