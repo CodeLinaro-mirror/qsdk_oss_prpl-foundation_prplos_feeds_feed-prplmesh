@@ -1,0 +1,966 @@
+From 8271a07c293af6d9f0403c062b3e0251c2309a03 Mon Sep 17 00:00:00 2001
+From: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+Date: Sat, 1 Aug 2026 20:38:09 +0530
+Subject: [PATCH] prplMesh: fix MLO per-link RCPI/traffic-stats queries and TLV
+ 0xa2 aggregation
+
+TLV 0x96 (Associated STA Link Metrics) and TLV 0xe4 (Affiliated STA
+Metrics) queried a guessed nested netlink attribute (ID 31) on a
+derived "parent MLD interface" to get per-affiliated-link signal and
+traffic counters. That attribute's sub-fields always read back zero on
+this driver, so both affiliated links of an MLO client collapsed onto
+the same fallback RCPI.
+
+Replace it with a direct nl80211 GET_STATION query per affiliated
+link, issued on that link's own per-link BSS interface for that link's
+own STA MAC, reusing the existing bwl::nl80211_client::get_sta_info()
+already used for non-MLO stations.
+
+Also fix TLV 0xe4 emitting up to 3x too many entries for a multi-BSS
+AP MLD: its dedup set was checked against the outer response entry's
+STA MAC before expanding to affiliated links, but that MAC differs
+across BSS iterations for the same MLD, so every new value re-emitted
+all affiliated links again. Move the dedup to per affiliated-link MAC,
+matching the TLV 0x96 handling.
+
+Fix is_sta_reported_bssid_valid() on the controller to resolve an
+affiliated link MAC to its MLD station the same way
+dm_set_sta_link_metrics() already does, so per-link TLV 0x96 entries
+are no longer rejected before they reach the data model.
+
+Finally, fix TLV 0xa2 (Associated STA Traffic Stats) not matching the
+true MLD-level aggregate: each monitor only reports the traffic it
+observes on its own BSS/link, so an MLO STA present on multiple
+monitors was previously deduped by keeping only the first monitor's
+partial report and discarding the rest. Replace the presence-only
+dedup set with an accumulator that sums byte/packet/error counters
+across every monitor call in a query round, so the emitted TLV 0xa2
+reflects the true MLD-level aggregate.
+
+Signed-off-by: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+---
+ .../tasks/link_metrics_collection_task.cpp    | 570 +++++++++---------
+ .../tasks/link_metrics_collection_task.h      |  17 +
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      |  24 +-
+ .../bwl/shared/nl80211_client_impl.cpp        |  64 +-
+ controller/src/beerocks/master/db/db.cpp      |  19 +
+ 5 files changed, 394 insertions(+), 300 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+index ab1342513..749cadaf0 100644
+--- a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+@@ -42,171 +42,93 @@
+ 
+ #include "../gate/1905_beacon_query_to_vs.h"
+ 
+-/* Direct NL80211 station GET for MLO per-link stats and signal.
++/* Per-link MLO signal/traffic stats via a direct, per-link NL80211_CMD_GET_STATION
++ * query.
+  *
+- * The QSDK kernel does not support NL80211_STA_INFO_MLD_LINK_INFO (upstream
+- * kernel 6.1+).  Instead, querying NL80211_CMD_GET_STATION on a link-specific
+- * interface (e.g. "wlan1_link0") with the affiliated link MAC returns the
+- * per-link stats using standard NL80211_STA_INFO_* attributes.
++ * The previous implementation queried the parent MLD interface (e.g.
++ * "wlan16mld1") with the MLD MAC and tried to parse a vendor-specific nested
++ * "per-link info" attribute inside NL80211_ATTR_STA_INFO, using a guessed
++ * attribute ID (31) and a guessed sub-attribute schema. On this kernel/driver
++ * build, that attribute's sub-fields are always zero, so every affiliated
++ * link collapsed into a single bogus zero-MAC map entry, and both real
++ * affiliated links fell through to the same fallback RCPI.
+  *
+- * This is the same approach `iw dev wlan1_link0 station get <link_mac>` uses.
++ * Instead, each affiliated link is queried directly: its own per-link BSS
++ * interface (agent_db.h sBssid::iface_name, NOT the parent MLD interface) for
++ * its own affiliated STA MAC, reusing bwl::nl80211_client::get_sta_info() —
++ * the same, already-working mechanism used for non-MLO stations in
++ * ieee802_11_link_metrics_collector.cpp. This relies only on the
++ * well-defined, policy-validated standard NL80211_STA_INFO_* attributes.
+  */
+-#include <netlink/netlink.h>
+-#include <netlink/genl/genl.h>
+-#include <netlink/genl/ctrl.h>
+-#include <linux/nl80211.h>
+-#include <net/if.h>
+-#include <climits>
++#include <bwl/nl80211_client_factory.h>
+ 
+ namespace {
+ 
+-/**
+- * Per-link station info populated by get_sta_info_nl80211().
+- */
+ struct sPerLinkStaInfo {
+-    int8_t   signal_dbm   = 0;      ///< NL80211_STA_INFO_SIGNAL (dBm)
+-    bool     signal_valid = false;  ///< true if signal < 0 dBm (link is active)
+-    uint64_t tx_bytes     = 0;      ///< NL80211_STA_INFO_TX_BYTES64
+-    uint64_t rx_bytes     = 0;      ///< NL80211_STA_INFO_RX_BYTES64
+-    uint32_t tx_packets   = 0;      ///< NL80211_STA_INFO_TX_PACKETS
+-    uint32_t rx_packets   = 0;      ///< NL80211_STA_INFO_RX_PACKETS
+-    uint32_t tx_failed    = 0;      ///< NL80211_STA_INFO_TX_FAILED
+-};
+-
+-struct sStaGetCbData {
+-    sPerLinkStaInfo *info = nullptr;
++    int8_t   signal_dbm       = 0;      ///< per-link instantaneous signal (dBm)
++    bool     signal_valid     = false;  ///< true if signal_dbm < 0 dBm (link is active)
++    int8_t   signal_avg_dbm   = 0;      ///< per-link averaged signal (dBm)
++    bool     signal_avg_valid = false;  ///< true if signal_avg_dbm < 0 dBm
++    uint64_t tx_bytes     = 0;      ///< per-link TX bytes
++    uint64_t rx_bytes     = 0;      ///< per-link RX bytes
++    uint32_t tx_packets   = 0;      ///< per-link TX packets
++    uint32_t rx_packets   = 0;      ///< per-link RX packets
++    uint32_t tx_failed    = 0;      ///< per-link TX failed
+ };
+ 
+-static int sta_get_cb(struct nl_msg *msg, void *arg)
+-{
+-    auto *cb_data = static_cast<sStaGetCbData *>(arg);
+-    if (!cb_data || !cb_data->info) {
+-        return NL_SKIP;
+-    }
+-
+-    struct genlmsghdr *gnlh =
+-        static_cast<struct genlmsghdr *>(nlmsg_data(nlmsg_hdr(msg)));
+-
+-    struct nlattr *tb[NL80211_ATTR_MAX + 1] = {};
+-    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
+-              genlmsg_attrlen(gnlh, 0), nullptr);
+-
+-    if (!tb[NL80211_ATTR_STA_INFO]) {
+-        return NL_SKIP;
+-    }
+-
+-    struct nlattr *sinfo[NL80211_STA_INFO_MAX + 1] = {};
+-    static struct nla_policy sta_policy[NL80211_STA_INFO_MAX + 1] = {};
+-    if (nla_parse_nested(sinfo, NL80211_STA_INFO_MAX,
+-                         tb[NL80211_ATTR_STA_INFO], sta_policy) < 0) {
+-        return NL_SKIP;
+-    }
+-
+-    sPerLinkStaInfo &info = *cb_data->info;
+-
+-    if (sinfo[NL80211_STA_INFO_SIGNAL]) {
+-        info.signal_dbm   = static_cast<int8_t>(nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL]));
+-        info.signal_valid = (info.signal_dbm < 0);
+-    }
+-    if (sinfo[NL80211_STA_INFO_TX_BYTES64]) {
+-        info.tx_bytes = nla_get_u64(sinfo[NL80211_STA_INFO_TX_BYTES64]);
+-    }
+-    if (sinfo[NL80211_STA_INFO_RX_BYTES64]) {
+-        info.rx_bytes = nla_get_u64(sinfo[NL80211_STA_INFO_RX_BYTES64]);
+-    }
+-    if (sinfo[NL80211_STA_INFO_TX_PACKETS]) {
+-        info.tx_packets = nla_get_u32(sinfo[NL80211_STA_INFO_TX_PACKETS]);
+-    }
+-    if (sinfo[NL80211_STA_INFO_RX_PACKETS]) {
+-        info.rx_packets = nla_get_u32(sinfo[NL80211_STA_INFO_RX_PACKETS]);
+-    }
+-    if (sinfo[NL80211_STA_INFO_TX_FAILED]) {
+-        info.tx_failed = nla_get_u32(sinfo[NL80211_STA_INFO_TX_FAILED]);
+-    }
+-
+-    return NL_OK;
+-}
+-
+-static bool get_sta_info_nl80211(
+-    const std::string &link_iface,
+-    const sMacAddr    &link_mac,
+-    sPerLinkStaInfo   &info)
++/**
++ * @brief Query signal/traffic stats for a single affiliated link by querying
++ *        that link's own BSS interface for that link's own STA MAC.
++ *
++ * @param link_iface   Per-link BSS interface (e.g. "wlan1_link0")
++ * @param link_sta_mac Affiliated STA MAC address on this link
++ * @param info         Output: populated on success
++ * @return             true if the driver returned station info for this link
++ */
++static bool get_link_sta_info_nl80211(const std::string &link_iface,
++                                      const sMacAddr &link_sta_mac, sPerLinkStaInfo &info)
+ {
+-    info = sPerLinkStaInfo{};
+-
+-    struct nl_sock *sock = nl_socket_alloc();
+-    if (!sock) {
+-        return false;
+-    }
+-
+-    if (genl_connect(sock) < 0) {
+-        nl_socket_free(sock);
++    if (link_iface.empty()) {
+         return false;
+     }
+ 
+-    int nl80211_id = genl_ctrl_resolve(sock, "nl80211");
+-    if (nl80211_id < 0) {
+-        nl_socket_free(sock);
++    auto client = bwl::nl80211_client_factory::create_instance();
++    bwl::nl80211_client::sta_info sta_info;
++    if (!client || !client->get_sta_info(link_iface, link_sta_mac, sta_info)) {
+         return false;
+     }
+ 
+-    struct nl_msg *msg = nlmsg_alloc();
+-    if (!msg) {
+-        nl_socket_free(sock);
+-        return false;
+-    }
+-
+-    genlmsg_put(msg, 0, 0, nl80211_id, 0, 0, NL80211_CMD_GET_STATION, 0);
+-
+-    unsigned int ifindex = if_nametoindex(link_iface.c_str());
+-    if (ifindex == 0) {
+-        nlmsg_free(msg);
+-        nl_socket_free(sock);
+-        return false;
+-    }
+-    nla_put_u32(msg, NL80211_ATTR_IFINDEX, ifindex);
+-    nla_put(msg, NL80211_ATTR_MAC, ETH_ALEN, link_mac.oct);
+-
+-    sStaGetCbData cb_data;
+-    cb_data.info = &info;
+-
+-    nl_socket_modify_cb(sock, NL_CB_VALID, NL_CB_CUSTOM, sta_get_cb, &cb_data);
+-
+-    int ret = nl_send_auto(sock, msg);
+-    if (ret >= 0) {
+-        nl_recvmsgs_default(sock);
+-    }
+-
+-    nlmsg_free(msg);
+-    nl_socket_free(sock);
+-
+-    return info.signal_valid;
++    info.signal_dbm       = sta_info.signal_dbm;
++    info.signal_valid     = (sta_info.signal_dbm < 0);
++    info.signal_avg_dbm   = static_cast<int8_t>(sta_info.signal_avg_dbm);
++    info.signal_avg_valid = (info.signal_avg_dbm < 0);
++    info.tx_bytes      = sta_info.tx_bytes;
++    info.rx_bytes      = sta_info.rx_bytes;
++    info.tx_packets    = sta_info.tx_packets;
++    info.rx_packets    = sta_info.rx_packets;
++    info.tx_failed     = sta_info.tx_failed;
++    return true;
+ }
+ 
+ /**
+- * @brief Query per-link stats for a list of (bss_iface, link_mac) pairs.
+- *
+- * For each pair, queries NL80211_CMD_GET_STATION on the link-specific
+- * interface (e.g. "wlan1_link0") with the affiliated link MAC.
+- * This works on QSDK kernels that don't support NL80211_STA_INFO_MLD_LINK_INFO.
+- *
+- * The caller (inside the beerocks namespace where AgentDB is available) is
+- * responsible for building the pairs from the MLD STA info.
++ * @brief Resolve the per-link BSS interface name for a given BSSID.
+  *
+- * @param link_iface_mac_pairs  Vector of (bss_iface_name, affiliated_link_mac)
+- * @param link_map              Output map: affiliated link MAC → sPerLinkStaInfo
++ * @param db    Agent DB
++ * @param bssid Affiliated link's own BSSID (per-link, NOT the AP MLD MAC)
++ * @return      Interface name (e.g. "wlan1_link0"), or empty string if not found
+  */
+-static void get_mlo_sta_info_nl80211(
+-    const std::vector<std::pair<std::string, sMacAddr>> &link_iface_mac_pairs,
+-    std::unordered_map<sMacAddr, sPerLinkStaInfo> &link_map)
++static std::string get_link_iface_by_bssid(beerocks::AgentDB::SafeDB &db, const sMacAddr &bssid)
+ {
+-    link_map.clear();
+-    for (const auto &p : link_iface_mac_pairs) {
+-        sPerLinkStaInfo info;
+-        get_sta_info_nl80211(p.first, p.second, info);
+-        /* Store regardless of signal validity so traffic stats are available */
+-        link_map[p.second] = info;
++    auto radio = db->get_radio_by_mac(bssid, beerocks::AgentDB::eMacType::BSSID);
++    if (!radio) {
++        return {};
+     }
++    for (const auto &bss : radio->front.bssids) {
++        if (bss.mac == bssid && !bss.iface_name.empty()) {
++            return bss.iface_name;
++        }
++    }
++    return {};
+ }
+ 
+ } // anonymous namespace
+@@ -1200,6 +1122,12 @@ bool LinkMetricsCollectionTask::send_ap_metric_query_message(
+     ap_metric_queries.clear();
+     pending_responses = 0;
+ 
++    /* New query round starting for this mid — reset the TLV 0x96 dedup set
++     * and the TLV 0xa2 accumulator so stale data from a previous round can't
++     * suppress a fresh TLV, or get summed into this round's totals. */
++    m_collected_link_sta_macs.clear();
++    m_traffic_stats_accumulator.clear();
++
+     for (const auto radio : db->get_radios_list()) {
+         if (!radio) {
+             continue;
+@@ -1364,11 +1292,20 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+ 
+     LOG(INFO) << "Found AP_Metrics_Query map for MID : " << std::hex << mid_index;
+ 
+-    /* TLV 0xa2 deduplication set — declared OUTSIDE the BSS loop so it persists
+-     * across all BSS iterations.  For a 3-BSS AP MLD, the same MLD STA MAC
+-     * matches via bss_apmld_mac on all 3 iterations; without this outer-scope
+-     * set the inner set resets each iteration and the STA is collected 3 times. */
+-    std::unordered_set<sMacAddr> collected_traffic_sta_macs;
++    /* TLV 0x96 dedup set / TLV 0xa2 accumulator are members
++     * (m_collected_link_sta_macs, m_traffic_stats_accumulator), NOT locals,
++     * because they must persist across every handle_ap_metrics_response()
++     * call in this query round — one call per radio/monitor — not just
++     * across the BSS iterations within a single call.  Otherwise an MLO STA
++     * reported by 2 monitors in the same round gets deduped independently in
++     * each call and still ends up duplicated in m_ap_metric_response (e.g. 2
++     * links x 2 monitor calls = 4 TLV 0x96 instead of 2), and each monitor's
++     * TLV 0xa2 only carries that monitor's own link -- summing across calls
++     * is required to reach the true MLD-level aggregate.
++     * They are cleared alongside m_ap_metric_response: at the start of a new
++     * query round and once the round completes. */
++    auto &collected_link_sta_macs   = m_collected_link_sta_macs;
++    auto &traffic_stats_accumulator = m_traffic_stats_accumulator;
+ 
+     for (const auto &ap_metrics_tlv : ap_metrics_tlv_list) {
+         wfa_map::tlvApExtendedMetrics *ap_extended_metrics_tlv     = 0;
+@@ -1452,41 +1389,61 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+         }
+ 
+         /* Associated STA Traffic Stats (TLV 0xa2) — MLD-level aggregate stats.
+-         * One TLV 0xa2 per MLD STA across all BSS iterations.
+-         * Deduplication is handled by collected_traffic_sta_macs declared above. */
++         * One TLV 0xa2 per MLD STA across all BSS iterations/monitor calls.
++         *
++         * Each monitor only reports the traffic it observes on its own
++         * BSS/link, so for an MLO STA present on multiple monitors, the
++         * per-monitor reports are partial views tagged with the same MLD
++         * MAC. traffic_stats_accumulator sums the per-field counters across
++         * every monitor call in this round so the emitted TLV reflects the
++         * true MLD-level aggregate instead of just the first monitor seen. */
+ 
+         std::vector<sStaTrafficStats> traffic_stats_response;
+ 
+-        for (const auto &sta_traffic :
+-             cmdu_rx.getClassList<wfa_map::tlvAssociatedStaTrafficStats>()) {
+-            if (!sta_traffic) {
+-                LOG(ERROR) << "Failed to get class list for tlvAssociatedStaTrafficStats";
+-                continue;
+-            }
+-
+-            const sMacAddr &sta_mac = sta_traffic->sta_mac();
+-
+-            /* Skip if already collected (dedup for MLO STAs on multiple BSSes) */
+-            if (collected_traffic_sta_macs.count(sta_mac)) {
+-                continue;
+-            }
++        {
++            auto sta_traffic_list = cmdu_rx.getClassList<wfa_map::tlvAssociatedStaTrafficStats>();
++            for (const auto &sta_traffic : sta_traffic_list) {
++                if (!sta_traffic) {
++                    LOG(ERROR) << "Failed to get class list for tlvAssociatedStaTrafficStats";
++                    continue;
++                }
+ 
+-            auto assoc_client = radio->associated_clients.find(sta_mac);
+-            if (assoc_client != radio->associated_clients.end() &&
+-                (assoc_client->second.bssid == metric.bssid ||
+-                 (bss_apmld_mac != net::network_utils::ZERO_MAC &&
+-                  assoc_client->second.bssid == bss_apmld_mac))) {
+-                traffic_stats_response.push_back({
+-                    sta_mac,
+-                    sta_traffic->byte_sent(),
+-                    sta_traffic->byte_received(),
+-                    sta_traffic->packets_sent(),
+-                    sta_traffic->packets_received(),
+-                    sta_traffic->tx_packets_error(),
+-                    sta_traffic->rx_packets_error(),
+-                    sta_traffic->retransmission_count(),
+-                });
+-                collected_traffic_sta_macs.insert(sta_mac);
++                const sMacAddr &sta_mac = sta_traffic->sta_mac();
++
++                auto assoc_client = radio->associated_clients.find(sta_mac);
++                if (assoc_client != radio->associated_clients.end() &&
++                    (assoc_client->second.bssid == metric.bssid ||
++                     (bss_apmld_mac != net::network_utils::ZERO_MAC &&
++                      assoc_client->second.bssid == bss_apmld_mac))) {
++                    auto acc_it = traffic_stats_accumulator.find(sta_mac);
++                    if (acc_it == traffic_stats_accumulator.end()) {
++                        /* First monitor report for this STA MAC this round */
++                        sStaTrafficStats stats{
++                            sta_mac,
++                            sta_traffic->byte_sent(),
++                            sta_traffic->byte_received(),
++                            sta_traffic->packets_sent(),
++                            sta_traffic->packets_received(),
++                            sta_traffic->tx_packets_error(),
++                            sta_traffic->rx_packets_error(),
++                            sta_traffic->retransmission_count(),
++                        };
++                        traffic_stats_accumulator.emplace(sta_mac, stats);
++                        traffic_stats_response.push_back(stats);
++                    } else {
++                        /* Additional monitor report for a STA MAC already seen
++                         * this round (MLO STA on another link) — sum into the
++                         * existing accumulated entry rather than discarding it. */
++                        sStaTrafficStats &acc = acc_it->second;
++                        acc.byte_sent += sta_traffic->byte_sent();
++                        acc.byte_received += sta_traffic->byte_received();
++                        acc.packets_sent += sta_traffic->packets_sent();
++                        acc.packets_received += sta_traffic->packets_received();
++                        acc.tx_packets_error += sta_traffic->tx_packets_error();
++                        acc.rx_packets_error += sta_traffic->rx_packets_error();
++                        acc.retransmission_count += sta_traffic->retransmission_count();
++                    }
++                }
+             }
+         }
+ 
+@@ -1550,67 +1507,72 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+                  *   bssid   = affiliated AP BSSID (per-link BSSID)
+                  *   RCPI    = per-link signal queried from driver with link MAC
+                  *
+-                 * For each affiliated link, query the driver directly using
+-                 * `iw dev <link_iface> station get <link_mac>` to get the
+-                 * per-link signal strength and convert to RCPI.
+-                 * RCPI = (signal_dbm + 110) * 2, clamped to [0, 220].
+-                 * This bypasses the monitor's MLD-MAC-based nl80211 query
+-                 * which returns RCPI=220 (not measured) for all links. */
+-                /* Query per-link signal and stats for all affiliated links in one
+-                 * NL80211_CMD_GET_STATION + NLM_F_DUMP call on the parent MLO interface.
+-                 * This replaces per-link popen("iw station dump | awk ...") calls. */
+-                std::unordered_map<sMacAddr, sPerLinkStaInfo> mlo_link_info;
+-                {
+-                    /* Build (bss_iface, link_mac) pairs from AgentDB and query nl80211.
+-                     * The anonymous-namespace helper cannot use AgentDB directly, so
+-                     * we resolve the BSS interface names here and pass them as pairs. */
+-                    std::vector<std::pair<std::string, sMacAddr>> link_pairs;
+-                    for (const auto &aff_sta : mld_info_ptr->affiliated_stas) {
+-                        auto lr = db->get_radio_by_mac(aff_sta.bssid, AgentDB::eMacType::BSSID);
+-                        if (!lr) { continue; }
+-                        for (const auto &be : lr->front.bssids) {
+-                            if (be.mac == aff_sta.bssid && !be.iface_name.empty()) {
+-                                /* Strip "_link<N>" suffix to get the parent MLD netdev
+-                                 * (e.g. "wlan1_link0" → "wlan1").  The nl80211 GET must
+-                                 * be issued on the MLD interface, not the link-specific
+-                                 * BSS interface, to get valid per-link signal and stats. */
+-                                std::string mld_iface = be.iface_name;
+-                                auto lpos = mld_iface.rfind("_link");
+-                                if (lpos != std::string::npos) {
+-                                    mld_iface = mld_iface.substr(0, lpos);
+-                                }
+-                                link_pairs.emplace_back(mld_iface,
+-                                                        aff_sta.affiliated_sta_mac);
+-                                break;
+-                            }
+-                        }
++                 * Each affiliated link is queried directly on its own per-link
++                 * BSS interface (NOT a "parent MLD interface") for its own
++                 * affiliated STA MAC, via the same nl80211 get_sta_info()
++                 * mechanism already used for non-MLO stations. This gives a
++                 * genuine per-link signal reading instead of relying on a
++                 * single MLD-wide query that cannot distinguish links. */
++                for (const auto &aff_sta : mld_info_ptr->affiliated_stas) {
++                    /* Dedup: spec §17.2.24 requires one TLV 0x96 per affiliated link
++                     * total across all BSS iterations. */
++                    if (collected_link_sta_macs.count(aff_sta.affiliated_sta_mac)) {
++                        continue;
+                     }
+-                    get_mlo_sta_info_nl80211(link_pairs, mlo_link_info);
+-                }
+ 
+-                for (const auto &aff_sta : mld_info_ptr->affiliated_stas) {
+                     wfa_map::tlvAssociatedStaLinkMetrics::sBssidInfo per_link_info = bssid_info;
+                     per_link_info.bssid = aff_sta.bssid;
+-                    /* Look up per-link signal from the NL80211 dump result.
+-                     * Only emit TLV 0x96 for links where signal < 0 dBm (active). */
+-                    auto it_link = mlo_link_info.find(aff_sta.affiliated_sta_mac);
+-                    if (it_link == mlo_link_info.end() || !it_link->second.signal_valid) {
+-                        LOG(INFO) << "\n TLV 0x96: SKIPPING inactive link affiliated_sta="
+-                                  << aff_sta.affiliated_sta_mac << " bssid=" << aff_sta.bssid;
+-                        continue;
++
++                    /* Look up per-link signal via a direct nl80211 query on this
++                     * link's own BSS interface, for this link's own STA MAC.
++                     * Per EasyMesh R6 §17.2.24 and 802.11-2020 §9.4.2.38:
++                     *   RCPI = floor((signal_dbm + 110) × 2), clamped [0, 220]
++                     *   RCPI = 220 (0xDC) means "not measured / not available"
++                     * Emit TLV 0x96 for ALL affiliated links; use RCPI=220 for
++                     * inactive links (NL80211 returned no signal) rather than
++                     * omitting the TLV — the spec requires one entry per link.
++                     *
++                     * NL80211_STA_INFO_SIGNAL (instantaneous) reads 0 for a link
++                     * with no recent frames (e.g. an idle/backup MLO link), even
++                     * though the driver still tracks NL80211_STA_INFO_SIGNAL_AVG
++                     * for it. Prefer signal_avg in that case — it is still this
++                     * link's own measurement, unlike the STA-wide monitor value,
++                     * which is dominated by whichever link actually carries
++                     * traffic and would misrepresent an idle link's real RSSI. */
++                    const std::string link_iface = get_link_iface_by_bssid(db, aff_sta.bssid);
++                    sPerLinkStaInfo   link_info;
++                    const bool got_link_info = get_link_sta_info_nl80211(
++                        link_iface, aff_sta.affiliated_sta_mac, link_info);
++
++                    int  link_signal_dbm  = 0;
++                    bool link_signal_used = false;
++                    if (got_link_info && link_info.signal_valid) {
++                        link_signal_dbm  = link_info.signal_dbm;
++                        link_signal_used = true;
++                    } else if (got_link_info && link_info.signal_avg_valid) {
++                        link_signal_dbm  = link_info.signal_avg_dbm;
++                        link_signal_used = true;
+                     }
+-                    const int signal_dbm = it_link->second.signal_dbm;
+-                    /* Convert dBm to RCPI per 802.11-2020 §9.4.2.38:
+-                     * RCPI = floor((signal_dbm + 110) * 2), clamped [0,220] */
+-                    int rcpi = (signal_dbm + 110) * 2;
+-                    if (rcpi < 0)   rcpi = 0;
+-                    if (rcpi > 220) rcpi = 220;
+-                    per_link_info.sta_measured_uplink_rcpi_dbm_enc = static_cast<uint8_t>(rcpi);
+ 
+-                    link_metrics_response.push_back({aff_sta.affiliated_sta_mac, per_link_info});
++                    if (link_signal_used) {
++                        int rcpi = (link_signal_dbm + 110) * 2;
++                        if (rcpi < 0)   rcpi = 0;
++                        if (rcpi > 220) rcpi = 220;
++                        per_link_info.sta_measured_uplink_rcpi_dbm_enc = static_cast<uint8_t>(rcpi);
++                    } else {
++                        /* No signal or signal_avg available at all for this link
++                         * (e.g. per-link nl80211 query failed) — RCPI=220 means
++                         * "not measured" per spec, which is more accurate than
++                         * borrowing the STA-wide monitor value from another link. */
++                        per_link_info.sta_measured_uplink_rcpi_dbm_enc = 220;
++                    }
+                     LOG(DEBUG) << "TLV 0x96: affiliated_sta=" << aff_sta.affiliated_sta_mac
+-                               << " bssid=" << aff_sta.bssid
++                               << " bssid=" << aff_sta.bssid << " iface=" << link_iface
++                               << " signal=" << link_signal_dbm << " dBm"
+                                << " rcpi=" << int(per_link_info.sta_measured_uplink_rcpi_dbm_enc);
++
++                    link_metrics_response.push_back({aff_sta.affiliated_sta_mac, per_link_info});
++                    collected_link_sta_macs.insert(aff_sta.affiliated_sta_mac);
+                 }
+             } else {
+                 /* Non-MLO STA: emit as-is */
+@@ -1737,6 +1699,16 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+         return;
+     }
+ 
++    /* TLV 0xe4 deduplication set — declared OUTSIDE the response loop, keyed
++     * on the emitted STA MAC (affiliated link MAC for MLO STAs, plain STA MAC
++     * for legacy non-MLO STAs), checked/inserted per-link inside the loop
++     * below — NOT per outer response-entry stat.sta_mac, which for MLO STAs
++     * can differ across BSS iterations and would otherwise re-emit all
++     * affiliated links every time a new stat.sta_mac value is seen (e.g. 3
++     * distinct stat.sta_mac values x 2 affiliated links = 6 TLVs instead of
++     * the correct 2). */
++    std::unordered_set<sMacAddr> emitted_mld_macs;
++
+     // Prepare tlvApMetrics for each processed query
+     for (const auto &response : m_ap_metric_response) {
+         auto ap_metrics_response_tlv = m_cmdu_tx.addClass<wfa_map::tlvApMetrics>();
+@@ -1781,7 +1753,16 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+         ap_extended_metrics_tlv->multicast_bytes_received() =
+             response.extended_metric.multicast_bytes_received;
+ 
+-        for (auto &stat : response.sta_traffic_stats) {
++        for (auto &stat_snapshot : response.sta_traffic_stats) {
++            /* response.sta_traffic_stats holds a snapshot captured the first
++             * time this STA MAC was seen in the round; for an MLO STA seen on
++             * multiple monitors, later calls sum their counters into
++             * m_traffic_stats_accumulator instead of updating this snapshot.
++             * Look up the final, fully-summed totals by MAC before emitting. */
++            auto acc_it = m_traffic_stats_accumulator.find(stat_snapshot.sta_mac);
++            const sStaTrafficStats &stat =
++                (acc_it != m_traffic_stats_accumulator.end()) ? acc_it->second : stat_snapshot;
++
+             auto sta_traffic_response_tlv =
+                 m_cmdu_tx.addClass<wfa_map::tlvAssociatedStaTrafficStats>();
+ 
+@@ -1812,12 +1793,30 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+             }
+             extended->associated_sta() = stat.sta_mac;
+ 
+-            // Find the matching link metric entry for this STA to get BSSID and rates.
++            /* Find the matching link metric entry for this STA to get BSSID and rates.
++             * For MLO STAs, stat.sta_mac is the MLD MAC but sta_link_metrics entries
++             * use affiliated link MACs. Search by affiliated link MAC if direct match fails. */
+             auto lm_it = std::find_if(response.sta_link_metrics.begin(),
+                                       response.sta_link_metrics.end(),
+                                       [&stat](const sStaLinkMetrics &lm) {
+                                           return lm.sta_mac == stat.sta_mac;
+                                       });
++            if (lm_it == response.sta_link_metrics.end()) {
++                /* stat.sta_mac may be MLD MAC; search by affiliated link MACs */
++                for (const auto &mld_entry : db->associated_sta_mlds) {
++                    const auto &mld_info = mld_entry.second;
++                    if (mld_info.mld_config.sta_mld_mac != stat.sta_mac) { continue; }
++                    for (const auto &aff_sta : mld_info.affiliated_stas) {
++                        lm_it = std::find_if(response.sta_link_metrics.begin(),
++                                             response.sta_link_metrics.end(),
++                                             [&aff_sta](const sStaLinkMetrics &lm) {
++                                                 return lm.sta_mac == aff_sta.affiliated_sta_mac;
++                                             });
++                        if (lm_it != response.sta_link_metrics.end()) { break; }
++                    }
++                    if (lm_it != response.sta_link_metrics.end()) { break; }
++                }
++            }
+ 
+             if (!extended->alloc_metrics_list(1)) {
+                 LOG(ERROR) << "alloc_metrics_list failed for ExtendedLinkMetrics sta="
+@@ -1947,14 +1946,18 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+          * Deduplication: track emitted MLD MACs so we only expand each MLD STA
+          * once even if the collection loop stored it multiple times.
+          */
+-        std::unordered_set<sMacAddr> emitted_mld_macs;
+         for (auto &stat : response.affiliated_sta_metrics) {
+-            /* Skip if we already emitted TLV 0xe4 for this MLD MAC */
+-            if (emitted_mld_macs.count(stat.sta_mac)) {
+-                continue;
+-            }
+-
+-            /* Find the MLD entry for this STA MAC.
++            /* NOTE: no dedup here on stat.sta_mac — for an MLO STA, different
++             * response entries can carry different affiliated link MACs (or
++             * the MLD MAC) as stat.sta_mac depending on which BSS reported it.
++             * Deduplication must happen per affiliated link MAC, inside the
++             * loop below (emitted_mld_macs is (mis)named but keyed on
++             * affiliated_sta_mac there), not per stat.sta_mac here — otherwise
++             * every distinct stat.sta_mac value re-emits all affiliated links
++             * again (e.g. 3 distinct stat.sta_mac values x 2 links = 6 TLVs
++             * instead of 2).
++             *
++             * Find the MLD entry for this STA MAC.
+              * stat.sta_mac may be the MLD MAC (monitor bug) or the link MAC
+              * (correct monitor behaviour).  Handle both cases. */
+             const AgentDB::sAssociatedStaMld *mld_info_ptr = nullptr;
+@@ -1978,40 +1981,20 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+             if (mld_info_ptr) {
+                 /* Emit one TLV 0xe4 per affiliated link MAC.
+                  *
+-                 * The monitor sends TLV 0xe4 with the MLD MAC and zero counters
+-                 * because nl80211 station entries are keyed by link MAC, not MLD MAC.
+-                 * Fix: query per-link stats from `iw dev <link_iface> station dump`
+-                 * by matching the affiliated link MAC in the Link N: sections. */
+-                /* Query per-link stats for all affiliated links in one NL80211 dump call.
+-                 * Reuse the same map if already populated for TLV 0x96 above; otherwise
+-                 * do a fresh dump on the first affiliated link's parent interface. */
+-                std::unordered_map<sMacAddr, sPerLinkStaInfo> mlo_link_info_e4;
+-                {
+-                    /* Same approach as TLV 0x96 */
+-                    std::vector<std::pair<std::string, sMacAddr>> link_pairs_e4;
+-                    for (const auto &aff_sta : mld_info_ptr->affiliated_stas) {
+-                        auto lr = db->get_radio_by_mac(aff_sta.bssid, AgentDB::eMacType::BSSID);
+-                        if (!lr) { continue; }
+-                        for (const auto &be : lr->front.bssids) {
+-                            if (be.mac == aff_sta.bssid && !be.iface_name.empty()) {
+-                                /* Strip "_link<N>" suffix to get the parent MLD netdev */
+-                                std::string mld_iface = be.iface_name;
+-                                auto lpos = mld_iface.rfind("_link");
+-                                if (lpos != std::string::npos) {
+-                                    mld_iface = mld_iface.substr(0, lpos);
+-                                }
+-                                link_pairs_e4.emplace_back(mld_iface,
+-                                                           aff_sta.affiliated_sta_mac);
+-                                break;
+-                            }
+-                        }
++                 * Each affiliated link is queried directly on its own per-link
++                 * BSS interface for its own affiliated STA MAC (same approach
++                 * as TLV 0x96 above), rather than relying on a single MLD-wide
++                 * query that cannot distinguish per-link counters. */
++                for (const auto &aff_sta : mld_info_ptr->affiliated_stas) {
++                    /* Dedup per affiliated link MAC — a 3-BSS AP MLD reports
++                     * this MLD's stats via multiple response entries (one per
++                     * BSS), each potentially triggering this branch, so this
++                     * must be checked per-link here rather than once per
++                     * outer stat.sta_mac (see NOTE above the loop). */
++                    if (emitted_mld_macs.count(aff_sta.affiliated_sta_mac)) {
++                        continue;
+                     }
+-                    get_mlo_sta_info_nl80211(link_pairs_e4, mlo_link_info_e4);
+-                    LOG(INFO) << "\n TLV 0xe4: per-link nl80211 GET → "
+-                              << mlo_link_info_e4.size() << " link(s)";
+-                }
+ 
+-                for (const auto &aff_sta : mld_info_ptr->affiliated_stas) {
+                     auto affiliated_sta_metrics_tlv =
+                         m_cmdu_tx.addClass<wfa_map::tlvAffiliatedStaMetrics>();
+                     if (!affiliated_sta_metrics_tlv) {
+@@ -2020,28 +2003,24 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+                     }
+                     affiliated_sta_metrics_tlv->sta_mac_addr() = aff_sta.affiliated_sta_mac;
+ 
+-                    /* Look up per-link counters from the NL80211 dump result. */
++                    /* Look up per-link counters via a direct nl80211 query on
++                     * this link's own BSS interface. */
+                     uint64_t link_tx_bytes   = 0;
+                     uint64_t link_rx_bytes   = 0;
+                     uint32_t link_tx_packets = 0;
+                     uint32_t link_rx_packets = 0;
+                     uint32_t link_tx_failed  = 0;
+ 
+-                    auto it_e4 = mlo_link_info_e4.find(aff_sta.affiliated_sta_mac);
+-                    if (it_e4 != mlo_link_info_e4.end()) {
+-                        link_tx_bytes   = it_e4->second.tx_bytes;
+-                        link_rx_bytes   = it_e4->second.rx_bytes;
+-                        link_tx_packets = it_e4->second.tx_packets;
+-                        link_rx_packets = it_e4->second.rx_packets;
+-                        link_tx_failed  = it_e4->second.tx_failed;
+-                        LOG(INFO) << "\n :::::::::::::::::::::::::::::::: TEST :::::::::::         "
+-                                  << "\n TLV 0xe4: affiliated_sta=" << aff_sta.affiliated_sta_mac
+-                                  << " tx_bytes=" << link_tx_bytes
+-                                  << " rx_bytes=" << link_rx_bytes
+-                                  << " tx_pkts=" << link_tx_packets
+-                                  << " rx_pkts=" << link_rx_packets
+-                                  << " tx_fail=" << link_tx_failed
+-                                  << "\n ::::::::::::::::::::::::::::::::::::::::::::::::::::      ";
++                    const std::string link_iface_e4 =
++                        get_link_iface_by_bssid(db, aff_sta.bssid);
++                    sPerLinkStaInfo link_info_e4;
++                    if (get_link_sta_info_nl80211(link_iface_e4, aff_sta.affiliated_sta_mac,
++                                                  link_info_e4)) {
++                        link_tx_bytes   = link_info_e4.tx_bytes;
++                        link_rx_bytes   = link_info_e4.rx_bytes;
++                        link_tx_packets = link_info_e4.tx_packets;
++                        link_rx_packets = link_info_e4.rx_packets;
++                        link_tx_failed  = link_info_e4.tx_failed;
+                     }
+ 
+                     affiliated_sta_metrics_tlv->bytes_sent()          = link_tx_bytes;
+@@ -2051,11 +2030,19 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+                     affiliated_sta_metrics_tlv->packets_sent_errors() = link_tx_failed;
+                     LOG(DEBUG) << "TLV 0xe4: affiliated_sta=" << aff_sta.affiliated_sta_mac
+                                << " mld_mac=" << stat.sta_mac
+-                               << " bytes_sent=" << link_tx_bytes;
++                               << " iface=" << link_iface_e4
++                               << " tx_bytes=" << link_tx_bytes
++                               << " rx_bytes=" << link_rx_bytes
++                               << " tx_pkts=" << link_tx_packets
++                               << " rx_pkts=" << link_rx_packets
++                               << " tx_fail=" << link_tx_failed;
++                    emitted_mld_macs.insert(aff_sta.affiliated_sta_mac);
+                 }
+-                emitted_mld_macs.insert(stat.sta_mac);
+             } else {
+                 /* stat.sta_mac is not an MLD STA — emit as-is (legacy path) */
++                if (emitted_mld_macs.count(stat.sta_mac)) {
++                    continue;
++                }
+                 auto affiliated_sta_metrics_tlv =
+                     m_cmdu_tx.addClass<wfa_map::tlvAffiliatedStaMetrics>();
+                 if (!affiliated_sta_metrics_tlv) {
+@@ -2068,6 +2055,7 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+                 affiliated_sta_metrics_tlv->packets_sent()        = stat.packets_sent;
+                 affiliated_sta_metrics_tlv->packets_received()    = stat.packets_received;
+                 affiliated_sta_metrics_tlv->packets_sent_errors() = stat.packets_sent_errors;
++                emitted_mld_macs.insert(stat.sta_mac);
+             }
+         }
+     }
+@@ -2098,6 +2086,8 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+     // after preparing response to the controller
+     m_ap_metric_response.clear();
+     m_radio_ap_metric_response.clear();
++    m_collected_link_sta_macs.clear();
++    m_traffic_stats_accumulator.clear();
+ 
+     LOG(DEBUG) << "Sending AP_METRICS_RESPONSE_MESSAGE, mid=" << std::hex << mid;
+     m_btl_ctx.send_cmdu_to_controller({}, m_cmdu_tx);
+diff --git a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.h b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.h
+index 5ce6159e9..3e0223329 100644
+--- a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.h
++++ b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.h
+@@ -28,6 +28,7 @@
+ #include <cstddef>
+ #include <cstring>
+ #include <set>
++#include <unordered_set>
+ 
+ #include "../helpers/link_metrics/link_metrics.h"
+ 
+@@ -315,6 +316,22 @@ private:
+ 
+     std::vector<sApMetricsResponse> m_ap_metric_response;
+ 
++    /* TLV 0x96 dedup set / TLV 0xa2 accumulator — scoped to the lifetime of a
++     * single AP_METRICS query round (same lifetime as m_ap_metric_response),
++     * NOT to a single handle_ap_metrics_response() call. A round consists of
++     * one handle_ap_metrics_response() call per radio/monitor; an MLO STA can
++     * be reported by more than one monitor in the same round, so per-call
++     * locals would let each call emit its own duplicate set of TLVs.
++     *
++     * For TLV 0xa2, each monitor only sees the traffic on its own BSS/link,
++     * so a plain presence-check would keep the first monitor's partial report
++     * and silently drop the rest -- the emitted stats would not match the
++     * true MLD-level aggregate. m_traffic_stats_accumulator instead sums the
++     * per-field counters across every monitor call for the same STA MAC; the
++     * final emission loop reads the summed totals back out of this map. */
++    std::unordered_set<sMacAddr> m_collected_link_sta_macs;
++    std::unordered_map<sMacAddr, sStaTrafficStats> m_traffic_stats_accumulator;
++
+     struct sRadioMetrics {
+         sMacAddr radio_uid;
+         uint8_t noise;
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 5dac0c9ec..2a74a8c31 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -283,11 +283,25 @@ bool mon_wlan_hal_nl80211::update_stations_stats(const std::string &vap_iface_na
+                 return false;
+             }
+ 
+-            // RX RSSI
+-            if (sinfo[NL80211_STA_INFO_SIGNAL]) {
+-                int8_t signal = int8_t(nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL]));
+-                sta_stats.rx_rssi_watt += pow(10, (signal / 10.0));
+-                sta_stats.rx_rssi_watt_samples_cnt++;
++            // RX RSSI: prefer SIGNAL_AVG over SIGNAL for MLO STAs.
++            // For MLO STAs, NL80211_STA_INFO_SIGNAL is 0 dBm (aggregate not measured),
++            // but NL80211_STA_INFO_SIGNAL_AVG contains the actual average signal.
++            {
++                int8_t signal = 0;
++                bool signal_valid = false;
++                if (sinfo[NL80211_STA_INFO_SIGNAL]) {
++                    signal = int8_t(nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL]));
++                    signal_valid = (signal < 0);
++                }
++                // Fallback to SIGNAL_AVG if SIGNAL is 0 dBm (MLO aggregate not measured)
++                if (!signal_valid && sinfo[NL80211_STA_INFO_SIGNAL_AVG]) {
++                    signal = int8_t(nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL_AVG]));
++                    signal_valid = (signal < 0);
++                }
++                if (signal_valid) {
++                    sta_stats.rx_rssi_watt += pow(10, (signal / 10.0));
++                    sta_stats.rx_rssi_watt_samples_cnt++;
++                }
+             }
+ 
+             // RX SNR is not supported
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.cpp b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+index ee2e8dcec..1fd853e3f 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -1130,11 +1130,20 @@ bool nl80211_client_impl::get_sta_info(const std::string &interface_name,
+         return false;
+     }
+ 
++    /* interface_name may be a synthetic per-link MLO name (e.g. "wlan1_link0"),
++     * which is not a real kernel netdev, so if_nametoindex() on it always fails.
++     * Resolve/query the real base interface (e.g. "wlan1") instead, and — since
++     * NL80211_CMD_GET_STATION has no per-link request filter — select the right
++     * link's stats from the response's nested NL80211_ATTR_MLO_LINKS, matching
++     * on the link ID encoded in interface_name. Mirrors get_tx_power_dbm(). */
++    std::string base_interface;
++    bwl::base_wlan_hal::extractLinkBaseInterface(interface_name, base_interface);
++
+     // Get the interface index for given interface name
+-    int iface_index = if_nametoindex(interface_name.c_str());
++    int iface_index = if_nametoindex(base_interface.c_str());
+     if (0 == iface_index) {
+-        LOG(ERROR) << "Failed to read the index of interface " << interface_name << ": "
+-                   << strerror(errno);
++        LOG(ERROR) << "Failed to read the index of interface '" << interface_name
++                   << "' base_interface: " << base_interface << ": " << strerror(errno);
+ 
+         return false;
+     }
+@@ -1158,7 +1167,52 @@ bool nl80211_client_impl::get_sta_info(const std::string &interface_name,
+                 return;
+             }
+ 
+-            if (!tb[NL80211_ATTR_STA_INFO]) {
++            struct nlattr *sta_info_attr = tb[NL80211_ATTR_STA_INFO];
++
++            /* MLO AP: the kernel always fills the flat NL80211_ATTR_STA_INFO
++             * from the STA's primary/deflink only (see net/mac80211/sta_info.c
++             * sta_set_sinfo()), even though the real per-link breakdown is
++             * separately nested under NL80211_ATTR_MLO_LINKS, keyed by
++             * NL80211_ATTR_MLO_LINK_ID. So whenever interface_name resolves to
++             * a specific link ID, the nested per-link block must take priority
++             * over the flat (primary-link-only) one, not just act as a
++             * fallback when the flat block happens to be absent. */
++            int target_link_id = -1;
++            bwl::base_wlan_hal::extractLinkId(interface_name, target_link_id);
++
++            if (tb[NL80211_ATTR_MLO_LINKS] && target_link_id != -1) {
++                struct nlattr *attrs, *link[NL80211_ATTR_MAX + 1];
++                int ret = 0;
++                nla_for_each_nested(attrs, tb[NL80211_ATTR_MLO_LINKS], ret) {
++                    nla_parse_nested(link, NL80211_ATTR_MAX, attrs, NULL);
++                    if (!link[NL80211_ATTR_MLO_LINK_ID]) {
++                        continue;
++                    }
++                    int link_id = nla_get_u8(link[NL80211_ATTR_MLO_LINK_ID]);
++                    if (link_id != target_link_id) {
++                        continue;
++                    }
++                    if (link[NL80211_ATTR_STA_INFO]) {
++                        sta_info_attr = link[NL80211_ATTR_STA_INFO];
++                    }
++                    break;
++                }
++            } else if (!sta_info_attr && tb[NL80211_ATTR_MLO_LINKS]) {
++                /* No specific link ID could be extracted (e.g. interface_name
++                 * is a bare base interface) — fall back to the first nested
++                 * link's stats rather than nothing. */
++                struct nlattr *attrs, *link[NL80211_ATTR_MAX + 1];
++                int ret = 0;
++                nla_for_each_nested(attrs, tb[NL80211_ATTR_MLO_LINKS], ret) {
++                    nla_parse_nested(link, NL80211_ATTR_MAX, attrs, NULL);
++                    if (link[NL80211_ATTR_STA_INFO]) {
++                        sta_info_attr = link[NL80211_ATTR_STA_INFO];
++                    }
++                    break;
++                }
++            }
++
++            if (!sta_info_attr) {
+                 LOG(ERROR) << "STA stats missing!";
+                 return;
+             }
+@@ -1186,7 +1240,7 @@ bool nl80211_client_impl::get_sta_info(const std::string &interface_name,
+ 
+                 return stats_policy;
+             };
+-            if (nla_parse_nested(sinfo, NL80211_STA_INFO_MAX, tb[NL80211_ATTR_STA_INFO],
++            if (nla_parse_nested(sinfo, NL80211_STA_INFO_MAX, sta_info_attr,
+                                  stats_policy())) {
+                 LOG(ERROR) << "Failed to parse nested STA attributes!";
+                 return;
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 80e218822..e7f14c1c5 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -1321,6 +1321,25 @@ std::string db::get_sta_parent(const std::string &mac)
+ bool db::is_sta_reported_bssid_valid(const sMacAddr &sta_mac, const sMacAddr &reported_bssid)
+ {
+     std::shared_ptr<Station> pSta = get_station(sta_mac);
++    if (!pSta) {
++        /* For MLO STAs the agent reports link metrics using the affiliated link MAC,
++         * not the MLD MAC. The controller stores the station under the MLD MAC, so
++         * a direct get_station(link_mac) fails. Fall back to a linear scan of all
++         * affiliated STA lists to resolve the link MAC → MLD MAC mapping, mirroring
++         * dm_set_sta_link_metrics(). */
++        for (const auto &sta_pair : m_stations) {
++            const auto &affiliated_stas = sta_pair.second->sta_mld_configuration.affiliated_stas;
++            for (const auto &affiliated_sta : affiliated_stas) {
++                if (affiliated_sta.affiliated_sta_mac == sta_mac) {
++                    pSta = sta_pair.second;
++                    break;
++                }
++            }
++            if (pSta) {
++                break;
++            }
++        }
++    }
+     if (!pSta) {
+         LOG(WARNING) << "station " << sta_mac << " does not exist!";
+         return false;
+-- 
+2.34.1
+
