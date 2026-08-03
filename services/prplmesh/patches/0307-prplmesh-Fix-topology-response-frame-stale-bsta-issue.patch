@@ -1,0 +1,520 @@
+From 2f723a1a4b663e6f75faa6f02713cfa43d076575 Mon Sep 17 00:00:00 2001
+From: Sandeep Tomer <stomer@qti.qualcomm.com>
+Date: Fri, 31 Jul 2026 14:17:48 +0530
+Subject: [PATCH] [prplmesh] Fix topology response frame stale bsta issue and
+ updating backhaul data model.
+
+-Agent side__: Stale `radio->associated_clients` entries (MLD disconnect bug)
+ causing the old agent to keep reporting the bSTA in `TOPOLOGY_RESPONSE` indefinitely.
+
+-Agent side__: Stale `backhaul_bssid` in AgentDB after a steady-state roam,
+ causing wrong `network_membership` in the topology report.
+
+-Agent side (HAL)__: Duplicate `STA_Connected` events from multiple
+ AP managers in MLD setups due to missing ownership guards.
+
+-Controller side__: Race condition in parent agent resolution from
+ `TOPOLOGY_RESPONSE` (Station DB dependency).
+
+-Controller side__: Stale `TOPOLOGY_RESPONSE` from the old parent
+ agent overwriting the correct BSS/agent association after a roam.
+
+-Controller side__: Backhaul DM (`ServingBSSID`/`BackhaulDeviceID`)
+ not updated on re-parenting.
+
+Signed-off-by: Sandeep Tomer <stomer@qti.qualcomm.com>
+---
+ .../backhaul_manager/backhaul_manager.cpp     |  19 +-
+ agent/src/beerocks/slave/son_slave_thread.cpp |  23 +-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  51 +++-
+ controller/src/beerocks/master/db/db.cpp      |   8 +-
+ .../src/beerocks/master/son_actions.cpp       |   3 +-
+ .../beerocks/master/tasks/topology_task.cpp   | 236 +++++++++++++-----
+ 6 files changed, 271 insertions(+), 69 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 7a1db0ece..b79c729a1 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -617,7 +617,6 @@ bool BackhaulManager::handle_backhaul_connect()
+             LOG_IF(!radio_info->sta_wlan_hal, FATAL) << "selected sta_hal is nullptr";
+             db->backhaul.backhaul_bssid =
+                 tlvf::mac_from_string(radio_info->sta_wlan_hal->get_bssid());
+-
+             //This code segment is commented out to avoid missing EndPoint Object change event, when
+             //BSTA disconnect
+             /*if (!radio_info->sta_wlan_hal->unique_file_descriptors() &&
+@@ -2858,6 +2857,24 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+             send_slaves_enable();
+ 
+             FSM_MOVE_STATE(CONNECTED);
++        } else if (iface == db->backhaul.selected_iface_name &&
++                  bssid != db->backhaul.backhaul_bssid) {
++            // Steady-state roam: the FSM is already OPERATIONAL/CONNECTED so none of the
++            // transitional branches above fired, but the bSTA's peer BSSID changed underneath
++            // us. handle_backhaul_connect() (the only other place backhaul_bssid gets updated)
++            // only runs on FSM entry into CONNECTED, so refresh AgentDB directly here.
++            //
++            // Guarded by "bssid != db->backhaul.backhaul_bssid" to avoid redundantly
++            // re-triggering this branch (and a fresh topology report) if wpa_supplicant
++            // delivers duplicate CTRL-EVENT-CONNECTED events for the same, already-known
++            // BSSID (e.g. a reconnect to the same AP without an actual roam).
++            db->backhaul.backhaul_bssid = bssid;
++            LOG(INFO) << "Backhaul roamed to new bssid=" << bssid << " on iface=" << iface;
++
++            // Push a fresh topology report now instead of waiting for the periodic
++            // (up to 60s) Topology Discovery, so the controller sees the corrected
++            // network_membership as soon as possible.
++            m_task_pool.send_event(eTaskType::TOPOLOGY, TopologyTask::eEvent::AGENT_RADIO_STATE_CHANGED);
+         }
+     } break;
+ 
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 184223e38..973313132 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -3889,8 +3889,27 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+             }
+         }
+         // For non-MLD clients: call erase_client to remove from radio->associated_clients.
+-        // For MLD clients: do NOT call erase_client(mld_mac) — it removes associated_sta_mlds.
+-        if (!is_mld_client) {
++        //
++        // For MLD clients: erase_client() must still be called once ALL affiliated links
++        // have disconnected (send_leave == true), to remove the stale
++        // radio->associated_clients[mld_mac] entry created on connect (see
++        // process_client_association()).  Calling erase_client() here is safe even though
++        // the associated_sta_mlds entry was already explicitly erased above (Case A/B) —
++        // that second erase is simply a no-op.
++        //
++        // BUG FIXED: previously this call was skipped unconditionally for ANY MLD client
++        // (is_mld_client == true), so radio->associated_clients[mld_mac] was NEVER cleared
++        // on disconnect.  The agent's own TOPOLOGY_RESPONSE tlvAssociatedClients (built from
++        // radio->associated_clients — see add_associated_clients_tlv()) then kept reporting
++        // this stale, long-disconnected bSTA to the Controller indefinitely (elapsed_sec kept
++        // climbing in logs).  When the bSTA later associated with a *different* agent, the
++        // Controller received this stale report from the OLD agent and incorrectly
++        // overwrote the bSTA's correct BSS/agent association and ServingBSSID in the
++        // backhaul Data Model, and fired a wrong StationConnected NBAPI event.
++        //
++        // While still connected on other links (send_leave == false), the entry must be
++        // preserved, so erase_client() is skipped exactly as before in that case.
++        if (!is_mld_client || send_leave) {
+             db->erase_client(client_mac);
+         }
+ 
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 39093e98d..a849baa0f 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -4688,14 +4688,36 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+ 
+     auto vap_id    = get_vap_id_with_bss(interface);
+     auto iface_ids = beerocks::utils::get_ids_from_iface_string(interface);
++
++    // Compute this radio's own MLD link ID once (from m_radio_info.iface_name).
++    // Reused below both by the MLD vap_id fallback loop and by the
++    // WDS-STA-INTERFACE-ADDED handler's backhaul-VAP ownership guard, avoiding
++    // a redundant extractLinkId() call on the same (unchanging) iface_name.
++    int own_link_id = -1;
++    extractLinkId(m_radio_info.iface_name, own_link_id);
++
+     if (vap_id < 0) {
+         // Fallback: for MLD radios, the event may arrive with the bare radio name
+         // (e.g. "wlan1mld1") or an MLD link pseudo-name, while available_vaps is keyed
+         // by the link-specific name (e.g. "wlan1mld1_link0"). Retry with the
+         // link-suffixed variants before giving up.
++        //
++        // MLD ownership guard: in MLD setups the global hostapd socket delivers
++        // AP-STA-CONNECTED for every link to every AP manager instance.  Each AP
++        // manager's available_vaps contains BSSes from all radios (shared hostapd
++        // instance), so without this guard the loop would find a valid vap_id on
++        // the first link regardless of which radio actually owns it, causing every
++        // AP manager to push a duplicate STA_Connected event.
++        // Fix: if this radio has a known link ID (MLD link interface), restrict the
++        // fallback to that specific link index only.  Non-MLD radios (link_id == -1)
++        // retain the original try-all behaviour.
+         for (int link_idx = 0;
+              link_idx < static_cast<int>(beerocks::message::DEV_MAX_RADIOS) && vap_id < 0;
+              link_idx++) {
++            // For MLD radios only try the link that belongs to this radio.
++            if (own_link_id >= 0 && link_idx != own_link_id) {
++                continue;
++            }
+             std::string candidate = interface + "_link" + std::to_string(link_idx);
+             vap_id                = get_vap_id_with_bss(candidate);
+             if (vap_id >= 0) {
+@@ -5361,18 +5383,37 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+         }
+ 
+         // Resolve the backhaul BSS bssid and vap_id from available_vaps.
++        //
++        // MLD ownership guard: in MLD setups available_vaps contains backhaul BSSes
++        // from all radios (shared hostapd instance).  Without filtering, every AP
++        // manager would pick the first backhaul VAP it finds — which may belong to a
++        // different radio — and report the wrong BSSID for the WDS interface.
++        // Fix: if this radio has a known link ID (own_link_id, computed once above),
++        // only accept the backhaul VAP whose BSS interface has the same link ID.
++        // Non-MLD radios (own_link_id == -1) retain the original "first backhaul VAP"
++        // behaviour.
+         sMacAddr bssid  = beerocks::net::network_utils::ZERO_MAC;
+         int8_t bh_vap_id = beerocks::IFACE_ID_INVALID;
+         for (const auto &vap_kv : m_radio_info.available_vaps) {
+-            if (vap_kv.second.backhaul) {
+-                bssid     = tlvf::mac_from_string(vap_kv.second.mac);
+-                bh_vap_id = vap_kv.first;
+-                break;
++            if (!vap_kv.second.backhaul) {
++                continue;
+             }
++            if (own_link_id >= 0) {
++                // MLD radio: only accept the backhaul VAP with the same link ID.
++                int vap_link_id = -1;
++                extractLinkId(vap_kv.second.bss, vap_link_id);
++                if (vap_link_id != own_link_id) {
++                    continue;
++                }
++            }
++            bssid     = tlvf::mac_from_string(vap_kv.second.mac);
++            bh_vap_id = vap_kv.first;
++            break;
+         }
+ 
+         if (bh_vap_id == beerocks::IFACE_ID_INVALID) {
+-            LOG(WARNING) << "WDS-STA-INTERFACE-ADDED: no backhaul VAP found on this radio";
++            LOG(DEBUG) << "WDS-STA-INTERFACE-ADDED: no matching backhaul VAP on this radio"
++                       << " (own_link_id=" << own_link_id << ") — ignoring";
+             break;
+         }
+ 
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 144113920..b04943313 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -10376,9 +10376,11 @@ bool db::dm_update_bsta_mld(const Agent &agent, const sMacAddr &bsta_mld_mac,
+         LOG(ERROR) << "Failed to set MLDMACAddress " << bsta_mld_mac;
+         ret_val &= false;
+     }
+-    if (!m_ambiorix_datamodel->set(bsta_mld_path, "BSSID", ap_mld_mac)) {
+-        LOG(ERROR) << "Failed to set BSSID " << ap_mld_mac;
+-        ret_val &= false;
++    if (ap_mld_mac != beerocks::net::network_utils::ZERO_MAC) {
++        if (!m_ambiorix_datamodel->set(bsta_mld_path, "BSSID", ap_mld_mac)) {
++            LOG(ERROR) << "Failed to set BSSID " << ap_mld_mac;
++            ret_val &= false;
++        }
+     }
+     if (!m_ambiorix_datamodel->set(bsta_mld_path, "AffiliatedbSTAList", affiliated_bsta_list)) {
+         LOG(ERROR) << "Failed to set AffiliatedbSTAList " << affiliated_bsta_list;
+diff --git a/controller/src/beerocks/master/son_actions.cpp b/controller/src/beerocks/master/son_actions.cpp
+index 1bf97a9ae..0302e0afc 100644
+--- a/controller/src/beerocks/master/son_actions.cpp
++++ b/controller/src/beerocks/master/son_actions.cpp
+@@ -947,8 +947,7 @@ bool son_actions::handle_backhaul_sta_mld_configuration_tlv(db &database, const
+     if (!backhaul_sta_mld_configuration_tlv->addr_valid().ap_mld_mac_addr_valid) {
+         LOG(DEBUG)
+             << "AP MLD MAC address is not valid in tlvBackhaulStaMldConfiguration from agent "
+-            << agent->al_mac;
+-        return false;
++            << agent->al_mac << ", will update DM without BSSID";
+     }
+     database.dm_set_isbsta(backhaul_sta_mld_configuration_tlv->bsta_mld_mac_addr());
+     std::string affiliated_bsta_list;
+diff --git a/controller/src/beerocks/master/tasks/topology_task.cpp b/controller/src/beerocks/master/tasks/topology_task.cpp
+index 3a698134f..a3ae68cce 100644
+--- a/controller/src/beerocks/master/tasks/topology_task.cpp
++++ b/controller/src/beerocks/master/tasks/topology_task.cpp
+@@ -210,39 +210,22 @@ bool topology_task::handle_topology_response(const sMacAddr &src_mac,
+             if (iface_role == ieee1905_1::eRole::NON_AP_NON_PCP_STA &&
+                 media_info->network_membership != beerocks::net::network_utils::ZERO_MAC) {
+ 
+-                // Search parent/connected agent
++                // Search parent/connected agent. The Device Information TLV's
++                // network_membership is the agent's own wire-confirmed report of its
++                // current attachment - trust it directly rather than requiring the
++                // controller's own (possibly-lagging) Station DB entry to already agree,
++                // which is a race that can permanently strand parent_agent unresolved
++                // across TOPOLOGY_RESPONSEs after a roam (the bSTA's Station DB entry
++                // may not have caught up yet, or may not exist yet at all).
+                 auto parent_agent = database.get_agent_by_bssid(media_info->network_membership);
+                 if (!parent_agent) {
+                     LOG(ERROR) << "Parent agent is not found on database";
+                     continue;
+                 }
+ 
+-                auto backhaul_sta = database.get_station(iface_mac);
+-                if (!backhaul_sta) {
+-                    LOG(ERROR) << "Backhaul station is not found on database";
+-                    continue;
+-                }
+-
+-                auto parent_bss = backhaul_sta->get_bss();
+-                if (!parent_bss) {
+-                    LOG(ERROR) << "Connected BSS of the station is not found, sta mac="
+-                               << backhaul_sta->mac;
+-                    continue;
+-                }
+-
+-                // Network Membership verification from database
+-                // This case could occur, if we can topology response before topology notification
+-                // with JOIN notification for that station.
+-                if (media_info->network_membership != parent_bss->bssid) {
+-                    LOG(INFO) << "Network membership does not align with database, parent_bssid="
+-                              << parent_bss->bssid
+-                              << ", network_membership=" << media_info->network_membership;
+-                    continue;
+-                }
+-
+                 LOG(DEBUG) << "Wireless BH Link is reported for agent=" << agent->al_mac
+                            << " parent agent=" << parent_agent->al_mac
+-                           << " parent's bss=" << parent_bss->bssid << " with bSTA=" << iface_mac;
++                           << " bssid=" << media_info->network_membership << " with bSTA=" << iface_mac;
+ 
+                 agent->backhaul.parent_agent = parent_agent;
+ 
+@@ -259,11 +242,11 @@ bool topology_task::handle_topology_response(const sMacAddr &src_mac,
+     }
+ 
+     // Update external agents multi ap backhaul datamodel only when the backhaul parent is already
+-    // resolved. For wireless agents: the bSTA must already be in the DB (no race); for wired
+-    // agents: parent resolution happens later via graph inference, which calls
+-    // dm_set_device_multi_ap_backhaul itself. When the parent is unresolved here, the deferred
+-    // path in handle_topology_notification will call dm_set_device_multi_ap_backhaul once the
+-    // bSTA joins the parent BSS.
++    // resolved. For wireless agents: resolved directly from this TLV's network_membership above;
++    // for wired agents: parent resolution happens later via graph inference, which calls
++    // dm_set_device_multi_ap_backhaul itself. When the parent is unresolved here (e.g. the
++    // parent agent/BSS itself isn't known yet), the deferred path in handle_topology_notification
++    // will call dm_set_device_multi_ap_backhaul once the bSTA joins the parent BSS.
+     if (!agent->is_gateway && !agent->backhaul.parent_agent.expired()) {
+         database.dm_set_device_multi_ap_backhaul(*agent);
+     }
+@@ -840,6 +823,38 @@ bool topology_task::handle_associated_clients_tlv(ieee1905_1::CmduMessageRx &cmd
+             continue;
+         }
+ 
++        // Guard against stale TOPOLOGY_RESPONSE from a PREVIOUS parent agent.
++        //
++        // previous_connected/current_connected above are scoped to THIS agent's own
++        // radios/BSSes only (built from agent.radios).  If this bSTA had never been
++        // associated to THIS agent's BSSes before, it looks like a brand-new station
++        // from this agent's point of view -- even if the controller's global database
++        // already has it correctly associated with a DIFFERENT agent (e.g. it moved
++        // there via a TOPOLOGY_NOTIFICATION some time ago, but this agent's own
++        // TOPOLOGY_RESPONSE association table is stale/out-of-date and still lists it).
++        //
++        // Without this guard, such a stale report is misclassified as "new station"
++        // (rather than "moved BSS", which already has this guard) and unconditionally
++        // overwrites the correct, already-established BSS/agent association with wrong
++        // stale data - causing a wrong StationConnected NBAPI event and wrong
++        // ServingBSSID in the backhaul DM.
++        auto existing_sta_ptr = database.get_station(mac);
++        if (existing_sta_ptr && existing_sta_ptr->is_bSta()) {
++            auto existing_bss = existing_sta_ptr->get_bss();
++            if (existing_bss) {
++                auto existing_bss_agent = database.get_agent_by_bssid(existing_bss->bssid);
++                if (existing_bss_agent && existing_bss_agent->al_mac != agent.al_mac) {
++                    LOG(WARNING) << "Stale TOPOLOGY_RESPONSE 'new station' report suppressed:"
++                                 << " sta_mac=" << mac
++                                 << " DB already has it on agent=" << existing_bss_agent->al_mac
++                                 << " bssid=" << existing_bss->bssid
++                                 << " but stale TOPOLOGY_RESPONSE from agent=" << agent.al_mac
++                                 << " claims bssid=" << bssid;
++                    continue;
++                }
++            }
++        }
++
+         database.add_station(agent.al_mac, mac, bssid);
+     }
+ 
+@@ -870,6 +885,32 @@ bool topology_task::handle_associated_clients_tlv(ieee1905_1::CmduMessageRx &cmd
+             continue;
+         }
+ 
++        // Guard against stale TOPOLOGY_RESPONSE: if this station is a backhaul STA
++        // and its current BSS in the DB belongs to a different agent than the one
++        // sending this TOPOLOGY_RESPONSE, the response is stale (the bSTA has already
++        // moved to a new parent agent via a TOPOLOGY_NOTIFICATION).  Applying the
++        // stale move would fire a wrong StationConnected NBAPI event and overwrite
++        // the correct ServingBSSID in the backhaul DM.
++        //
++        // Root cause: in MLD setups the previous parent agent still has the bSTA in
++        // its associated_clients list (DISASSOCIATE not yet processed) when it sends
++        // its TOPOLOGY_RESPONSE, causing handle_associated_clients_tlv to detect a
++        // spurious "BSS move" back to the old parent.
++        auto sta_ptr = database.get_station(sta_mac);
++        if (sta_ptr && sta_ptr->is_bSta()) {
++            auto current_bss_agent = database.get_agent_by_bssid(old_bssid);
++            if (current_bss_agent &&
++                current_bss_agent->al_mac != agent.al_mac) {
++                LOG(WARNING) << "Stale TOPOLOGY_RESPONSE bSTA move suppressed:"
++                             << " sta_mac=" << sta_mac
++                             << " DB has it on agent=" << current_bss_agent->al_mac
++                             << " bssid=" << old_bssid
++                             << " but TOPOLOGY_RESPONSE from agent=" << agent.al_mac
++                             << " claims bssid=" << current_bssid;
++                continue;
++            }
++        }
++
+         database.add_station(agent.al_mac, sta_mac, current_bssid);
+     }
+ 
+@@ -1058,44 +1099,127 @@ bool topology_task::handle_topology_notification(const sMacAddr &src_mac,
+         LOG(INFO) << "client connected, al_mac=" << src_mac << " mac=" << client_mac_str
+                   << ", bssid=" << bssid_str;
+ 
++        // Proactively remove this bSTA from every OTHER agent's connected_stations list
++        // in the controller's own database.
++        //
++        // Root cause this guards against: when a bSTA roams to a new parent agent
++        // (src_mac), the DISASSOCIATE sent to the previous agent (below, via
++        // son_actions::handle_completed_connection) takes time to reach that agent and
++        // be processed there.  In that window, the previous agent may still send a
++        // TOPOLOGY_RESPONSE (built from its own, not-yet-updated associated_clients
++        // list) that still reports this bSTA as connected to its old BSS.  Without this
++        // proactive cleanup, handle_associated_clients_tlv() would see that stale BSSID
++        // as "unchanged" for the previous agent (since the controller DB itself still
++        // had it there) and skip the moved-BSS guard, causing the wrong StationConnected
++        // event / wrong ServingBSSID to reappear.
++        //
++        // By erasing the bSTA from every other agent's connected_stations here (as soon
++        // as the JOIN is processed for the new agent), the controller's own view becomes
++        // "previous_connected has NO entry for this bSTA" the next time a stale
++        // TOPOLOGY_RESPONSE from the old agent is processed - which correctly routes it
++        // through the "new station" guard (Fix 4) instead of silently matching stale
++        // data as unchanged.
++        if (client->is_bSta()) {
++            for (auto &agent_pair : database.m_agents) {
++                auto &other_agent = agent_pair.second;
++                if (!other_agent || other_agent->al_mac == src_mac) {
++                    continue; // skip the new (correct) parent agent
++                }
++                for (auto &radio_pair : other_agent->radios) {
++                    if (!radio_pair.second) {
++                        continue;
++                    }
++                    for (auto &bss_pair : radio_pair.second->bsses) {
++                        if (!bss_pair.second) {
++                            continue;
++                        }
++                        auto &connected_stations = bss_pair.second->connected_stations;
++                        if (connected_stations.erase(client_mac) > 0) {
++                            LOG(DEBUG) << "Proactively removed bSTA " << client_mac_str
++                                      << " from previous agent " << other_agent->al_mac
++                                      << " BSS " << bss_pair.second->bssid
++                                      << " after JOIN to new agent " << src_mac
++                                      << " BSS " << bssid_str;
++                        }
++                    }
++                }
++            }
++        }
++
+         // If this STA is connecting to a backhaul BSS, it may be a backhaul STA (bSTA) of a
+-        // child agent.  When the child agent's TOPOLOGY_RESPONSE was processed earlier, the bSTA
+-        // was not yet in the database (timing: TOPOLOGY_RESPONSE arrives before TOPOLOGY_
+-        // NOTIFICATION with JOIN), so parent_agent was left null and BackhaulDeviceID was set
+-        // to "" in the DM.  Now that the bSTA has joined, re-resolve the parent and update the
+-        // backhaul DM so that BackhaulDeviceID is correctly populated.
++        // child agent.  Re-resolve the parent and update the backhaul DM (ServingBSSID,
++        // BackhaulDeviceID, ParentALMAC) so that it always reflects the CURRENT parent/BSS.
++        //
++        // This must run UNCONDITIONALLY on every JOIN of a bSTA to a backhaul BSS, not only
++        // when parent_agent was previously unresolved.  Two distinct scenarios both rely on
++        // this block firing:
++        //
++        //   1) Initial connection: TOPOLOGY_RESPONSE from the child agent arrived before the
++        //      TOPOLOGY_NOTIFICATION JOIN (the bSTA wasn't in the DB yet), so parent_agent was
++        //      left null/expired and BackhaulDeviceID was "" in the DM.
++        //
++        //   2) Re-parenting (bSTA roams from one parent agent to another, e.g. GW -> agent07):
++        //      child_agent_ptr->backhaul.parent_agent is ALREADY resolved (points to the OLD
++        //      parent), so the previous "only if expired()" guard skipped this block entirely,
++        //      permanently leaving the backhaul DM (ServingBSSID/BackhaulDeviceID/ParentALMAC)
++        //      stuck on the stale, previous parent even though the bSTA correctly moved.
++        //
++        // Skip only when nothing actually changed (same parent + same BSS) to avoid redundant
++        // DM writes on every JOIN retry/duplicate notification for an already-correct mapping.
+         {
+             auto bss_ptr = database.get_bss(bssid);
+             if (bss_ptr && bss_ptr->backhaul) {
+-                // Find the child agent whose backhaul_interface matches this bSTA MAC
+-                // and whose parent_agent is not yet resolved.
++                // Find the child agent whose backhaul_interface matches this bSTA MAC.
+                 for (auto &agent_pair : database.m_agents) {
+                     auto &child_agent_ptr = agent_pair.second;
+                     if (!child_agent_ptr || child_agent_ptr->is_gateway) {
+                         continue;
+                     }
+-                    if (child_agent_ptr->backhaul.backhaul_interface == client_mac &&
+-                        child_agent_ptr->backhaul.parent_agent.expired()) {
++                    if (child_agent_ptr->backhaul.backhaul_interface == client_mac) {
+                         auto parent_agent_ptr = database.get_agent_by_bssid(bssid);
+                         if (parent_agent_ptr) {
+-                            child_agent_ptr->backhaul.parent_agent =
+-                                parent_agent_ptr;
+-                            child_agent_ptr->backhaul.backhaul_iface_type =
+-                                beerocks::IFACE_TYPE_WIFI_UNSPECIFIED;
+-                            child_agent_ptr->backhaul.parent_interface = bssid;
+-                            child_agent_ptr->backhaul.wireless_backhaul_radio =
+-                                database.get_radio_by_backhaul_cap(bssid);
+-                            if (!database.dm_set_device_multi_ap_backhaul(*child_agent_ptr)) {
+-                                LOG(ERROR)
+-                                    << "Failed to update backhaul DM for agent "
+-                                    << child_agent_ptr->al_mac << " after bSTA " << client_mac
+-                                    << " joined BSS " << bssid;
++                            auto current_parent_ptr = child_agent_ptr->backhaul.parent_agent.lock();
++                            const bool already_correct =
++                                current_parent_ptr &&
++                                current_parent_ptr->al_mac == parent_agent_ptr->al_mac &&
++                                child_agent_ptr->backhaul.parent_interface == bssid;
++
++                            if (already_correct) {
++                                LOG(DEBUG) << "Backhaul DM for agent " << child_agent_ptr->al_mac
++                                          << " already correctly parented to "
++                                          << parent_agent_ptr->al_mac << " via bssid=" << bssid
++                                          << " — skipping redundant DM update";
+                             } else {
+-                                LOG(INFO)
+-                                    << "Backhaul DM updated for agent "
+-                                    << child_agent_ptr->al_mac
+-                                    << " parent=" << parent_agent_ptr->al_mac
+-                                    << " after bSTA " << client_mac << " joined BSS " << bssid;
++                                if (current_parent_ptr &&
++                                    current_parent_ptr->al_mac != parent_agent_ptr->al_mac) {
++                                    LOG(INFO)
++                                        << "Backhaul DM re-parent: agent "
++                                        << child_agent_ptr->al_mac << " moving from parent "
++                                        << current_parent_ptr->al_mac << " to "
++                                        << parent_agent_ptr->al_mac
++                                        << " (old bssid=" << child_agent_ptr->backhaul.parent_interface
++                                        << " new bssid=" << bssid << ")";
++                                }
++
++                                child_agent_ptr->backhaul.parent_agent =
++                                    parent_agent_ptr;
++                                child_agent_ptr->backhaul.backhaul_iface_type =
++                                    beerocks::IFACE_TYPE_WIFI_UNSPECIFIED;
++                                child_agent_ptr->backhaul.parent_interface = bssid;
++                                child_agent_ptr->backhaul.wireless_backhaul_radio =
++                                    database.get_radio_by_backhaul_cap(bssid);
++                                if (!database.dm_set_device_multi_ap_backhaul(*child_agent_ptr)) {
++                                    LOG(ERROR)
++                                        << "Failed to update backhaul DM for agent "
++                                        << child_agent_ptr->al_mac << " after bSTA " << client_mac
++                                        << " joined BSS " << bssid;
++                                } else {
++                                    LOG(INFO)
++                                        << "Backhaul DM updated for agent "
++                                        << child_agent_ptr->al_mac
++                                        << " parent=" << parent_agent_ptr->al_mac
++                                        << " after bSTA " << client_mac << " joined BSS " << bssid;
++                                }
+                             }
+                         }
+                         break;
+-- 
+2.34.1
+
