@@ -1,0 +1,998 @@
+From 5cded6fd7c4bb80454b4aeb67b82a6403309728c Mon Sep 17 00:00:00 2001
+From: Sureshkumar <suresure@qti.qualcomm.com>
+Date: Fri, 7 Aug 2026 19:32:42 +0530
+Subject: [PATCH] multi-link: fix per-link metrics delivery for MLO client
+ stations
+
+Five issues are addressed for multi-link operation (MLO) client stations
+that caused per-link signal strength and throughput metrics to be silently
+dropped or written to the wrong data model path:
+
+1. agent monitor: use affiliated link MAC as TLV 0xE4 key
+   The affiliated STA metrics TLV must carry the affiliated link MAC as
+   its station identifier, not the MLD MAC. Using the MLD MAC caused
+   every link's TLV to carry the same key, so the controller's per-link
+   DM path lookup always failed and metrics were silently discarded.
+
+2. agent monitor: send raw bytes in TLV 0xE4 byte counters
+   Per-link driver counters are already in bytes. Applying the BSS-level
+   byte unit conversion divided by 1024 unnecessarily, causing the
+   controller to store values 1024x smaller than the actual counters.
+
+3. agent link metrics task: apply byte unit scaling for TLV 0xE4
+   The affiliated STA metrics TLV must carry byte counters in the unit
+   declared by the agent's Profile-2 ByteCounterUnits field. Add the
+   missing scaling so the controller's inverse conversion produces the
+   correct raw byte value in the data model.
+
+4. controller: iterate all bssid_info entries in TLV 0x96 for MLO
+   For MLO stations the agent sends one bssid_info entry per affiliated
+   link. Previously only entry [0] was processed, leaving every other
+   link's SignalStrength and EstMACDataRate fields at their default
+   values. Iterate all entries and resolve each BSSID to the affiliated
+   link MAC so each AffiliatedSTA DM path is updated correctly.
+
+5. controller db: write link metrics to per-link AffiliatedSTA DM path
+   dm_set_sta_link_metrics() and dm_set_affiliated_sta_metrics() were
+   writing to the STAMLD-level station DM path instead of the specific
+   AffiliatedSTA.{k} path. Capture the affiliated link's own DM path
+   during the MLD MAC resolution fallback and use it as the write target.
+   Fire vendor events with the affiliated link MAC so the steering
+   application's per-link lookup succeeds.
+
+6. Also fix the AffiliatedSTA.SignalStrength ODL schema type from uint8 to
+   uint32 with a max-220 validator. RCPI is encoded as 0-220 per IEEE
+   802.11-2020 Table 9-176 and uint8 caused silent truncation.
+
+7. topology: skip non-1905 neighbor entry for known client stations
+    MLO station MLD MACs appear in the Non-1905 Neighbor Device TLV because
+    they are not 1905 agents. Adding them to the neighbor list prevents the
+    station from being registered via the normal topology path, breaking
+    metrics delivery and station connect notifications. Skip any MAC that
+    already exists as a known client station.
+
+8. controller db: register MLO station when MLD configuration report arrives
+    The associated clients TLV from the agent may report affiliated link MACs
+    instead of the MLD MAC, so the normal topology path never registers the
+    MLD MAC. When the MLD configuration report is processed and the station is
+    not yet registered, add it using the first affiliated link's serving BSSID.
+    This ensures metrics events and station connect notifications reach the
+    steering application correctly.
+
+9. steering: use AP MLD MAC as target in client steering request for MLO STAs
+    Per EasyMesh R6 and IEEE 802.11be, the target BSSID in a client steering
+    request must be the AP MLD MAC address when steering an MLO station, not
+    a link-specific BSSID. Resolve the link BSSID to the corresponding AP MLD
+    MAC before building the steering request TLV. Legacy non-MLO stations are
+    unaffected.
+
+10. monitor: ignore ROC scan complete event when no pending measurements
+    Both the monitor and the AP manager processes subscribe to the same nl80211
+    multicast group, so the kernel delivers the remain-on-channel expired event
+    to both. Only the process that initiated the scan has pending measurements.
+    Without this guard the AP manager pushes an empty unassociated station stats
+    event, causing the controller to receive a noise-floor RCPI value for every
+    unassociated station query.
+
+11. monitor: skip duplicate ROC scan request for already-pending station
+    When a second unassociated station query arrives while a ROC scan is already
+    in progress for the same station, skip the debugfs add to avoid a kernel
+    EEXIST error. The in-flight scan will return the measurement when it expires.
+
+12. controller: resolve affiliated link MAC when building unassociated query
+    The station database is keyed by MLD MAC. When an unassociated query is
+    requested for an affiliated link MAC, the direct station lookup returns
+    nothing and the serving agent is not identified. Add a fallback that scans
+    all registered stations for one whose affiliated link list contains the
+    requested MAC, then uses that station's serving radio and agent. Also skip
+    agents where the MLO station is currently associated, matching the existing
+    logic for non-MLO stations.
+
+13. controller: send single unassociated station query broadcast per request
+    The previous path called the full station registration and broadcast helper
+    once per qualifying agent, causing redundant broadcasts. Register each
+    station in the database directly and send one broadcast after all agents
+    have been processed.
+
+14. Guard against a stale TOPOLOGY_RESPONSE STA MLD report from a PREVIOUS
+    parent agent
+
+Signed-off-by: Sureshkumar <suresure@qti.qualcomm.com>
+---
+ .../fronthaul_manager/monitor/monitor.cpp     |   9 +
+ .../monitor/monitor_stats.cpp                 |  26 ++-
+ .../tasks/link_metrics_collection_task.cpp    |  31 +++-
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      |  36 +++-
+ controller/nbapi/odl/device.odl.in            |  10 +-
+ controller/nbapi/on_action.cpp                |  46 ++++-
+ controller/src/beerocks/master/controller.cpp | 167 ++++++++++++++----
+ controller/src/beerocks/master/db/db.cpp      | 150 ++++++++++++++--
+ controller/src/beerocks/master/db/db.h        |  14 ++
+ .../master/tasks/btm_request_task.cpp         |  33 +++-
+ .../master/tasks/client_steering_task.cpp     |  36 +++-
+ .../beerocks/master/tasks/topology_task.cpp   |  12 ++
+ 12 files changed, 499 insertions(+), 71 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+index 6094813a1..f4f7232cb 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+@@ -1544,6 +1544,10 @@ void Monitor::handle_cmdu_vs_message(ieee1905_1::CmduMessageRx &cmdu_rx)
+ 
+             new_list_unassociated_stations.emplace(
+                 mac_address, SUnassocStaParams{.channel = channel, .operating_class = op_class});
++            LOG(INFO) << "[UNASSOC-TRACE][6-AGENT-QUERY-RX]"
++                      << " sta=" << mac_address
++                      << " op_class=" << int(op_class)
++                      << " ch=" << int(channel);
+             LOG(DEBUG) << " New unassociated stations list contain station with mac_address"
+                        << mac_address << " and channel: " << channel;
+         }
+@@ -2743,6 +2747,11 @@ bool Monitor::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+             };
+ 
+             std::get<1>(station_stat) = un_sta_stats;
++            LOG(INFO) << "[UNASSOC-TRACE][7-AGENT-RESP-TX]"
++                      << " sta=" << tlvf::mac_to_string(station_out.mac_adress)
++                      << " signal_strength=" << int(station_out.signal_strength)
++                      << " ch=" << int(station_out.channel)
++                      << " op_class=" << int(station_out.operating_class);
+             LOG(DEBUG) << "adding unassociated station stats for: "
+                        << tlvf::mac_to_string(station_out.mac_adress)
+                        << " and signal_strength = " << station_out.signal_strength
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor_stats.cpp b/agent/src/beerocks/fronthaul_manager/monitor/monitor_stats.cpp
+index f04af5cb0..67422f960 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor_stats.cpp
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor_stats.cpp
+@@ -650,14 +650,24 @@ bool monitor_stats::add_affiliated_sta_metrics(ieee1905_1::CmduMessageTx &cmdu_t
+         return false;
+     }
+     auto affiliated_sta_stats = sta_node.get_stats().hal_stats.affiliated_sta_stats;
+-    // For MLO STAs use the MLD MAC as the STA MAC address (EasyMesh R6 §17.2.36).
+-    affiliated_sta_metrics_tlv->sta_mac_addr() =
+-        sta_node.is_mlo() ? sta_node.get_mld_mac()
+-                          : tlvf::mac_from_string(sta_node.get_mac());
+-    affiliated_sta_metrics_tlv->bytes_sent() =
+-        recalculate_byte_units(affiliated_sta_stats.bytes_sent);
+-    affiliated_sta_metrics_tlv->bytes_received() =
+-        recalculate_byte_units(affiliated_sta_stats.bytes_received);
++    /* sta_mac_addr identifies WHICH affiliated link these per-link counters
++     * belong to. The caller (monitor.cpp) only invokes this function once per
++     * affiliated link's own sta_node, so sta_node.get_mac() is already that
++     * link's MAC — using the MLD MAC here instead would make every affiliated
++     * link's TLV carry the same (wrong) key, so the controller's per-link
++     * lookup in db::dm_set_affiliated_sta_metrics() (matching against
++     * affiliated_sta.affiliated_sta_mac) never finds the link's DM path and
++     * silently drops the metrics update. */
++    affiliated_sta_metrics_tlv->sta_mac_addr() = tlvf::mac_from_string(sta_node.get_mac());
++    /* affiliated_sta_stats.bytes_sent/bytes_received are per-link driver counters
++     * reported in raw bytes (not KB), unlike the BSS-level stats which the driver
++     * reports in KB and which go through recalculate_byte_units().  Applying
++     * recalculate_byte_units() here would divide by 1024 (KIBIBYTES path), and the
++     * controller would then multiply by 1024 again, producing DM values that are
++     * 1024× larger than the actual driver counters.  Send the raw byte values so
++     * the controller stores them directly without any unit conversion. */
++    affiliated_sta_metrics_tlv->bytes_sent()     = affiliated_sta_stats.bytes_sent;
++    affiliated_sta_metrics_tlv->bytes_received() = affiliated_sta_stats.bytes_received;
+     affiliated_sta_metrics_tlv->packets_sent()        = affiliated_sta_stats.packets_sent;
+     affiliated_sta_metrics_tlv->packets_received()    = affiliated_sta_stats.packets_received;
+     affiliated_sta_metrics_tlv->packets_sent_errors() = affiliated_sta_stats.packets_sent_errors;
+diff --git a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+index 6a44711df..c16b31347 100644
+--- a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+@@ -131,6 +131,27 @@ static std::string get_link_iface_by_bssid(beerocks::AgentDB::SafeDB &db, const
+     return {};
+ }
+ 
++/**
++ * @brief Scale a raw byte count (as read from nl80211) down to the unit
++ *        declared in this agent's Profile-2 AP Capability (ByteCounterUnits),
++ *        mirroring monitor_stats::recalculate_byte_units(). TLV 0xe4 carries
++ *        bytes_sent()/bytes_received() in that declared unit, and the
++ *        controller multiplies back up by the same factor when writing the
++ *        DM (db::recalculate_attr_to_byte_units()) — skipping this on the
++ *        agent side causes the controller to inflate the value by 1024x
++ *        (or 1024x1024x for MEBIBYTES).
++ */
++static uint64_t recalculate_byte_units(wfa_map::tlvProfile2ApCapability::eByteCounterUnits units,
++                                       uint64_t bytes)
++{
++    if (units == wfa_map::tlvProfile2ApCapability::eByteCounterUnits::KIBIBYTES) {
++        return bytes / 1024;
++    } else if (units == wfa_map::tlvProfile2ApCapability::eByteCounterUnits::MEBIBYTES) {
++        return bytes / 1024 / 1024;
++    }
++    return bytes;
++}
++
+ } // anonymous namespace
+ 
+ using namespace multi_vendor;
+@@ -2028,8 +2049,14 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+                         link_tx_failed  = link_info_e4.tx_failed;
+                     }
+ 
+-                    affiliated_sta_metrics_tlv->bytes_sent()          = link_tx_bytes;
+-                    affiliated_sta_metrics_tlv->bytes_received()      = link_rx_bytes;
++                    /* TLV 0xe4 must carry bytes_sent()/bytes_received() in the
++                     * unit declared via this agent's Profile-2 ByteCounterUnits
++                     * (KIBIBYTES per spec) — the controller multiplies back up
++                     * by the same factor when writing the DM. */
++                    affiliated_sta_metrics_tlv->bytes_sent() =
++                        recalculate_byte_units(db->device_conf.byte_counter_units, link_tx_bytes);
++                    affiliated_sta_metrics_tlv->bytes_received() =
++                        recalculate_byte_units(db->device_conf.byte_counter_units, link_rx_bytes);
+                     affiliated_sta_metrics_tlv->packets_sent()        = link_tx_packets;
+                     affiliated_sta_metrics_tlv->packets_received()    = link_rx_packets;
+                     affiliated_sta_metrics_tlv->packets_sent_errors() = link_tx_failed;
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index b15223241..d6c6b6eef 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -1516,6 +1516,19 @@ bool mon_wlan_hal_nl80211::process_roc_expired_event()
+     LOG(DEBUG) << "Unassoc link metric query - slave gets driver event on scan complete: "
+                 << "pending_measurements=" << m_pending_unassoc_measurements.size();
+ 
++    // Both the monitor and the ap_manager processes subscribe to the same nl80211
++    // mlme multicast group, so the kernel delivers the ROC-expired event to both.
++    // Only the process that initiated the ROC scan (the monitor) has pending
++    // measurements.  If this instance has none, the event belongs to another
++    // process — silently ignore it.  Without this guard the ap_manager pushes an
++    // empty Unassociation_Stations_Stats event which causes the controller to
++    // receive RCPI=32 (noise floor) for every unassoc query.
++    if (m_pending_unassoc_measurements.empty()) {
++        LOG(DEBUG) << "process_roc_expired_event: no pending measurements — "
++                      "ignoring ROC event (not initiated by this process)";
++        return true;
++    }
++
+     sUnassociatedStationsStats stats_out;
+ 
+     // Get radio info for operating class calculation
+@@ -1627,6 +1640,23 @@ bool mon_wlan_hal_nl80211::sta_unassoc_rssi_measurement(
+             continue;
+         }
+ 
++        /* Pre-check: if this MAC is already in m_pending_unassoc_measurements,
++         * a ROC scan is already in progress for it (triggered by a previous query
++         * that arrived within the 600ms ROC window).  Skip the echo-add entirely
++         * to avoid the EEXIST kernel error storm — the in-flight ROC scan will
++         * return the RSSI when it expires. */
++        bool already_pending = std::any_of(
++            m_pending_unassoc_measurements.begin(),
++            m_pending_unassoc_measurements.end(),
++            [&](const UnassocMeasurementContext &ctx) {
++                return ctx.mac_address == mac_address;
++            });
++        if (already_pending) {
++            LOG(DEBUG) << "sta_unassoc_rssi_measurement: " << mac_address
++                       << " already in pending list — ROC scan in progress, skipping re-add";
++            continue;
++        }
++
+         // Add STA to the driver's debugfs list for monitoring
+         bool already_exists = false;
+         if (!add_peer_neighbor(mac_address, &already_exists)) {
+@@ -1634,7 +1664,11 @@ bool mon_wlan_hal_nl80211::sta_unassoc_rssi_measurement(
+                 /* STA is currently associated on this radio — driver cannot
+                  * measure it as an unassociated peer via ROC scan.  Skip it
+                  * silently; the unassoc query for this STA will return RCPI=0
+-                 * (noise floor) which the steering app treats as no-measurement. */
++                 * (noise floor) which the steering app treats as no-measurement.
++                 *
++                 * Note: the "already in pending list" case (repeated query within
++                 * the 600ms ROC window) is handled by the pre-check above, so
++                 * EEXIST here genuinely means the STA is associated. */
+                 LOG(INFO) << "sta_unassoc_rssi_measurement: skipping " << mac_address
+                           << " (associated peer on this radio)";
+             } else {
+diff --git a/controller/nbapi/odl/device.odl.in b/controller/nbapi/odl/device.odl.in
+index f6adca5cc..dff7e30d2 100644
+--- a/controller/nbapi/odl/device.odl.in
++++ b/controller/nbapi/odl/device.odl.in
+@@ -703,7 +703,15 @@
+                     %read-only uint32 PacketsSent = 0;
+                     %read-only uint32 PacketsReceived = 0;
+                     %read-only uint32 ErrorsSent = 0;
+-                    %read-only uint8 SignalStrength = 0;
++                    /**
++                    * An indicator of radio signal strength of the uplink from the affiliated STA
++                    * to the access point - measured as RCPI, encoded per [Table 9-176/802.11-2020].
++                    * Valid range: 0–220. Reserved: 221–255.
++                    * @version 2.19.1
++                    */
++                    %read-only uint32 SignalStrength = 0 {
++                        on action validate call check_maximum 220;
++                    }
+                     %read-only uint32 EstMACDataRateDownlink = 0;
+                     %read-only uint32 EstMACDataRateUplink = 0;
+                     %read-only uint32 LastDataDownlinkRate = 0;
+diff --git a/controller/nbapi/on_action.cpp b/controller/nbapi/on_action.cpp
+index 4c3a3450a..38230b395 100644
+--- a/controller/nbapi/on_action.cpp
++++ b/controller/nbapi/on_action.cpp
+@@ -1843,6 +1843,39 @@ amxd_status_t unassoc_sta_rcpi_query(amxd_object_t *object, amxd_function_t *fun
+             LOG(DEBUG) << "unassoc_sta_rcpi_query: STA " << sta_mac_str
+                        << " not found in DB or not associated — querying all radios";
+         }
++
++        /* Fix A2-equiv: MLO fallback — sta_mac may be an affiliated link MAC.
++         * db::get_station() is keyed by MLD MAC so the direct lookup above
++         * returns NULL for affiliated link MACs.  Scan all stations for one
++         * whose sta_mld_configuration.affiliated_stas list contains sta_mac,
++         * then resolve its serving radio/agent the same way. */
++        if (serving_radio_uid == beerocks::net::network_utils::ZERO_MAC) {
++            for (const auto &sta_mac_str_iter : g_database->get_stations()) {
++                auto mld_sta = g_database->get_station(
++                    tlvf::mac_from_string(sta_mac_str_iter));
++                if (!mld_sta || !mld_sta->get_bss()) { continue; }
++                bool found_link = false;
++                for (const auto &aff : mld_sta->sta_mld_configuration.affiliated_stas) {
++                    if (aff.affiliated_sta_mac == sta_mac) {
++                        found_link = true;
++                        break;
++                    }
++                }
++                if (!found_link) { continue; }
++                serving_radio_uid = mld_sta->get_bss()->radio.radio_uid;
++                for (const auto &agent : g_database->get_all_connected_agents()) {
++                    if (agent->radios.count(serving_radio_uid)) {
++                        serving_agent_mac = agent->al_mac;
++                        break;
++                    }
++                }
++                LOG(DEBUG) << "unassoc_sta_rcpi_query: MLO fallback — affiliated link "
++                           << sta_mac_str << " resolved to MLD " << sta_mac_str_iter
++                           << " serving radio=" << tlvf::mac_to_string(serving_radio_uid)
++                           << " serving agent=" << tlvf::mac_to_string(serving_agent_mac);
++                break;
++            }
++        }
+     }
+ 
+     /* Iterate all Device instances in the DM to find qualifying agents/radios */
+@@ -1940,7 +1973,11 @@ amxd_status_t unassoc_sta_rcpi_query(amxd_object_t *object, amxd_function_t *fun
+                 }
+             }
+ 
+-            if (!controller_ctx->add_unassociated_station(
++            /* Fix B: DB-only insert — do NOT call add_unassociated_station()
++             * (which triggers a full CMDU broadcast on every call).  Instead
++             * insert directly into the DB here and send ONE broadcast after
++             * the loop via get_unassociated_stations_stats(). */
++            if (!g_database->add_unassociated_station(
+                     sta_mac, channel, op_class,
+                     tlvf::mac_from_string(agent_mac_s),
+                     tlvf::mac_from_string(radio_mac_s))) {
+@@ -1948,12 +1985,17 @@ amxd_status_t unassoc_sta_rcpi_query(amxd_object_t *object, amxd_function_t *fun
+                              << " agent=" << agent_mac_s << " radio=" << radio_mac_s;
+             } else {
+                 sent_count++;
+-                LOG(DEBUG) << "unassoc_sta_rcpi_query: query sent"
++                LOG(DEBUG) << "unassoc_sta_rcpi_query: registered in DB"
+                            << " agent=" << agent_mac_s << " radio=" << radio_mac_s;
+             }
+         }
+     }
+ 
++    /* Fix B: send ONE broadcast covering all just-registered (agent,radio) pairs. */
++    if (sent_count > 0) {
++        controller_ctx->get_unassociated_stations_stats();
++    }
++
+     amxc_var_clean(&value);
+ 
+     LOG(INFO) << "unassoc_sta_rcpi_query: sta=" << sta_mac_str
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 78690f830..94d279f79 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -3062,30 +3062,64 @@ bool Controller::handle_tlv_associated_sta_link_metrics(const sMacAddr &src_mac,
+ 
+     for (auto &sta_link_metric : cmdu_rx.getClassList<wfa_map::tlvAssociatedStaLinkMetrics>()) {
+ 
+-        // STA Metrics can hold information from different BSS sources, mostly when steering
+-        // Metrics of last registered and active value needs to be considered.
+-        auto response_list = sta_link_metric->bssid_info_list(0);
++        LOG(DEBUG) << "[CONTROLLER][TLV 0x96] received from agent=" << src_mac
++                   << " sta_mac=" << sta_link_metric->sta_mac()
++                   << " num_bssid_entries=" << int(sta_link_metric->bssid_info_list_length());
+ 
+-        if (!std::get<0>(response_list)) {
+-            LOG(ERROR) << "Failed to get bssid info list.";
+-            continue;
+-        }
++        /* For legacy/SLO STAs the TLV carries exactly one bssid_info entry.
++         * For MLO STAs the agent carries ONE entry per affiliated link, each with its own
++         * BSSID / DL rate / UL rate / RCPI.  We must iterate over ALL entries, otherwise only
++         * the first affiliated link gets written to the DM and the remaining
++         * AffiliatedSTA.{k}.SignalStrength / EstMACDataRate* fields stay stale/default. */
++        for (int i = 0; i < sta_link_metric->bssid_info_list_length(); i++) {
+ 
+-        auto bssid_info = std::get<1>(response_list);
++            auto response_list = sta_link_metric->bssid_info_list(i);
+ 
+-        // Verify reported BSSID is one of this station's valid serving BSSIDs
+-        // (parent, or -- for MLO stations -- any affiliated link).
+-        if (!database.is_sta_reported_bssid_valid(sta_link_metric->sta_mac(), bssid_info.bssid)) {
+-            LOG(INFO) << "Reported STA BSSID is not matching with datamodel. Reported bssid:"
+-                      << bssid_info.bssid;
+-            continue;
+-        }
+-        if (!database.dm_set_sta_link_metrics(sta_link_metric->sta_mac(),
+-                                              bssid_info.downlink_estimated_mac_data_rate_mbps,
+-                                              bssid_info.uplink_estimated_mac_data_rate_mbps,
+-                                              bssid_info.sta_measured_uplink_rcpi_dbm_enc)) {
+-            LOG(ERROR) << "Failed to set link metrics for STA:" << sta_link_metric->sta_mac();
+-            ret_val = false;
++            if (!std::get<0>(response_list)) {
++                LOG(ERROR) << "Failed to get bssid info list entry " << i;
++                continue;
++            }
++
++            auto &bssid_info = std::get<1>(response_list);
++
++            // Verify reported BSSID is one of this station's valid serving BSSIDs
++            // (parent, or -- for MLO stations -- any affiliated link).
++            if (!database.is_sta_reported_bssid_valid(sta_link_metric->sta_mac(),
++                                                      bssid_info.bssid)) {
++                LOG(INFO) << "Reported STA BSSID is not matching with datamodel. Reported bssid:"
++                          << bssid_info.bssid;
++                continue;
++            }
++
++            /* For MLO STAs the TLV key (sta_mac) is the MLD MAC, while each bssid_info entry
++             * identifies the specific affiliated link by its BSSID. Resolve that BSSID to the
++             * affiliated link MAC so dm_set_sta_link_metrics() writes into the correct
++             * AffiliatedSTA.{k} DM path. For legacy/SLO STAs no affiliated link is found and we
++             * keep using the TLV's sta_mac directly. */
++            sMacAddr target_sta_mac = sta_link_metric->sta_mac();
++            auto affiliated_sta_mac =
++                database.get_affiliated_sta_mac_by_bssid(sta_link_metric->sta_mac(),
++                                                         bssid_info.bssid);
++            if (affiliated_sta_mac != beerocks::net::network_utils::ZERO_MAC) {
++                target_sta_mac = affiliated_sta_mac;
++            }
++
++            LOG(DEBUG) << "[CONTROLLER][TLV 0x96] entry[" << i << "]"
++                       << " bssid=" << bssid_info.bssid
++                       << " target_sta_mac=" << target_sta_mac
++                       << " dl_rate=" << bssid_info.downlink_estimated_mac_data_rate_mbps
++                       << " ul_rate=" << bssid_info.uplink_estimated_mac_data_rate_mbps
++                       << " rcpi=" << int(bssid_info.sta_measured_uplink_rcpi_dbm_enc);
++
++            if (!database.dm_set_sta_link_metrics(target_sta_mac,
++                                                  bssid_info.downlink_estimated_mac_data_rate_mbps,
++                                                  bssid_info.uplink_estimated_mac_data_rate_mbps,
++                                                  bssid_info.sta_measured_uplink_rcpi_dbm_enc)) {
++                LOG(ERROR) << "Failed to set link metrics for STA TLV key="
++                           << sta_link_metric->sta_mac() << " resolved_key=" << target_sta_mac
++                           << " bssid=" << bssid_info.bssid;
++                ret_val = false;
++            }
+         }
+     }
+     return ret_val;
+@@ -3289,14 +3323,18 @@ bool Controller::handle_tlv_affiliated_sta_metrics(const sMacAddr &src_mac,
+ 
+     for (auto &affiliated_sta_metrics : cmdu_rx.getClassList<wfa_map::tlvAffiliatedStaMetrics>()) {
+ 
+-        db::sAffiliatedStaMetrics affl_sta_metrics;
++        LOG(DEBUG) << "AffiliatedStaMetrics TLV (0xE4): agent=" << src_mac
++                   << " affiliated_sta=" << affiliated_sta_metrics->sta_mac_addr();
+ 
+-        // Recalculate counters according to Agent Byte Units.
+-        affl_sta_metrics.bytes_sent = database.recalculate_attr_to_byte_units(
+-            agent->byte_counter_units, affiliated_sta_metrics->bytes_sent());
++        db::sAffiliatedStaMetrics affl_sta_metrics;
+ 
+-        affl_sta_metrics.bytes_received = database.recalculate_attr_to_byte_units(
+-            agent->byte_counter_units, affiliated_sta_metrics->bytes_received());
++        /* The agent sends affiliated STA byte counters as raw bytes (not KB) —
++         * recalculate_byte_units() in the agent is a no-op for this path because
++         * the per-link driver counters are already in bytes.  Applying
++         * recalculate_attr_to_byte_units() here would multiply by 1024 (KIBIBYTES),
++         * inflating the DM values by 1024×.  Store the TLV values directly. */
++        affl_sta_metrics.bytes_sent     = affiliated_sta_metrics->bytes_sent();
++        affl_sta_metrics.bytes_received = affiliated_sta_metrics->bytes_received();
+ 
+         affl_sta_metrics.packets_received    = affiliated_sta_metrics->packets_received();
+         affl_sta_metrics.packets_sent        = affiliated_sta_metrics->packets_sent();
+@@ -7624,6 +7662,12 @@ bool Controller::add_unassociated_station(const sMacAddr &station_mac_addr, uint
+                                           uint8_t operating_class, const sMacAddr &agent_mac_addr,
+                                           const sMacAddr &radio_mac_addr)
+ {
++    LOG(INFO) << "[UNASSOC-TRACE][3-CTRL-NBAPI-ADD]"
++              << " sta=" << tlvf::mac_to_string(station_mac_addr)
++              << " op_class=" << int(operating_class)
++              << " ch=" << int(channel)
++              << " agent=" << tlvf::mac_to_string(agent_mac_addr)
++              << " radio=" << tlvf::mac_to_string(radio_mac_addr);
+     if (!database.add_unassociated_station(station_mac_addr, channel, operating_class,
+                                            agent_mac_addr, radio_mac_addr)) {
+         return false;
+@@ -7678,20 +7722,65 @@ bool Controller::send_unassociated_sta_link_metrics_query_message(
+                  * m_agents may contain stale entries from before the STA
+                  * associated; sending an unassoc query there causes the
+                  * agent to reject it with STA_ASSOCIATED_WITH_A_BSS_OPERATED_BY_THE_AGENT.
+-                 * Record the entry as stale so it is pruned from m_agents below. */
++                 * Record the entry as stale so it is pruned from m_agents below.
++                 *
++                 * MLO extension: for affiliated link MACs (e.g. C2:6B:35:8E:5B:04),
++                 * database.get_station() may return NULL because the controller's
++                 * station DB only has the MLD MAC (B6:09:EC:30:3D:04), not the
++                 * individual affiliated link MACs.  In that case, iterate over all
++                 * stations and check if any of them have this MAC as an affiliated
++                 * link that is associated on this agent. */
+                 {
++                    bool skip_agent = false;
++
++                    /* Primary check: direct station lookup */
+                     auto sta_db = database.get_station(station.first);
+                     if (sta_db && sta_db->get_bss()) {
+                         sMacAddr serving_radio = sta_db->get_bss()->radio.radio_uid;
+                         if (database.get_radio(agent.first, serving_radio)) {
+-                            LOG(DEBUG) << "send_unassoc_query: skipping agent "
+-                                       << tlvf::mac_to_string(agent.first)
+-                                       << " — STA " << tlvf::mac_to_string(station.first)
+-                                       << " is currently associated there (stale m_agents entry)";
+-                            stale_agents.push_back(agent.first);
+-                            continue;
++                            skip_agent = true;
++                        }
++                    }
++
++                    /* MLO fallback: station.first is an affiliated link MAC.
++                     * database.get_stations() returns MAC strings; for each,
++                     * look up the Station object and check if it has station.first
++                     * in its sta_mld_configuration.affiliated_stas list.
++                     * If found, check if that MLD station is associated on this agent. */
++                    if (!skip_agent) {
++                        for (const auto &sta_mac_str : database.get_stations()) {
++                            auto mld_sta = database.get_station(
++                                tlvf::mac_from_string(sta_mac_str));
++                            if (!mld_sta || !mld_sta->get_bss()) { continue; }
++                            /* Check if this MLD station has station.first as an
++                             * affiliated link MAC. */
++                            bool has_link = false;
++                            for (const auto &aff_sta :
++                                 mld_sta->sta_mld_configuration.affiliated_stas) {
++                                if (aff_sta.affiliated_sta_mac == station.first) {
++                                    has_link = true;
++                                    break;
++                                }
++                            }
++                            if (!has_link) { continue; }
++                            /* Found the MLD station — check if it is associated
++                             * on this agent. */
++                            sMacAddr serving_radio = mld_sta->get_bss()->radio.radio_uid;
++                            if (database.get_radio(agent.first, serving_radio)) {
++                                skip_agent = true;
++                                break;
++                            }
+                         }
+                     }
++
++                    if (skip_agent) {
++                        LOG(DEBUG) << "send_unassoc_query: skipping agent "
++                                   << tlvf::mac_to_string(agent.first)
++                                   << " — STA " << tlvf::mac_to_string(station.first)
++                                   << " is currently associated there (stale m_agents entry)";
++                        stale_agents.push_back(agent.first);
++                        continue;
++                    }
+                 }
+ 
+                 if (global_map.find(agent.first) == global_map.end()) {
+@@ -7768,6 +7857,16 @@ bool Controller::send_unassociated_sta_link_metrics_query_message(
+             unassociated_sta_query->operating_class_of_channel_list() = operating_class.first;
+             unassociated_sta_query->channel_list_length() =
+                 operating_class.second.size(); //number of channels
++            // Log each STA in this query for tracing
++            for (auto &ch_entry : operating_class.second) {
++                for (auto &sta_mac : ch_entry.second) {
++                    LOG(INFO) << "[UNASSOC-TRACE][4-CTRL-SEND-QUERY]"
++                              << " sta=" << tlvf::mac_to_string(sta_mac)
++                              << " agent=" << tlvf::mac_to_string(agent.first)
++                              << " op_class=" << int(operating_class.first)
++                              << " ch=" << int(ch_entry.first);
++                }
++            }
+             son_actions::send_cmdu_to_agent(agent.first, cmdu_tx, database);
+         }
+     }
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 5fc85918a..63a5a81f6 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -1318,6 +1318,20 @@ std::string db::get_sta_parent(const std::string &mac)
+     return pSta->parent_mac;
+ }
+ 
++sMacAddr db::get_affiliated_sta_mac_by_bssid(const sMacAddr &mld_mac, const sMacAddr &bssid)
++{
++    auto station = get_station(mld_mac);
++    if (!station) {
++        return beerocks::net::network_utils::ZERO_MAC;
++    }
++    for (const auto &affiliated_sta : station->sta_mld_configuration.affiliated_stas) {
++        if (affiliated_sta.bssid == bssid) {
++            return affiliated_sta.affiliated_sta_mac;
++        }
++    }
++    return beerocks::net::network_utils::ZERO_MAC;
++}
++
+ bool db::is_sta_reported_bssid_valid(const sMacAddr &sta_mac, const sMacAddr &reported_bssid)
+ {
+     std::shared_ptr<Station> pSta = get_station(sta_mac);
+@@ -6635,8 +6649,21 @@ void db::disable_periodic_link_metrics_requests()
+ bool db::dm_set_sta_link_metrics(const sMacAddr &sta_mac, uint32_t downlink_est_mac_data_rate,
+                                  uint32_t uplink_est_mac_data_rate, uint8_t signal_strength)
+ {
++    LOG(DEBUG) << "dm_set_sta_link_metrics: sta_mac=" << sta_mac
++               << " dl_rate=" << downlink_est_mac_data_rate
++               << " ul_rate=" << uplink_est_mac_data_rate
++               << " rcpi=" << int(signal_strength);
+     bool ret_val = true;
+     auto station = get_station(sta_mac);
++    /* dm_path defaults to the resolved station's own path (correct for the
++     * legacy/non-MLO case, where sta_mac == station->mac and the STA has no
++     * affiliated links). For an MLO affiliated link (resolved via the
++     * fallback scan below), this is overridden to that specific link's own
++     * AffiliatedSTA.N path — writing SignalStrength/EstMACDataRate* to the
++     * STAMLD-level station->dm_path instead would silently update the wrong
++     * DM node and leave every AffiliatedSTA.N.SignalStrength stuck at its
++     * default, even though the correct per-link RCPI was received. */
++    std::string link_dm_path;
+     if (!station) {
+         /* For MLO STAs the agent reports link metrics using the affiliated link MAC,
+          * not the MLD MAC.  The controller stores the station under the MLD MAC, so
+@@ -6647,7 +6674,8 @@ bool db::dm_set_sta_link_metrics(const sMacAddr &sta_mac, uint32_t downlink_est_
+                 sta_pair.second->sta_mld_configuration.affiliated_stas;
+             for (const auto &affiliated_sta : affiliated_stas) {
+                 if (affiliated_sta.affiliated_sta_mac == sta_mac) {
+-                    station = sta_pair.second;
++                    station      = sta_pair.second;
++                    link_dm_path = affiliated_sta.dm_path;
+                     LOG(DEBUG) << "dm_set_sta_link_metrics: resolved link MAC "
+                                << sta_mac << " → MLD MAC " << station->mac;
+                     break;
+@@ -6678,27 +6706,43 @@ bool db::dm_set_sta_link_metrics(const sMacAddr &sta_mac, uint32_t downlink_est_
+         }
+     }
+ 
+-    // Device.WiFi.DataElements.Network.Device.{i}.Radio.{i}.BSS.{i}.STA.{i}.
+-    if (station->dm_path.empty()) {
++    // link_dm_path is set only when sta_mac resolved to an affiliated link
++    // (MLO); otherwise use the station's own DM path (legacy/non-MLO STA).
++    //   MLO:        Device.WiFi.DataElements.Network.Device.{i}.APMLD.{i}.STAMLD.{i}.AffiliatedSTA.{i}.
++    //   Legacy/SLO: Device.WiFi.DataElements.Network.Device.{i}.Radio.{i}.BSS.{i}.STA.{i}.
++    const std::string &target_dm_path = link_dm_path.empty() ? station->dm_path : link_dm_path;
++    if (target_dm_path.empty()) {
+         return true;
+     }
+ 
++    LOG(DEBUG) << "dm_set_sta_link_metrics: DM path=" << target_dm_path
++               << " affiliated_link=" << (!link_dm_path.empty());
++
+     station->last_assoc_sta_link_metrics_timestamp   = std::chrono::steady_clock::now();
+     station->last_assoc_sta_link_metrics_uplink_rcpi = signal_strength;
+ 
+-    ret_val &= m_ambiorix_datamodel->set(station->dm_path, "EstMACDataRateDownlink",
++    ret_val &= m_ambiorix_datamodel->set(target_dm_path, "EstMACDataRateDownlink",
+                                          downlink_est_mac_data_rate);
+-    ret_val &= m_ambiorix_datamodel->set(station->dm_path, "EstMACDataRateUplink",
++    ret_val &= m_ambiorix_datamodel->set(target_dm_path, "EstMACDataRateUplink",
+                                          uplink_est_mac_data_rate);
+-    ret_val &= m_ambiorix_datamodel->set(station->dm_path, "SignalStrength", signal_strength);
++    ret_val &= m_ambiorix_datamodel->set(target_dm_path, "SignalStrength", signal_strength);
+ 
+-    /* Trigger vendor-specific event for associated STA link metrics update */
++    /* Trigger vendor-specific event for associated STA link metrics update.
++     *
++     * Pass the original sta_mac (the MAC exactly as the agent reported it
++     * in the TLV) rather than station->mac. For legacy/SLO STAs these are
++     * the same value. For MLO, sta_mac is the specific affiliated link's
++     * own MAC while station->mac is always the MLD MAC shared by every
++     * link — using station->mac here would make qmesh-lib/the steering app
++     * unable to tell which affiliated link this event's metrics belong to,
++     * since their per-link lookup keys on this MAC matching a specific
++     * link's own address, never the MLD MAC. */
+     if (ret_val) {
+         auto bss_mac = tlvf::mac_from_string(station->parent_mac);
+         auto radio   = get_radio_by_bssid(bss_mac);
+         if (radio) {
+             auto agent_al_mac = get_bss_parent_agent(bss_mac);
+-            dm_trigger_assoc_sta_link_metrics_event(station->mac, station->dm_path, bss_mac,
++            dm_trigger_assoc_sta_link_metrics_event(sta_mac, target_dm_path, bss_mac,
+                                                     radio->radio_uid, agent_al_mac);
+         }
+     }
+@@ -8863,21 +8907,53 @@ bool db::dm_set_sta_traffic_stats(const sMacAddr &sta_mac, sAssociatedStaTraffic
+ bool db::dm_set_affiliated_sta_metrics(const sMacAddr &sta_mac,
+                                        sAffiliatedStaMetrics &affl_sta_metrics)
+ {
++    LOG(DEBUG) << "dm_set_affiliated_sta_metrics: sta_mac=" << sta_mac
++               << " bytes_sent=" << affl_sta_metrics.bytes_sent
++               << " bytes_rcvd=" << affl_sta_metrics.bytes_received
++               << " pkts_sent=" << affl_sta_metrics.packets_sent
++               << " pkts_rcvd=" << affl_sta_metrics.packets_received
++               << " tx_errors=" << affl_sta_metrics.packets_sent_errors;
+     bool ret_val = true;
+     auto station = get_station(sta_mac);
++    std::string affiliated_sta_dm_path;
++
+     if (!station) {
+-        LOG(ERROR) << "Failed to get station on db with mac: " << sta_mac;
+-        return false;
++        /* For MLO STAs the agent reports affiliated STA metrics using the affiliated
++         * link MAC, not the MLD MAC.  The controller stores the station under the MLD
++         * MAC, so a direct get_station(link_mac) fails.  Fall back to a linear scan of
++         * all affiliated STA lists to resolve the link MAC → MLD MAC mapping and
++         * capture the affiliated link's own DM path — mirroring the fix already applied
++         * to dm_set_sta_link_metrics() for TLV 0x96. */
++        for (const auto &sta_pair : m_stations) {
++            const auto &affiliated_stas =
++                sta_pair.second->sta_mld_configuration.affiliated_stas;
++            for (const auto &affiliated_sta : affiliated_stas) {
++                if (affiliated_sta.affiliated_sta_mac == sta_mac) {
++                    station                = sta_pair.second;
++                    affiliated_sta_dm_path = affiliated_sta.dm_path;
++                    LOG(DEBUG) << "dm_set_affiliated_sta_metrics: resolved link MAC "
++                               << sta_mac << " → MLD MAC " << station->mac;
++                    break;
++                }
++            }
++            if (station) {
++                break;
++            }
++        }
++    } else {
++        /* Legacy/SLO path: station found directly by sta_mac.
++         * Look up the affiliated STA DM path from the station's MLD configuration. */
++        for (const auto &affiliated_sta : station->sta_mld_configuration.affiliated_stas) {
++            if (affiliated_sta.affiliated_sta_mac == sta_mac) {
++                affiliated_sta_dm_path = affiliated_sta.dm_path;
++                break;
++            }
++        }
+     }
+ 
+-    std::string affiliated_sta_dm_path = "";
+-
+-    // Get Affiliated STA DM path from Station DB
+-    for (auto &affiliated_sta : station->sta_mld_configuration.affiliated_stas) {
+-        if (affiliated_sta.affiliated_sta_mac == sta_mac) {
+-            affiliated_sta_dm_path = affiliated_sta.dm_path;
+-            break;
+-        }
++    if (!station) {
++        LOG(ERROR) << "Failed to get station on db with mac: " << sta_mac;
++        return false;
+     }
+ 
+     if (affiliated_sta_dm_path.empty()) {
+@@ -8885,6 +8961,8 @@ bool db::dm_set_affiliated_sta_metrics(const sMacAddr &sta_mac,
+         return false;
+     }
+ 
++    LOG(DEBUG) << "dm_set_affiliated_sta_metrics: DM path=" << affiliated_sta_dm_path;
++
+     ret_val &=
+         m_ambiorix_datamodel->set(affiliated_sta_dm_path, "BytesSent", affl_sta_metrics.bytes_sent);
+     ret_val &= m_ambiorix_datamodel->set(affiliated_sta_dm_path, "BytesReceived",
+@@ -10686,6 +10764,32 @@ bool db::update_assoc_sta_mld(
+             affiliated_sta.affiliated_sta_mac = affiliated_sta_db.second->mac;
+             station->sta_mld_configuration.affiliated_stas.push_back(affiliated_sta);
+         }
++    } else {
++        /* MLD STA not yet in m_stations — add it now so that metrics events
++         * (TLV 0x96, 0xE4, traffic stats) and the STATION_CONNECTED event
++         * are delivered correctly to the steering app.
++         *
++         * Root cause: the tlvAssociatedClients TLV from the agent may not
++         * include the MLD MAC (it reports affiliated link MACs instead), so
++         * the normal topology path never calls add_station() for the MLD MAC.
++         * The AssocStaMldConfigReport is the authoritative source for the MLD
++         * MAC — add the station here when it arrives.
++         *
++         * Use the first affiliated STA's BSSID as the serving BSSID.
++         * If no affiliated STA has a valid BSSID, use ZERO_MAC (the station
++         * will be updated when the topology task processes the next
++         * TOPOLOGY_NOTIFICATION). */
++        sMacAddr serving_bssid = beerocks::net::network_utils::ZERO_MAC;
++        for (const auto &aff_sta : affiliated_sta_vector) {
++            if (aff_sta.bssid != beerocks::net::network_utils::ZERO_MAC) {
++                serving_bssid = aff_sta.bssid;
++                break;
++            }
++        }
++        LOG(INFO) << "update_assoc_sta_mld: MLD STA " << sta_mld_mac
++                  << " not in m_stations — adding (agent=" << agent.al_mac
++                  << " bssid=" << serving_bssid << ")";
++        add_station(agent.al_mac, sta_mld_mac, serving_bssid);
+     }
+ 
+     /* Fire AssocStaMldConfigReport vendor event after writing all MLD config to DM.
+@@ -10726,6 +10830,12 @@ bool db::add_unassociated_station(sMacAddr const &new_station_mac_add, uint8_t c
+ {
+     std::string new_station_mac_add_str(tlvf::mac_to_string(new_station_mac_add));
+     std::string agent_mac_addr_str(tlvf::mac_to_string(agent_mac_addr));
++    LOG(INFO) << "[UNASSOC-TRACE][3b-DB-ADD]"
++              << " sta=" << new_station_mac_add_str
++              << " op_class=" << int(operating_class)
++              << " ch=" << int(channel)
++              << " agent=" << agent_mac_addr_str
++              << " radio=" << tlvf::mac_to_string(radio_mac_addr);
+ 
+     bool all_connected_agents =
+         agent_mac_addr_str ==
+@@ -11617,6 +11727,8 @@ bool db::dm_trigger_affiliated_sta_metrics_event(const sMacAddr &sta_mac,
+                                                  const sMacAddr &sta_mld_mac,
+                                                  const sMacAddr &agent_al_mac)
+ {
++    LOG(DEBUG) << "[CONTROLLER][TLV 0xE4] dm_trigger_affiliated_sta_metrics_event: sta_mac="
++               << sta_mac << " dm_path=" << sta_dm_path;
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12015,6 +12127,8 @@ bool db::dm_trigger_assoc_sta_link_metrics_event(const sMacAddr &sta_mac,
+                                                  const sMacAddr &bss_mac, const sMacAddr &radio_mac,
+                                                  const sMacAddr &agent_al_mac)
+ {
++    LOG(DEBUG) << "[CONTROLLER][TLV 0x96] dm_trigger_assoc_sta_link_metrics_event: sta_mac="
++               << sta_mac << " dm_path=" << sta_dm_path;
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+diff --git a/controller/src/beerocks/master/db/db.h b/controller/src/beerocks/master/db/db.h
+index abc93abc1..c0b6807fd 100644
+--- a/controller/src/beerocks/master/db/db.h
++++ b/controller/src/beerocks/master/db/db.h
+@@ -1286,6 +1286,20 @@ public:
+      */
+     bool is_sta_reported_bssid_valid(const sMacAddr &sta_mac, const sMacAddr &reported_bssid);
+ 
++    /**
++     * @brief Resolve the affiliated STA MAC for a given MLD STA and BSSID.
++     *
++     * For MLO STAs, the TLV_ASSOCIATED_STA_LINK_METRICS (0x96) carries the MLD MAC as
++     * sta_mac and one bssid_info entry per affiliated link. Each entry's BSSID identifies
++     * the affiliated link. This function resolves BSSID → affiliated_sta_mac so that
++     * dm_set_sta_link_metrics() can write to the correct AffiliatedSTA.{k} DM path.
++     *
++     * @param mld_mac  MLD MAC of the station (key in m_stations).
++     * @param bssid    BSSID of the affiliated link to resolve.
++     * @return The affiliated STA MAC if found, ZERO_MAC otherwise.
++     */
++    sMacAddr get_affiliated_sta_mac_by_bssid(const sMacAddr &mld_mac, const sMacAddr &bssid);
++
+     sMacAddr get_radio_parent_agent(const sMacAddr &radio_mac);
+     sMacAddr get_bss_parent_agent(const sMacAddr &bssid);
+     sMacAddr get_agent_parent(const sMacAddr &al_mac);
+diff --git a/controller/src/beerocks/master/tasks/btm_request_task.cpp b/controller/src/beerocks/master/tasks/btm_request_task.cpp
+index f84879976..13aaef51a 100644
+--- a/controller/src/beerocks/master/tasks/btm_request_task.cpp
++++ b/controller/src/beerocks/master/tasks/btm_request_task.cpp
+@@ -253,8 +253,37 @@ void btm_request_task::steer_sta()
+     std::get<1>(sta_list) = tlvf::mac_from_string(m_sta_mac);
+ 
+     steering_request_tlv->alloc_target_bssid_list();
+-    auto bssid_list                      = steering_request_tlv->target_bssid_list(0);
+-    std::get<1>(bssid_list).target_bssid = tlvf::mac_from_string(m_target_bssid);
++    auto bssid_list = steering_request_tlv->target_bssid_list(0);
++
++    // For MLO STAs the BTM Request target BSSID must be the AP MLD MAC address,
++    // not a link-specific BSSID (EasyMesh R6 §17.2.14 / IEEE 802.11be §35.3.16).
++    // Resolve the link BSSID to the AP MLD MAC when the STA is an MLO STA.
++    // For legacy (non-MLO) STAs, effective_target_bssid stays as the link BSSID.
++    sMacAddr effective_target_bssid = tlvf::mac_from_string(m_target_bssid);
++    {
++        auto sta = m_database.get_station(tlvf::mac_from_string(m_sta_mac));
++        if (sta && sta->sta_mld_configuration.mld_config.sta_mld_mac
++                       != beerocks::net::network_utils::ZERO_MAC) {
++            auto target_agent =
++                m_database.get_agent_by_bssid(tlvf::mac_from_string(m_target_bssid));
++            if (target_agent) {
++                bool found = false;
++                for (const auto &ap_mld_pair : target_agent->ap_mlds) {
++                    for (const auto &affl_ap : ap_mld_pair.second.affiliated_aps) {
++                        if (affl_ap.second.bssid == tlvf::mac_from_string(m_target_bssid)) {
++                            effective_target_bssid = ap_mld_pair.first;
++                            LOG(INFO) << "MLO steer: resolved target BSSID " << m_target_bssid
++                                      << " → AP MLD MAC " << effective_target_bssid;
++                            found = true;
++                            break;
++                        }
++                    }
++                    if (found) break;
++                }
++            }
++        }
++    }
++    std::get<1>(bssid_list).target_bssid = effective_target_bssid;
+     std::shared_ptr<Agent::sRadio::sBss> bss =
+         m_database.get_bss(tlvf::mac_from_string(m_target_bssid));
+     if (bss) {
+diff --git a/controller/src/beerocks/master/tasks/client_steering_task.cpp b/controller/src/beerocks/master/tasks/client_steering_task.cpp
+index 66e9283a7..d7d51f702 100644
+--- a/controller/src/beerocks/master/tasks/client_steering_task.cpp
++++ b/controller/src/beerocks/master/tasks/client_steering_task.cpp
+@@ -451,8 +451,37 @@ bool client_steering_task::steer_sta()
+     std::get<1>(sta_list) = tlvf::mac_from_string(m_sta_mac);
+ 
+     steering_request_tlv->alloc_target_bssid_list();
+-    auto bssid_list                      = steering_request_tlv->target_bssid_list(0);
+-    std::get<1>(bssid_list).target_bssid = tlvf::mac_from_string(m_target_bssid);
++    auto bssid_list = steering_request_tlv->target_bssid_list(0);
++
++    // For MLO STAs the BTM Request target BSSID must be the AP MLD MAC address,
++    // not a link-specific BSSID (EasyMesh R6 §17.2.14 / IEEE 802.11be §35.3.16).
++    // Resolve the link BSSID to the AP MLD MAC when the STA is an MLO STA.
++    // For legacy (non-MLO) STAs, effective_target_bssid stays as the link BSSID.
++    sMacAddr effective_target_bssid = tlvf::mac_from_string(m_target_bssid);
++    {
++        auto sta = m_database.get_station(tlvf::mac_from_string(m_sta_mac));
++        if (sta && sta->sta_mld_configuration.mld_config.sta_mld_mac
++                       != beerocks::net::network_utils::ZERO_MAC) {
++            auto target_agent =
++                m_database.get_agent_by_bssid(tlvf::mac_from_string(m_target_bssid));
++            if (target_agent) {
++                bool found = false;
++                for (const auto &ap_mld_pair : target_agent->ap_mlds) {
++                    for (const auto &affl_ap : ap_mld_pair.second.affiliated_aps) {
++                        if (affl_ap.second.bssid == tlvf::mac_from_string(m_target_bssid)) {
++                            effective_target_bssid = ap_mld_pair.first;
++                            LOG(INFO) << "MLO steer: resolved target BSSID " << m_target_bssid
++                                      << " → AP MLD MAC " << effective_target_bssid;
++                            found = true;
++                            break;
++                        }
++                    }
++                    if (found) break;
++                }
++            }
++        }
++    }
++    std::get<1>(bssid_list).target_bssid = effective_target_bssid;
+     std::get<1>(bssid_list).target_bss_operating_class =
+         m_database.get_radio_operating_class(tlvf::mac_from_string(target_radio_mac));
+ 
+@@ -465,7 +494,8 @@ bool client_steering_task::steer_sta()
+     son_actions::send_cmdu_to_agent(source_agent->al_mac, m_cmdu_tx, m_database,
+                                     original_radio_mac);
+     TASK_LOG(DEBUG) << "sending steering request, sta " << m_sta_mac << " steer from bssid "
+-                    << m_original_bssid << " to bssid " << m_target_bssid << " channel "
++                    << m_original_bssid << " to bssid " << m_target_bssid
++                    << " (effective_target=" << effective_target_bssid << ") channel "
+                     << std::to_string(std::get<1>(bssid_list).target_bss_channel_number)
+                     << " freq_type="
+                     << beerocks::utils::convert_frequency_type_to_string(
+diff --git a/controller/src/beerocks/master/tasks/topology_task.cpp b/controller/src/beerocks/master/tasks/topology_task.cpp
+index 34c43657b..6473ebce3 100644
+--- a/controller/src/beerocks/master/tasks/topology_task.cpp
++++ b/controller/src/beerocks/master/tasks/topology_task.cpp
+@@ -491,6 +491,18 @@ bool topology_task::handle_topology_response(const sMacAddr &src_mac,
+                 continue;
+             }
+ 
++            // MLO STA MLD MACs appear in the Non-1905 Neighbor TLV because they are
++            // not 1905 agents, but they are client stations — not infrastructure
++            // neighbors.  Adding them to the neighbor list causes the topology task
++            // to treat them as non-1905 devices, which prevents the station from
++            // being added to m_stations via the normal topology path and breaks
++            // metrics delivery (TLV 0x96, 0xE4) and the STATION_CONNECTED event.
++            if (database.get_station(neighbor_al_mac)) {
++                LOG(DEBUG) << "MAC " << neighbor_al_mac
++                           << " belongs to a known client station — skipping non-1905 neighbor";
++                continue;
++            }
++
+             // Add neighbor to related the interface
+             database.add_neighbor(al_mac, tlvNon1905NeighborDevice->mac_local_iface(),
+                                   neighbor_al_mac, false);
+-- 
+2.34.1
+
