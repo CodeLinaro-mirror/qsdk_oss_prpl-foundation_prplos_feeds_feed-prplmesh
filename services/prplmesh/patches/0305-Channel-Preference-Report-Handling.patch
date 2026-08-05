@@ -1,0 +1,1082 @@
+From c13ab62d1f8f1fa5cc8a171d3a246fc531427b6f Mon Sep 17 00:00:00 2001
+From: Manoj Sekar <sekar@qti.qualcomm.com>
+Date: Tue, 4 Aug 2026 12:47:07 +0530
+Subject: [PATCH] [Channel Planning] Channel Preference Report handling with
+ Driver Rank
+
+Three device_conf knobs control the channel-preference-report behaviour.
+Two of them were already declared in AgentDB and consumed by
+ChannelSelectionTask but were never plumbed through config parsing or
+validated in agent main; a third knob is added here to let the customer
+choose whether the unsolicited report is change-gated or emitted on every
+cache update. This change completes the end-to-end wiring so all three
+knobs are configurable and enforced for every combination.
+
+Knobs (all in the [global] section of beerocks_agent.conf):
+  - chansel_preference_report_refresh_enable
+      Rebuild + normalize the local channel-preference table (rank 1..15,
+      per-radio max-rank anchor) from the driver ranking on every
+      CBS / ACS / DYNAMIC-ACS completion, independent of the
+      channel-selection approach knobs (enable_auto_chansel_handling /
+      cbs_based_chansel_enable / active_acs_chansel_enable). Keeps a fresh
+      normalized preference table available for proprietary channel
+      selection and for the values reported in the Channel Preference
+      Report (CPR).
+  - chansel_unsolicited_preference_report_enable
+      Emit an unsolicited CPR on a ranking cache refresh. Latched to the
+      refresh knob: without a fresh normalized table there is nothing
+      meaningful to report.
+  - unsolicited_preference_report_only_on_cache_update  (default 1)
+      Controls WHEN the unsolicited CPR is emitted (only relevant when the
+      two knobs above are enabled):
+        1 - send only when the normalized preference set CHANGED since the
+            last report (change-detected; duplicate refreshes suppressed).
+        0 - send on EVERY cache refresh (every CBS / dynamic ACS / ACS
+            completion), regardless of whether the preference changed.
+
+Changes:
+  - agent_db.h              : add
+    unsolicited_preference_report_only_on_cache_update to device_conf
+    (default true).
+  - beerocks_config_file.h  : add the three std::string members to
+    sConfigSlave.
+  - beerocks_config_file.cpp: add the three parse tuples to
+    slave_global_conf_args so the keys are read from [global].
+  - beerocks_agent_main.cpp : convert the config strings into the
+    device_conf booleans; validate that unsolicited=1 requires refresh=1
+    (otherwise treat unsolicited as disabled and log a WARNING); resolve
+    the new only-on-cache-update knob (absent/empty -> default 1); add a
+    [CBS] Config debug line dumping resolved + raw values.
+  - beerocks_agent.conf.in  : document all three keys; refresh and
+    unsolicited default to 0, only_on_cache_update defaults to 1.
+  - channel_selection_task.cpp: in handle_vs_channels_list_response(),
+    gate the unsolicited-CPR emission on
+    unsolicited_preference_report_only_on_cache_update. When 1, keep the
+    existing change-detected behaviour (compare against the last reported
+    snapshot); when 0, send on every refresh. The last-reported snapshot
+    is still updated on send in both modes, so toggling back to 1 resumes
+    correct change detection.
+
+MLD link handling:
+On an MLD single-PHY setup the driver ACS report and CBS trigger are
+per-affiliated-link (hostapd_cli -i <mld_iface> -l <link> ...). The nl80211
+HAL was issuing "ACS show_report" and "CBS enable 1" on the base radio
+socket WITHOUT a link selector, so every radio (link) read/triggered link 0.
+This caused a 5GHz radio to ingest another link's (2.4/6GHz) ranks, and the
+per-radio preference table to be built from the wrong band's data and to
+differ between two back-to-back refreshes.
+
+Fixes (nl80211 backend only; QMESH/QSDK path):
+  - read_acs_ranks(): derive the link id from the radio's link iface via
+    extractLinkId() and append "-l <link_id>" to "ACS show_report" on MLD
+    interfaces (non-MLD -> link_id -1 -> unchanged plain command).
+  - trigger_cbs(): likewise send "CBS -l <link_id> enable 1" on MLD so the
+    scan runs on the intended link/band.
+  - refresh_preference_table() (backhaul, HAL-agnostic safety net): discard
+    any rank entry whose channel is not in this radio's channels_list before
+    building the table, so a 5GHz radio can never ingest 2.4/6GHz ranks even
+    if a foreign entry leaks in. The normalization anchor and ranked-by-bw
+    index use the filtered set. Foreign drops are logged.
+
+All changes are generic: link selection is derived from the iface name (no
+hard-coded link indices), the band filter uses the radio's own channel list
+(no hard-coded bands), and non-MLD single-link setups are unaffected.
+
+Behaviour matrix (now fully enforced):
+  - refresh=0                          : legacy; no normalization / no CPR.
+  - refresh=1, unsolicited=0           : table refreshed + normalized on
+                                         CBS/ACS/DYNAMIC-ACS; no unsolicited
+                                         CPR.
+  - refresh=1 & unsolicited=1 &
+    only_on_cache_update=1 (default)   : refresh + normalize + unsolicited
+                                         CPR emitted only on change.
+  - refresh=1 & unsolicited=1 &
+    only_on_cache_update=0             : refresh + normalize + unsolicited
+                                         CPR emitted on every cache update.
+  - unsolicited=1 & refresh=0          : treated as disabled (warned in
+                                         agent main).
+
+Note: these knobs are consumed only by the backhaul-side
+ChannelSelectionTask (agent/son_slave process, which reads AgentDB
+directly), so unlike cbs_based_chansel_enable they are not propagated to
+the fronthaul ap_manager process via cACTION_APMANAGER_CONFIGURE. No
+TLVF / ap_manager changes are required.
+
+Signed-off-by: Manoj Sekar <sekar@qti.qualcomm.com>
+---
+ agent/config/beerocks_agent.conf.in           |  39 +-
+ .../ap_manager/ap_manager.cpp                 |   8 +-
+ .../fronthaul_manager/ap_manager/ap_manager.h |   5 +
+ agent/src/beerocks/slave/agent_db.h           |  20 +
+ .../beerocks/slave/beerocks_agent_main.cpp    |  51 +++
+ agent/src/beerocks/slave/son_slave_thread.cpp |   2 +
+ .../slave/tasks/channel_selection_task.cpp    | 400 +++++++++++++++---
+ .../slave/tasks/channel_selection_task.h      |  40 ++
+ .../bcl/include/bcl/beerocks_config_file.h    |  11 +
+ .../bcl/source/beerocks_config_file.cpp       |   6 +
+ .../bwl/include/bwl/base_wlan_hal_types.h     |   7 +
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  76 ++--
+ .../tlvf/beerocks_message_apmanager.yaml      |   5 +
+ 13 files changed, 577 insertions(+), 93 deletions(-)
+
+diff --git a/agent/config/beerocks_agent.conf.in b/agent/config/beerocks_agent.conf.in
+index fd75f7c..4d9aeb0 100644
+--- a/agent/config/beerocks_agent.conf.in
++++ b/agent/config/beerocks_agent.conf.in
+@@ -17,23 +17,54 @@ bridge_iface=@BEEROCKS_BRIDGE_IFACE@
+ enable_system_hang_test=0 # 0 - disabled
+ monitor_polling_rate_msec=@BEEROCKS_MONITOR_POLLING_RATE_MSEC@
+ enable_auto_chansel_handling=0 # 0 - disabled
+-# active_acs_chansel_enable: Active ACS channel selection.
++
++# active_acs_chansel_enable: Active ACS based channel selection.
+ # Effective ONLY when enable_auto_chansel_handling=1.
+ # 0 - disabled (existing exclude-list behaviour / stubbed platform ACS)
+ # 1 - enabled  (build_acs_list blocks all-radio-channels-minus-preferred, and nl80211
+ #               start_platform_acs drives the driver: acs clear_block_chan_list +
+ #               acs set_block_chan_list <block> + acs invoke 0)
+ active_acs_chansel_enable=0 # 0 - disabled, 1 - enabled
++
+ # cbs_based_chansel_enable: CBS-based channel selection.
+ # Effective ONLY when enable_auto_chansel_handling=1 and active_acs_chansel_enable=0.
+-# When set, the agent periodically triggers CBS, builds a channel preference table from the
+-# driver's ACS rank, and uses it (with the controller's preferred list) to select the channel.
++# When set, the agent refers the the controller's preferred list along with channel preference
++# table to select the best channel to operate.
+ # Mutually exclusive with active_acs_chansel_enable: if both are 1, both are ignored and the
+-# original (controller+radio preference) logic is used.
++# default controller+radio preference logic is used.
+ cbs_based_chansel_enable=0 # 0 - disabled, 1 - enabled
++
+ # cbs_trigger_periodic_interval: periodicity (seconds) of the internal CBS trigger timer.
+ # 0 = disabled (no periodic CBS trigger). Valid range: 0..86400.
++# This is an independent parameter to trigger periodic CBS
+ cbs_trigger_periodic_interval=0
++
++# chansel_preference_report_refresh_enable: rebuild+normalize the local channel-preference
++# table from the driver ranking on every CBS / ACS / DYNAMIC-ACS completion, independent of the
++# channel-selection approach knobs (enable_auto_chansel_handling / cbs_based_chansel_enable /
++# active_acs_chansel_enable). Keeps a fresh normalized preference table available (e.g. for
++# proprietary channel-selection logic and for the values reported in the Channel Preference Report).
++# 0 - disabled (legacy: table only refreshed by the CBS-based approach when enabled)
++# 1 - enabled  (table refreshed+normalized on every ranking cache completion)
++chansel_preference_report_refresh_enable=0 # 0 - disabled, 1 - enabled
++
++# chansel_unsolicited_preference_report_enable: emit an unsolicited Channel Preference Report
++# Works along with chansel_preference_report_refresh_enable: without a fresh normalized table
++# there is nothing meaningful to report, so this is treated as disabled (and warned) when the
++# refresh knob is 0.
++# 0 - disabled
++# 1 - enabled (requires chansel_preference_report_refresh_enable=1; report sent only on change)
++chansel_unsolicited_preference_report_enable=0 # 0 - disabled, 1 - enabled
++
++# unsolicited_preference_report_only_on_cache_update: controls WHEN the unsolicited Channel
++# Preference Report is emitted on a ranking cache refresh (only relevant when both
++# chansel_preference_report_refresh_enable=1 and chansel_unsolicited_preference_report_enable=1).
++# 1 - (default) send the unsolicited CPR only when the normalized preference set CHANGED since the
++#     last report (change-detected; duplicate refreshes are suppressed).
++# 0 - send the unsolicited CPR on EVERY cache refresh (every CBS / dynamic ACS / ACS completion),
++#     regardless of whether the preference actually changed.
++unsolicited_preference_report_only_on_cache_update=1 # 0 - every refresh, 1 - only on change
++
+ enable_smd=0 # 0 - disabled, 1 - enabled (SMD - Seamless Mobility Domain)
+ 
+ # This variable is a workaround that turn on the profile_x_disallow flag when configuring the
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index ca9c74a..a1b2c00 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -419,9 +419,12 @@ bool ApManager::create_ap_wlan_hal()
+     // channels-list requests. (The ap_manager runs in a separate process whose AgentDB copy is
+     // not fully populated, so the decision flag must travel through hal_conf.)
+     hal_conf.cbs_based_chansel_enable = cbs_based_chansel_enable;
++    hal_conf.chansel_preference_report_refresh_enable = chansel_preference_report_refresh_enable;
+     LOG(DEBUG) << "[ACTIVE_ACS] create_ap_wlan_hal: iface=" << m_iface
+                << " active_acs_chansel_enable=" << hal_conf.active_acs_chansel_enable
+                << " cbs_based_chansel_enable=" << hal_conf.cbs_based_chansel_enable
++               << " chansel_preference_report_refresh_enable="
++               << hal_conf.chansel_preference_report_refresh_enable
+                << " ap_acs_enabled=" << hal_conf.ap_acs_enabled;
+ 
+ #ifdef USE_PRPLMESH_NLHAL
+@@ -1385,6 +1388,8 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+          */
+         cbs_based_chansel_enable  = static_cast<bool>(config->cbs_based_chansel_enable());
+         active_acs_chansel_enable = static_cast<bool>(config->active_acs_chansel_enable());
++        chansel_preference_report_refresh_enable =
++            static_cast<bool>(config->chansel_preference_report_refresh_enable());
+         m_local_gw         = static_cast<bool>(config->local_gw());
+         m_radio_disable    = static_cast<bool>(config->radio_disable());
+         LOG(DEBUG) << "ACTION_APMANAGER_CONFIGURE: local_gw=" << m_local_gw
+@@ -3337,7 +3342,8 @@ bool ApManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+             // refreshed IMMEDIATELY on CBS completion. Without this, the ranks only reach the
+             // backhaul on the next explicit CHANNELS_LIST_REQUEST, so a CHANNEL_SELECTION_REQUEST
+             // arriving right after CBS completes would run against a stale (rank-0) cache.
+-            if (ap_wlan_hal->get_hal_conf().cbs_based_chansel_enable) {
++            if (ap_wlan_hal->get_hal_conf().cbs_based_chansel_enable ||
++                ap_wlan_hal->get_hal_conf().chansel_preference_report_refresh_enable) {
+                 auto channels_list_response = beerocks::message_com::create_vs_message<
+                     beerocks_message::cACTION_APMANAGER_CHANNELS_LIST_RESPONSE>(cmdu_tx);
+                 if (!channels_list_response) {
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
+index 32ec6a6..f6a17a0 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
+@@ -400,6 +400,11 @@ private:
+      */
+     bool cbs_based_chansel_enable  = false;
+     bool active_acs_chansel_enable = false;
++    // When set, the fronthaul HAL parses driver ACS ranks (read_acs_report) and the ap_manager
++    // pushes a CHANNELS_LIST_RESPONSE with those ranks to the backhaul on every CBS/ACS/DYNAMIC-ACS
++    // completion, independent of the CBS-based channel-selection approach. Received from the agent
++    // process in cACTION_APMANAGER_CONFIGURE (beerocks_agent.conf).
++    bool chansel_preference_report_refresh_enable = false;
+     bool radio_state_lock   = false;
+     uint8_t multi_ap_profile =
+         wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_2;
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 40c2ab7..071cb5d 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -199,6 +199,26 @@ public:
+         bool cbs_based_chansel_enable               = false;
+         // Periodicity (seconds) of the internal CBS trigger timer (0..86400; 0 = disabled).
+         uint32_t cbs_trigger_periodic_interval      = 0;
++        // When set, the local channel-preference table is (re)built and normalized from the driver
++        // ranking on every CBS / ACS / DYNAMIC-ACS completion, independent of the channel-selection
++        // approach knobs (enable_auto_chansel_handling / cbs_based_chansel_enable /
++        // active_acs_chansel_enable). Keeps a fresh normalized preference table available (e.g. for
++        // proprietary channel-selection logic and for the values reported in the CPR).
++        bool chansel_preference_report_refresh_enable   = false;
++        // When set (and chansel_preference_report_refresh_enable is also set), an unsolicited
++        // Channel Preference Report is emitted whenever the normalized preference set changes on a
++        // ranking cache refresh. Latched to the refresh knob: without a fresh table there is
++        // nothing meaningful to report.
++        bool chansel_unsolicited_preference_report_enable = false;
++        // Controls WHEN the unsolicited Channel Preference Report is emitted on a cache refresh
++        // (only relevant when chansel_unsolicited_preference_report_enable and
++        // chansel_preference_report_refresh_enable are both set):
++        //   true  (default): send the unsolicited CPR only when the normalized preference set
++        //                    actually CHANGED since the last report (change-detected; suppresses
++        //                    duplicates).
++        //   false          : send the unsolicited CPR on EVERY cache refresh (every CBS / dynamic
++        //                    ACS / ACS completion), regardless of whether the preference changed.
++        bool unsolicited_preference_report_only_on_cache_update = true;
+         bool enable_smd                             = false;
+         int8_t num_of_bands = 0;
+         uint8_t beacon_11k_default_measurement_mode = 2; ///< Beacon measurement mode for regular (fronthaul) STAs. Default: TABLE (2).
+diff --git a/agent/src/beerocks/slave/beerocks_agent_main.cpp b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+index 90cb3e6..d2b79b1 100644
+--- a/agent/src/beerocks/slave/beerocks_agent_main.cpp
++++ b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+@@ -648,6 +648,57 @@ static int run_beerocks_slave(beerocks::config_file::sConfigSlave &beerocks_slav
+             db->device_conf.active_acs_chansel_enable = false;
+         }
+ 
++        // Channel-preference-report refresh / unsolicited-CPR knobs.
++        //
++        // chansel_preference_report_refresh_enable: when "1", the local channel-preference table is
++        // (re)built and normalized from the driver ranking on every CBS / ACS / DYNAMIC-ACS
++        // completion, independent of the channel-selection approach knobs. Provides a fresh
++        // normalized preference table (e.g. for proprietary channel-selection logic and CPR values).
++        //
++        // chansel_unsolicited_preference_report_enable: when "1", an unsolicited Channel Preference
++        // Report is emitted whenever the normalized preference set changes on a ranking cache
++        // refresh. This is LATCHED to the refresh knob - without a fresh table there is nothing
++        // meaningful to report - so unsolicited=1 with refresh=0 is treated as disabled (warned).
++        db->device_conf.chansel_preference_report_refresh_enable =
++            beerocks_slave_conf.chansel_preference_report_refresh_enable == "1";
++        db->device_conf.chansel_unsolicited_preference_report_enable =
++            beerocks_slave_conf.chansel_unsolicited_preference_report_enable == "1";
++
++        if (db->device_conf.chansel_unsolicited_preference_report_enable &&
++            !db->device_conf.chansel_preference_report_refresh_enable) {
++            LOG(WARNING) << "[CBS] Config: chansel_unsolicited_preference_report_enable=1 requires "
++                            "chansel_preference_report_refresh_enable=1 (nothing to report without "
++                            "a fresh normalized preference table). Treating unsolicited CPR as "
++                            "disabled.";
++            db->device_conf.chansel_unsolicited_preference_report_enable = false;
++        }
++
++        // unsolicited_preference_report_only_on_cache_update: controls WHEN the unsolicited CPR is
++        // emitted on a cache refresh (only relevant when the two knobs above are set):
++        //   absent / "1" (default): send only when the normalized preference set CHANGED (dedup).
++        //   "0"                   : send on EVERY cache refresh (every CBS / dynamic ACS / ACS
++        //                           completion), regardless of change.
++        if (beerocks_slave_conf.unsolicited_preference_report_only_on_cache_update.empty()) {
++            db->device_conf.unsolicited_preference_report_only_on_cache_update = true; // default
++        } else {
++            db->device_conf.unsolicited_preference_report_only_on_cache_update =
++                beerocks_slave_conf.unsolicited_preference_report_only_on_cache_update == "1";
++        }
++
++        LOG(DEBUG) << "[CBS] Config: chansel_preference_report_refresh_enable="
++                   << db->device_conf.chansel_preference_report_refresh_enable
++                   << " chansel_unsolicited_preference_report_enable="
++                   << db->device_conf.chansel_unsolicited_preference_report_enable
++                   << " unsolicited_preference_report_only_on_cache_update="
++                   << db->device_conf.unsolicited_preference_report_only_on_cache_update
++                   << " (raw chansel_preference_report_refresh_enable='"
++                   << beerocks_slave_conf.chansel_preference_report_refresh_enable
++                   << "', raw chansel_unsolicited_preference_report_enable='"
++                   << beerocks_slave_conf.chansel_unsolicited_preference_report_enable
++                   << "', raw unsolicited_preference_report_only_on_cache_update='"
++                   << beerocks_slave_conf.unsolicited_preference_report_only_on_cache_update
++                   << "')";
++
+         LOG(DEBUG) << "[CBS] Config: enable_auto_chansel_handling="
+                    << db->device_conf.enable_auto_chansel_handling
+                    << " cbs_based_chansel_enable=" << db->device_conf.cbs_based_chansel_enable
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 3a73af2..4acdaa6 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -3431,6 +3431,8 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+             static_cast<uint8_t>(db->device_conf.cbs_based_chansel_enable);
+         config_msg->active_acs_chansel_enable() =
+             static_cast<uint8_t>(db->device_conf.active_acs_chansel_enable);
++        config_msg->chansel_preference_report_refresh_enable() =
++            static_cast<uint8_t>(db->device_conf.chansel_preference_report_refresh_enable);
+         LOG(DEBUG) << "[CBS] son_slave: sending CONFIGURE to fronthaul " << iface
+                    << " with cbs_based_chansel_enable="
+                    << int(config_msg->cbs_based_chansel_enable())
+diff --git a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+index 5d6f5d3..90c0c2f 100644
+--- a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+@@ -191,18 +191,67 @@ uint8_t ChannelSelectionTask::rank_to_preference(int32_t rank)
+     return static_cast<uint8_t>(WORST_PREF);
+ }
+ 
++uint8_t ChannelSelectionTask::normalize_rank_to_preference(int32_t rank, int32_t max_rank_on_radio)
++{
++    // Non-operable / unknown: reserve preference 0.
++    if (rank < 0) {
++        return 0;
++    }
++    // Operable but unranked by the driver: keep the lowest operable preference so it is not
++    // penalized as non-operable; the controller decides whether to use it.
++    if (rank == 0) {
++        return 1;
++    }
++    constexpr int BEST_PREF  = 15;
++    constexpr int WORST_PREF = 1;
++    // Best ranked channel always maps to the maximum preference.
++    if (rank <= 1 || max_rank_on_radio <= 1) {
++        return static_cast<uint8_t>(BEST_PREF);
++    }
++    // Linearly spread the remaining ranks over [WORST_PREF..BEST_PREF] using the radio's largest
++    // observed positive rank, so the mapping is normalized per radio regardless of the band /
++    // regulatory rank range or how many channels the driver ranked.
++    const int span   = BEST_PREF - WORST_PREF; // 14
++    const int denom  = max_rank_on_radio - 1;
++    const int numer  = max_rank_on_radio - rank;
++    int pref         = WORST_PREF + ((span * numer) + (denom / 2)) / denom; // rounded
++    if (pref < WORST_PREF) {
++        pref = WORST_PREF;
++    }
++    if (pref > BEST_PREF) {
++        pref = BEST_PREF;
++    }
++    return static_cast<uint8_t>(pref);
++}
++
++bool ChannelSelectionTask::preference_changed_since_last_reported(
++    const sMacAddr &radio_mac, const AgentDB::sRadio::channel_preferences_map &new_pref)
++{
++    auto it = m_last_reported_preferences.find(radio_mac);
++    if (it == m_last_reported_preferences.end()) {
++        // No snapshot yet -> treat as changed so the first report is emitted.
++        return true;
++    }
++    return it->second != new_pref;
++}
++
+ bool ChannelSelectionTask::refresh_preference_table(const sMacAddr &radio_mac,
+                                                     const std::vector<sChannelBwRank> &entries)
+ {
+     auto db = AgentDB::get();
+ 
+-    // Guard: the whole CBS preference-table path is anchored to cbs_based_chansel_enable. When it
+-    // is not enabled (default), this function is a strict no-op and does NOT touch any existing
+-    // state (channels_list / supported_bw_list[bw].rank / cbs_preference_table), so the regular
+-    // channel-selection and ZWDFS flows are completely unaffected.
+-    if (!db->device_conf.cbs_based_chansel_enable) {
+-        LOG(DEBUG) << "[CBS] refresh_preference_table: cbs_based_chansel_enable=0 -> skipping "
+-                      "(existing flow untouched) for radio "
++    // Gate: the preference-table refresh runs when either the CBS-based channel-selection approach
++    // is enabled, or the independent preference-report refresh knob is set (which keeps a fresh,
++    // normalized preference table from the driver ranking regardless of the channel-selection
++    // approach knobs). When neither is set (default), this function is a strict no-op and does NOT
++    // touch any existing state (channels_list / supported_bw_list[bw].rank / cbs_preference_table),
++    // so the regular channel-selection and ZWDFS flows are completely unaffected.
++    const bool refresh_enabled = db->device_conf.cbs_based_chansel_enable ||
++                                 db->device_conf.chansel_preference_report_refresh_enable;
++    if (!refresh_enabled) {
++        LOG(DEBUG) << "[CBS] refresh_preference_table: cbs_based_chansel_enable=0 and "
++                      "chansel_preference_report_refresh_enable=0 -> skipping (existing flow "
++                      "untouched) for radio "
+                    << radio_mac;
+         return false;
+     }
+@@ -220,41 +269,214 @@ bool ChannelSelectionTask::refresh_preference_table(const sMacAddr &radio_mac,
+         return false;
+     }
+ 
+-    LOG(DEBUG) << "[CBS] refresh_preference_table: starting cache rebuild for radio " << radio_mac
+-               << " with " << entries.size() << " (channel,bw,rank) entries.";
+-
+-    // Temporary map to hold the aggregated ranks per (op-class, channel).
+-    std::map<uint8_t, std::map<uint8_t, AgentDB::sRadio::sPreferenceEntry>> new_cache;
+-
+     const auto freq_type = radio->wifi_channel.get_freq_type();
+ 
++    // Filter incoming ranks by this radio's frequency band.
++    // In MLO (multi-link) setups, the HAL may sometimes deliver an ACS report containing
++    // channels from a different band (e.g. if the driver's cross-link report bleeding
++    // was not scoped properly by the backend). To prevent cross-band contamination
++    // (where a 5GHz radio ingests 2.4/6GHz ranks), we strictly discard any rank entry
++    // for a channel not in this radio's known channels_list.
++    std::vector<sChannelBwRank> filtered_entries;
+     for (const auto &e : entries) {
+-        if (e.rank < 0 || e.bandwidth == beerocks::eWiFiBandwidth::BANDWIDTH_UNKNOWN) {
+-            continue; // Skip invalid/unknown entries.
++        if (radio->channels_list.find(e.channel) != radio->channels_list.end()) {
++            filtered_entries.push_back(e);
++        } else {
++            // Log once per dropped channel to avoid flooding
++            static std::set<uint8_t> dropped_logged;
++            if (dropped_logged.find(e.channel) == dropped_logged.end()) {
++                LOG(WARNING) << "[CBS] refresh_preference_table: dropped foreign channel "
++                             << int(e.channel) << " (not in radio " << radio_mac << " channels_list)";
++                dropped_logged.insert(e.channel);
++            }
+         }
++    }
++
++    if (filtered_entries.empty()) {
++        LOG(WARNING) << "[CBS] refresh_preference_table: no valid entries for radio "
++                     << radio_mac << " after band filtering. Keeping previous cache.";
++        return false;
++    }
+ 
+-        const uint8_t chan = e.channel;
+-        const beerocks::eWiFiBandwidth bw = e.bandwidth;
++    LOG(DEBUG) << "[CBS] refresh_preference_table: starting cache rebuild for radio " << radio_mac
++               << " with " << filtered_entries.size() << " valid (channel,bw,rank) entries"
++               << " (dropped " << (entries.size() - filtered_entries.size()) << " foreign entries).";
+ 
+-        // Derive the operating class directly from the (channel, bandwidth) we already know.
+-        // No center-frequency round-trip or candidate-bandwidth probing (that produced a lot of
+-        // "invalid channel" log noise). Op-class 0 means the (channel, bw) is not a valid combo
+-        // for this band -> skip quietly.
+-        uint8_t op_class = son::wireless_utils::get_operating_class_by_channel(
+-            beerocks::WifiChannel(chan, freq_type, bw));
+-        if (op_class == 0) {
++    // Determine the largest positive rank reported for this radio in this refresh. It is the
++    // normalization anchor: the best ranked channel (rank 1) maps to the maximum preference, and
++    // the remaining ranks are spread down to it. Normalizing per radio keeps the mapping
++    // comparable across bands / regulatory rank ranges (which vary per radio and country).
++    int32_t max_rank_on_radio = 0;
++    for (const auto &e : filtered_entries) {
++        if (e.rank > max_rank_on_radio) {
++            max_rank_on_radio = e.rank;
++        }
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // Multi-bandwidth projection (matches qca-ezmesh mapServiceAgentPopulateChannelPref()).
++    //
++    // The QCA "ACS show_report" assigns positive ranks ONLY for the radio's CURRENT operating
++    // bandwidth (all other rows carry rank 0). The prop agent does NOT leave the other bandwidths
++    // unranked: it PROJECTS the single-operating-bandwidth ranks onto every op-class the radio
++    // supports, by comparing the op-class bandwidth against the ranked (CBS report) bandwidth:
++    //
++    //   * op-class bw == ranked bw : use the ranked channel's rank directly.
++    //   * op-class bw >  ranked bw : the wide op-class channel COVERS several ranked sub-channels;
++    //                                take the BEST (MIN, i.e. lowest/closest-to-1) covered rank.
++    //                                (Prop takes the MAX *preference*, which after rank->pref
++    //                                 inversion is the MIN *rank*.)
++    //   * op-class bw <  ranked bw : the narrow op-class channel is COVERED BY a wider ranked
++    //                                block; be conservative and take the WORST (MAX rank) among the
++    //                                ranked blocks that cover it. (Prop: MIN preference == MAX rank.)
++    //   * no covered ranked channel: leave at the operable baseline (rank 0 -> pref 1).
++    //
++    // We first index the ranked entries by their ranked bandwidth, then, for every (op-class,
++    // channel) the radio actually supports (from channels_list.supported_bw_list), compute the
++    // projected rank using the covering/covered beacon-channel relationship. Center/beacon channel
++    // math reuses the same son_wireless_utils helpers used elsewhere in this task.
++    // ---------------------------------------------------------------------------------------------
++
++    // Index the driver-ranked entries: ranked_by_bw[bw][beacon_channel] = best (min) positive rank.
++    // Only positive ranks are indexed here (rank 0 is the operable baseline, not a real ranking).
++    std::map<beerocks::eWiFiBandwidth, std::map<uint8_t, int32_t>> ranked_by_bw;
++    for (const auto &e : filtered_entries) {
++        if (e.rank <= 0 || e.bandwidth == beerocks::eWiFiBandwidth::BANDWIDTH_UNKNOWN) {
+             continue;
+         }
++        auto &slot = ranked_by_bw[e.bandwidth][e.channel];
++        if (slot == 0 || e.rank < slot) {
++            slot = e.rank;
++        }
++    }
++
++    // Helper: numeric MHz of a bandwidth (generic and specific 320-1/-2 collapse to the same MHz).
++    const auto bw_mhz = [](beerocks::eWiFiBandwidth bw) -> uint32_t {
++        return get_bandwidth_mhz(bw);
++    };
++
++    // Helper: the set of 20MHz beacon channels covered by (channel, bw). For 20MHz this is just the
++    // channel itself; for wider bandwidths it is the beacon channels of the wide block (the wide
++    // channel may be a beacon or a center channel depending on the op-class numbering).
++    const auto covered_beacon_channels =
++        [&](uint8_t channel, beerocks::eWiFiBandwidth bw) -> std::vector<uint8_t> {
++        if (bw_mhz(bw) <= 20) {
++            return {channel};
++        }
++        // center_channel_to_beacon_channels() expects the CENTER channel of the wide block. If the
++        // provided channel is a beacon channel, first resolve its center for this bandwidth.
++        uint8_t center = son::wireless_utils::get_center_channel(channel, freq_type, bw);
++        uint8_t use    = (center != 0) ? center : channel;
++        auto beacons   = son::wireless_utils::center_channel_to_beacon_channels(use, bw, freq_type);
++        if (!beacons.empty()) {
++            return beacons;
++        }
++        return {channel};
++    };
+ 
+-        // Insert or update the cache entry. Aggregation: keep the MIN (best) rank per (opclass,ch).
+-        auto &entry = new_cache[op_class][chan];
+-        if (entry.rank == -1 || e.rank < entry.rank) {
+-            entry.channel = chan;
++    // Project a rank for (channel, op_bw) from the ranked_by_bw index using the prop rules.
++    // Returns >0 projected rank if any ranked entry covers/is-covered-by this (channel, op_bw),
++    // or 0 (baseline) if none applies.
++    const auto project_rank = [&](uint8_t channel, beerocks::eWiFiBandwidth op_bw) -> int32_t {
++        const uint32_t op_mhz = bw_mhz(op_bw);
++        int32_t best_min      = 0; // for exact / wider-op-class cases we take MIN positive rank
++        int32_t worst_max     = 0; // for narrower-op-class case we take MAX positive rank
++        bool have_min         = false;
++        bool have_max         = false;
++
++        for (const auto &bw_pair : ranked_by_bw) {
++            const beerocks::eWiFiBandwidth ranked_bw = bw_pair.first;
++            const uint32_t ranked_mhz                = bw_mhz(ranked_bw);
++            const auto &chan_rank_map                = bw_pair.second;
++
++            if (ranked_mhz == op_mhz) {
++                // Exact bandwidth match: use this channel's rank directly (if ranked).
++                auto it = chan_rank_map.find(channel);
++                if (it != chan_rank_map.end() && it->second > 0) {
++                    if (!have_min || it->second < best_min) {
++                        best_min = it->second;
++                        have_min = true;
++                    }
++                }
++            } else if (op_mhz > ranked_mhz) {
++                // Op-class WIDER than the ranked bw: this wide channel covers several ranked
++                // sub-channels. Prop picks the MAX preference == MIN rank among covered ranked
++                // sub-channels.
++                const auto covered = covered_beacon_channels(channel, op_bw);
++                for (const auto sub : covered) {
++                    auto it = chan_rank_map.find(sub);
++                    if (it != chan_rank_map.end() && it->second > 0) {
++                        if (!have_min || it->second < best_min) {
++                            best_min = it->second;
++                            have_min = true;
++                        }
++                    }
++                }
++            } else {
++                // Op-class NARROWER than the ranked bw: this narrow channel is covered BY a wider
++                // ranked block. Prop is conservative: MIN preference == MAX rank among the ranked
++                // wide blocks that cover this narrow channel.
++                for (const auto &rc_pair : chan_rank_map) {
++                    const uint8_t ranked_wide_chan = rc_pair.first;
++                    const int32_t ranked_wide_rank = rc_pair.second;
++                    if (ranked_wide_rank <= 0) {
++                        continue;
++                    }
++                    const auto covered =
++                        covered_beacon_channels(ranked_wide_chan, ranked_bw);
++                    if (std::find(covered.begin(), covered.end(), channel) != covered.end()) {
++                        if (!have_max || ranked_wide_rank > worst_max) {
++                            worst_max = ranked_wide_rank;
++                            have_max  = true;
++                        }
++                    }
++                }
++            }
++        }
++
++        // Prefer the exact/wider (MIN) result when present; otherwise use the conservative
++        // narrower (MAX) result. If neither applies, return 0 (baseline).
++        if (have_min) {
++            return best_min;
++        }
++        if (have_max) {
++            return worst_max;
++        }
++        return 0;
++    };
++
++    // Temporary map to hold the aggregated ranks per (op-class, channel).
++    std::map<uint8_t, std::map<uint8_t, AgentDB::sRadio::sPreferenceEntry>> new_cache;
++
++    // Build the cache from what the RADIO actually supports (channels_list x supported_bw_list),
++    // projecting a rank onto each (channel, bw) as described above. This is the prop-aligned
++    // behaviour: every op-class the radio supports gets a preference derived from the driver
++    // ranking, not just the single operating-bandwidth op-class.
++    for (const auto &ch_pair : radio->channels_list) {
++        const uint8_t chan     = ch_pair.first;
++        const auto &chan_info  = ch_pair.second;
++        for (const auto &sbw : chan_info.supported_bw_list) {
++            const beerocks::eWiFiBandwidth bw = sbw.bandwidth;
++            if (bw == beerocks::eWiFiBandwidth::BANDWIDTH_UNKNOWN) {
++                continue;
++            }
++            uint8_t op_class = son::wireless_utils::get_operating_class_by_channel(
++                beerocks::WifiChannel(chan, freq_type, bw));
++            if (op_class == 0) {
++                continue;
++            }
++
++            const int32_t projected_rank = project_rank(chan, bw);
++
++            auto &entry           = new_cache[op_class][chan];
++            entry.channel         = chan;
+             entry.operating_class = op_class;
+-            entry.bandwidth = bw;
+-            entry.rank = e.rank;
+-            entry.preference = rank_to_preference(e.rank);
+-            entry.reason = wfa_map::cPreferenceOperatingClasses::eReasonCode::UNSPECIFIED;
++            entry.bandwidth       = bw;
++            entry.rank            = projected_rank;
++            // Normalized 1..15 preference (per-radio, best rank -> highest preference). A projected
++            // rank of 0 maps to the operable baseline (pref 1).
++            entry.preference = normalize_rank_to_preference(projected_rank, max_rank_on_radio);
++            entry.reason     = wfa_map::cPreferenceOperatingClasses::eReasonCode::UNSPECIFIED;
+         }
+     }
+ 
+@@ -274,13 +496,15 @@ bool ChannelSelectionTask::refresh_preference_table(const sMacAddr &radio_mac,
+ 
+             auto &ch_info = it_ch->second;
+ 
+-            // Update AgentDB supported_bw_list rank (used by ZWDFS)
++            // Update AgentDB supported_bw_list rank (used by ZWDFS) and the normalized preference
++            // (consumed by the Channel Preference Report builder, which reads multiap_preference).
+             auto bw_it = std::find_if(ch_info.supported_bw_list.begin(), ch_info.supported_bw_list.end(),
+                                       [&](const beerocks_message::sSupportedBandwidth &sbw) {
+                                           return sbw.bandwidth == entry.bandwidth;
+                                       });
+             if (bw_it != ch_info.supported_bw_list.end()) {
+-                bw_it->rank = entry.rank;
++                bw_it->rank              = entry.rank;
++                bw_it->multiap_preference = entry.preference;
+             } else {
+                 // BW unsupported on this channel
+                 entry.preference = 0;
+@@ -2043,11 +2267,15 @@ void ChannelSelectionTask::handle_vs_channels_list_response(
+     const auto &sender_iface_name = radio->front.iface_name;
+     LOG(TRACE) << "received ACTION_APMANAGER_CHANNELS_LIST_RESPONSE from " << sender_iface_name;
+ 
+-    // CBS: if enabled, the channels-list response now carries the driver ACS ranks (injected by
+-    // the HAL read_acs_report() on CBS/ACS completion and serialized into supported_bw_list.rank).
+-    // Build the rank list from AgentDB and refresh the CBS preference-table cache. This is a
+-    // strict no-op when cbs_based_chansel_enable is disabled (refresh_preference_table self-gates).
+-    if (db->device_conf.cbs_based_chansel_enable) {
++    // The channels-list response now carries the driver ACS ranks (injected by the HAL
++    // read_acs_report() on CBS/ACS/DYNAMIC-ACS completion and serialized into
++    // supported_bw_list.rank). Build the rank list from AgentDB and refresh the normalized
++    // preference-table cache. The refresh runs when either the CBS approach is enabled or the
++    // independent preference-report refresh knob is set; it is a strict no-op otherwise
++    // (refresh_preference_table self-gates on the same condition).
++    const bool rank_refresh_enabled = db->device_conf.cbs_based_chansel_enable ||
++                                      db->device_conf.chansel_preference_report_refresh_enable;
++    if (rank_refresh_enabled) {
+         std::vector<sChannelBwRank> cbs_ranks;
+         size_t positive_rank_count = 0;
+         for (const auto &ch_pair : radio->channels_list) {
+@@ -2099,7 +2327,64 @@ void ChannelSelectionTask::handle_vs_channels_list_response(
+         }
+ 
+         if (!cbs_ranks.empty()) {
+-            refresh_preference_table(radio_mac, cbs_ranks);
++            const bool table_refreshed = refresh_preference_table(radio_mac, cbs_ranks);
++
++            // Unsolicited Channel Preference Report on a driver-ranking cache refresh.
++            //
++            // Gated by chansel_unsolicited_preference_report_enable AND the refresh knob (the
++            // refresh knob is required because there is no fresh normalized preference table to
++            // report without it). Only sent when the normalized preference set actually changed
++            // since the last report for this radio, and only when no solicited preference/selection
++            // flow is already in progress (that flow will send/refresh the report itself).
++            if (table_refreshed && db->device_conf.chansel_unsolicited_preference_report_enable &&
++                db->device_conf.chansel_preference_report_refresh_enable &&
++                m_pending_preference.mid == 0 && m_pending_selection.mid == 0) {
++
++                // Rebuild the radio's preference set from the freshly normalized table.
++                // NOTE: the report is built per-radio here (same pattern as the AWGN / CAC-completed
++                // unsolicited paths). The mandatory agent-wide CAC Status/Completion Report TLVs are
++                // emitted by send_channel_preference_report() -> create_cac_*_report_tlv(), which
++                // iterate ALL radios in the AgentDB (not just this one), so the report always
++                // carries the CAC TLVs the controller requires even when the refresh is triggered
++                // by a non-5GHz (2.4GHz / 6GHz) radio.
++                if (build_channel_preference_report(radio_mac)) {
++                    // Change-detection gate is controlled by the config knob
++                    // unsolicited_preference_report_only_on_cache_update:
++                    //   true  -> send only when the normalized preference set changed (dedup).
++                    //   false -> send on EVERY cache refresh, regardless of change.
++                    const bool only_on_change =
++                        db->device_conf.unsolicited_preference_report_only_on_cache_update;
++                    const bool preference_changed =
++                        preference_changed_since_last_reported(radio_mac,
++                                                               radio->channel_preferences);
++                    if (!only_on_change || preference_changed) {
++                        LOG(DEBUG) << "[CBS] handle_vs_channels_list_response: sending unsolicited "
++                                      "Channel Preference Report for radio "
++                                   << radio_mac
++                                   << (only_on_change
++                                           ? " (preference set changed)"
++                                           : " (only_on_cache_update=0 -> send on every refresh)");
++                        // Emit the unsolicited report (mid = 0). preference_ready was set for this
++                        // radio by build_channel_preference_report() above.
++                        if (send_channel_preference_report()) {
++                            m_last_reported_preferences[radio_mac] = radio->channel_preferences;
++                        } else {
++                            LOG(ERROR) << "[CBS] handle_vs_channels_list_response: failed to send "
++                                          "unsolicited Channel Preference Report for radio "
++                                       << radio_mac;
++                        }
++                    } else {
++                        LOG(DEBUG) << "[CBS] handle_vs_channels_list_response: preference set "
++                                      "unchanged for radio "
++                                   << radio_mac << " -> suppressing unsolicited Channel Preference "
++                                                   "Report";
++                    }
++                    // Clear the pending-preference bookkeeping used by the unsolicited build so it
++                    // does not leak into a subsequent solicited query.
++                    m_pending_preference.mid = 0;
++                    m_pending_preference.preference_ready.clear();
++                }
++            }
+         }
+     }
+ 
+@@ -2549,16 +2834,24 @@ bool ChannelSelectionTask::create_cac_completion_report_tlv()
+ {
+     // CAC is a 5 GHz DFS mechanism — skip 2.4 GHz and 6 GHz radios entirely.
+     // One TLV per 5G radio to stay within MAX_TLV_SIZE (1492 B).
++    //
++    // IMPORTANT: the CAC Completion/Status Report is an AGENT-WIDE report (Wi-Fi EasyMesh
++    // Profile2+), NOT tied to the subset of radios in m_pending_preference.preference_ready. It
++    // must be present in EVERY Channel Preference Report the agent sends (solicited query/response,
++    // AWGN, CAC-completed, and the CBS-refresh unsolicited path). Iterating only the pending
++    // preference radios meant a per-single-radio CPR triggered by a NON-5GHz radio (2.4GHz / 6GHz)
++    // carried ZERO CAC TLVs, and the controller dropped the whole report
++    // ("missing tlv[TLV_TYPE_CAC_STATUS_REPORT] ... validation failed"). Iterate ALL radios in the
++    // AgentDB instead and emit the CAC TLV for the 5GHz radio(s), independent of which radio(s)
++    // triggered the report.
+     CacStatusDatabase cac_status_database;
+     auto db = AgentDB::get();
+ 
+-    for (const auto &pending_preference_iter : m_pending_preference.preference_ready) {
+-        const auto &radio_mac = pending_preference_iter.first;
+-        auto radio            = db->get_radio_by_mac(radio_mac);
++    for (const auto radio : db->get_radios_list()) {
+         if (!radio) {
+-            LOG(DEBUG) << "Radio " << radio_mac << " does not exist on the db";
+-            return false;
++            continue;
+         }
++        const auto &radio_mac = radio->front.iface_mac;
+ 
+         const auto freq_type = radio->wifi_channel.get_freq_type();
+         if (freq_type != beerocks::eFreqType::FREQ_5G &&
+@@ -2594,16 +2887,23 @@ bool ChannelSelectionTask::create_cac_status_report_tlv()
+ {
+     // CAC is a 5 GHz DFS mechanism — skip 2.4 GHz and 6 GHz radios entirely.
+     // One TLV per 5G radio to stay within MAX_TLV_SIZE (1492 B).
++    //
++    // IMPORTANT: the CAC Status Report is an AGENT-WIDE report (Wi-Fi EasyMesh Profile2+) and is
++    // MANDATORY in every Channel Preference Report. It is NOT tied to the subset of radios in
++    // m_pending_preference.preference_ready. Iterate ALL radios in the AgentDB (emitting the TLV
++    // for the 5GHz radio(s)) so any CPR - including a per-single-radio unsolicited CPR triggered
++    // by a NON-5GHz (2.4GHz / 6GHz) radio - always carries this TLV. Previously iterating only the
++    // pending-preference radios produced a CPR with zero CAC Status TLVs when the trigger radio was
++    // not 5GHz, and the controller rejected it
++    // ("missing tlv[TLV_TYPE_CAC_STATUS_REPORT] ... validation failed").
+     CacStatusDatabase cac_status_database;
+     auto db = AgentDB::get();
+ 
+-    for (const auto &pending_preference_iter : m_pending_preference.preference_ready) {
+-        const auto &radio_mac = pending_preference_iter.first;
+-        auto radio            = db->get_radio_by_mac(radio_mac);
++    for (const auto radio : db->get_radios_list()) {
+         if (!radio) {
+-            LOG(DEBUG) << "Radio " << radio_mac << " does not exist on the db";
+-            return false;
++            continue;
+         }
++        const auto &radio_mac = radio->front.iface_mac;
+ 
+         const auto freq_type = radio->wifi_channel.get_freq_type();
+         if (freq_type != beerocks::eFreqType::FREQ_5G &&
+diff --git a/agent/src/beerocks/slave/tasks/channel_selection_task.h b/agent/src/beerocks/slave/tasks/channel_selection_task.h
+index 59a0321..e2b6751 100644
+--- a/agent/src/beerocks/slave/tasks/channel_selection_task.h
++++ b/agent/src/beerocks/slave/tasks/channel_selection_task.h
+@@ -376,6 +376,46 @@ private:
+     // is logged only once instead of on every work() tick.
+     bool m_cbs_interval_override_logged = false;
+ 
++    // Set when a driver-ranking cache refresh (CBS/ACS/DYNAMIC-ACS completion) has produced a
++    // changed, normalized preference set and an unsolicited Channel Preference Report should be
++    // emitted. Consumed by the shared channels-list-response report path (same pattern as the
++    // other m_send_preference_report_after_*_event latches).
++    bool m_send_preference_report_after_rank_refresh_event = false;
++
++    // Snapshot of the last preference set reported per radio, used to suppress unsolicited
++    // Channel Preference Reports when a cache refresh did not actually change the preferences.
++    std::unordered_map<sMacAddr, AgentDB::sRadio::channel_preferences_map> m_last_reported_preferences;
++
++    /**
++     * @brief Normalize a driver channel rank into a standard MAP preference value (1..15).
++     *
++     * The driver assigns a positive rank (1 = best) only to the channels it evaluated; other
++     * operable channels carry rank 0, and unknown/unsupported entries carry rank < 0. The mapping
++     * is normalized per radio to the radio's largest observed positive rank so that the best
++     * ranked channel always maps to the maximum preference regardless of how many channels were
++     * ranked or the band/regulatory rank range:
++     *   rank < 0            -> 0  (non-operable)
++     *   rank == 0           -> 1  (operable but unranked; not penalized)
++     *   rank == 1           -> 15 (best)
++     *   1 < rank <= max     -> clamp(round(1 + 14 * (max - rank) / max(1, max - 1)), 1, 15)
++     *
++     * @param rank            The driver rank for the (channel, bandwidth).
++     * @param max_rank_on_radio The largest positive rank observed on the radio in this refresh.
++     * @return The normalized MAP preference (0..15).
++     */
++    static uint8_t normalize_rank_to_preference(int32_t rank, int32_t max_rank_on_radio);
++
++    /**
++     * @brief Compare a freshly-built preference set against the last one reported for a radio.
++     *
++     * @param radio_mac The radio to compare for.
++     * @param new_pref  The freshly-built preference map.
++     * @return true if the preference set changed since the last unsolicited report (or none was
++     *         sent yet), false if identical.
++     */
++    bool preference_changed_since_last_reported(
++        const sMacAddr &radio_mac, const AgentDB::sRadio::channel_preferences_map &new_pref);
++
+     std::string m_zwdfs_iface;
+     std::string m_zwdfs_primary_radio_iface;
+     std::chrono::steady_clock::time_point m_zwdfs_fsm_timeout;
+diff --git a/common/beerocks/bcl/include/bcl/beerocks_config_file.h b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+index abe1383..f0c65eb 100644
+--- a/common/beerocks/bcl/include/bcl/beerocks_config_file.h
++++ b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+@@ -128,6 +128,17 @@ public:
+         std::string cbs_based_chansel_enable;
+         // Periodicity (seconds) of the internal CBS trigger timer (0..86400; 0 = disabled).
+         std::string cbs_trigger_periodic_interval;
++        // When "1", the local channel-preference table is (re)built and normalized from the driver
++        // ranking on every CBS / ACS / DYNAMIC-ACS completion, independent of the channel-selection
++        // approach knobs. Keeps a fresh normalized preference table available (e.g. for proprietary
++        // channel-selection logic and for the values reported in the CPR).
++        std::string chansel_preference_report_refresh_enable;
++        // When "1" (and chansel_preference_report_refresh_enable is also "1"), an unsolicited
++        // Channel Preference Report is emitted whenever the normalized preference set changes on a
++        // ranking cache refresh. Latched to the refresh knob: without a fresh table there is nothing
++        // meaningful to report.
++        std::string chansel_unsolicited_preference_report_enable;
++        std::string unsolicited_preference_report_only_on_cache_update;
+         std::string enable_smd;
+         std::string clients_unicast_measurements;
+         std::string send_btm_to_non_11v_sta;
+diff --git a/common/beerocks/bcl/source/beerocks_config_file.cpp b/common/beerocks/bcl/source/beerocks_config_file.cpp
+index 1b6fa5d..712d6ed 100644
+--- a/common/beerocks/bcl/source/beerocks_config_file.cpp
++++ b/common/beerocks/bcl/source/beerocks_config_file.cpp
+@@ -187,6 +187,12 @@ bool config_file::read_slave_config_file(const std::string &config_file_path, sC
+             std::make_tuple("cbs_based_chansel_enable=", &conf.cbs_based_chansel_enable, 0),
+             std::make_tuple("cbs_trigger_periodic_interval=", &conf.cbs_trigger_periodic_interval,
+                             0),
++            std::make_tuple("chansel_preference_report_refresh_enable=",
++                            &conf.chansel_preference_report_refresh_enable, 0),
++            std::make_tuple("chansel_unsolicited_preference_report_enable=",
++                            &conf.chansel_unsolicited_preference_report_enable, 0),
++            std::make_tuple("unsolicited_preference_report_only_on_cache_update=",
++                            &conf.unsolicited_preference_report_only_on_cache_update, 0),
+             std::make_tuple("enable_smd=", &conf.enable_smd, 0),
+             std::make_tuple("clients_unicast_measurements=", &conf.clients_unicast_measurements, 0),
+             std::make_tuple("send_btm_to_non_11v_sta=", &conf.send_btm_to_non_11v_sta, 0),
+diff --git a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+index 48160cc..7a4bfe6 100644
+--- a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
++++ b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+@@ -288,6 +288,13 @@ struct hal_conf_t {
+     // actually runs a fresh CBS scan (emitting CBS-STARTED/CBS-COMPLETED) instead of only
+     // re-reading the last "ACS show_report".
+     bool cbs_based_chansel_enable = false;
++    // AgentDB::device_conf.chansel_preference_report_refresh_enable, forwarded via
++    // ap_manager::create_ap_wlan_hal(). When true, the fronthaul HAL parses the driver ACS ranks
++    // (read_acs_report) and the ap_manager pushes a CHANNELS_LIST_RESPONSE with those ranks to the
++    // backhaul on every CBS/ACS/DYNAMIC-ACS completion, independent of the CBS-based
++    // channel-selection approach. Enables the channel-preference-report refresh / unsolicited CPR
++    // feature without requiring cbs_based_chansel_enable.
++    bool chansel_preference_report_refresh_enable = false;
+     std::string wpa_ctrl_path;
+     std::set<std::string> monitored_BSSs;
+     bool is_repeater         = false;
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 14b8b3a..b7bdc8f 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -2279,7 +2279,10 @@ bool ap_wlan_hal_nl80211::refresh_radio_info()
+                 // read_acs_report() then overlays the driver ranks (>=1) on top of that baseline.
+                 // (Non-CBS flows are therefore completely unaffected by this change.)
+                 channel_info.bw_info_list[bw] =
+-                    m_hal_conf.cbs_based_chansel_enable ? 0 : 1;
++                    (m_hal_conf.cbs_based_chansel_enable ||
++                     m_hal_conf.chansel_preference_report_refresh_enable)
++                        ? 0
++                        : 1;
+             }
+         }
+     } else {
+@@ -5326,7 +5329,8 @@ bool ap_wlan_hal_nl80211::read_acs_report()
+ {
+     // GATING: CBS is the only consumer of "ACS show_report". When disabled (default), keep the
+     // original pre-CBS no-op so NOTHING runs here (not even the TRACE below) with all knobs off.
+-    if (!m_hal_conf.cbs_based_chansel_enable) {
++    if (!m_hal_conf.cbs_based_chansel_enable &&
++        !m_hal_conf.chansel_preference_report_refresh_enable) {
+         return true;
+     }
+ 
+@@ -5496,31 +5500,33 @@ bool ap_wlan_hal_nl80211::read_acs_ranks(std::vector<sAcsChannelRank> &out_ranks
+ {
+     out_ranks.clear();
+ 
+-    // The "ACS show_report" command is a hostapd control-interface command registered on the
+-    // BASE radio socket (e.g. /var/run/hostapd/wlan2), same as the other "ACS ..." commands used
+-    // by start_platform_acs(). Derive the base iface from the link iface and register its socket.
+-    const std::string link_iface = m_radio_info.iface_name;
+-    std::string radio_iface;
+-    extractLinkBaseInterface(link_iface, radio_iface);
+-    if (radio_iface.empty()) {
+-        radio_iface = link_iface;
+-    }
+ 
+-    if (!is_wpa_ctrl_interface_registered(radio_iface)) {
+-        if (add_interface(radio_iface) < 0) {
+-            LOG(WARNING) << "[CBS] read_acs_ranks: add_interface(" << radio_iface
+-                         << ") failed; will still attempt to send on it";
+-        }
+-    }
++    std::string cmd = "ACS show_report";
+ 
+     // The "ACS show_report" output can be large (e.g. a 6GHz radio has 200+ channels x several
+     // bandwidths), exceeding the shared 4096-byte wpa_ctrl buffer -> the underlying request()
+     // would fail with "reply of size 4096". Use a dedicated large (32 KB) buffer for this command.
+     std::string report;
+     constexpr size_t ACS_REPORT_BUF_SIZE = 32768;
+-    if (!wpa_ctrl_send_msg_bufsize("ACS show_report", report, ACS_REPORT_BUF_SIZE, radio_iface) ||
++
++    // We no longer format "-l <link>" into the ACS command because hostapd's command parser 
++    // does not actually parse it. Instead, the command executes on whichever `hapd` owns the 
++    // control socket we connect to. We just need to send it to the control socket for this 
++    // specific radio's interface. For MLD, this is typically the link interface (wlanX_linkY), 
++    // and for SLO it's the base interface. `m_radio_info.iface_name` correctly identifies 
++    // the interface for this radio's ap_manager instance.
++    const std::string target_iface = m_radio_info.iface_name;
++    
++    if (!is_wpa_ctrl_interface_registered(target_iface)) {
++        if (add_interface(target_iface) < 0) {
++            LOG(WARNING) << "[CBS] read_acs_ranks: add_interface(" << target_iface
++                         << ") failed; will still attempt to send on it";
++        }
++    }
++
++    if (!wpa_ctrl_send_msg_bufsize(cmd, report, ACS_REPORT_BUF_SIZE, target_iface) ||
+         report.empty()) {
+-        LOG(ERROR) << "[CBS] read_acs_ranks: 'ACS show_report' failed on iface=" << radio_iface;
++        LOG(ERROR) << "[CBS] read_acs_ranks: '" << cmd << "' failed on iface=" << target_iface;
+         return false;
+     }
+ 
+@@ -5610,7 +5616,7 @@ bool ap_wlan_hal_nl80211::read_acs_ranks(std::vector<sAcsChannelRank> &out_ranks
+     {
+         std::stringstream log_ss;
+         log_ss << "[CBS] read_acs_ranks: parsed " << out_ranks.size()
+-               << " rows from 'ACS show_report' on iface=" << radio_iface << ":" << std::endl;
++               << " rows from '" << cmd << "' on iface=" << target_iface << ":" << std::endl;
+         for (const auto &e : out_ranks) {
+             log_ss << "  channel=" << int(e.channel) << " center_chan=" << int(e.center_chan)
+                    << " rank=" << e.rank << std::endl;
+@@ -5628,31 +5634,25 @@ bool ap_wlan_hal_nl80211::read_acs_ranks(std::vector<sAcsChannelRank> &out_ranks
+ 
+ bool ap_wlan_hal_nl80211::trigger_cbs()
+ {
+-    // Trigger a one-shot CBS scan via "CBS enable 1" on the base radio hostapd control socket.
+-    // Same socket-selection logic as read_acs_ranks()/start_platform_acs(): the CBS control
+-    // command is registered on the base radio socket (e.g. /var/run/hostapd/wlan2), not the
+-    // per-link socket.
+-    const std::string link_iface = m_radio_info.iface_name;
+-    std::string radio_iface;
+-    extractLinkBaseInterface(link_iface, radio_iface);
+-    if (radio_iface.empty()) {
+-        radio_iface = link_iface;
+-    }
++    std::string cmd = "CBS enable 1";
+ 
+-    if (!is_wpa_ctrl_interface_registered(radio_iface)) {
+-        if (add_interface(radio_iface) < 0) {
+-            LOG(WARNING) << "[CBS] trigger_cbs: add_interface(" << radio_iface
++    // As with read_acs_ranks, we target the specific interface for this radio.
++    // The driver executes the command on the hapd owning the control socket.
++    const std::string target_iface = m_radio_info.iface_name;
++
++    if (!is_wpa_ctrl_interface_registered(target_iface)) {
++        if (add_interface(target_iface) < 0) {
++            LOG(WARNING) << "[CBS] trigger_cbs: add_interface(" << target_iface
+                          << ") failed; will still attempt to send on it";
+         }
+     }
+ 
+-    const std::string cmd = "CBS enable 1";
+-    LOG(INFO) << "[CBS] trigger_cbs: sending '" << cmd << "' on iface=" << radio_iface;
+-    if (!wpa_ctrl_send_msg(cmd, radio_iface)) {
+-        LOG(ERROR) << "[CBS] trigger_cbs: '" << cmd << "' failed on iface=" << radio_iface;
++    LOG(INFO) << "[CBS] trigger_cbs: sending '" << cmd << "' on iface=" << target_iface;
++    if (!wpa_ctrl_send_msg(cmd, target_iface)) {
++        LOG(ERROR) << "[CBS] trigger_cbs: '" << cmd << "' failed on iface=" << target_iface;
+         return false;
+     }
+-    LOG(DEBUG) << "[CBS] trigger_cbs: '" << cmd << "' OK on iface=" << radio_iface;
++    LOG(DEBUG) << "[CBS] trigger_cbs: '" << cmd << "' OK on iface=" << target_iface;
+     return true;
+ }
+ 
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+index e2f9602..2c42e25 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+@@ -46,6 +46,11 @@ cACTION_APMANAGER_CONFIGURE:
+   # (refresh_radio_info() rank baseline, read_acs_report(), CBS trigger) rely on these values.
+   cbs_based_chansel_enable: uint8_t #bool
+   active_acs_chansel_enable: uint8_t #bool
++  # When set, the fronthaul HAL parses the driver ACS ranks (read_acs_report) and pushes a
++  # CHANNELS_LIST_RESPONSE to the backhaul on every CBS/ACS/DYNAMIC-ACS completion, independent of
++  # the CBS-based channel-selection approach. Enables the channel-preference-report refresh / CPR
++  # feature without requiring cbs_based_chansel_enable.
++  chansel_preference_report_refresh_enable: uint8_t #bool
+ 
+ cACTION_APMANAGER_JOINED_NOTIFICATION:
+   _type: class
+-- 
+2.34.1
+
