@@ -1,0 +1,358 @@
+From 8a916e9a6357cdcd3610490cee35adfc970f3fc5 Mon Sep 17 00:00:00 2001
+From: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+Date: Wed, 5 Aug 2026 07:56:38 +0530
+Subject: [PATCH] Agent: fix MLO backhaul VLAN tagging and AP MLD operational
+ status
+
+Fix VLAN tagging and status-detection issues specific to MLO backhaul
+connections:
+
+- Resolve the correct per-link BSSID for MLO clients in
+  process_client_association() instead of storing the AP MLD MAC in
+  client.bssid. The mismatch meant client.bssid never matched the WDS
+  notification's bssid, so the WDS interface was never VLAN-tagged.
+
+- Add sta_wlan_hal::get_multi_ap_primary_vlan_id() (and WHM
+  implementation) to read the endpoint's MultiAPVlanId without pushing
+  an event.
+
+- In BackhaulManager, reassociate on the bSTA interface that reports a
+  non-zero MultiAPVlanId (the anchor link) instead of the first
+  connected interface, so the resulting Connected event carries the
+  correct VLAN ID. Also handle the case where a non-anchor link's
+  Connected event itself carries a non-zero VLAN ID: update
+  primary_vlan_id, record the interface in the new
+  AgentDB::mlo_primary_bsta_iface field, and re-trigger VLAN policy
+  application.
+
+- In TrafficSeparationTask::add_backhaul_connection_trunk(), use
+  mlo_primary_bsta_iface as the trunk port for MLO backhauls instead of
+  the per-link interface, since only the primary interface carries
+  real traffic.
+
+- Add slave_thread::is_ap_mld_operationally_up(), which checks all BSS
+  entries sharing an AP MLD MAC for an up-and-running interface. Some
+  platforms implement a multi-link AP as a single fused interface
+  while prplMesh still registers one BSS entry per radio, so only one
+  entry's own interface ever comes up. Use this helper alongside the
+  existing per-interface check in
+  refresh_backhaul_bss_enabled_and_retrigger_wds_ts() and
+  update_vaps_info() so MLO fronthaul BSSes are correctly detected as
+  enabled.
+
+- In hal_event_handler(), check the return of create_vs_message() for
+  both APPLY_VLAN_POLICY_REQUEST sends before calling send_cmdu(), so a
+  failed message allocation cannot result in an invalid CMDU being
+  transmitted.
+
+- Guard the non-anchor-link VLAN update path with a check that the
+  backhaul is currently wireless and that the reporting interface is
+  not the already-selected one, so the anchor link's own
+  reconnect/roam events (handled by the branch above) cannot retrigger
+  this path and overwrite a correct VLAN ID.
+
+Signed-off-by: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/agent_db.h           |  4 ++
+ .../backhaul_manager/backhaul_manager.cpp     | 60 ++++++++++++++++---
+ agent/src/beerocks/slave/son_slave_thread.cpp | 43 ++++++++++---
+ agent/src/beerocks/slave/son_slave_thread.h   | 17 ++++++
+ .../slave/tasks/traffic_separation_task.cpp   | 13 ++++
+ .../beerocks/bwl/include/bwl/sta_wlan_hal.h   |  9 +++
+ common/beerocks/bwl/whm/sta_wlan_hal_whm.cpp  | 12 ++++
+ common/beerocks/bwl/whm/sta_wlan_hal_whm.h    |  2 +
+ 8 files changed, 146 insertions(+), 14 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 40c2ab70b..d18942d0d 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -284,6 +284,10 @@ public:
+         sMacAddr observed_ap_mld_mac   = net::network_utils::ZERO_MAC;
+         sMacAddr observed_bsta_mld_mac = net::network_utils::ZERO_MAC;
+ 
++        // MLO: interface reporting a non-zero multi_ap_primary_vlanid on the connected event.
++        // Empty in SLO mode or before it has been identified.
++        std::string mlo_primary_bsta_iface;
++
+         struct sBackhaulLink {
+             explicit sBackhaulLink(
+                 const sBackhaul::eConnectionType &connection_type_, const std::string &iface_name_,
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 762cd084f..a224203b3 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -787,6 +787,8 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+         db->controller_info.bridge_mac = beerocks::net::network_utils::ZERO_MAC;
+         db->backhaul.backhaul_bss_multi_ap_profile =
+             wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_1;
++        // Clear MLO primary bSTA interface so it is re-identified on the next connection.
++        db->backhaul.mlo_primary_bsta_iface.clear();
+ 
+         FSM_MOVE_STATE(WAIT_ENABLE);
+         break;
+@@ -1631,16 +1633,31 @@ bool BackhaulManager::backhaul_fsm_wireless(bool &skip_select)
+                         }
+                     }
+                 } else if (!roam_flag && radio_info->sta_wlan_hal->is_connected()) {
++                    // MLO: reassociate on the interface reporting a non-zero
++                    // MultiAPVlanId (the anchor link) so the Connected event carries
++                    // the correct VLAN ID. Fall back to the first connected
++                    // interface if no link reports a non-zero value.
++                    std::string preferred_iface;
+                     for (const auto &sta_iface : slave_sta_ifaces) {
+                         auto sta_iface_hal = get_wireless_hal(sta_iface);
+                         if (!sta_iface_hal) {
+                             break;
+                         }
+-                        if (sta_iface_hal->reassociate()) {
+-                            // reassociate() will return true only when we pushed Event::Connected.
+-                            // no need to repeat.
++                        if (!sta_iface_hal->is_connected()) {
++                            continue;
++                        }
++                        if (preferred_iface.empty()) {
++                            preferred_iface = sta_iface; // fallback: first connected
++                        }
++                        if (sta_iface_hal->get_multi_ap_primary_vlan_id() != 0) {
++                            preferred_iface = sta_iface; // prefer anchor link
++                            break;
++                        }
++                    }
++                    if (!preferred_iface.empty()) {
++                        auto preferred_hal = get_wireless_hal(preferred_iface);
++                        if (preferred_hal && preferred_hal->reassociate()) {
+                             reassociation = true;
+-                            break; // exit slave_sta_ifaces loop
+                         }
+                     }
+                 }
+@@ -2801,9 +2818,38 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+ 
+             auto request = message_com::create_vs_message<
+                 beerocks_message::cACTION_BACKHAUL_APPLY_VLAN_POLICY_REQUEST>(cmdu_tx);
+-
+-            // Send the message to one of the son_slaves.
+-            send_cmdu(m_agent_fd, cmdu_tx);
++            if (!request) {
++                LOG(ERROR) << "Failed to build APPLY_VLAN_POLICY_REQUEST message";
++            } else {
++                // Send the message to one of the son_slaves.
++                send_cmdu(m_agent_fd, cmdu_tx);
++            }
++        } else {
++            // MLO: a non-anchor link's Connected event can carry a non-zero
++            // multi_ap_primary_vlanid. Update the DB and re-trigger VLAN policy.
++            // Restricted to the active wireless backhaul and to interfaces other than
++            // the already-selected one, so the anchor link's own reconnect/roam events
++            // (which go through the branch above) cannot retrigger this path.
++            auto msg = static_cast<bwl::sACTION_BACKHAUL_CONNECTED_NOTIFICATION *>(data);
++            if (msg && msg->multi_ap_primary_vlan_id != 0 &&
++                db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wireless &&
++                iface != db->backhaul.selected_iface_name &&
++                db->traffic_separation.primary_vlan_id != msg->multi_ap_primary_vlan_id) {
++                LOG(INFO) << "MLO: updating primary_vlan_id "
++                          << db->traffic_separation.primary_vlan_id << " -> "
++                          << msg->multi_ap_primary_vlan_id << " from iface=" << iface;
++                db->traffic_separation.primary_vlan_id = msg->multi_ap_primary_vlan_id;
++                // bsta_mld_configuration isn't available yet, so record this interface
++                // as the trunk port for traffic_separation_task to use.
++                db->backhaul.mlo_primary_bsta_iface = iface;
++                auto request = message_com::create_vs_message<
++                    beerocks_message::cACTION_BACKHAUL_APPLY_VLAN_POLICY_REQUEST>(cmdu_tx);
++                if (!request) {
++                    LOG(ERROR) << "Failed to build APPLY_VLAN_POLICY_REQUEST message";
++                } else {
++                    send_cmdu(m_agent_fd, cmdu_tx);
++                }
++            }
+         }
+ 
+         // Notify fronthaul manager to restore hop count (bSTA connected)
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 3a73af2f1..b9e7f6f59 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -2909,11 +2909,15 @@ bool slave_thread::process_client_association(
+         // the association frame is stored in radio->associated_clients[mld_mac].
+         auto radio = db->get_radio_by_mac(link_mac, AgentDB::eMacType::BSSID);
+ 
+-        // For MLO clients, bssid is the AP MLD MAC (EasyMesh 17.2.6), which never
+-        // matches a per-link BSSID in AgentDB. Fall back to an affiliated-STA's
+-        // per-link bssid instead, matching what the WDS-iface-ready cache uses.
++        // For MLO clients, bssid is the AP MLD MAC, which never matches a per-link
++        // BSSID in AgentDB or the WDS-iface-ready cache (keyed by the client's real
++        // per-link BSSID, as reported by hostapd). Store the resolved per-link BSSID
++        // instead - link_mac when the primary lookup above found it, otherwise the
++        // affiliated-STA bssid matched in the fallback below. Leaving this at the AP
++        // MLD MAC meant client.bssid never matched the WDS notification's bssid, so
++        // the WDS interface was never VLAN-tagged.
+         // Must run before mld_info is moved below, or affiliated_stas is empty.
+-        sMacAddr link_bssid = bssid;
++        sMacAddr link_bssid = radio ? link_mac : bssid;
+         if (!radio) {
+             for (const auto &affiliated_entry : mld_info.affiliated_stas) {
+                 radio = db->get_radio_by_mac(affiliated_entry.bssid, AgentDB::eMacType::BSSID);
+@@ -3161,6 +3165,25 @@ void slave_thread::retrigger_wds_ts(AgentDB::sRadio &radio,
+     }
+ }
+ 
++bool slave_thread::is_ap_mld_operationally_up(const sMacAddr &ap_mld_mac) const
++{
++    auto db = AgentDB::get();
++    for (const auto *radio : db->get_radios_list()) {
++        if (!radio) {
++            continue;
++        }
++        for (const auto &bss : radio->front.bssids) {
++            if (bss.apmld_mac != ap_mld_mac || bss.iface_name.empty()) {
++                continue;
++            }
++            if (net::network_utils::linux_iface_is_up_and_running(bss.iface_name)) {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
+ void slave_thread::refresh_backhaul_bss_enabled_and_retrigger_wds_ts(AgentDB::sRadio &radio,
+                                                                       const sMacAddr &bssid)
+ {
+@@ -3183,7 +3206,10 @@ void slave_thread::refresh_backhaul_bss_enabled_and_retrigger_wds_ts(AgentDB::sR
+                                     network_utils::linux_iface_is_up_and_running(base_interface);
+ #else
+         const bool is_enabled_now =
+-            !bss.iface_name.empty() && network_utils::linux_iface_is_up_and_running(bss.iface_name);
++            !bss.iface_name.empty() &&
++            (network_utils::linux_iface_is_up_and_running(bss.iface_name) ||
++             (bss.apmld_mac != net::network_utils::ZERO_MAC &&
++              is_ap_mld_operationally_up(bss.apmld_mac)));
+ #endif
+         if (!is_enabled_now) {
+             return;
+@@ -7550,8 +7576,11 @@ bool slave_thread::update_vaps_info(const std::string &iface,
+         const bool is_enabled = has_bssid && !iface_name.empty() &&
+                                 network_utils::linux_iface_is_up_and_running(base_interface);
+ #else
+-        const bool is_enabled                 = has_bssid && !iface_name.empty() &&
+-                                network_utils::linux_iface_is_up_and_running(iface_name);
++        const sMacAddr &ap_mld_mac = vaps[vap_idx].ap_mld_mac;
++        const bool is_enabled      = has_bssid && !iface_name.empty() &&
++                                     (network_utils::linux_iface_is_up_and_running(iface_name) ||
++                                      (ap_mld_mac != net::network_utils::ZERO_MAC &&
++                                       is_ap_mld_operationally_up(ap_mld_mac)));
+ #endif
+ 
+         const auto clear_previous_fh_iface = [&]() {
+diff --git a/agent/src/beerocks/slave/son_slave_thread.h b/agent/src/beerocks/slave/son_slave_thread.h
+index 9e681d66b..6a7b60afb 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.h
++++ b/agent/src/beerocks/slave/son_slave_thread.h
+@@ -680,6 +680,23 @@ private:
+      */
+     void erase_pending_wds_notification(const sMacAddr &client_mac, const sMacAddr &bssid);
+ 
++    /**
++     * @brief Check whether an AP MLD is operationally up, by checking every BSS entry
++     * that belongs to it.
++     *
++     * On some platforms a multi-link AP is a single fused interface carrying all
++     * affiliated links, while prplMesh still registers one BSS entry per radio for
++     * that MLD. Only the entry hosting the fused interface ever comes up, so checking
++     * a single entry's own interface is not sufficient - this checks all entries
++     * sharing ap_mld_mac and returns true if any one of their interfaces is up.
++     *
++     * @param ap_mld_mac The AP MLD MAC.
++     * @return true if at least one BSS entry belonging to this MLD has its interface up
++     *         and running, false otherwise (including when ap_mld_mac is ZERO_MAC or no
++     *         entry belongs to it).
++     */
++    bool is_ap_mld_operationally_up(const sMacAddr &ap_mld_mac) const;
++
+     /**
+      * @brief Re-trigger the WDS traffic separation flow (CLEAR then NEW WDS iface events)
+      * for every currently associated client whose bssid matches bss, so that
+diff --git a/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp b/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
+index 60052e0ce..0139fc375 100644
+--- a/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
++++ b/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
+@@ -787,6 +787,19 @@ bool TrafficSeparationTask::add_backhaul_connection_trunk(
+         const uint8_t eff   = std::min(local, peer);
+ 
+         trunk.is_untagged_mode = (eff <= 1);
++
++        // MLO: all links share one primary bSTA interface carrying real traffic;
++        // per-link helper interfaces carry none. Use the interface recorded in
++        // db->backhaul.mlo_primary_bsta_iface (set on the first Connected event that
++        // reports a non-zero multi_ap_primary_vlanid) instead of the per-link
++        // interface in wifi_iface. bsta_mld_configuration isn't populated yet here.
++        if (!db->backhaul.mlo_primary_bsta_iface.empty() &&
++            db->backhaul.mlo_primary_bsta_iface != wifi_iface) {
++            LOG(DEBUG) << "MLO: overriding trunk iface from " << trunk.iface_name
++                       << " to primary bSTA iface " << db->backhaul.mlo_primary_bsta_iface;
++            trunk.iface_name = db->backhaul.mlo_primary_bsta_iface;
++        }
++
+         break;
+     }
+     case AgentDB::sBackhaul::eConnectionType::Wired: {
+diff --git a/common/beerocks/bwl/include/bwl/sta_wlan_hal.h b/common/beerocks/bwl/include/bwl/sta_wlan_hal.h
+index 8dd40d82e..de69d5b96 100644
+--- a/common/beerocks/bwl/include/bwl/sta_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/sta_wlan_hal.h
+@@ -107,6 +107,15 @@ public:
+     virtual bool is_disconnected()  = 0;
+ 
+     virtual bool add_new_network(son::wireless_utils::sBssInfoConf bSta_conf) = 0;
++
++    /*!
++     * @brief Returns the Multi-AP Primary VLAN ID reported by the endpoint.
++     *
++     * In MLO mode only the anchor link endpoint carries this value; secondary
++     * per-link interfaces return 0.  The default implementation returns 0 so
++     * non-WHM backends need not override it.
++     */
++    virtual uint16_t get_multi_ap_primary_vlan_id() { return 0; }
+ };
+ 
+ // STA HAL factory types
+diff --git a/common/beerocks/bwl/whm/sta_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/sta_wlan_hal_whm.cpp
+index 69f4b52d3..19601a5e5 100644
+--- a/common/beerocks/bwl/whm/sta_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/sta_wlan_hal_whm.cpp
+@@ -626,6 +626,18 @@ bool sta_wlan_hal_whm::reassociate()
+     return false;
+ }
+ 
++uint16_t sta_wlan_hal_whm::get_multi_ap_primary_vlan_id()
++{
++    // Read the endpoint status to obtain MultiAPVlanId without pushing any
++    // event.  In MLO mode only the anchor link endpoint has this field set;
++    // secondary per-link interfaces return 0.
++    Endpoint endpoint;
++    if (read_status(endpoint)) {
++        return endpoint.multi_ap_primary_vlanid;
++    }
++    return 0;
++}
++
+ bool sta_wlan_hal_whm::is_connected()
+ {
+     Endpoint endpoint;
+diff --git a/common/beerocks/bwl/whm/sta_wlan_hal_whm.h b/common/beerocks/bwl/whm/sta_wlan_hal_whm.h
+index 624624163..b38756d0b 100644
+--- a/common/beerocks/bwl/whm/sta_wlan_hal_whm.h
++++ b/common/beerocks/bwl/whm/sta_wlan_hal_whm.h
+@@ -78,6 +78,8 @@ public:
+ 
+     virtual bool enable_disable_ep(bool enable) override;
+ 
++    virtual uint16_t get_multi_ap_primary_vlan_id() override;
++
+     virtual sMacAddr get_bsta_mld_mac() override;
+     virtual sMacAddr get_ap_mld_mac() override;
+ 
+-- 
+2.34.1
+
