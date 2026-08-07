@@ -1,0 +1,766 @@
+From a30b49aeca58db15e0064ea2cae0ed8bf0e8d250 Mon Sep 17 00:00:00 2001
+From: Manoj Sekar <sekar@qti.qualcomm.com>
+Date: Wed, 5 Aug 2026 12:53:43 +0530
+Subject: [PATCH] Channel Planning: Enhance rank caching with keying of
+ (opclass, chan, bw)
+
+The CBS preference-table cache (AgentDB::sRadio::cbs_preference_table.
+by_opclass_channel) was a 2-level map keyed on (op_class, chan). For 6GHz
+op-class 137 (320MHz), a single (op_class, chan) pair corresponds to TWO
+physically distinct wide channel blocks (BANDWIDTH_320_1 and
+BANDWIDTH_320_2) with different center frequencies, different beacon-
+channel coverage and different driver ranks. Because both variants map
+to the SAME op-class number, refresh_preference_table()'s
+new_cache[op_class][chan] = entry write collapsed both into ONE cell,
+so whichever the supported_bw_list iterated LAST silently overwrote the
+other. On the current QCA driver ordering that put 320MHz-1 last with
+rank=0, silently dropping the positive rank of the 320MHz-2 block the
+driver had actually scanned. select_best_channel_from_cbs() then saw
+NO positively-ranked (>0) channel in the controller-preferred set and
+fell back to the cumulative-preference score, defeating CBS-based
+channel selection on any 6GHz 320MHz deployment.
+
+Reproduced on a 6GHz-only channel-selection request with preferred set
+P={61,65,...,157} and driver-ranked 320MHz-2 blocks at primary channels
+{37, 85, 117, 149, 165} (rank 4, 3, 7, 1, 2 respectively). Cache dump
+before fix showed every op_class=137 entry as bw=320MHz-1 rank=0, and
+the log line "NO positively-ranked (>0) channel in the controller-
+preferred set for radio ... -> CBS has no useful ordering" fired on
+every request.
+
+Fix: make the cache bandwidth-variant-aware by adding bw as a third map
+key, so both 320MHz-1 and 320MHz-2 for the same (op_class, chan) are
+stored independently. The two variants then compete against each other
+in select_best_channel_from_cbs() via the existing "lowest rank_key
+wins, tie-break by wider bw" policy. Because the driver only ranks the
+block it physically scanned, exactly one variant carries a positive
+rank and the other stays at rank=0 -> the positive-ranked variant wins
+its (op_class, chan) cell deterministically and is picked as the CBS
+winner. For every other op-class the inner map has a single entry per
+(op_class, chan), so behaviour is byte-for-byte identical to before.
+
+Every other layer that touches this data was already variant-safe (the
+fronthaul HAL bw_info_list[bw], the CHANNELS_LIST_RESPONSE transport
+and the outgoing Channel Preference Report all key on the specific
+BANDWIDTH_320_1 / BANDWIDTH_320_2), so this change is scoped to the
+backhaul CBS cache and its readers.
+
+Changes:
+
+  agent/src/beerocks/slave/agent_db.h
+    - sPreferenceTable::by_opclass_channel: change the value type from
+      map<uint8_t, sPreferenceEntry> to
+      map<uint8_t, map<eWiFiBandwidth, sPreferenceEntry>> so each
+      (op_class, chan) can hold both 320MHz-1 and 320MHz-2 entries
+      side by side. Added a block comment explaining the collision and
+      why the extra dimension is required.
+
+  agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+    - refresh_preference_table():
+      - new_cache type upgraded to the 3-level shape.
+      - Writer projects the rank into new_cache[op_class][chan][bw]
+        so both 320MHz variants coexist.
+      - Overlay post-loop (DFS UNAVAILABLE / AWGN / bw-not-supported)
+        adds the extra bw-level iteration so overlays are applied to
+        every (op_class, chan, bw) entry independently.
+      - SUCCESS cache dump log iterates the bw-level too; total_entries
+        now counts (op_class, chan, bw) rows.
+    - select_best_channel_from_cbs():
+      - "any positive rank in preferred" pre-check iterates the bw
+        level too so the positive-ranked variant is visible even when
+        its sibling variant carries rank=0.
+      - Winner-selection loop iterates the bw level; the existing
+        rank_key comparison + wider-bw tie-break naturally selects the
+        positively-ranked variant against its rank=0 sibling.
+
+Regression scope:
+  6GHz op-class 137 (320MHz): both variants now preserved and reachable.
+  6GHz op-class 131/132/133/134: single-variant per (chan) -> no change.
+  5GHz op-class 128/129/130 (80/160MHz), op-class 116/117/119/120/125/
+    126/127 (40MHz), op-class 115/118/121/124 (20MHz): single-variant
+    per (op_class, chan) -> inner map has 1 entry -> byte-for-byte
+    identical cache content and identical selection outcome as before.
+  2.4GHz op-class 81/83/84: same, single-variant -> unchanged.
+  Fronthaul HAL, CHANNELS_LIST_RESPONSE transport, Channel Preference
+    Report TLV builder, legacy select_next_channel and ZWDFS
+    select_best_usable_channel: unchanged (all already variant-aware).
+
+Verified on 6GHz 320MHz test: cache now shows both variants per (137,
+chan) with rank=4/3/7/1/2 preserved on the 320MHz-2 rows, and the CBS
+selection winner correctly resolves to chan=149 bw=320MHz-2 rank=1 ->
+real channel switch (no cumulative-score fallback).
+
+Additionally this change also update the base interface tracking for
+setting blocklist appropriately.
+
+Signed-off-by: Manoj Sekar <sekar@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/agent_db.h           |  38 +-
+ .../slave/tasks/channel_selection_task.cpp    | 355 +++++++++++++-----
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  78 ++--
+ 3 files changed, 330 insertions(+), 141 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 071cb5d..f83fb78 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -453,11 +453,45 @@ public:
+             uint8_t preference                         = 0;
+             wfa_map::cPreferenceOperatingClasses::eReasonCode reason =
+                 wfa_map::cPreferenceOperatingClasses::eReasonCode::UNSPECIFIED;
++
++            // Best (lowest positive) DIRECT driver rank observed for this PRIMARY channel across
++            // ANY bandwidth in the CBS report, independent of the projection. This is used as a
++            // secondary tie-break in select_best_channel_from_cbs when multiple primaries share
++            // the same projected wide-BW rank_key: prefer the primary the driver ACTUALLY ranked
++            // (positive direct rank) over primaries that only got a rank via wider-op-class MIN
++            // projection (where the wide 80MHz block's rank leaks onto every 20MHz sub-channel it
++            // covers).
++            //
++            // Example (5GHz): driver ranks (chan=60, 40MHz) at rank=3. The 80MHz block containing
++            // {52,56,60,64} then projects rank=3 onto ALL four 80MHz entries. Without this field,
++            // the winner-selection tie-break picks whichever chan iterates first (chan=52).
++            // With this field, chan=60 wins because it has a positive DIRECT driver rank and the
++            // others don't, honouring the driver's actual best-primary decision.
++            //
++            // Semantics: 0 = no positive direct rank on this primary at any bandwidth (rank was
++            //                purely projected from a wider block); INT32_MAX = same as 0 sentinel;
++            //            >0 = the best positive direct rank the driver reported for this primary
++            //                 on any single (chan, bw) row.
++            int32_t direct_rank_min_bw = 0;
+         };
+ 
+         struct sPreferenceTable {
+-            // key: op_class -> (channel -> entry)
+-            std::map<uint8_t, std::map<uint8_t, sPreferenceEntry>> by_opclass_channel;
++            // key: op_class -> (channel -> (bandwidth -> entry))
++            //
++            // The third dimension (bandwidth) is REQUIRED for 6GHz op-class 137 (320MHz), which
++            // has two physically distinct variants (BANDWIDTH_320_1 and BANDWIDTH_320_2) that
++            // both map to the SAME op-class number but differ in center frequency, beacon-channel
++            // coverage and the driver's per-block CBS rank. A 2-level map keyed only on
++            // (op_class, chan) collapsed both variants into ONE cell, so whichever the
++            // supported_bw_list iterated LAST silently overwrote the other, dropping the
++            // positive rank of the actually-scanned variant. For all other op-classes the
++            // (chan) already uniquely identifies the bandwidth (e.g. op-class 131 -> 20MHz
++            // only, 132 -> 40MHz only, ...) so the inner map has a single entry per (op_class,
++            // chan). Keying on (op_class, chan, bw) is the general, variant-safe shape.
++            std::map<uint8_t,
++                     std::map<uint8_t,
++                              std::map<beerocks::eWiFiBandwidth, sPreferenceEntry>>>
++                by_opclass_channel;
+             bool valid = false;
+             std::chrono::steady_clock::time_point last_cbs_complete{};
+             beerocks::eWiFiBandwidth cbs_measurement_bw = beerocks::eWiFiBandwidth::BANDWIDTH_UNKNOWN;
+diff --git a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+index 90c0c2f..28c06ca 100644
+--- a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+@@ -340,6 +340,20 @@ bool ChannelSelectionTask::refresh_preference_table(const sMacAddr &radio_mac,
+     // Index the driver-ranked entries: ranked_by_bw[bw][beacon_channel] = best (min) positive rank.
+     // Only positive ranks are indexed here (rank 0 is the operable baseline, not a real ranking).
+     std::map<beerocks::eWiFiBandwidth, std::map<uint8_t, int32_t>> ranked_by_bw;
++
++    // Also track the best (lowest positive) DIRECT driver rank per PRIMARY channel across ANY
++    // bandwidth. This is stored into sPreferenceEntry::direct_rank_min_bw and used as a secondary
++    // tie-break in select_best_channel_from_cbs: when several primaries share the same projected
++    // wide-BW rank (typical when a wider op-class projects one primary's rank onto every 20MHz
++    // sub-channel it covers), prefer the primary the driver ACTUALLY ranked over primaries that
++    // only received a projected rank.
++    //
++    // Example (5GHz): driver ranks chan=60 at rank=3 (40MHz). The 80MHz block containing
++    // {52,56,60,64} then projects rank=3 onto ALL four 80MHz entries. Without this, the
++    // selection picks whichever primary iterates first (chan=52). With direct_rank_by_chan
++    // populated, chan=60 wins because it has direct_rank_min_bw=3 while 52/56/64 have 0.
++    std::map<uint8_t, int32_t> direct_rank_by_chan;
++
+     for (const auto &e : filtered_entries) {
+         if (e.rank <= 0 || e.bandwidth == beerocks::eWiFiBandwidth::BANDWIDTH_UNKNOWN) {
+             continue;
+@@ -348,6 +362,10 @@ bool ChannelSelectionTask::refresh_preference_table(const sMacAddr &radio_mac,
+         if (slot == 0 || e.rank < slot) {
+             slot = e.rank;
+         }
++        auto &drc = direct_rank_by_chan[e.channel];
++        if (drc == 0 || e.rank < drc) {
++            drc = e.rank;
++        }
+     }
+ 
+     // Helper: numeric MHz of a bandwidth (generic and specific 320-1/-2 collapse to the same MHz).
+@@ -374,6 +392,36 @@ bool ChannelSelectionTask::refresh_preference_table(const sMacAddr &radio_mac,
+         return {channel};
+     };
+ 
++    // Helper: 320MHz-1 and 320MHz-2 are physically distinct 320MHz-wide blocks (offset by 160MHz;
++    // different center frequencies; different beacon-channel coverage). Both have bw_mhz==320, so a
++    // pure-numeric-MHz comparison in the exact-match branch below would silently leak a rank from
++    // one variant into the other's cache cell (e.g. driver ranks (chan=101, 320MHz-2) at rank=7 and
++    // the projection then applies rank=7 to (chan=101, 320MHz-1) too, which is a completely
++    // different physical spectrum slice the driver never scanned). The exact-match branch must
++    // therefore require SAME-VARIANT identity for the two 320MHz variants, not just same MHz.
++    const auto is_same_320_variant_class = [](beerocks::eWiFiBandwidth a,
++                                              beerocks::eWiFiBandwidth b) -> bool {
++        const bool a_is_320 = (a == beerocks::eWiFiBandwidth::BANDWIDTH_320 ||
++                               a == beerocks::eWiFiBandwidth::BANDWIDTH_320_1 ||
++                               a == beerocks::eWiFiBandwidth::BANDWIDTH_320_2);
++        const bool b_is_320 = (b == beerocks::eWiFiBandwidth::BANDWIDTH_320 ||
++                               b == beerocks::eWiFiBandwidth::BANDWIDTH_320_1 ||
++                               b == beerocks::eWiFiBandwidth::BANDWIDTH_320_2);
++        if (!a_is_320 || !b_is_320) {
++            // Not a 320MHz comparison -> nothing to guard here; the numeric MHz check in the
++            // caller is sufficient for all other widths (20/40/80/160 have a single enum each).
++            return true;
++        }
++        // Both sides are 320MHz. Only the two SPECIFIC variants must be kept apart. Treat the
++        // generic BANDWIDTH_320 as compatible with either specific variant so that any legacy
++        // callers that store rank under the generic enum are not accidentally dropped.
++        if (a == beerocks::eWiFiBandwidth::BANDWIDTH_320 ||
++            b == beerocks::eWiFiBandwidth::BANDWIDTH_320) {
++            return true;
++        }
++        return a == b;
++    };
++
+     // Project a rank for (channel, op_bw) from the ranked_by_bw index using the prop rules.
+     // Returns >0 projected rank if any ranked entry covers/is-covered-by this (channel, op_bw),
+     // or 0 (baseline) if none applies.
+@@ -391,6 +439,16 @@ bool ChannelSelectionTask::refresh_preference_table(const sMacAddr &radio_mac,
+ 
+             if (ranked_mhz == op_mhz) {
+                 // Exact bandwidth match: use this channel's rank directly (if ranked).
++                //
++                // GUARD: for the 6GHz 320MHz case, BANDWIDTH_320_1 and BANDWIDTH_320_2 numerically
++                // both have op_mhz==ranked_mhz==320, but they are PHYSICALLY DIFFERENT wide-channel
++                // blocks (offset by 160MHz, distinct center frequencies, non-identical beacon-
++                // channel coverage). Applying one variant's driver rank to the other's cache cell
++                // would land the AP on unranked spectrum. Require SAME-VARIANT identity here so
++                // the driver's per-variant scan result stays on its own variant only.
++                if (!is_same_320_variant_class(op_bw, ranked_bw)) {
++                    continue;
++                }
+                 auto it = chan_rank_map.find(channel);
+                 if (it != chan_rank_map.end() && it->second > 0) {
+                     if (!have_min || it->second < best_min) {
+@@ -445,8 +503,19 @@ bool ChannelSelectionTask::refresh_preference_table(const sMacAddr &radio_mac,
+         return 0;
+     };
+ 
+-    // Temporary map to hold the aggregated ranks per (op-class, channel).
+-    std::map<uint8_t, std::map<uint8_t, AgentDB::sRadio::sPreferenceEntry>> new_cache;
++    // Temporary map to hold the aggregated ranks per (op-class, channel, bandwidth).
++    //
++    // NOTE: the third dimension (bw) is REQUIRED for 6GHz op-class 137 (320MHz). Both
++    // BANDWIDTH_320_1 and BANDWIDTH_320_2 map to op-class 137, but they are physically distinct
++    // wide channel blocks (different center freqs, different beacon coverage, different driver
++    // ranks). A 2-level (op_class, chan) key collapsed both variants into one cell and the
++    // last-iterated variant overwrote the other, silently dropping the positive rank of the
++    // actually-scanned block. Keying on (op_class, chan, bw) preserves both variants
++    // independently and is a no-op for every other op-class (single bw per chan there).
++    std::map<uint8_t,
++             std::map<uint8_t,
++                      std::map<beerocks::eWiFiBandwidth, AgentDB::sRadio::sPreferenceEntry>>>
++        new_cache;
+ 
+     // Build the cache from what the RADIO actually supports (channels_list x supported_bw_list),
+     // projecting a rank onto each (channel, bw) as described above. This is the prop-aligned
+@@ -468,7 +537,7 @@ bool ChannelSelectionTask::refresh_preference_table(const sMacAddr &radio_mac,
+ 
+             const int32_t projected_rank = project_rank(chan, bw);
+ 
+-            auto &entry           = new_cache[op_class][chan];
++            auto &entry           = new_cache[op_class][chan][bw];
+             entry.channel         = chan;
+             entry.operating_class = op_class;
+             entry.bandwidth       = bw;
+@@ -477,54 +546,71 @@ bool ChannelSelectionTask::refresh_preference_table(const sMacAddr &radio_mac,
+             // rank of 0 maps to the operable baseline (pref 1).
+             entry.preference = normalize_rank_to_preference(projected_rank, max_rank_on_radio);
+             entry.reason     = wfa_map::cPreferenceOperatingClasses::eReasonCode::UNSPECIFIED;
++
++            auto drc_it = direct_rank_by_chan.find(chan);
++            if (drc_it != direct_rank_by_chan.end() && drc_it->second > 0) {
++                entry.direct_rank_min_bw = drc_it->second;
++            } else {
++                entry.direct_rank_min_bw = 0;
++            }
+         }
+     }
+ 
+     // Now overlay the non-operable states from the channels_list (DFS, AWGN, unsupported)
+     // and write the ranks into supported_bw_list[bw].rank.
++    //
++    // NOTE: the cache is now 3-level (op_class -> chan -> bw -> entry). Iterate the extra bw
++    // dimension so the overlay is applied to EACH (op_class, chan, bw) entry (this matters for
++    // 6GHz op-class 137, where a single chan carries two entries - 320MHz-1 and 320MHz-2 - each
++    // of which must be overlayed independently).
+     for (auto &opclass_pair : new_cache) {
+         for (auto &chan_pair : opclass_pair.second) {
+-            auto &entry = chan_pair.second;
+-
+-            auto it_ch = radio->channels_list.find(entry.channel);
+-            if (it_ch == radio->channels_list.end()) {
+-                // Channel completely unsupported
+-                entry.preference = 0;
+-                entry.reason = wfa_map::cPreferenceOperatingClasses::eReasonCode::UNSPECIFIED;
+-                continue;
+-            }
++            for (auto &bw_pair : chan_pair.second) {
++                auto &entry = bw_pair.second;
++
++                auto it_ch = radio->channels_list.find(entry.channel);
++                if (it_ch == radio->channels_list.end()) {
++                    // Channel completely unsupported
++                    entry.preference = 0;
++                    entry.reason = wfa_map::cPreferenceOperatingClasses::eReasonCode::UNSPECIFIED;
++                    continue;
++                }
+ 
+-            auto &ch_info = it_ch->second;
+-
+-            // Update AgentDB supported_bw_list rank (used by ZWDFS) and the normalized preference
+-            // (consumed by the Channel Preference Report builder, which reads multiap_preference).
+-            auto bw_it = std::find_if(ch_info.supported_bw_list.begin(), ch_info.supported_bw_list.end(),
+-                                      [&](const beerocks_message::sSupportedBandwidth &sbw) {
+-                                          return sbw.bandwidth == entry.bandwidth;
+-                                      });
+-            if (bw_it != ch_info.supported_bw_list.end()) {
+-                bw_it->rank              = entry.rank;
+-                bw_it->multiap_preference = entry.preference;
+-            } else {
+-                // BW unsupported on this channel
+-                entry.preference = 0;
+-                entry.reason = wfa_map::cPreferenceOperatingClasses::eReasonCode::UNSPECIFIED;
+-                continue;
+-            }
++                auto &ch_info = it_ch->second;
++
++                // Update AgentDB supported_bw_list rank (used by ZWDFS) and the normalized
++                // preference (consumed by the Channel Preference Report builder, which reads
++                // multiap_preference). The match is exact on the SPECIFIC bandwidth variant
++                // (BANDWIDTH_320_1 vs BANDWIDTH_320_2 are kept separate here).
++                auto bw_it = std::find_if(
++                    ch_info.supported_bw_list.begin(), ch_info.supported_bw_list.end(),
++                    [&](const beerocks_message::sSupportedBandwidth &sbw) {
++                        return sbw.bandwidth == entry.bandwidth;
++                    });
++                if (bw_it != ch_info.supported_bw_list.end()) {
++                    bw_it->rank               = entry.rank;
++                    bw_it->multiap_preference = entry.preference;
++                } else {
++                    // BW unsupported on this channel
++                    entry.preference = 0;
++                    entry.reason = wfa_map::cPreferenceOperatingClasses::eReasonCode::UNSPECIFIED;
++                    continue;
++                }
+ 
+-            // Overlay AWGN
+-            if (ch_info.awgn_detected) {
+-                entry.preference = 0;
+-                entry.reason = wfa_map::cPreferenceOperatingClasses::eReasonCode::AWGN_DETECTED;
+-                continue;
+-            }
++                // Overlay AWGN
++                if (ch_info.awgn_detected) {
++                    entry.preference = 0;
++                    entry.reason = wfa_map::cPreferenceOperatingClasses::eReasonCode::AWGN_DETECTED;
++                    continue;
++                }
+ 
+-            // Overlay DFS radar
+-            if (ch_info.dfs_state == beerocks_message::eDfsState::UNAVAILABLE) {
+-                entry.preference = 0;
+-                entry.reason = wfa_map::cPreferenceOperatingClasses::eReasonCode::
+-                    OPERATION_DISALLOWED_DUE_TO_RADAR_DETECTION_ON_A_DFS_CHANNEL;
+-                continue;
++                // Overlay DFS radar
++                if (ch_info.dfs_state == beerocks_message::eDfsState::UNAVAILABLE) {
++                    entry.preference = 0;
++                    entry.reason = wfa_map::cPreferenceOperatingClasses::eReasonCode::
++                        OPERATION_DISALLOWED_DUE_TO_RADAR_DETECTION_ON_A_DFS_CHANNEL;
++                    continue;
++                }
+             }
+         }
+     }
+@@ -538,20 +624,28 @@ bool ChannelSelectionTask::refresh_preference_table(const sMacAddr &radio_mac,
+     // NOTE: log each entry on its OWN line. A single multi-line LOG() gets truncated by the
+     // logger/syslog transport, which is why the per-entry dump was previously not visible even
+     // though "SUCCESS" printed.
++    //
++    // The cache is 3-level; total_entries counts individual (op_class, chan, bw) rows, so both
++    // 320MHz-1 and 320MHz-2 for the same (op_class, chan) show up as separate rows in the dump.
+     size_t total_entries = 0;
+     for (const auto &oc_pair : radio->cbs_preference_table.by_opclass_channel) {
+-        total_entries += oc_pair.second.size();
++        for (const auto &ch_pair : oc_pair.second) {
++            total_entries += ch_pair.second.size();
++        }
+     }
+     LOG(DEBUG) << "[CBS] refresh_preference_table: SUCCESS on radio " << radio_mac << " ("
+                << radio->cbs_preference_table.by_opclass_channel.size() << " op-classes, "
+                << total_entries << " entries):";
+     for (const auto &oc_pair : radio->cbs_preference_table.by_opclass_channel) {
+         for (const auto &ch_pair : oc_pair.second) {
+-            const auto &e = ch_pair.second;
+-            LOG(DEBUG) << "[CBS]   op_class=" << int(oc_pair.first) << " chan=" << int(e.channel)
+-                       << " bw=" << beerocks::utils::convert_bandwidth_to_string(e.bandwidth)
+-                       << " rank=" << e.rank << " -> pref=" << int(e.preference)
+-                       << " reason=" << int(e.reason);
++            for (const auto &bw_pair : ch_pair.second) {
++                const auto &e = bw_pair.second;
++                LOG(DEBUG) << "[CBS]   op_class=" << int(oc_pair.first)
++                           << " chan=" << int(e.channel) << " bw="
++                           << beerocks::utils::convert_bandwidth_to_string(e.bandwidth)
++                           << " rank=" << e.rank << " -> pref=" << int(e.preference)
++                           << " reason=" << int(e.reason);
++            }
+         }
+     }
+ 
+@@ -836,19 +930,28 @@ bool ChannelSelectionTask::select_best_channel_from_cbs(
+     // request. In that case we must NOT arbitrarily pick a rank-0 preferred channel; instead we
+     // return false so the caller falls back to the existing cumulative-preference-score selection
+     // (build_acs_list / check_is_there_better_channel_than_current), preserving legacy behaviour.
++    // Cache is now 3-level (op_class -> chan -> bw -> entry). The extra bw dimension matters for
++    // 6GHz op-class 137 where a single (op_class, chan) can carry both 320MHz-1 and 320MHz-2
++    // entries with independent ranks; the pre-check must iterate all three levels to see the
++    // positive-ranked variant even when the other variant carries rank=0.
+     {
+         bool any_positive_rank_in_preferred = false;
+         for (const auto &oc_pair : cache.by_opclass_channel) {
+             for (const auto &ch_pair : oc_pair.second) {
+-                const auto &e = ch_pair.second;
+-                if (e.preference == 0) {
+-                    continue; // non-operable
+-                }
+-                if (preferred_channels.find(e.channel) == preferred_channels.end()) {
+-                    continue; // not preferred
++                for (const auto &bw_pair : ch_pair.second) {
++                    const auto &e = bw_pair.second;
++                    if (e.preference == 0) {
++                        continue; // non-operable
++                    }
++                    if (preferred_channels.find(e.channel) == preferred_channels.end()) {
++                        continue; // not preferred
++                    }
++                    if (e.rank > 0) {
++                        any_positive_rank_in_preferred = true;
++                        break;
++                    }
+                 }
+-                if (e.rank > 0) {
+-                    any_positive_rank_in_preferred = true;
++                if (any_positive_rank_in_preferred) {
+                     break;
+                 }
+             }
+@@ -873,66 +976,113 @@ bool ChannelSelectionTask::select_best_channel_from_cbs(
+         return (rank > 0) ? static_cast<int64_t>(rank) : INT64_MAX;
+     };
+ 
+-    int64_t  best_key   = INT64_MAX;
+-    uint32_t best_bwmhz = 0;
+-    bool     found      = false;
++    int64_t  best_key        = INT64_MAX;
++    int64_t  best_direct_key = INT64_MAX;
++    uint32_t best_bwmhz      = 0;
++    // Final deterministic tie-break anchor: when rank_key, bw and direct-rank are ALL equal
++    // between two candidates, prefer the LOWER primary channel number. This removes the last
++    // remaining dependency on std::map iteration order so the winner is always well-defined
++    // (previously the running-best simply KEPT whichever channel iterated first - the observed
++    // "picked chan 52 because the iterator started there" bug).
++    uint16_t best_primary     = UINT16_MAX;
++    bool     found           = false;
+     AgentDB::sRadio::sPreferenceEntry best{};
+ 
+     // Selection trace. Each candidate and each running-best update is logged on its OWN LOG line
+     // (a single multi-line LOG gets truncated by the syslog transport, hiding the decisive rows).
+     // "rank_key" is the sort key actually used: lower is better; a positive driver rank maps to
+     // rank_key=rank, while a rank-0 (operable-but-unranked baseline) maps to a very large key so it
+-    // only wins when nothing positively-ranked exists. Tie on rank_key is broken by wider bw_mhz.
++    // only wins when nothing positively-ranked exists. Tie on rank_key is broken by wider bw_mhz,
++    // and a tie on both rank_key and bw_mhz is broken by preferring the primary with a positive
++    // DIRECT driver rank.
+     LOG(DEBUG) << "[CBS] select_best_channel_from_cbs: radio=" << radio_mac
+                << " preferred_count=" << preferred_channels.size()
+-               << " -- evaluating candidates (policy: lowest rank_key wins; tie -> wider bw). "
++               << " -- evaluating candidates (policy: lowest rank_key wins; tie -> wider bw; "
++                  "tie -> better direct_rank_min_bw). "
+                   "NOTE: this is a RANK-FIRST selection, not a bw_weight*preference score.";
+ 
++    // 3-level iteration: for each (op_class, chan, bw) the cache stores an independent entry, so
++    // the two 6GHz 320MHz variants (BANDWIDTH_320_1 / BANDWIDTH_320_2) compete against each other
++    // AND against every other bandwidth on the same primary channel. The tie-break "same rank_key,
++    // wider bw" resolves to whichever variant happens to be wider (both are 320 MHz, so the map
++    // insertion order breaks the tie deterministically) - which is desired because the driver only
++    // ranks the physical block it actually scanned, so exactly one of the two variants carries a
++    // positive rank and the other stays at rank=0.
+     size_t candidate_count = 0;
+     for (const auto &oc_pair : cache.by_opclass_channel) {
+         for (const auto &ch_pair : oc_pair.second) {
+-            const auto &e = ch_pair.second;
+-            if (e.preference == 0) {
+-                continue; // non-operable in CBS (radar/awgn/unsupported)
+-            }
+-            if (preferred_channels.find(e.channel) == preferred_channels.end()) {
+-                continue; // not in controller-preferred set
+-            }
+-            ++candidate_count;
+-            const uint32_t bw_mhz = bw_to_mhz(e.bandwidth);
+-            const int64_t  key    = rank_key(e.rank);
+-
+-            // Best (lowest) rank_key wins; tie-break by higher bandwidth.
+-            bool better = false;
+-            const char *reason = "not-better";
+-            if (!found) {
+-                better = true;
+-                reason = "first-candidate";
+-            } else if (key < best_key) {
+-                better = true;
+-                reason = "lower-rank_key";
+-            } else if (key == best_key && bw_mhz > best_bwmhz) {
+-                better = true;
+-                reason = "same-rank_key-wider-bw";
+-            }
++            for (const auto &bw_pair : ch_pair.second) {
++                const auto &e = bw_pair.second;
++                if (e.preference == 0) {
++                    continue; // non-operable in CBS (radar/awgn/unsupported)
++                }
++                if (preferred_channels.find(e.channel) == preferred_channels.end()) {
++                    continue; // not in controller-preferred set
++                }
++                ++candidate_count;
++                const uint32_t bw_mhz     = bw_to_mhz(e.bandwidth);
++                const int64_t  key        = rank_key(e.rank);
++                const int64_t  direct_key = rank_key(e.direct_rank_min_bw);
++                const uint16_t primary    = static_cast<uint16_t>(e.channel);
++
++                // Best (lowest) rank_key wins.
++                // Tie-break 1: wider bandwidth.
++                // Tie-break 2: better (lower) direct driver rank for the primary channel.
++                // Tie-break 3 (final, deterministic): lower primary channel number. This is the
++                //             decisive fix for the reported bug: when the wide-BW projection makes
++                //             several primaries share the SAME rank_key and bw (e.g. the 80MHz
++                //             block {52,56,60,64} all inherit rank=3) AND none/all of them carry a
++                //             positive direct rank, the previous code silently KEPT whichever
++                //             primary iterated first. Making the last tie-break an explicit,
++                //             value-based comparison removes the dependency on std::map iteration
++                //             order so the winner is always well-defined instead of "whatever the
++                //             iterator happened to visit first".
++                bool better        = false;
++                const char *reason = "not-better";
++                if (!found) {
++                    better = true;
++                    reason = "first-candidate";
++                } else if (key < best_key) {
++                    better = true;
++                    reason = "lower-rank_key";
++                } else if (key == best_key) {
++                    if (bw_mhz > best_bwmhz) {
++                        better = true;
++                        reason = "same-rank_key-wider-bw";
++                    } else if (bw_mhz == best_bwmhz) {
++                        if (direct_key < best_direct_key) {
++                            better = true;
++                            reason = "same-rank_key-same-bw-better-direct-rank";
++                        } else if (direct_key == best_direct_key && primary < best_primary) {
++                            better = true;
++                            reason = "same-rank_key-same-bw-same-direct-rank-lower-primary";
++                        }
++                    }
++                }
+ 
+-            LOG(DEBUG) << "[CBS]   candidate op_class=" << int(e.operating_class)
+-                       << " chan=" << int(e.channel)
+-                       << " bw=" << beerocks::utils::convert_bandwidth_to_string(e.bandwidth)
+-                       << " (" << bw_mhz << "MHz)"
+-                       << " pref=" << int(e.preference) << " rank=" << e.rank
+-                       << " rank_key=" << (key == INT64_MAX ? -1 : key) << " -> "
+-                       << (better ? "NEW-BEST" : "keep-current-best") << " [" << reason << "]"
+-                       << (better ? "" : (" (current best: chan=" + std::to_string(int(best.channel)) +
+-                                          " bw=" +
+-                                          beerocks::utils::convert_bandwidth_to_string(best.bandwidth) +
+-                                          " rank=" + std::to_string(best.rank) + ")"));
+-
+-            if (better) {
+-                best_key   = key;
+-                best_bwmhz = bw_mhz;
+-                best       = e;
+-                found      = true;
++                LOG(DEBUG) << "[CBS]   candidate op_class=" << int(e.operating_class)
++                           << " chan=" << int(e.channel)
++                           << " bw=" << beerocks::utils::convert_bandwidth_to_string(e.bandwidth)
++                           << " (" << bw_mhz << "MHz)"
++                           << " pref=" << int(e.preference) << " rank=" << e.rank
++                           << " rank_key=" << (key == INT64_MAX ? -1 : key)
++                           << " direct_rank=" << e.direct_rank_min_bw << " -> "
++                           << (better ? "NEW-BEST" : "keep-current-best") << " [" << reason << "]"
++                           << (better
++                                   ? ""
++                                   : (" (current best: chan=" + std::to_string(int(best.channel)) +
++                                      " bw=" +
++                                      beerocks::utils::convert_bandwidth_to_string(best.bandwidth) +
++                                      " rank=" + std::to_string(best.rank) + ")"));
++
++                if (better) {
++                    best_key        = key;
++                    best_bwmhz      = bw_mhz;
++                    best_direct_key = direct_key;
++                    best_primary    = primary;
++                    best            = e;
++                    found           = true;
++                }
+             }
+         }
+     }
+@@ -940,7 +1090,8 @@ bool ChannelSelectionTask::select_best_channel_from_cbs(
+                << " preferred&operable candidate(s); winner (pre-bw-upgrade): chan="
+                << int(best.channel) << " op_class=" << int(best.operating_class)
+                << " bw=" << beerocks::utils::convert_bandwidth_to_string(best.bandwidth)
+-               << " rank=" << best.rank << " rank_key=" << (best_key == INT64_MAX ? -1 : best_key);
++               << " rank=" << best.rank << " rank_key=" << (best_key == INT64_MAX ? -1 : best_key)
++               << " direct_rank_min_bw=" << best.direct_rank_min_bw;
+ 
+     if (!found) {
+         LOG(WARNING) << "[CBS] select_best_channel_from_cbs: no feasible (preferred & operable) "
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index b7bdc8f..baa26a2 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -5658,24 +5658,29 @@ bool ap_wlan_hal_nl80211::trigger_cbs()
+ 
+ bool ap_wlan_hal_nl80211::acs_clear_block_chan_list()
+ {
+-    const std::string link_iface = m_radio_info.iface_name;
+-    std::string radio_iface;
+-    extractLinkBaseInterface(link_iface, radio_iface);
+-    if (radio_iface.empty()) {
+-        radio_iface = link_iface;
+-    }
+-    if (!is_wpa_ctrl_interface_registered(radio_iface)) {
+-        if (add_interface(radio_iface) < 0) {
+-            LOG(WARNING) << "acs_clear_block_chan_list: add_interface(" << radio_iface
++    // Send the hostapd "ACS clear_block_chan_list" control command directly to the wpa_ctrl socket
++    // of THIS radio's interface (m_radio_info.iface_name). Do NOT derive a "base" interface via
++    // extractLinkBaseInterface(): on MLD the "wlanX" base socket maps hostapd-side to link 0's
++    // hapd context, so sending an "ACS ..." control command there would mis-target link 0's
++    // block list regardless of which radio actually asked for it (this was the observed 5GHz
++    // block-list-landing-on-2.4GHz bug). m_radio_info.iface_name already identifies THIS radio
++    // (MLD link iface like wlanX_linkN, or a plain iface in SLO); hostapd dispatches the
++    // command to the correct per-link hapd based on the receiving control socket. Same fix
++    // pattern applied to read_acs_ranks() and trigger_cbs().
++    const std::string target_iface = m_radio_info.iface_name;
++
++    if (!is_wpa_ctrl_interface_registered(target_iface)) {
++        if (add_interface(target_iface) < 0) {
++            LOG(WARNING) << "acs_clear_block_chan_list: add_interface(" << target_iface
+                          << ") failed; will still attempt to send on it";
+         }
+     }
+ 
+     char *reply           = nullptr;
+     const std::string cmd = "ACS clear_block_chan_list";
+-    LOG(INFO) << "acs_clear_block_chan_list: sending '" << cmd << "' on iface=" << radio_iface;
+-    if (!wpa_ctrl_send_msg(cmd, &reply, radio_iface)) {
+-        LOG(ERROR) << "acs_clear_block_chan_list: '" << cmd << "' failed on iface=" << radio_iface
++    LOG(INFO) << "acs_clear_block_chan_list: sending '" << cmd << "' on iface=" << target_iface;
++    if (!wpa_ctrl_send_msg(cmd, &reply, target_iface)) {
++        LOG(ERROR) << "acs_clear_block_chan_list: '" << cmd << "' failed on iface=" << target_iface
+                    << " reply='" << (reply ? reply : "") << "'";
+         return false;
+     }
+@@ -5685,22 +5690,22 @@ bool ap_wlan_hal_nl80211::acs_clear_block_chan_list()
+ 
+ bool ap_wlan_hal_nl80211::acs_set_block_chan_list(const std::vector<uint8_t> &channels)
+ {
+-    const std::string link_iface = m_radio_info.iface_name;
+-    std::string radio_iface;
+-    extractLinkBaseInterface(link_iface, radio_iface);
+-    if (radio_iface.empty()) {
+-        radio_iface = link_iface;
+-    }
+-    if (!is_wpa_ctrl_interface_registered(radio_iface)) {
+-        if (add_interface(radio_iface) < 0) {
+-            LOG(WARNING) << "acs_set_block_chan_list: add_interface(" << radio_iface
++    // See acs_clear_block_chan_list() for the rationale: send the "ACS set_block_chan_list ..."
++    // control command directly to m_radio_info.iface_name, NOT to any "base" interface, so the
++    // block list lands on the correct radio's link (previously the 5GHz block list was being
++    // written onto link 0 = 2.4GHz because we targeted the MLD "base" socket).
++    const std::string target_iface = m_radio_info.iface_name;
++
++    if (!is_wpa_ctrl_interface_registered(target_iface)) {
++        if (add_interface(target_iface) < 0) {
++            LOG(WARNING) << "acs_set_block_chan_list: add_interface(" << target_iface
+                          << ") failed; will still attempt to send on it";
+         }
+     }
+ 
+     if (channels.empty()) {
+         LOG(DEBUG) << "acs_set_block_chan_list: empty channel list, nothing to set on iface="
+-                   << radio_iface;
++                   << target_iface;
+         return true;
+     }
+ 
+@@ -5713,9 +5718,9 @@ bool ap_wlan_hal_nl80211::acs_set_block_chan_list(const std::vector<uint8_t> &ch
+ 
+     char *reply = nullptr;
+     LOG(INFO) << "acs_set_block_chan_list: sending '" << cmd << "' (" << channels.size()
+-              << " channels) on iface=" << radio_iface;
+-    if (!wpa_ctrl_send_msg(cmd, &reply, radio_iface)) {
+-        LOG(ERROR) << "acs_set_block_chan_list: '" << cmd << "' failed on iface=" << radio_iface
++              << " channels) on iface=" << target_iface;
++    if (!wpa_ctrl_send_msg(cmd, &reply, target_iface)) {
++        LOG(ERROR) << "acs_set_block_chan_list: '" << cmd << "' failed on iface=" << target_iface
+                    << " reply='" << (reply ? reply : "") << "'";
+         return false;
+     }
+@@ -5727,24 +5732,23 @@ bool ap_wlan_hal_nl80211::acs_get_block_chan_list(std::vector<uint8_t> &out_chan
+ {
+     out_channels.clear();
+ 
+-    const std::string link_iface = m_radio_info.iface_name;
+-    std::string radio_iface;
+-    extractLinkBaseInterface(link_iface, radio_iface);
+-    if (radio_iface.empty()) {
+-        radio_iface = link_iface;
+-    }
+-    if (!is_wpa_ctrl_interface_registered(radio_iface)) {
+-        if (add_interface(radio_iface) < 0) {
+-            LOG(WARNING) << "acs_get_block_chan_list: add_interface(" << radio_iface
++    // See acs_clear_block_chan_list() for the rationale: read the block list from
++    // m_radio_info.iface_name (this radio's link/plain iface), NOT any derived "base" iface.
++    // Symmetric with the set/clear paths so we read from the same per-radio bucket we wrote to.
++    const std::string target_iface = m_radio_info.iface_name;
++
++    if (!is_wpa_ctrl_interface_registered(target_iface)) {
++        if (add_interface(target_iface) < 0) {
++            LOG(WARNING) << "acs_get_block_chan_list: add_interface(" << target_iface
+                          << ") failed; will still attempt to send on it";
+         }
+     }
+ 
+     char *reply           = nullptr;
+     const std::string cmd = "ACS get_block_chan_list";
+-    if (!wpa_ctrl_send_msg(cmd, &reply, radio_iface) || !reply) {
++    if (!wpa_ctrl_send_msg(cmd, &reply, target_iface) || !reply) {
+         LOG(DEBUG) << "acs_get_block_chan_list: '" << cmd << "' failed/empty on iface="
+-                   << radio_iface;
++                   << target_iface;
+         return false;
+     }
+ 
+@@ -5772,7 +5776,7 @@ bool ap_wlan_hal_nl80211::acs_get_block_chan_list(std::vector<uint8_t> &out_chan
+     flush_token();
+ 
+     LOG(DEBUG) << "acs_get_block_chan_list: parsed " << out_channels.size()
+-               << " blocked channel(s) on iface=" << radio_iface;
++               << " blocked channel(s) on iface=" << target_iface;
+     return true;
+ }
+ 
+-- 
+2.34.1
+
