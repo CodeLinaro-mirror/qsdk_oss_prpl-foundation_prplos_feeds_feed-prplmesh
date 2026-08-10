@@ -1,0 +1,580 @@
+From 8b82d8262b73aa1485dffbde0fe8dc4cd06ce6cf Mon Sep 17 00:00:00 2001
+From: Muthuchamy Kumar <muthucha@qti.qualcomm.com>
+Date: Wed, 19 Aug 2026 12:36:22 +0530
+Subject: [PATCH] patch: fix code-review issues in DPP chirp/onboarding patch
+ series
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Addresses every issue raised by code review against the recent DPP
+bSTA-onboarding/chirp changes (backhaul_manager.cpp, son_slave_thread.cpp,
+ap_autoconfiguration_task.cpp, dpp_agent_task.cpp, bpl_cfg_wifi.cpp,
+beerocks_event_loop_impl.cpp):
+
+- backhaul_manager.h/.cpp: fix DPP bridge socket resource leak —
+  m_dpp_bridge_delivered/m_dpp_1905_bridge_delivered now track whether each
+  credential set has been forwarded to AgentDB, and
+  process_dpp_bridge_events() closes m_dpp_bridge_socket and removes its
+  event-loop handler once both sets are delivered, instead of leaving the
+  wpa_supplicant event socket open indefinitely. Replace the hardcoded
+  bSTAList AKM string in inject_dpp_bootstrap_key_and_conf_req() with a new
+  bwl_security_to_bh_akm() helper that derives the AKM combo from the
+  agent's actual configured backhaul security type
+  (AgentDB::device_conf.back_radio.security_type), mirroring the
+  controller-side wsc_auth_to_bh_akm() design. Fix a base64 decode padding
+  bug in extract_net_role_from_connector(): EVP_DecodeBlock() always
+  returns a length that is a multiple of 3 regardless of trailing '='
+  padding, so the decoded length is now corrected for counted padding
+  characters before use.
+
+- ap_autoconfiguration_task.cpp: replace the hand-rolled DPP BSS
+  Configuration Response JSON parsing's hardcoded magic-number offsets
+  with an extract_quoted_field() lambda (offset derived from the search
+  key's own length) and size()-derived offsets for the non-string fields,
+  so the parsing can no longer silently drift if a key's text changes.
+  Give base_auth_type a defensive default initializer — every branch of
+  its resolving if/else-if chain already assigned it, but the bare
+  declaration is fragile against a future branch that forgets to. Also
+  drops the comment above the vap_label extraction line.
+
+- dpp_agent_task.cpp: jwk_pubkey_to_der() hardcoded the "P-256" curve name
+  and 32-byte x/y coordinate length regardless of the JWK's own "crv"
+  field. Now reads "crv" from the JWK and derives both the OpenSSL group
+  name and the coordinate length from it (P-256: 32, P-384: 48, P-521:
+  66), defaulting to P-256 only when "crv" is absent.
+
+- framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp: dpp_connector/
+  dpp_csign/dpp_netaccesskey were being derived unconditionally for every
+  BSS, writing empty strings to UCI for non-DPP BSSes. Both occurrences
+  now scope those three options inside the same
+  WSC_AUTH_DPP-conditional as the sibling dpp/dpp_controller/
+  dpp_configurator_connectivity options, explicitly clearing them for
+  non-DPP BSSes instead of leaving them to be silently derived as empty.
+
+- common/beerocks/bcl/source/beerocks_event_loop_impl.cpp:
+  EventLoopImpl::register_handlers() now explicitly erases a detected-
+  stale map entry before attempting epoll_ctl(ADD), restoring it only if
+  the add fails with the fd still genuinely tracked by the kernel —
+  cleans up stale bookkeeping left behind by a previous owner closing the
+  fd directly, without risking corruption of a genuinely-active
+  registration.
+
+- son_slave_thread.cpp: move the anonymous namespace holding
+  base64url_encode()/der_pubkey_to_jwk() (which uses the LOG macro) out
+  from between two halves of the file's #include block into the
+  "Local Module Functions" section where it belongs. Pure relocation, no
+  logic change.
+---
+ .../backhaul_manager/backhaul_manager.cpp     | 37 ++++++-
+ agent/src/beerocks/slave/son_slave_thread.cpp | 54 +++++-----
+ .../slave/tasks/ap_autoconfiguration_task.cpp | 99 +++++++------------
+ .../beerocks/slave/tasks/dpp_agent_task.cpp   | 35 +++++--
+ .../bcl/source/beerocks_event_loop_impl.cpp   | 18 +++-
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     | 72 ++++++++------
+ 6 files changed, 181 insertions(+), 134 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 2737a6db0..49fd2c9a4 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -5327,6 +5327,28 @@ void BackhaulManager::retry_dpp_chirp_after_failure(const std::string &sta_iface
+ // DPP bootstrap key injection — wpa_supplicant setup for a wireless bSTA
+ // ---------------------------------------------------------------------------
+ 
++// AKM OUI values (Wi-Fi Alliance DPP OUI 50:6F:9A type 2, IEEE 802.11 AKM suite selectors):
++//   506F9A02 = DPP, 000FAC02 = PSK (WPA2-Personal), 000FAC08 = SAE (WPA3-Personal).
++// DPP is always prepended for the BH bSTA (the agent authenticates via the DPP connector), then
++// the AKM(s) matching the backhaul network's actual configured security are appended — mirrors
++// wsc_auth_to_bh_akm()/wsc_auth_to_fh_akm() in the controller's dpp_configurator_task.cpp, just
++// driven by the agent's own bwl::WiFiSec config instead of a WSC::eWscAuth from a TLV.
++static std::string bwl_security_to_bh_akm(bwl::WiFiSec security_type)
++{
++    switch (security_type) {
++    case bwl::WiFiSec::WPA2_PSK:
++        return "506F9A02+000FAC02";
++    case bwl::WiFiSec::WPA3_PSK:
++        return "506F9A02+000FAC08";
++    case bwl::WiFiSec::WPA2_WPA3_PSK:
++        return "506F9A02+000FAC08+000FAC02";
++    default:
++        LOG(WARNING) << "DPP: unsupported backhaul security type " << security_type
++                     << " for bSTAList AKM — defaulting to DPP+SAE";
++        return "506F9A02+000FAC08";
++    }
++}
++
+ bool BackhaulManager::inject_dpp_bootstrap_key_and_conf_req(
+     const std::shared_ptr<sRadioInfo> &radio_info)
+ {
+@@ -5367,8 +5389,9 @@ bool BackhaulManager::inject_dpp_bootstrap_key_and_conf_req(
+     db->dpp_bootstrap.dpp_uri = uri;
+ 
+     // Set bSTAList for the EasyMesh config request.
++    std::string akm = bwl_security_to_bh_akm(db->device_conf.back_radio.security_type);
+     std::string bsta_val = "[{\"netRole\":\"mapBackhaulSta\","
+-                           "\"akm\":\"506F9A02+000FAC08\","
++                           "\"akm\":\"" + akm + "\","
+                            "\"channelList\":\"81/1,6,11,115/36,121/100,125/149\"}]";
+     radio_info->sta_wlan_hal->dpp_set_extra_conf_req_bsta_list(bsta_val);
+ 
+@@ -5404,12 +5427,24 @@ std::string BackhaulManager::extract_net_role_from_connector(const std::string &
+     while (s.size() % 4) {
+         s += '=';
+     }
++    // EVP_DecodeBlock() always returns a length that is a multiple of 3 (one full 4-char base64
++    // group -> 3 bytes), regardless of trailing '=' padding — it does NOT subtract the 1-2 bytes
++    // that padding indicates are not actually part of the payload. Callers must do that
++    // themselves, or the decoded buffer ends up with 1-2 bogus trailing bytes.
++    size_t pad_len = 0;
++    for (auto it = s.rbegin(); it != s.rend() && *it == '='; ++it) {
++        ++pad_len;
++    }
+     std::vector<uint8_t> raw(s.size());
+     int len = EVP_DecodeBlock(raw.data(), reinterpret_cast<const unsigned char *>(s.c_str()),
+                                static_cast<int>(s.size()));
+     if (len <= 0) {
+         return {};
+     }
++    len -= static_cast<int>(pad_len);
++    if (len <= 0) {
++        return {};
++    }
+     std::string payload_json(reinterpret_cast<const char *>(raw.data()),
+                              static_cast<size_t>(len));
+ 
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index fb7306e51..310a6c9f8 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -93,6 +93,33 @@
+ 
+ #include <cstring>
+ 
++#include <algorithm>
++#include <fstream>
++#include <string>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <unistd.h>
++#include <sstream>
++
++#include <sys/socket.h>
++#include <net/if.h>
++
++//////////////////////////////////////////////////////////////////////////////
++///////////////////////////////// Constatnts /////////////////////////////////
++//////////////////////////////////////////////////////////////////////////////
++
++constexpr int SLAVE_INIT_DELAY_SEC                                    = 4;
++constexpr int WAIT_FOR_PLATFORM_MANAGER_REGISTER_RESPONSE_TIMEOUT_SEC = 600;
++constexpr int MONITOR_HEARTBEAT_TIMEOUT_SEC                           = 10;
++constexpr int MONITOR_HEARTBEAT_RETRIES                               = 10;
++constexpr int AP_MANAGER_HEARTBEAT_TIMEOUT_SEC                        = 10;
++constexpr int AP_MANAGER_HEARTBEAT_RETRIES                            = 10;
++constexpr std::chrono::seconds WAIT_FOR_FRONTHAUL_JOINED_TIMEOUT_SEC  = std::chrono::seconds(60);
++
++//////////////////////////////////////////////////////////////////////////////
++/////////////////////////// Local Module Functions ///////////////////////////
++//////////////////////////////////////////////////////////////////////////////
++
+ namespace {
+ 
+ // Mirrors controller-side DppCryptoHelper::ec_key_to_jwk() (not linked into the agent build);
+@@ -166,33 +193,6 @@ bool der_pubkey_to_jwk(const std::vector<uint8_t> &der, std::string &jwk_out)
+ 
+ } // namespace
+ 
+-#include <algorithm>
+-#include <fstream>
+-#include <string>
+-#include <sys/stat.h>
+-#include <sys/types.h>
+-#include <unistd.h>
+-#include <sstream>
+-
+-#include <sys/socket.h>
+-#include <net/if.h>
+-
+-//////////////////////////////////////////////////////////////////////////////
+-///////////////////////////////// Constatnts /////////////////////////////////
+-//////////////////////////////////////////////////////////////////////////////
+-
+-constexpr int SLAVE_INIT_DELAY_SEC                                    = 4;
+-constexpr int WAIT_FOR_PLATFORM_MANAGER_REGISTER_RESPONSE_TIMEOUT_SEC = 600;
+-constexpr int MONITOR_HEARTBEAT_TIMEOUT_SEC                           = 10;
+-constexpr int MONITOR_HEARTBEAT_RETRIES                               = 10;
+-constexpr int AP_MANAGER_HEARTBEAT_TIMEOUT_SEC                        = 10;
+-constexpr int AP_MANAGER_HEARTBEAT_RETRIES                            = 10;
+-constexpr std::chrono::seconds WAIT_FOR_FRONTHAUL_JOINED_TIMEOUT_SEC  = std::chrono::seconds(60);
+-
+-//////////////////////////////////////////////////////////////////////////////
+-/////////////////////////// Local Module Functions ///////////////////////////
+-//////////////////////////////////////////////////////////////////////////////
+-
+ //////////////////////////////////////////////////////////////////////////////
+ /////////////////////////////// Implementation ///////////////////////////////
+ //////////////////////////////////////////////////////////////////////////////
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 343dd3fee..5b0a10cfe 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -2184,66 +2184,48 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+ 
+             sDppBssConfig cfg;
+ 
++            // Extracts `"key":"value"` and returns value, or empty if key is absent. The offset
++            // past the opening quote is derived from the search string's own length, so the two
++            // can never silently drift apart if the key text is ever changed.
++            auto extract_quoted_field = [&json](const std::string &key) -> std::string {
++                std::string needle = "\"" + key + "\":\"";
++                auto pos = json.find(needle);
++                if (pos == std::string::npos) {
++                    return {};
++                }
++                pos += needle.size();
++                auto end = json.find('"', pos);
++                if (end == std::string::npos) {
++                    return {};
++                }
++                return json.substr(pos, end - pos);
++            };
++
+             // Extract wi-fi_tech ("map" = backhaul BSS, "inframap" = fronthaul BSS)
+-            auto tech_pos = json.find("\"wi-fi_tech\":\"");
+-            if (tech_pos != std::string::npos) {
+-                tech_pos += 14;
+-                auto tech_end = json.find('"', tech_pos);
+-                if (tech_end != std::string::npos)
+-                    cfg.wifi_tech = json.substr(tech_pos, tech_end - tech_pos);
+-            }
++            cfg.wifi_tech = extract_quoted_field("wi-fi_tech");
+ 
+             // Extract SSID from discovery.ssid
+-            auto ssid_pos = json.find("\"ssid\":\"");
+-            if (ssid_pos != std::string::npos) {
+-                ssid_pos += 8;
+-                auto ssid_end = json.find('"', ssid_pos);
+-                if (ssid_end != std::string::npos)
+-                    cfg.ssid = json.substr(ssid_pos, ssid_end - ssid_pos);
+-            }
++            cfg.ssid = extract_quoted_field("ssid");
+ 
+             // Extract RUID from discovery.RUID (hex, no colons, e.g. "00037f123535")
+-            auto ruid_pos = json.find("\"RUID\":\"");
+-            if (ruid_pos != std::string::npos) {
+-                ruid_pos += 8;
+-                auto ruid_end = json.find('"', ruid_pos);
+-                if (ruid_end != std::string::npos)
+-                    cfg.ruid = json.substr(ruid_pos, ruid_end - ruid_pos);
+-            }
++            cfg.ruid = extract_quoted_field("RUID");
+ 
+             // Extract AKM
+-            auto akm_pos = json.find("\"akm\":\"");
+-            if (akm_pos != std::string::npos) {
+-                akm_pos += 7;
+-                auto akm_end = json.find('"', akm_pos);
+-                if (akm_end != std::string::npos)
+-                    cfg.akm = json.substr(akm_pos, akm_end - akm_pos);
+-            }
++            cfg.akm = extract_quoted_field("akm");
+ 
+             // Extract passphrase
+-            auto pass_pos = json.find("\"pass\":\"");
+-            if (pass_pos != std::string::npos) {
+-                pass_pos += 8;
+-                auto pass_end = json.find('"', pass_pos);
+-                if (pass_end != std::string::npos)
+-                    cfg.passphrase = json.substr(pass_pos, pass_end - pass_pos);
+-            }
++            cfg.passphrase = extract_quoted_field("pass");
+ 
+             // Extract signedConnector (DPP Connector, JWS compact serialization string)
+-            auto connector_pos = json.find("\"signedConnector\":\"");
+-            if (connector_pos != std::string::npos) {
+-                connector_pos += 19;
+-                auto connector_end = json.find('"', connector_pos);
+-                if (connector_end != std::string::npos)
+-                    cfg.signed_connector = json.substr(connector_pos, connector_end - connector_pos);
+-            }
++            cfg.signed_connector = extract_quoted_field("signedConnector");
+ 
+             // Extract csign (Configurator C-sign-key). Unlike other fields this is an
+             // embedded JSON object, not a quoted string, so find the matching closing
+             // brace by depth instead of the next quote.
+-            auto csign_pos = json.find("\"csign\":");
++            static const std::string kCsignKey = "\"csign\":";
++            auto csign_pos = json.find(kCsignKey);
+             if (csign_pos != std::string::npos) {
+-                csign_pos += 8;
++                csign_pos += kCsignKey.size();
+                 int depth  = 0;
+                 size_t end = csign_pos;
+                 for (; end < json.size(); ++end) {
+@@ -2260,9 +2242,10 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+             }
+ 
+             // Extract map_bss_type (present on the 1905-layer and BH BSS objects)
+-            auto bss_type_pos = json.find("\"map_bss_type\":");
++            static const std::string kMapBssTypeKey = "\"map_bss_type\":";
++            auto bss_type_pos = json.find(kMapBssTypeKey);
+             if (bss_type_pos != std::string::npos) {
+-                const char *s = json.c_str() + bss_type_pos + 15;
++                const char *s = json.c_str() + bss_type_pos + kMapBssTypeKey.size();
+                 char *end_ptr = nullptr;
+                 long v = strtol(s, &end_ptr, 10);
+                 if (end_ptr != s) cfg.map_bss_type = static_cast<uint8_t>(v);
+@@ -2270,32 +2253,20 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+ 
+             // Extract SSIDAdvertisement — false = hidden SSID, true/absent = advertised.
+             // Per EasyMesh v6.1 Table 6: boolean field in the DPP config object.
+-            auto advert_pos = json.find("\"SSIDAdvertisement\":");
++            static const std::string kSsidAdvertKey = "\"SSIDAdvertisement\":";
++            auto advert_pos = json.find(kSsidAdvertKey);
+             if (advert_pos != std::string::npos) {
+                 cfg.ssid_advert_present = true;
+-                const char *s = json.c_str() + advert_pos + 20;
++                const char *s = json.c_str() + advert_pos + kSsidAdvertKey.size();
+                 while (*s == ' ') ++s;
+                 // value is JSON boolean: true or false
+                 cfg.hidden_ssid = (strncmp(s, "false", 5) == 0);
+             }
+ 
+-            // Extract vap_label from "Extension-ID" (QCA proprietary vendor field)
+-            auto ext_id_pos = json.find("\"Extension-ID\":\"");
+-            if (ext_id_pos != std::string::npos) {
+-                ext_id_pos += 16;
+-                auto ext_id_end = json.find('"', ext_id_pos);
+-                if (ext_id_end != std::string::npos)
+-                    cfg.vap_label = json.substr(ext_id_pos, ext_id_end - ext_id_pos);
+-            }
++            cfg.vap_label = extract_quoted_field("Extension-ID");
+ 
+             // Extract custom_alias from "customAlias" (VAP role tag: home/guest/video/backhaul/hotspot)
+-            auto alias_pos = json.find("\"customAlias\":\"");
+-            if (alias_pos != std::string::npos) {
+-                alias_pos += 15;
+-                auto alias_end = json.find('"', alias_pos);
+-                if (alias_end != std::string::npos)
+-                    cfg.custom_alias = json.substr(alias_pos, alias_end - alias_pos);
+-            }
++            cfg.custom_alias = extract_quoted_field("customAlias");
+ 
+             if (!cfg.ssid.empty()) {
+                 LOG(INFO) << "DPP BSS Config: ssid=" << cfg.ssid
+@@ -2402,7 +2373,7 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+                 LOG(DEBUG) << "DPP: AKM='" << dpp_cfg.akm << "' → dpp=" << has_dpp
+                            << " psk=" << has_psk << " sae=" << has_sae;
+ 
+-                WSC::eWscAuth base_auth_type;
++                WSC::eWscAuth base_auth_type = WSC::eWscAuth::WSC_AUTH_OPEN;
+                 if (has_dpp && !has_psk && !has_sae && dpp_cfg.passphrase.empty()) {
+                     // DPP-only: connector-based auth, no PSK/SAE passphrase. Per hostapd
+                     // (wpa_key_mgmt=DPP, src/ap/ap_config.h dpp_connector/dpp_csign/
+diff --git a/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp b/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
+index f1d8eecbc..daf853269 100644
+--- a/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
++++ b/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
+@@ -3390,31 +3390,50 @@ std::vector<uint8_t> DppAgentTask::jwk_pubkey_to_der(const std::string &jwk_json
+ 
+     std::string x_b64 = extract_jwk_field("x");
+     std::string y_b64 = extract_jwk_field("y");
++    std::string crv   = extract_jwk_field("crv");
+     if (x_b64.empty() || y_b64.empty()) {
+         LOG(ERROR) << "jwk_pubkey_to_der: jwk missing x or y";
+         return {};
+     }
+ 
++    // DPP Configurators may sign with any of the curves listed in the DPP spec, not just
++    // P-256 -- the JWK's own "crv" tells us which one this key actually is. Coordinate byte
++    // length is curve-dependent (P-256: 32, P-384: 48, P-521: 66); getting it wrong truncates
++    // or misreads x/y for anything other than P-256. Default to P-256 only if "crv" is absent,
++    // matching the previous unconditional assumption for that one case.
++    size_t coord_len = 32;
++    if (crv.empty() || crv == "P-256") {
++        crv       = "P-256";
++        coord_len = 32;
++    } else if (crv == "P-384") {
++        coord_len = 48;
++    } else if (crv == "P-521") {
++        coord_len = 66;
++    } else {
++        LOG(ERROR) << "jwk_pubkey_to_der: unsupported jwk curve '" << crv << "'";
++        return {};
++    }
++
+     std::vector<uint8_t> x_bytes = base64url_decode(x_b64);
+     std::vector<uint8_t> y_bytes = base64url_decode(y_b64);
+-    if (x_bytes.size() < 32 || y_bytes.size() < 32) {
+-        LOG(ERROR) << "jwk_pubkey_to_der: x or y too short";
++    if (x_bytes.size() < coord_len || y_bytes.size() < coord_len) {
++        LOG(ERROR) << "jwk_pubkey_to_der: x or y too short for curve " << crv;
+         return {};
+     }
+ 
+-    // Build uncompressed EC point: 0x04 || x(32) || y(32)
+-    uint8_t pub[65];
++    // Build uncompressed EC point: 0x04 || x(coord_len) || y(coord_len)
++    std::vector<uint8_t> pub(1 + 2 * coord_len);
+     pub[0] = 0x04;
+-    memcpy(pub + 1,  x_bytes.data(), 32);
+-    memcpy(pub + 33, y_bytes.data(), 32);
++    memcpy(pub.data() + 1, x_bytes.data(), coord_len);
++    memcpy(pub.data() + 1 + coord_len, y_bytes.data(), coord_len);
+ 
+     EVP_PKEY *pkey = nullptr;
+     OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
+     OSSL_PARAM *par     = nullptr;
+     EVP_PKEY_CTX *fctx  = nullptr;
+     if (bld) {
+-        OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME, "P-256", 0);
+-        OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY, pub, 65);
++        OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME, crv.c_str(), 0);
++        OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY, pub.data(), pub.size());
+         par = OSSL_PARAM_BLD_to_param(bld);
+     }
+     fctx = EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr);
+diff --git a/common/beerocks/bcl/source/beerocks_event_loop_impl.cpp b/common/beerocks/bcl/source/beerocks_event_loop_impl.cpp
+index a2fbd6d95..9db3bd0e6 100755
+--- a/common/beerocks/bcl/source/beerocks_event_loop_impl.cpp
++++ b/common/beerocks/bcl/source/beerocks_event_loop_impl.cpp
+@@ -68,12 +68,19 @@ bool EventLoopImpl::register_handlers(int fd, const EventLoop::EventHandlers &ha
+     // (e.g. its destructor closed the underlying descriptor) without going through
+     // remove_handlers() first. Trusting this bookkeeping over the kernel would make that fd
+     // number permanently unusable for the rest of the process lifetime, since a new descriptor
+-    // can be assigned the same (now free) number by the OS. So only warn here; epoll_ctl() below
+-    // is the actual source of truth and will fail with EEXIST if the fd is genuinely still
+-    // registered.
+-    if (m_fd_to_event_handlers.find(fd) != m_fd_to_event_handlers.end()) {
++    // can be assigned the same (now free) number by the OS. So drop it from the map up front —
++    // epoll_ctl() below is the actual source of truth. If it fails with EEXIST the fd is
++    // genuinely still registered (not stale after all), so the erased entry is restored rather
++    // than leaving its real owner with dangling bookkeeping.
++    EventLoop::EventHandlers stale_handlers;
++    bool had_stale_entry = false;
++    auto stale_it        = m_fd_to_event_handlers.find(fd);
++    if (stale_it != m_fd_to_event_handlers.end()) {
+         LOG(WARNING) << "FD (" << fd << ") already tracked in the poll — recovering if the "
+                      << "kernel confirms it was actually released";
++        stale_handlers  = stale_it->second;
++        had_stale_entry = true;
++        m_fd_to_event_handlers.erase(stale_it);
+     }
+ 
+     LOG(INFO) << "Register handlers for FD (" << fd << ")" << get_fd_name_print(handlers.name);
+@@ -103,6 +110,9 @@ bool EventLoopImpl::register_handlers(int fd, const EventLoop::EventHandlers &ha
+         if (epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, fd, &event) == -1) {
+             LOG(ERROR) << "Failed adding FD (" << fd << ")" << get_fd_name_print(handlers.name)
+                        << " to the poll: " << strerror(errno);
++            if (had_stale_entry) {
++                m_fd_to_event_handlers[fd] = stale_handlers;
++            }
+             return false;
+         }
+ 
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index 26cb9ef06..0085ba2b1 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -1149,27 +1149,33 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+ 		    options["dpp"] = "1";
+ 		    options["dpp_controller"] = "ipaddr=127.0.0.1 pkhash=" + zero_pkhash;
+ 		    options["dpp_configurator_connectivity"] = "1";
++
++		    // Persist the actual per-BSS DPP Connector/C-sign-key/Network-Access-Key so UCI
++		    // matches the dpp_connector=/dpp_csign=/dpp_netaccesskey= directives written
++		    // directly into hostapd.conf by ap_wlan_hal_nl80211, and survives a UCI-driven
++		    // hostapd.conf regeneration / reboot. csign/netaccesskey are DER bytes, hex-encoded
++		    // to match hostapd's own dpp_csign=/dpp_netaccesskey= directive format.
++		    options["dpp_connector"] = configuration.dpp_connector;
++		    options["dpp_csign"] = configuration.dpp_csign_der.empty()
++			    ? ""
++			    : string_utils::bytes_to_hex_string(configuration.dpp_csign_der.data(),
++								 configuration.dpp_csign_der.size());
++		    options["dpp_netaccesskey"] = configuration.dpp_netaccesskey_der.empty()
++			    ? ""
++			    : string_utils::bytes_to_hex_string(configuration.dpp_netaccesskey_der.data(),
++								 configuration.dpp_netaccesskey_der.size());
+ 	    } else {
+ 		    options["dpp"] = "";
+ 		    options["dpp_controller"] = "";
+ 		    options["dpp_configurator_connectivity"] = "";
++		    // Not a DPP-enabled BSS — clear any stale per-BSS DPP Connector/C-sign-key/
++		    // Network-Access-Key rather than deriving them from (empty) configuration
++		    // fields unconditionally for every BSS.
++		    options["dpp_connector"] = "";
++		    options["dpp_csign"] = "";
++		    options["dpp_netaccesskey"] = "";
+ 	    }
+ 
+-	    // Persist the actual per-BSS DPP Connector/C-sign-key/Network-Access-Key so UCI
+-	    // matches the dpp_connector=/dpp_csign=/dpp_netaccesskey= directives written
+-	    // directly into hostapd.conf by ap_wlan_hal_nl80211, and survives a UCI-driven
+-	    // hostapd.conf regeneration / reboot. csign/netaccesskey are DER bytes, hex-encoded
+-	    // to match hostapd's own dpp_csign=/dpp_netaccesskey= directive format.
+-	    options["dpp_connector"] = configuration.dpp_connector;
+-	    options["dpp_csign"] = configuration.dpp_csign_der.empty()
+-		    ? ""
+-		    : string_utils::bytes_to_hex_string(configuration.dpp_csign_der.data(),
+-							 configuration.dpp_csign_der.size());
+-	    options["dpp_netaccesskey"] = configuration.dpp_netaccesskey_der.empty()
+-		    ? ""
+-		    : string_utils::bytes_to_hex_string(configuration.dpp_netaccesskey_der.data(),
+-							 configuration.dpp_netaccesskey_der.size());
+-
+ 	    if(!configuration.multi_ap.empty()) {
+ 		    options["multi_ap"] = configuration.multi_ap;
+ 	    }
+@@ -1616,27 +1622,33 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+                 options["dpp"] = "1";
+                 options["dpp_controller"] = "ipaddr=127.0.0.1 pkhash=" + zero_pkhash;
+                 options["dpp_configurator_connectivity"] = "1";
++
++                // Persist the actual per-BSS DPP Connector/C-sign-key/Network-Access-Key so UCI
++                // matches the dpp_connector=/dpp_csign=/dpp_netaccesskey= directives written
++                // directly into hostapd.conf by ap_wlan_hal_nl80211, and survives a UCI-driven
++                // hostapd.conf regeneration / reboot. csign/netaccesskey are DER bytes, hex-encoded
++                // to match hostapd's own dpp_csign=/dpp_netaccesskey= directive format.
++                options["dpp_connector"] = config.dpp_connector;
++                options["dpp_csign"] = config.dpp_csign_der.empty()
++                        ? ""
++                        : string_utils::bytes_to_hex_string(config.dpp_csign_der.data(),
++                                                             config.dpp_csign_der.size());
++                options["dpp_netaccesskey"] = config.dpp_netaccesskey_der.empty()
++                        ? ""
++                        : string_utils::bytes_to_hex_string(config.dpp_netaccesskey_der.data(),
++                                                             config.dpp_netaccesskey_der.size());
+             } else {
+                 options["dpp"] = "";
+                 options["dpp_controller"] = "";
+                 options["dpp_configurator_connectivity"] = "";
++                // Not a DPP-enabled BSS — clear any stale per-BSS DPP Connector/C-sign-key/
++                // Network-Access-Key rather than deriving them from (empty) config fields
++                // unconditionally for every BSS.
++                options["dpp_connector"] = "";
++                options["dpp_csign"] = "";
++                options["dpp_netaccesskey"] = "";
+             }
+ 
+-            // Persist the actual per-BSS DPP Connector/C-sign-key/Network-Access-Key so UCI
+-            // matches the dpp_connector=/dpp_csign=/dpp_netaccesskey= directives written
+-            // directly into hostapd.conf by ap_wlan_hal_nl80211, and survives a UCI-driven
+-            // hostapd.conf regeneration / reboot. csign/netaccesskey are DER bytes, hex-encoded
+-            // to match hostapd's own dpp_csign=/dpp_netaccesskey= directive format.
+-            options["dpp_connector"] = config.dpp_connector;
+-            options["dpp_csign"] = config.dpp_csign_der.empty()
+-                    ? ""
+-                    : string_utils::bytes_to_hex_string(config.dpp_csign_der.data(),
+-                                                         config.dpp_csign_der.size());
+-            options["dpp_netaccesskey"] = config.dpp_netaccesskey_der.empty()
+-                    ? ""
+-                    : string_utils::bytes_to_hex_string(config.dpp_netaccesskey_der.data(),
+-                                                         config.dpp_netaccesskey_der.size());
+-
+             // Decode the SecurityIEs blob and persist the six rsn_override_* UCI options
+             // so UCI matches hostapd.conf and survives a regeneration / reboot.
+             if (!config.security_ies.empty()) {
+-- 
+2.34.1
+
