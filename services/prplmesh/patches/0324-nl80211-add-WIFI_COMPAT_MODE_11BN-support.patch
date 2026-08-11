@@ -1,0 +1,651 @@
+From 21e5f0fe34c3792316a5a7fd18ff47dc9e74c283 Mon Sep 17 00:00:00 2001
+From: Nirmal Raj S <nirm@qti.qualcomm.com>
+Date: Mon, 10 Aug 2026 10:25:22 +0530
+Subject: [PATCH] nl80211: add WIFI_COMPAT_MODE_11BN support in
+ handle_wifi_compat_mode
+
+Signed-off-by: Nirmal Raj S <nirm@qti.qualcomm.com>
+---
+ .../bcl/include/bcl/son/son_wireless_utils.h  |   9 +-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 217 +++++++++++++++++-
+ .../multi_vendor/qca/src/tlvf_qca_utils.cpp   |   9 +-
+ .../beerocks/master/beerocks_master_main.cpp  |  31 ++-
+ controller/src/beerocks/master/controller.cpp |   9 +-
+ .../src/beerocks/master/son_management.cpp    |  33 +--
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     |  88 +++++--
+ .../yaml/tlvf/WSC/eWscWifiCompatMode.yaml     |  12 +-
+ .../yaml/tlvf/qca/tlvQcaWifiCompatMode.yaml   |  11 +-
+ 9 files changed, 350 insertions(+), 69 deletions(-)
+
+diff --git a/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h b/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
+index 05d214234..417c41361 100644
+--- a/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
++++ b/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
+@@ -400,10 +400,11 @@ public:
+          */
+         std::vector<uint8_t> security_ies;
+ 
+-        /** WiFi Compatibility Mode derived from UCI wireless wifi-device "disable_11be":
+-         *   disable_11be = 1  ->  WIFI_COMPAT_MODE_11AX  (802.11ax / Wi-Fi 6)
+-         *   disable_11be = 0  ->  WIFI_COMPAT_MODE_11BE  (802.11be / Wi-Fi 7)
+-         *   option absent     ->  WIFI_COMPAT_MODE_UNSET  (vendor extension omitted from M2)
++        /** WiFi Compatibility Mode derived from UCI wireless wifi-device options:
++         *   disable_11be = 1                    ->  WIFI_COMPAT_MODE_11AX  (802.11ax / Wi-Fi 6)
++         *   disable_11be = 0, disable_11bn = 1  ->  WIFI_COMPAT_MODE_11BE  (802.11be / Wi-Fi 7)
++         *   disable_11be = 0, disable_11bn = 0  ->  WIFI_COMPAT_MODE_11BN  (802.11bn / Wi-Fi 8)
++         *   option absent                       ->  WIFI_COMPAT_MODE_UNSET  (vendor extension omitted from M2)
+          */
+         WSC::eWscWifiCompatMode wifi_compat_mode = WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_UNSET;
+ 
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index baa26a2ac..0538ad139 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -3338,6 +3338,20 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+     //      11ax VAPs that never had it set explicitly.
+     //   2. MLO detection (11AX path below): read num_links to decide between
+     //      LINK_REMOVE and REMOVE without issuing a second STATUS command.
++    // SSID match check: if SSID is present in bss_conf, verify it matches the VAP's SSID.
++    // If they don't match, this compat mode request is not applicable to this VAP - return early.
++    // The compat_mode_lock RAII guard releases the lock automatically on this return path.
++    if (!bss_conf.ssid.empty()) {
++        const std::string &vap_ssid = vap_iter->second.ssid;
++        if (!vap_ssid.empty() && vap_ssid != bss_conf.ssid) {
++            LOG(DEBUG) << "handle_wifi_compat_mode: SSID mismatch for bssid=" << bssid_str
++                       << " bss_conf.ssid='" << bss_conf.ssid
++                       << "' vap_ssid='" << vap_ssid
++                       << "' -> returning early (not applicable to this VAP)";
++            return true;
++        }
++    }
++
+     parsed_obj_map_t bss_status;
+     bool bss_status_valid = wpa_ctrl_send_msg("STATUS", bss_status, bss_iface);
+     if (!bss_status_valid) {
+@@ -3357,11 +3371,80 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+                     ? "0"
+                     : "1";
+             if (current_ieee80211be == expected_ieee80211be) {
+-                LOG(DEBUG) << "handle_wifi_compat_mode: ieee80211be already="
+-                           << current_ieee80211be
+-                           << " bssid=" << bssid_str
+-                           << " (no change needed, returning early)";
+-                return true;
++                // For WIFI_COMPAT_MODE_11BE: also check if ieee80211bn needs to be disabled.
++                // Use m_radio_info.uhr_supported (set from hostapd config ieee80211bn head value
++                // in refresh_radio_info()) to determine if the device is Wi-Fi 8 capable.
++                // Only Wi-Fi 8 capable devices need disable_11bn=1; on Wi-Fi 7-only devices
++                // the ieee80211bn option is invalid and must not be set.
++                if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11BE) {
++                    if (m_radio_info.uhr_supported) {
++                        // Check ieee80211bn from STATUS: if already=0, disable_11bn is already
++                        // applied and no further action is needed — return early.
++                        auto bn_it = bss_status.find("ieee80211bn");
++                        if (bn_it != bss_status.end() && bn_it->second == "0") {
++                            LOG(DEBUG) << "handle_wifi_compat_mode: ieee80211be already=1 and"
++                                       << " uhr_supported=true but ieee80211bn already=0"
++                                       << " (disable_11bn already applied) for bssid=" << bssid_str
++                                       << " (no change needed, returning early)";
++                            return true;
++                        }
++                        LOG(DEBUG) << "handle_wifi_compat_mode: ieee80211be already=1 and"
++                                   << " uhr_supported=true (ieee80211bn=1 in hostapd config)"
++                                   << " -> need to set disable_11bn=1"
++                                   << " for bssid=" << bssid_str;
++                        // Don't return early — fall through to handle disable_11bn=1
++                        conversion_performed = true;
++                    } else {
++                        LOG(DEBUG) << "handle_wifi_compat_mode: ieee80211be already="
++                                   << current_ieee80211be
++                                   << " uhr_supported=false (not Wi-Fi 8 capable)"
++                                   << " -> bssid=" << bssid_str
++                                   << " (no change needed, returning early)";
++                        return true;
++                    }
++                } else if (bss_conf.wifi_compat_mode ==
++                           WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11BN) {
++                    // For 11BN: first check if device is Wi-Fi 8 (11BN) capable.
++                    // Only devices with uhr_supported=true have ieee80211bn enabled in hostapd;
++                    // on Wi-Fi 7-only devices the ieee80211bn option is invalid and must not
++                    // be touched.
++                    if (!m_radio_info.uhr_supported) {
++                        LOG(DEBUG) << "handle_wifi_compat_mode: WIFI_COMPAT_MODE_11BN -"
++                                   << " device is not Wi-Fi 8 (11BN) capable"
++                                   << " (uhr_supported=false) for bssid=" << bssid_str
++                                   << " -> skipping (no change needed)";
++                        return true;
++                    }
++                    // Check if ieee80211bn is already absent or enabled (i.e., disable_11bn
++                    // already cleared).  In 11BN mode, ieee80211bn=1 (or absent from STATUS)
++                    // means Wi-Fi 8 is already fully enabled — no change needed.
++                    // Only proceed if ieee80211bn=0 (disable_11bn still set in hostapd config).
++                    // This mirrors the symmetric early-exit check in the 11BE path above which
++                    // returns early when ieee80211bn=0 (disable_11bn already applied).
++                    {
++                        auto bn_it = bss_status.find("ieee80211bn");
++                        if (bn_it == bss_status.end() || bn_it->second != "0") {
++                            LOG(DEBUG) << "handle_wifi_compat_mode: WIFI_COMPAT_MODE_11BN -"
++                                       << " ieee80211be=1 and ieee80211bn already enabled/absent"
++                                       << " for bssid=" << bssid_str
++                                       << " (no change needed, returning early)";
++                            return true;
++                        }
++                    }
++                    // ieee80211bn=0 still set: need to clear disable_11bn.
++                    // Don't return early — fall through to clear disable_11be and disable_11bn.
++                    LOG(DEBUG) << "handle_wifi_compat_mode: WIFI_COMPAT_MODE_11BN -"
++                               << " ieee80211be already=1 and uhr_supported=true"
++                               << " but ieee80211bn=0 -> need to clear disable_11bn"
++                               << " for bssid=" << bssid_str;
++                    conversion_performed = true;
++                } else {
++                    LOG(DEBUG) << "handle_wifi_compat_mode: ieee80211be already="
++                               << current_ieee80211be
++                               << " bssid=" << bssid_str
++                               << " (no change needed, returning early)";
++                    return true;
++                }
+             }
+             LOG(DEBUG) << "handle_wifi_compat_mode: ieee80211be=" << current_ieee80211be
+                        << " but expected=" << expected_ieee80211be
+@@ -3382,17 +3465,26 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+     //   WIFI_COMPAT_MODE_11AX → disable_11be=1  (802.11ax / Wi-Fi 6 only, EHT disabled)
+     //   WIFI_COMPAT_MODE_11BE → disable_11be=0  (802.11be / Wi-Fi 7 enabled)
+     std::string disable_11be_val;
++    std::string disable_11bn_val;
+     std::string mld_ap_val;
+     if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11AX) {
+         disable_11be_val = "1";
++        disable_11bn_val = "1";
+         mld_ap_val = "0";
+         LOG(INFO) << "handle_wifi_compat_mode: wifi_compat_mode=11AX"
+-                  << " -> disable_11be=1 (EHT disabled) for bssid=" << bssid_str;
++                  << " -> disable_11be=1 disable_11bn=1 (EHT+UHR disabled) for bssid=" << bssid_str;
+     } else if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11BE) {
+         disable_11be_val = "0";
++        disable_11bn_val = "1";
+         mld_ap_val = "1";
+         LOG(INFO) << "handle_wifi_compat_mode: wifi_compat_mode=11BE"
+-                  << " -> disable_11be=0 (EHT enabled) for bssid=" << bssid_str;
++                  << " -> disable_11be=0 disable_11bn=1 (EHT enabled, UHR disabled) for bssid=" << bssid_str;
++    } else if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11BN) {
++        disable_11be_val = "0";
++        disable_11bn_val = "";
++        mld_ap_val = "1";
++        LOG(INFO) << "handle_wifi_compat_mode: wifi_compat_mode=11BN"
++                  << " -> disable_11be=0 disable_11bn cleared (EHT+UHR enabled) for bssid=" << bssid_str;
+     } else {
+         LOG(WARNING) << "handle_wifi_compat_mode: unrecognised wifi_compat_mode="
+                      << int(bss_conf.wifi_compat_mode) << " for bssid=" << bssid_str
+@@ -3420,8 +3512,12 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+         return true;
+     }
+ 
+-    // Write the disable_11be per-VAP option.
++    // Write the disable_11be / disable_11bn per-VAP options.
+     conf.set_create_vap_value(vap_id, "disable_11be", disable_11be_val);
++    // disable_11bn is only valid on Wi-Fi 8 (UHR) capable devices; skip on Wi-Fi 7-only hardware.
++    if (m_radio_info.uhr_supported) {
++        conf.set_create_vap_value(vap_id, "disable_11bn", disable_11bn_val);
++    }
+     conf.set_create_vap_value(vap_id, "mld_ap", mld_ap_val);
+ 
+     // Lambda: generate a free BSS interface name using the wlan<radio_num>_<index>
+@@ -3880,6 +3976,61 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+          // MLO→SLO transition; the ADD BSS command already brought up the new BSS.
+          return true;
+     } else if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11BE) {
++        // For WIFI_COMPAT_MODE_11BE: first check if ieee80211be is already=1 (BSS is already
++        // in 11BE mode). In that case we reached here because ieee80211bn=1 was detected in
++        // STATUS (the modified early-exit check above did not return early). Apply disable_11bn=1
++        // to the BSS config and trigger RELOAD_CONFIG — a simple in-place update, no BSS
++        // teardown/recreate needed.
++        //
++        // If ieee80211be=0 (BSS is still in 11AX mode), fall through to the existing
++        // MLO/SLO transition logic below.
++        {
++            bool ieee80211be_already_correct = false;
++            if (bss_status_valid) {
++                auto be_it = bss_status.find("ieee80211be");
++                if (be_it != bss_status.end() && be_it->second == "1") {
++                    ieee80211be_already_correct = true;
++                }
++            }
++
++            if (ieee80211be_already_correct) {
++                // ieee80211be=1 AND ieee80211bn=1: device supports Wi-Fi 8 but we need
++                // to disable it (disable_11bn=1) for Wi-Fi 7 compat mode.
++                LOG(INFO) << "handle_wifi_compat_mode: WIFI_COMPAT_MODE_11BE - ieee80211be=1"
++                          << " and ieee80211bn=1 -> setting disable_11bn=1 for bssid="
++                          << bssid_str;
++
++                // Add disable_11bn=1 to the BSS section in hostapd config.
++                conf.set_create_vap_value(vap_id, "disable_11bn", "1");
++                if (!conf.store(vap_id)) {
++                    LOG(ERROR) << "handle_wifi_compat_mode: failed to store hostapd config"
++                               << " for disable_11bn=1 bssid=" << bssid_str;
++                    return false;
++                }
++
++                // Trigger RELOAD_CONFIG so hostapd picks up the new disable_11bn=1.
++                const std::string reload_cmd("RELOAD_CONFIG");
++                if (!wpa_ctrl_send_msg(reload_cmd, bss_iface)) {
++                    LOG(ERROR) << "handle_wifi_compat_mode: RELOAD_CONFIG failed for "
++                               << bss_iface;
++                } else {
++                    LOG(INFO) << "handle_wifi_compat_mode: RELOAD_CONFIG sent for"
++                              << " disable_11bn=1 on " << bss_iface;
++                    // Update UCI wireless disable_11bn=1 after RELOAD_CONFIG.
++                    // set_wifi_compat_mode_from_vap() calls bpl_cfg_set_wifi_compat_mode_uci()
++                    // which sets disable_11bn=1 for WIFI_COMPAT_MODE_11BE.
++                    std::string base_iface;
++                    extractLinkBaseInterface(bss_iface, base_iface);
++                    set_wifi_compat_mode_from_vap(bss_conf, base_iface, base_iface,
++                                                  m_radio_info.radio_id);
++                }
++
++                conversion_performed = true;
++                return true;
++            }
++        }
++
++        // ieee80211be=0: BSS is still in 11AX mode, proceed with the MLO/SLO transition.
+         // For 11BE compat mode: check if there is an MLO interface registered for the
+         // corresponding mld_id in MLD_PAIR_ENTRANT_FILE.  If one exists, rename the BSS
+         // in hostapd.conf to that MLO interface name before triggering RELOAD_CONFIG so
+@@ -4170,6 +4321,43 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+                 }
+             }
+         }
++    } else if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11BN) {
++        // For WIFI_COMPAT_MODE_11BN (Wi-Fi 8): clear disable_11be and disable_11bn,
++        // then trigger RELOAD_CONFIG. No BSS teardown/recreate needed.
++        // This is the reverse of the 11BE path that sets disable_11bn=1:
++        //   11BE mode: disable_11be=0, disable_11bn=1  (Wi-Fi 7, no Wi-Fi 8)
++        //   11BN mode: disable_11be=0, disable_11bn=0  (Wi-Fi 8 fully enabled)
++        LOG(INFO) << "handle_wifi_compat_mode: WIFI_COMPAT_MODE_11BN - clearing disable_11be"
++                  << " and disable_11bn for bssid=" << bssid_str;
++
++        // Clear both disable_11be and disable_11bn (empty string removes the option).
++        conf.set_create_vap_value(vap_id, "disable_11be", "");
++        conf.set_create_vap_value(vap_id, "disable_11bn", "");
++
++        if (!conf.store(vap_id)) {
++            LOG(ERROR) << "handle_wifi_compat_mode: failed to store hostapd config"
++                       << " for 11BN bssid=" << bssid_str;
++            return false;
++        }
++
++        // Trigger RELOAD_CONFIG so hostapd picks up the cleared disable_11be/disable_11bn.
++        const std::string reload_cmd("RELOAD_CONFIG");
++        if (!wpa_ctrl_send_msg(reload_cmd, bss_iface)) {
++            LOG(ERROR) << "handle_wifi_compat_mode: RELOAD_CONFIG failed for " << bss_iface;
++        } else {
++            LOG(INFO) << "handle_wifi_compat_mode: RELOAD_CONFIG sent for"
++                      << " 11BN (disable_11be and disable_11bn cleared) on " << bss_iface;
++            // Update UCI wireless to clear disable_11be and disable_11bn.
++            // set_wifi_compat_mode_from_vap() calls bpl_cfg_set_wifi_compat_mode_uci()
++            // which handles WIFI_COMPAT_MODE_11BN by clearing both options.
++            std::string base_iface;
++                    extractLinkBaseInterface(bss_iface, base_iface);
++            set_wifi_compat_mode_from_vap(bss_conf, base_iface, base_iface,
++                                          m_radio_info.radio_id);
++        }
++
++        conversion_performed = true;
++        return true;
+     } else {
+         LOG(DEBUG) << "handle_wifi_compat_mode: disable_11be already=" << disable_11be_val
+                    << " in hostapd config for VAP=" << vap_id
+@@ -4467,6 +4655,7 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                     LOG(INFO) << "update_vap_credentials: compat mode conversion performed"
+                               << " for bssid=" << tlvf::mac_to_string(bss_it.bssid)
+                               << ", skipping credential update for this BSS";
++                    new_radio_iface_name_update_req = 0;
+                     continue;
+                 }
+             }
+@@ -8071,6 +8260,18 @@ bool ap_wlan_hal_nl80211::create_new_hostapd_conf_file(std::string &ifname, son:
+         conf.set_create_vap_value(vap_id, "mld_ap","1");
+     }
+ 
++    // Set disable_11bn=1 when WIFI_COMPAT_MODE_11BE is requested on a Wi-Fi 8 (UHR) capable
++    // device.  In 11BE compat mode EHT is enabled (disable_11be=0) but UHR (802.11bn) must be
++    // disabled so the BSS operates as Wi-Fi 7 only.  disable_11bn is only a valid hostapd option
++    // on devices that have ieee80211bn enabled in the radio config; skip it on Wi-Fi 7-only
++    // hardware (uhr_supported=false) to avoid an invalid-option error from hostapd.
++    if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11BE &&
++        m_radio_info.uhr_supported) {
++        conf.set_create_vap_value(vap_id, "disable_11bn", "1");
++        LOG(INFO) << "create_new_hostapd_conf_file: WIFI_COMPAT_MODE_11BE and uhr_supported=true"
++                  << " -> setting disable_11bn=1 for vap_id=" << vap_id;
++    }
++
+     if (!bridge.empty()) {
+         conf.set_create_vap_value(vap_id,"bridge", bridge);
+     }
+diff --git a/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp b/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
+index d9a1d3a4c..0b2d049c1 100644
+--- a/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
++++ b/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
+@@ -75,9 +75,13 @@ bool tlvf_qca_utils::add_qca_wifi_compat_mode_tlv(ieee1905_1::CmduMessageTx &cmd
+             LOG(ERROR) << "Failed to add BSS entry to QCA tlvQcaWifiCompatMode"
+                        << " ssid=" << entry.ssid;
+         } else {
++            const char *mode_str =
++                (entry.wifi_mode == 0x00) ? "11ax" :
++                (entry.wifi_mode == 0x01) ? "11be" :
++                (entry.wifi_mode == 0x02) ? "11bn" : "unknown";
+             LOG(DEBUG) << "QCA WiFi Compat Mode TLV: added BSS ssid=" << entry.ssid
+                        << " wifi_mode=0x" << std::hex << int(entry.wifi_mode) << std::dec
+-                       << " (" << (entry.wifi_mode == 0x00 ? "11ax" : "11be") << ")";
++                       << " (" << mode_str << ")";
+         }
+     }
+ 
+@@ -446,7 +450,8 @@ tlvf_qca_utils::parse_qca_wifi_compat_mode_tlv(ieee1905_1::CmduMessageRx &cmdu_r
+         std::string ssid(bss_entry.ssid(), bss_entry.ssid_length());
+         const char *mode_str =
+             (wifi_mode == 0x00) ? "11ax (Wi-Fi 6)" :
+-            (wifi_mode == 0x01) ? "11be (Wi-Fi 7)" : "unknown";
++            (wifi_mode == 0x01) ? "11be (Wi-Fi 7)" :
++            (wifi_mode == 0x02) ? "11bn (Wi-Fi 8)" : "unknown";
+         LOG(DEBUG) << "  QCA WiFi Compat Mode: SSID='" << ssid
+                    << "' wifi_mode=0x" << std::hex << int(wifi_mode) << std::dec
+                    << " (" << mode_str << ")";
+diff --git a/controller/src/beerocks/master/beerocks_master_main.cpp b/controller/src/beerocks/master/beerocks_master_main.cpp
+index 599e52890..3ec503e14 100644
+--- a/controller/src/beerocks/master/beerocks_master_main.cpp
++++ b/controller/src/beerocks/master/beerocks_master_main.cpp
+@@ -915,18 +915,25 @@ int main(int argc, char *argv[])
+ 					}
+ 
+ 					if (mld_unit >= 0) {
+-						son::wireless_utils::sMldInfoConf mld_info;
+-						mld_info.ssid = configuration.ssid;
+-
+-						// TODO: Read Modes from Configuration (PPM-3588)
+-						mld_info.str   = true;
+-						mld_info.nstr  = true;
+-						mld_info.emlsr = true;
+-						mld_info.emlmr = false;
+-
+-						master_db.add_mld_info_configuration(mld_info, std::to_string(mld_unit));
+-                        LOG(DEBUG) << "Debug: add_mld_info_configuration call completed";
+-
++						if (configuration.wifi_compat_mode ==
++						    WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11AX) {
++							LOG(DEBUG) << "Skipping mld_info configuration for ssid="
++							           << configuration.ssid << " mld_id=" << configuration.mld_id
++							           << " because wifi_compat_mode is 11AX";
++						} else {
++							son::wireless_utils::sMldInfoConf mld_info;
++							mld_info.ssid = configuration.ssid;
++
++							// TODO: Read Modes from Configuration (PPM-3588)
++							mld_info.str   = true;
++							mld_info.nstr  = true;
++							mld_info.emlsr = true;
++							mld_info.emlmr = false;
++
++							master_db.add_mld_info_configuration(mld_info,
++							                                     std::to_string(mld_unit));
++							LOG(DEBUG) << "Debug: add_mld_info_configuration call completed";
++						}
+ 					}
+ 
+                 }
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 94d279f79..d0016b63e 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -1764,12 +1764,6 @@ static bool add_agent_ap_mld_configuration_tlv(db &database, ieee1905_1::CmduMes
+             continue;
+         }
+ 
+-
+-        if (bss_conf_check->wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11AX) {
+-            LOG(ERROR) << "WifiCompat mode set as 11ax for MLDID " << mld.first;
+-            continue;
+-        }
+-
+         if (agent_ap_mld_configuration->num_ap_mld() >= (agent.max_num_mlds)) {
+             LOG(INFO) << "More AP MLDs than maximum MLD (" << (agent.max_num_mlds) << ")";
+             break;
+@@ -1816,7 +1810,8 @@ static bool add_agent_ap_mld_configuration_tlv(db &database, ieee1905_1::CmduMes
+                 continue;
+             }
+             if (!bss_conf.ssid.empty() && bss_conf.ssid == mld.second.ssid &&
+-                bss_conf.mld_id == mld.first) {
++                bss_conf.mld_id == mld.first &&
++                bss_conf.wifi_compat_mode != WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11AX) {
+ 
+                 for (const auto &affiliated_radio : agent.radios) {
+                     if (!affiliated_radio.second) {
+diff --git a/controller/src/beerocks/master/son_management.cpp b/controller/src/beerocks/master/son_management.cpp
+index c051afdfe..af8fa3ea3 100644
+--- a/controller/src/beerocks/master/son_management.cpp
++++ b/controller/src/beerocks/master/son_management.cpp
+@@ -1715,20 +1715,27 @@ void son_management::handle_bml_message(int sd, std::shared_ptr<beerocks_header>
+                 if (!configuration.mld_id.empty() &&
+                      configuration.mld_id != std::to_string(DISABLED_MLDUNIT)) {
+ 
+-                     int mld_unit = -1;
+-                     mld_unit = beerocks::string_utils::stoi(configuration.mld_id);
+-                     if (mld_unit >= 0) {
+-                             son::wireless_utils::sMldInfoConf mld_info;
+-                             mld_info.ssid = configuration.ssid;
+-
+-                             // TODO: Read Modes from Configuration (PPM-3588)
+-                             mld_info.str   = true;
+-                             mld_info.nstr  = true;
+-                             mld_info.emlsr = true;
+-                             mld_info.emlmr = false;
+-
+-                             database.add_mld_info_configuration(mld_info,configuration.mld_id);
++                 int mld_unit = -1;
++                 mld_unit = beerocks::string_utils::stoi(configuration.mld_id);
++                 if (mld_unit >= 0) {
++                     if (configuration.wifi_compat_mode ==
++                         WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11AX) {
++                         LOG(DEBUG) << "Skipping mld_info configuration for ssid="
++                                    << configuration.ssid << " mld_id=" << configuration.mld_id
++                                    << " because wifi_compat_mode is 11AX";
++                     } else {
++                         son::wireless_utils::sMldInfoConf mld_info;
++                         mld_info.ssid = configuration.ssid;
++
++                         // TODO: Read Modes from Configuration (PPM-3588)
++                         mld_info.str   = true;
++                         mld_info.nstr  = true;
++                         mld_info.emlsr = true;
++                         mld_info.emlmr = false;
++
++                         database.add_mld_info_configuration(mld_info, configuration.mld_id);
+                      }
++                 }
+                 }
+            }
+         } else {
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index 52f735d83..e9758d6e7 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -856,29 +856,64 @@ bool bpl_cfg_get_wireless_settings(std::list<son::wireless_utils::sBssInfoConf>
+             }
+         }
+ 
+-        // Read "disable_11be" from the wifi-device section to determine WiFi Compat Mode.
+-        // disable_11be=1 -> 802.11ax (Wi-Fi 6)
+-        // disable_11be=0 -> 802.11be (Wi-Fi 7)
+-        // option absent  -> UNSET (vendor extension omitted from M2)
++        // Read "disable_11bn" and "disable_11be" from the wifi-iface section to determine
++        // WiFi Compat Mode.  Check the higher-version option (disable_11bn) first, then
++        // allow disable_11be to overwrite to 11AX:
++        //
++        //   Step 1 — disable_11bn (Wi-Fi 8 specific):
++        //     disable_11bn=0  -> 11BN (Wi-Fi 8 fully enabled)
++        //     disable_11bn=1  -> 11BE (Wi-Fi 8 disabled, Wi-Fi 7 enabled)
++        //     absent          -> UNSET (no Wi-Fi 8 option present)
++        //
++        //   Step 2 — disable_11be (overrides to 11AX if set):
++        //     disable_11be=1  -> 11AX (overwrite whatever Step 1 produced)
++        //     absent/0        -> keep Step 1 result
+         {
++            // Step 1: check disable_11bn (higher version / Wi-Fi 8 specific option)
++            std::string disable_11bn;
++            if (uci_get_option(package_name, section_type, section_name, "disable_11bn",
++                               disable_11bn)) {
++                if (disable_11bn == "0") {
++                    configuration.wifi_compat_mode =
++                        WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11BN;
++                    LOG(DEBUG) << "disable_11bn=0 for SSID " << configuration.ssid
++                               << " -> wifi_compat_mode=11BN";
++                } else {
++                    // disable_11bn=1: Wi-Fi 8 disabled, Wi-Fi 7 enabled
++                    configuration.wifi_compat_mode =
++                        WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11BE;
++                    LOG(DEBUG) << "disable_11bn=1 for SSID " << configuration.ssid
++                               << " -> wifi_compat_mode=11BE";
++                }
++            } else {
++                // disable_11bn absent: no Wi-Fi 8 option present
++                configuration.wifi_compat_mode = WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_UNSET;
++                LOG(DEBUG) << "disable_11bn not set for SSID " << configuration.ssid
++                           << " -> wifi_compat_mode=UNSET (checking disable_11be)";
++            }
++
++            // Step 2: check disable_11be.
++            //   disable_11be=1 -> override to 11AX (Wi-Fi 6 compat, regardless of Step 1)
++            //   disable_11be=0/absent -> set to 11BE when Step 1 left mode UNSET
++            //                           (Wi-Fi 7-only device with no disable_11bn present)
+             std::string disable_11be;
+-            if (uci_get_option(package_name,section_type,section_name, "disable_11be",
++            if (uci_get_option(package_name, section_type, section_name, "disable_11be",
+                                disable_11be)) {
+                 if (disable_11be == "1") {
+                     configuration.wifi_compat_mode =
+                         WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11AX;
+                     LOG(DEBUG) << "disable_11be=1 for SSID " << configuration.ssid
+-                               << " -> wifi_compat_mode=11AX";
+-                } else {
++                               << " -> wifi_compat_mode=11AX (overwrite)";
++                } else if (configuration.wifi_compat_mode ==
++                           WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_UNSET) {
++                    // disable_11be=0 and no disable_11bn: Wi-Fi 7-only device.
++                    // Map to 11BE so the compat-mode TLV is included in M2.
+                     configuration.wifi_compat_mode =
+                         WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11BE;
+-                    LOG(DEBUG) << "disable_11be=0 for SSID " << configuration.ssid
++                    LOG(DEBUG) << "disable_11be=0 (no disable_11bn) for SSID "
++                               << configuration.ssid
+                                << " -> wifi_compat_mode=11BE";
+                 }
+-            } else {
+-                configuration.wifi_compat_mode = WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_UNSET;
+-                LOG(DEBUG) << "disable_11be not set for SSID " << configuration.ssid
+-                           << " -> wifi_compat_mode=UNSET";
+             }
+         }
+ 
+@@ -3475,17 +3510,38 @@ bool bpl_cfg_set_wifi_compat_mode_uci(const son::wireless_utils::sBssInfoConf &b
+         // check afterwards whether this was the last link referencing that wifi-mld section.
+         std::string current_mld_val;
+ 
++        // Determine if device is Wi-Fi 8 (UHR) capable and set disable_11bn=1 if so.
++        // Extracted to avoid duplicating the identical check in both the 11AX and 11BE branches.
++        auto set_disable_11bn_if_uhr = [&]() {
++            std::string htmode_val;
++            if (uci_get_option("wireless", "wifi-device", device_section, "htmode",
++                               htmode_val) &&
++                htmode_val.rfind("UHR", 0) == 0) {
++                options["disable_11bn"] = "1";
++                LOG(INFO) << "bpl_cfg_set_wifi_compat_mode_uci: htmode=" << htmode_val
++                          << " (UHR/Wi-Fi 8 capable) -> setting disable_11bn=1";
++            } else {
++                LOG(DEBUG) << "bpl_cfg_set_wifi_compat_mode_uci: htmode=" << htmode_val
++                           << " (not UHR, disable_11bn not set)";
++            }
++        };
++
+         if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11AX) {
+             // MLO → SLO: set disable_11be=1, clear mld option
+             uci_get_option(package_name, section_type, sec, "mld", current_mld_val);
+             options["disable_11be"] = "1";
++            set_disable_11bn_if_uhr();
+             options["mld"]          = ""; // empty string removes the option
+             LOG(INFO) << "bpl_cfg_set_wifi_compat_mode_uci: 11AX mode -"
+                       << " setting disable_11be=1, clearing mld='" << current_mld_val
+                       << "', ifname='" << new_bss_name << "'";
+         } else if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11BE) {
+-            // SLO → MLO: clear disable_11be, set mld option if mld_id is valid
++            // SLO → MLO: clear disable_11be, set mld option if mld_id is valid.
++            // Also set disable_11bn=1 if the device is Wi-Fi 8 capable (htmode starts with "UHR").
++            // disable_11bn is only valid on Wi-Fi 8 devices; on Wi-Fi 7-only devices this
++            // option does not exist and must not be written.
+             options["disable_11be"] = ""; // empty string removes the option
++            set_disable_11bn_if_uhr();
+             if (!bss_conf.mld_id.empty() &&
+                 bss_conf.mld_id != std::to_string(beerocks::DISABLED_MLDUNIT)) {
+                 // Before using the mld_id from bss_conf, check if an existing wifi-mld
+@@ -3530,6 +3586,12 @@ bool bpl_cfg_set_wifi_compat_mode_uci(const son::wireless_utils::sBssInfoConf &b
+                           << " clearing disable_11be, no valid mld_id, ifname='"
+                           << new_bss_name << "'";
+             }
++        } else if (bss_conf.wifi_compat_mode == WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11BN) {
++            // Wi-Fi 8: clear both disable_11be and disable_11bn (empty string removes the option).
++            options["disable_11be"] = ""; // empty string removes the option
++            options["disable_11bn"] = ""; // empty string removes the option
++            LOG(INFO) << "bpl_cfg_set_wifi_compat_mode_uci: 11BN mode -"
++                      << " clearing disable_11be and disable_11bn, ifname='" << new_bss_name << "'";
+         } else {
+             LOG(WARNING) << "bpl_cfg_set_wifi_compat_mode_uci: unrecognised wifi_compat_mode="
+                          << int(bss_conf.wifi_compat_mode) << " for ssid='" << bss_conf.ssid
+diff --git a/framework/tlvf/yaml/tlvf/WSC/eWscWifiCompatMode.yaml b/framework/tlvf/yaml/tlvf/WSC/eWscWifiCompatMode.yaml
+index d6f6a50c3..08d8a1db3 100644
+--- a/framework/tlvf/yaml/tlvf/WSC/eWscWifiCompatMode.yaml
++++ b/framework/tlvf/yaml/tlvf/WSC/eWscWifiCompatMode.yaml
+@@ -8,11 +8,13 @@ eWscWifiCompatMode:
+   _comment: |
+     WiFi Compatibility Mode carried in the Airties Vendor Extension of WSC M2.
+ 
+-    Derived from the UCI wireless wifi-device option "disable_11be":
+-      disable_11be = 1  ->  WIFI_COMPAT_MODE_11AX  (Wi-Fi 6 / 802.11ax)
+-      disable_11be = 0  ->  WIFI_COMPAT_MODE_11BE  (Wi-Fi 7 / 802.11be)
+-      option absent     ->  WIFI_COMPAT_MODE_UNSET  (not included in M2)
++    Derived from the UCI wireless wifi-device options "disable_11be" and "disable_11bn":
++      disable_11be = 1                    ->  WIFI_COMPAT_MODE_11AX  (Wi-Fi 6 / 802.11ax)
++      disable_11be = 0, disable_11bn = 1  ->  WIFI_COMPAT_MODE_11BE  (Wi-Fi 7 / 802.11be)
++      disable_11be = 0, disable_11bn = 0  ->  WIFI_COMPAT_MODE_11BN  (Wi-Fi 8 / 802.11bn)
++      option absent                       ->  WIFI_COMPAT_MODE_UNSET  (not included in M2)
+   WIFI_COMPAT_MODE_11AX: 0x00
+   WIFI_COMPAT_MODE_11BE: 0x01
+-  # 2-254 = UNSPECIFIED
++  WIFI_COMPAT_MODE_11BN: 0x02
++  # 3-254 = UNSPECIFIED
+   WIFI_COMPAT_MODE_UNSET: 0xFF
+diff --git a/framework/tlvf/yaml/tlvf/qca/tlvQcaWifiCompatMode.yaml b/framework/tlvf/yaml/tlvf/qca/tlvQcaWifiCompatMode.yaml
+index f12c378e8..aa95e1ced 100644
+--- a/framework/tlvf/yaml/tlvf/qca/tlvQcaWifiCompatMode.yaml
++++ b/framework/tlvf/yaml/tlvf/qca/tlvQcaWifiCompatMode.yaml
+@@ -12,11 +12,12 @@ _include:
+ # Sent as a separate IEEE 1905.1 Vendor Specific TLV (type 0x0B) in the
+ # AP_AUTOCONFIGURATION_WSC_MESSAGE CMDU alongside the WSC M2 TLV.
+ #
+-# The controller reads the UCI wireless wifi-device option "disable_11be" for each
+-# configured BSS and includes all BSSes with a known wifi_mode in a single TLV:
+-#   disable_11be = 1  ->  wifi_mode = 0x00 (WIFI_COMPAT_MODE_11AX, 802.11ax / Wi-Fi 6)
+-#   disable_11be = 0  ->  wifi_mode = 0x01 (WIFI_COMPAT_MODE_11BE, 802.11be / Wi-Fi 7)
+-#   option absent     ->  BSS is omitted from the TLV
++# The controller reads the UCI wireless wifi-device options "disable_11be" and "disable_11bn"
++# for each configured BSS and includes all BSSes with a known wifi_mode in a single TLV:
++#   disable_11be = 1                    ->  wifi_mode = 0x00 (WIFI_COMPAT_MODE_11AX, 802.11ax / Wi-Fi 6)
++#   disable_11be = 0, disable_11bn = 1  ->  wifi_mode = 0x01 (WIFI_COMPAT_MODE_11BE, 802.11be / Wi-Fi 7)
++#   disable_11be = 0, disable_11bn = 0  ->  wifi_mode = 0x02 (WIFI_COMPAT_MODE_11BN, 802.11bn / Wi-Fi 8)
++#   option absent                       ->  BSS is omitted from the TLV
+ #
+ # Wire format:
+ #   type(1B) | length(2B) | vendor_oui(3B) | tlv_id(2B) | num_bss(1B) |
+-- 
+2.34.1
+
