@@ -1,0 +1,451 @@
+From 68691573b426f2e92bbf03f0ed7a00a8873cd325 Mon Sep 17 00:00:00 2001
+From: Manoj Sekar <sekar@qti.qualcomm.com>
+Date: Fri, 7 Aug 2026 10:36:24 +0530
+Subject: [PATCH] CBS: send Channel Preference Report at boot via one-shot
+ bootstrap trigger
+
+On a fresh boot the unsolicited Channel Preference Report (CPR) was never
+sent unless something first triggered a driver "ACS show_report": the CPR
+is emitted from handle_vs_channels_list_response() only after the driver
+ranks are pushed back and refresh_preference_table() populates
+cbs_preference_table. That first report is normally produced by the
+periodic CBS trigger in work(), but the periodic block only runs when the
+effective interval is > 0 (i.e. cbs_trigger_periodic_interval configured
+non-zero, or the full CBS auto-handling enable_auto_chansel_handling &&
+cbs_based_chansel_enable is on).
+
+A device that enables only the preference-report refresh knob
+(chansel_preference_report_refresh_enable=1) with interval=0 therefore never
+fired "cbs enable 1" at boot -> the cache stayed empty -> no CPR was ever
+sent after reboot.
+
+Fix: at the natural "register the periodic timer" instant (the first work()
+pass) perform a ONE-SHOT, per-radio bootstrap step whenever any CBS/CPR knob
+is active:
+
+(A) CBS/ACS cache already valid (cbs_preference_table.valid == true, e.g.
+an earlier CBS/ACS/dynamic-ACS or an external factor already produced a
+report): send ONE unsolicited CPR immediately from the existing normalized
+preference table - no re-scan. (B) No valid cache yet: fire a single
+"cbs enable 1" (TRIGGER_CBS). When the scan completes, the existing
+CHANNELS_LIST_RESPONSE path refreshes the cache and emits the unsolicited
+CPR (so no CPR is sent here, avoiding an empty/stale report).
+
+The unsolicited CPR in case (A) reuses the same build/send pair and gating
+as the post-refresh path
+(build_channel_preference_report -> send_channel_preference_report; gated by
+chansel_unsolicited_preference_report_enable &&
+chansel_preference_report_refresh_enable and no in-progress solicited
+preference/selection flow), and updates m_last_reported_preferences
+for change-based dedup. send_channel_preference_report() adds the mandatory
+agent-wide CAC Status/Completion TLVs, so the CPR is accepted even when the
+bootstrap radio is 2.4/6 GHz.
+
+The step self-limits via a new m_cbs_bootstrap_trigger_done latch (fires at
+most once per process), is complementary to the periodic path (which continues
+unchanged for interval > 0), and is a strict no-op on default builds
+(cbs_based_chansel_enable=0 && chansel_preference_report_refresh_enable=0).
+It reuses only existing symbols (cbs_preference_table.valid,
+cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS, the config knobs), so no new message
+plumbing is introduced.
+
+Files:
+    agent/src/beerocks/slave/tasks/channel_selection_task.h - add bool
+             m_cbs_bootstrap_trigger_done (one-shot latch) + rationale.
+    agent/src/beerocks/slave/tasks/channel_selection_task.cpp -
+             ChannelSelectionTask::work(): add the one-shot bootstrap (A/B)
+             block at the top of the periodic-CBS section.
+
+Signed-off-by: Manoj Sekar <sekar@qti.qualcomm.com>
+---
+ .../slave/tasks/channel_selection_task.cpp    | 263 +++++++++++++++++-
+ .../slave/tasks/channel_selection_task.h      |  23 ++
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  25 +-
+ 3 files changed, 301 insertions(+), 10 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+index 28c06ca..dde176b 100644
+--- a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+@@ -1263,6 +1263,221 @@ void ChannelSelectionTask::work()
+     {
+         auto db = AgentDB::get();
+ 
++        // ---------------------------------------------------------------------------------------
++        // Reboot-time bootstrap CBS trigger (ONE-SHOT).
++        //
++        // Rationale (reboot-time "CPR never sent" fix): the unsolicited Channel Preference Report
++        // is emitted from handle_vs_channels_list_response() only AFTER the driver has produced an
++        // "ACS show_report" and refresh_preference_table() populated cbs_preference_table. On a
++        // fresh boot that report only appears once something fires "cbs enable 1" (the periodic CBS
++        // trigger below) or a dynamic ACS invoke. But the periodic block only runs when
++        // effective_interval > 0, i.e. when cbs_trigger_periodic_interval was configured non-zero
++        // OR the full CBS auto-handling (enable_auto_chansel_handling && cbs_based_chansel_enable)
++        // is on. A device that only enables the preference-report refresh knob
++        // (chansel_preference_report_refresh_enable=1) with interval=0 therefore never fires
++        // "cbs enable 1" at boot -> the cache stays empty -> no CPR is ever sent.
++        //
++        // To close that gap we perform a SINGLE bootstrap step on the first work() pass, per radio,
++        // whenever ANY CBS/CPR-related knob is active. The action taken depends on whether we
++        // ALREADY have a usable driver-ranked cache for that radio:
++        //
++        //   (A) cache VALID (cbs_preference_table.valid == true): some earlier CBS/ACS/dynamic-ACS
++        //       already produced a report (e.g. brought up before this task's first tick, or an
++        //       external factor). We do NOT need to scan again - the normalized preference table
++        //       is already populated. Emit ONE unsolicited Channel Preference Report right now,
++        //       directly from that cache, so the controller learns our preferences at boot.
++        //
++        //   (B) cache NOT valid: fire a one-shot "cbs enable 1" (TRIGGER_CBS). When the CBS scan
++        //       completes, the existing CHANNELS_LIST_RESPONSE path refreshes the cache AND emits
++        //       the unsolicited CPR - so we do NOT send a CPR here in this case (it would carry an
++        //       empty/stale preference table); the post-scan path handles it.
++        //
++        // This is the natural "register the periodic timer" instant. It is complementary to the
++        // periodic path (which continues to run unchanged for interval > 0) and self-limits via
++        // m_cbs_bootstrap_trigger_done, so it neither adds recurring scans nor duplicate CPRs.
++        //
++        if (!m_cbs_bootstrap_trigger_done) {
++            const bool cbs_or_cpr_active = db->device_conf.cbs_based_chansel_enable ||
++                                           db->device_conf.chansel_preference_report_refresh_enable;
++            if (cbs_or_cpr_active) {
++                // The unsolicited CPR (case A) is only meaningful/allowed when the unsolicited
++                // report feature is on AND a normalized preference table exists to report
++                // (refresh knob), AND no solicited preference/selection flow is currently active
++                // (that flow builds/sends its own report). This mirrors the gating used by the
++                // post-refresh unsolicited path in handle_vs_channels_list_response().
++                const bool unsolicited_cpr_allowed =
++                    db->device_conf.chansel_unsolicited_preference_report_enable &&
++                    db->device_conf.chansel_preference_report_refresh_enable &&
++                    m_pending_preference.mid == 0 && m_pending_selection.mid == 0;
++
++                // IMPORTANT (bring-up ordering): on the very first work() ticks the radios may not
++                // yet be registered in the AgentDB (they are added only after the fronthaul sends
++                // ACTION_APMANAGER_UP_NOTIFICATION and the CONFIGURE handshake completes). If we
++                // latched the one-shot on an EMPTY radio list, the bootstrap would be marked done
++                // before any radio existed and would never actually run. Therefore we only latch
++                // m_cbs_bootstrap_trigger_done once we have at least one radio to act on; while the
++                // list is empty we leave the flag false and retry on the next tick.
++                const auto radios = db->get_radios_list();
++
++                // Bring-up readiness gate. On the first ticks the AgentDB may already contain
++                // placeholder radio objects whose front.iface_mac is still ZERO (the fronthaul
++                // CONFIGURE handshake has not completed), and the socket to the Agent is not yet
++                // connected. If we act now we would send TRIGGER_CBS for radio 00:00:00:00:00:00
++                // and/or hit "socket to Agent not found", and then (previously) latch the one-shot
++                // as done on that failed attempt. Require BOTH: at least one radio with a REAL
++                // (non-zero) MAC, AND a valid agent socket. Until then, defer WITHOUT latching so
++                // the next tick retries.
++                const auto boot_agent_fd = m_btl_ctx.get_agent_fd();
++                if (boot_agent_fd == beerocks::net::FileDescriptor::invalid_descriptor) {
++                    LOG(DEBUG) << "[CBS] work: bootstrap - socket to Agent not ready yet; deferring "
++                                  "one-shot bootstrap to a later work() tick";
++                    goto cbs_periodic_after_bootstrap;
++                }
++
++                // Onboarding vs. controller-less reboot:
++                //
++                // During onboarding, wait for ApAutoConfigurationTask to finish before CBS so
++                // the driver is not addressed through the transient pre-configuration interfaces.
++                // A normal reboot is different: it restores an already-persisted topology, but
++                // may have no controller reachable at all; in that case autoconfiguration never
++                // completes and waiting for it would suppress CBS forever.
++                //
++                // Give a possible controller a bounded chance to start discovery. Once discovery
++                // starts, wait strictly for autoconfiguration completion. If discovery never
++                // starts during the grace period, this is controller-less reboot recovery and the
++                // ready AP managers already expose the persisted final SLO/MLO interfaces.
++                constexpr auto CBS_CONTROLLER_DISCOVERY_GRACE = std::chrono::seconds(15);
++                const auto now = std::chrono::steady_clock::now();
++                if (m_cbs_controller_discovery_grace_expiry ==
++                    std::chrono::steady_clock::time_point::min()) {
++                    m_cbs_controller_discovery_grace_expiry =
++                        now + CBS_CONTROLLER_DISCOVERY_GRACE;
++                    LOG(DEBUG) << "[CBS] work: bootstrap - waiting up to "
++                               << CBS_CONTROLLER_DISCOVERY_GRACE.count()
++                               << "s for controller discovery before selecting onboarding or "
++                                  "controller-less reboot path";
++                }
++
++                const bool onboarding_complete = db->statuses.ap_autoconfiguration_completed;
++                const bool discovery_started   = db->statuses.controller_discovery_completed;
++                const bool controllerless_reboot =
++                    !discovery_started && now >= m_cbs_controller_discovery_grace_expiry;
++
++                if (!onboarding_complete && !controllerless_reboot) {
++                    LOG(DEBUG) << "[CBS] work: bootstrap - "
++                               << (discovery_started
++                                       ? "controller discovery is active; waiting for AP "
++                                         "autoconfiguration completion"
++                                       : "awaiting controller discovery or controller-less reboot "
++                                         "grace expiry")
++                               << "; deferring one-shot CBS";
++                    goto cbs_periodic_after_bootstrap;
++                }
++
++                if (controllerless_reboot) {
++                    LOG(DEBUG) << "[CBS] work: bootstrap - no controller discovery within "
++                               << CBS_CONTROLLER_DISCOVERY_GRACE.count()
++                               << "s; using restored controller-less reboot topology";
++                }
++
++                bool any_ready_radio = false;
++                for (const auto radio : radios) {
++                    if (radio && radio->front.iface_mac != beerocks::net::network_utils::ZERO_MAC) {
++                        any_ready_radio = true;
++                        break;
++                    }
++                }
++                if (!any_ready_radio) {
++                    LOG(DEBUG) << "[CBS] work: bootstrap - no radios with a valid (non-zero) MAC in "
++                                  "AgentDB yet; deferring one-shot bootstrap to a later work() tick";
++                    // Do NOT set m_cbs_bootstrap_trigger_done here -> retry next tick.
++                    goto cbs_periodic_after_bootstrap;
++                }
++
++                for (const auto radio : radios) {
++                    if (!radio) {
++                        continue;
++                    }
++                    const auto &radio_mac = radio->front.iface_mac;
++
++                    // Skip radios that are not fully registered yet (zero MAC). They will be
++                    // handled by a later tick / the periodic path once their MAC is populated.
++                    if (radio_mac == beerocks::net::network_utils::ZERO_MAC) {
++                        LOG(DEBUG) << "[CBS] work: bootstrap - skipping radio with zero MAC (not "
++                                      "fully registered yet)";
++                        continue;
++                    }
++
++                    if (radio->cbs_preference_table.valid) {
++                        // ---- Case (A): cache already available -> send one unsolicited CPR now.
++                        if (!unsolicited_cpr_allowed) {
++                            LOG(DEBUG) << "[CBS] work: bootstrap - radio " << radio_mac
++                                       << " has a valid CBS cache but unsolicited CPR is not "
++                                          "enabled/allowed (unsolicited_enable/refresh knobs or a "
++                                          "pending solicited flow); skipping CPR";
++                            continue;
++                        }
++                        LOG(WARNING) << "[CBS] work: bootstrap - radio " << radio_mac
++                                     << " already has a valid CBS cache; sending one unsolicited "
++                                        "Channel Preference Report at boot (no re-scan needed)";
++
++                        // Build the per-radio preference set from the freshly-normalized table and
++                        // emit it (mid = 0). This is the same build/send pair the post-refresh
++                        // unsolicited path uses; send_channel_preference_report() adds the
++                        // mandatory agent-wide CAC TLVs for the 5GHz radio(s).
++                        m_pending_preference.mid = 0;
++                        m_pending_preference.preference_ready.clear();
++                        if (build_channel_preference_report(radio_mac)) {
++                            if (send_channel_preference_report()) {
++                                m_last_reported_preferences[radio_mac] = radio->channel_preferences;
++                            } else {
++                                LOG(ERROR) << "[CBS] work: bootstrap - failed to send unsolicited "
++                                              "Channel Preference Report for radio "
++                                           << radio_mac;
++                            }
++                        } else {
++                            LOG(ERROR) << "[CBS] work: bootstrap - failed to build Channel "
++                                          "Preference Report for radio "
++                                       << radio_mac;
++                        }
++                        // Clear the pending-preference bookkeeping so this unsolicited build does
++                        // not leak into a subsequent solicited query.
++                        m_pending_preference.mid = 0;
++                        m_pending_preference.preference_ready.clear();
++                        continue;
++                    }
++
++                    // ---- Case (B): no cache yet -> fire a one-shot CBS trigger. The post-scan
++                    // CHANNELS_LIST_RESPONSE path will refresh the cache and send the CPR.
++                    LOG(WARNING) << "[CBS] work: bootstrap CBS trigger for radio " << radio_mac
++                                 << " (no valid CBS/ACS cache yet at boot; firing a one-shot "
++                                    "'cbs enable 1' so the driver produces an ACS report and the "
++                                    "Channel Preference Report is sent on scan completion)";
++
++                    auto request = message_com::create_vs_message<
++                        beerocks_message::cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS>(m_cmdu_tx);
++                    if (!request) {
++                        LOG(ERROR) << "[CBS] work: bootstrap - failed to build TRIGGER_CBS message";
++                        break;
++                    }
++                    auto agent_fd = m_btl_ctx.get_agent_fd();
++                    if (agent_fd == beerocks::net::FileDescriptor::invalid_descriptor) {
++                        LOG(ERROR) << "[CBS] work: bootstrap - socket to Agent not found";
++                        break;
++                    }
++                    auto action_header = message_com::get_beerocks_header(m_cmdu_tx)->actionhdr();
++                    action_header->radio_mac() = radio_mac;
++                    m_btl_ctx.send_cmdu(agent_fd, m_cmdu_tx);
++                }
++            }
++            // Latch regardless of outcome: this is a best-effort one-shot boot-time kick. If the
++            // agent socket was not ready yet, the periodic path (when enabled) still covers
++            // subsequent refreshes, and any later solicited preference query / channel-selection
++            // request will populate the cache and report anyway.
++            m_cbs_bootstrap_trigger_done = true;
++        }
++
++cbs_periodic_after_bootstrap:
+         int32_t effective_interval = db->device_conf.cbs_trigger_periodic_interval;
+ 
+         constexpr int32_t CBS_DEFAULT_PERIODIC_INTERVAL_SEC = 3600;
+@@ -1281,13 +1496,54 @@ void ChannelSelectionTask::work()
+ 
+         if (effective_interval > 0) {
+             auto now = std::chrono::steady_clock::now();
++
+             if (m_cbs_next_trigger_time == std::chrono::steady_clock::time_point::min() ||
+                 now >= m_cbs_next_trigger_time) {
+ 
++                // Count how many radios we actually issued the trigger for. On the very first
++                // work() ticks the AgentDB radio list can still be EMPTY (radios are registered
++                // only after the fronthaul ACTION_APMANAGER_UP_NOTIFICATION / CONFIGURE handshake
++                // completes). Previously we armed m_cbs_next_trigger_time unconditionally here,
++                // which "consumed" the first (min()) fire on an empty list and pushed the REAL
++                // first CBS trigger out by a full interval (e.g. 3600s) - so at boot no
++                // "cbs enable 1" was ever sent, the cache stayed empty and the CPR was never sent.
++                // Only arm the next-trigger time once we have actually triggered at least one
++                // radio; while the list is empty, leave m_cbs_next_trigger_time at min() so the
++                // next tick retries immediately.
++                // Same bring-up readiness gate as the bootstrap block: do not attempt the periodic
++                // trigger until the agent socket is connected. Otherwise we spam
++                // "periodic CBS trigger for radio 00:00:00:00:00:00" + "socket to Agent not found"
++                // (and son_slave then fails to forward a zero-MAC TRIGGER_CBS).
++                if (m_btl_ctx.get_agent_fd() == beerocks::net::FileDescriptor::invalid_descriptor) {
++                    // Leave m_cbs_next_trigger_time unchanged (min()) so we retry once ready.
++                    goto cbs_periodic_done;
++                }
++                // Match bootstrap policy: onboarding waits for completion, while a controller-less
++                // reboot is allowed after the bounded discovery grace period.
++                const bool periodic_onboarding_complete =
++                    db->statuses.ap_autoconfiguration_completed;
++                const bool periodic_discovery_started =
++                    db->statuses.controller_discovery_completed;
++                const bool periodic_controllerless_reboot =
++                    m_cbs_controller_discovery_grace_expiry !=
++                        std::chrono::steady_clock::time_point::min() &&
++                    !periodic_discovery_started &&
++                    std::chrono::steady_clock::now() >=
++                        m_cbs_controller_discovery_grace_expiry;
++                if (!periodic_onboarding_complete && !periodic_controllerless_reboot) {
++                    goto cbs_periodic_done;
++                }
++
++                size_t triggered = 0;
+                 for (const auto radio : db->get_radios_list()) {
+                     if (!radio) {
+                         continue;
+                     }
++                    // Skip radios not fully registered yet (zero MAC) - a zero-MAC TRIGGER_CBS
++                    // cannot be routed by son_slave/ap_manager.
++                    if (radio->front.iface_mac == beerocks::net::network_utils::ZERO_MAC) {
++                        continue;
++                    }
+                     LOG(DEBUG) << "[CBS] work: periodic CBS trigger for radio "
+                                << radio->front.iface_mac
+                                << " (interval=" << effective_interval << "s)";
+@@ -1311,11 +1567,16 @@ void ChannelSelectionTask::work()
+                     auto action_header = message_com::get_beerocks_header(m_cmdu_tx)->actionhdr();
+                     action_header->radio_mac() = radio->front.iface_mac;
+                     m_btl_ctx.send_cmdu(agent_fd, m_cmdu_tx);
++                    ++triggered;
+                 }
+ 
+-                m_cbs_next_trigger_time = now + std::chrono::seconds(effective_interval);
++                if (triggered > 0) {
++                    // Only advance the schedule after a real trigger; otherwise retry next tick.
++                    m_cbs_next_trigger_time = now + std::chrono::seconds(effective_interval);
++                }
+             }
+         }
++cbs_periodic_done:;
+     }
+ }
+ 
+diff --git a/agent/src/beerocks/slave/tasks/channel_selection_task.h b/agent/src/beerocks/slave/tasks/channel_selection_task.h
+index e2b6751..230c259 100644
+--- a/agent/src/beerocks/slave/tasks/channel_selection_task.h
++++ b/agent/src/beerocks/slave/tasks/channel_selection_task.h
+@@ -376,6 +376,29 @@ private:
+     // is logged only once instead of on every work() tick.
+     bool m_cbs_interval_override_logged = false;
+ 
++    // Reboot-time bootstrap CBS trigger.
++    //
++    // On a fresh boot the CBS/ACS preference-table cache is empty (cbs_preference_table.valid ==
++    // false) until the driver produces its first "ACS show_report". That report is normally
++    // produced only after a "cbs enable 1" (periodic CBS trigger) or a dynamic ACS invoke. If the
++    // periodic interval is 0 AND the full CBS auto-handling is not enabled (e.g. only the
++    // preference-report refresh knob is set), the periodic block in work() is skipped entirely, so
++    // "cbs enable 1" is never fired at boot, the cache never gets populated, and the (unsolicited)
++    // Channel Preference Report is never sent - the reboot-time "CPR never sent" issue.
++    //
++    // To close that gap, work() performs a ONE-SHOT bootstrap CBS trigger on its first pass when
++    // any CBS/CPR-related knob is active and the radio has no valid cache yet. This flag makes the
++    // bootstrap fire at most once per process lifetime (it is independent of, and complementary to,
++    // the periodic-interval path which continues to run for interval > 0).
++    bool m_cbs_bootstrap_trigger_done = false;
++
++    // A controller-less reboot restores the already-persisted SLO/MLO topology but does not run
++    // AP autoconfiguration, so ap_autoconfiguration_completed remains false forever. Delay the
++    // controller-less fallback long enough for a normal onboarding cycle to start discovery; if
++    // discovery still has not started, CBS can safely run on the restored topology.
++    std::chrono::steady_clock::time_point m_cbs_controller_discovery_grace_expiry =
++        std::chrono::steady_clock::time_point::min();
++
+     // Set when a driver-ranking cache refresh (CBS/ACS/DYNAMIC-ACS completion) has produced a
+     // changed, normalized preference set and an unsolicited Channel Preference Report should be
+     // emitted. Consumed by the shared channels-list-response report path (same pattern as the
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index baa26a2..e2dac4e 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -5042,11 +5042,11 @@ bool ap_wlan_hal_nl80211::switch_channel(int chan, beerocks::eWiFiBandwidth bw,
+                 }
+             }
+         } else {
+-            // For 6GHz (and other non-5GHz bands):
+-            // For 80MHz: comparing freq vs vht_center_frequency (80MHz center) is correct.
+-            // For 160MHz and 320MHz: vht_center_frequency is the full-width block center, but
+-            //   sec_channel_offset must reflect the primary's position within its 40MHz block.
+-            //   Narrow the block down to its 40MHz sub-block center by repeatedly halving:
++            // For 6GHz (and other non-5GHz bands): vht_center_frequency is the full-width
++            //   block center (80/160/320MHz), but sec_channel_offset must reflect the
++            //   primary's position within its 40MHz block. Narrow the block down to its
++            //   40MHz sub-block center by repeatedly halving:
++            //   80MHz  -> 40MHz segment (±20MHz);
+             //   160MHz -> 80MHz segment (±40MHz) -> 40MHz segment (±20MHz);
+             //   320MHz -> 160MHz segment (±80MHz) -> 80MHz segment (±40MHz) -> 40MHz segment (±20MHz).
+             //
+@@ -5056,10 +5056,13 @@ bool ap_wlan_hal_nl80211::switch_channel(int chan, beerocks::eWiFiBandwidth bw,
+             //   40MHz center = 6185 + 20 = 6205 MHz
+             //   6195 < 6205 → sec_channel_offset=1 (secondary above primary) ✓
+             int center_for_offset = vht_center_frequency;
+-            if (bw == beerocks::BANDWIDTH_160 || bw == beerocks::BANDWIDTH_320 ||
+-                bw == beerocks::BANDWIDTH_320_1 || bw == beerocks::BANDWIDTH_320_2) {
+-                int full_width_mhz = (bw == beerocks::BANDWIDTH_160) ? 160 : 320;
+-                int half_step      = full_width_mhz / 4; // 40 for 160MHz, 80 for 320MHz
++            if (bw == beerocks::BANDWIDTH_80 || bw == beerocks::BANDWIDTH_160 ||
++                bw == beerocks::BANDWIDTH_320 || bw == beerocks::BANDWIDTH_320_1 ||
++                bw == beerocks::BANDWIDTH_320_2) {
++                int full_width_mhz = (bw == beerocks::BANDWIDTH_80)
++                                ? 80
++                                : (bw == beerocks::BANDWIDTH_160) ? 160 : 320;
++                int half_step = full_width_mhz / 4; // 20 for 80MHz, 40 for 160MHz, 80 for 320MHz
+                 while (half_step >= 20) {
+                     int offset = freq - center_for_offset;
+                     center_for_offset += (offset > 0) ? half_step : -half_step;
+@@ -6302,6 +6305,10 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+             // Commented out for now - can be re-enabled later.
+             // remove_stale_mld_links(interface);
+         }
++    } else if (event == Event::CSA_Started) {
++        if (from_global_sock) {
++            return true;
++        }
+     }
+ 
+     auto vap_id    = get_vap_id_with_bss(interface);
+-- 
+2.34.1
+
