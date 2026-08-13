@@ -1,0 +1,606 @@
+From a989aa05654d64eb2cbfc4e05cc28fc01179c9bf Mon Sep 17 00:00:00 2001
+From: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+Date: Wed, 12 Aug 2026 07:55:38 +0530
+Subject: [PATCH] bwl, controller: fix unassoc RSSI cancellation, scope query,
+ fix response radio resolution
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A duplicate unassoc-metrics query arriving mid-scan (~5s re-query vs. ~600ms
+ROC scan) destroyed the in-flight measurement: first_channel stayed 0, the
+emptiness guard fired on the wrong list, and trigger_roc_scan(0) failed and
+wiped every pending measurement, not just the duplicate's. Track each call's
+own MACs, key the early-return/cleanup off that list, and serialise
+m_pending_unassoc_measurements (shared by the ap_manager and monitor threads).
+
+Separately, unassoc_sta_rcpi_query re-queried the entire persistent
+unassociated-STA DB on every registration, turning N requests into N*M CMDUs
+across all (agent, operating_class) pairs. Add
+get_unassociated_stations_stats_scoped() to restrict each RPC to only the
+pairs it just registered; other callers keep the unscoped behaviour.
+
+Finally, handle_cmdu_1905_unassociated_station_link_metric_response() matched
+a response's operating_class/channel against each radio's advertised
+scan_capabilities.operating_classes to find which radio answered. When that
+map is stale or missing the reported class/channel entirely, the lookup
+failed and the response was dropped (ERROR "has no radio that supports
+operating_class X or channel Y") even though the query was sent to, and
+answered by, a real, currently-tuned radio. Add a further fallback matching
+the radio's live operating channel via database.get_radio_wifi_channel() —
+the same basis unassoc_sta_rcpi_query() already uses to pick which radio to
+query in the first place.
+
+Signed-off-by: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+---
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 249 ++++++++++++------
+ .../bwl/nl80211/mon_wlan_hal_nl80211.h        |   7 +
+ controller/nbapi/on_action.cpp                |  15 +-
+ controller/src/beerocks/master/controller.cpp |  27 +-
+ controller/src/beerocks/master/controller.h   |  48 +++-
+ .../master/tasks/link_metrics_task.cpp        |  25 ++
+ 6 files changed, 286 insertions(+), 85 deletions(-)
+
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index d6c6b6eef..b11cf4638 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -18,10 +18,13 @@
+ 
+ #include <easylogging++.h>
+ 
++#include <algorithm>
+ #include <cmath>
+ #include <fstream>
++#include <mutex>
+ #include <sstream>
+ #include <sys/timerfd.h>
++#include <vector>
+ 
+ extern "C" {
+ #include <wpa_ctrl.h>
+@@ -1485,6 +1488,14 @@ bool mon_wlan_hal_nl80211::trigger_roc_scan(uint8_t channel, uint32_t duration_m
+ 
+     // -----------------------------------------------
+     // Workaround: create a sleeper thread to trigger ROC event manually
++    //
++    // Note on logging: this thread never calls attach_current_thread_to_logger_id(),
++    // so easylogging routes its lines to the default logger id rather than the
++    // monitor's. In fronthaul_manager the ap_manager logger is initialized first,
++    // so "[ROC] Sleeper thread ..." lines appear under beerocks_ap_manager_* even
++    // though ap_manager and monitor are threads of the SAME process and this code
++    // is running on behalf of the monitor. Don't read that prefix as evidence that
++    // the wrong process ran the callback.
+     // -----------------------------------------------
+     std::thread([this, duration_ms]() {
+             constexpr uint32_t buffer_period_ms = 500;
+@@ -1513,19 +1524,30 @@ static inline int rssi_db_to_dbm(int rssi_db, int noise_floor_to_chanwidth = 94)
+ 
+ bool mon_wlan_hal_nl80211::process_roc_expired_event()
+ {
++    /* Take ownership of the pending list up front: claim it under the lock and
++     * process the (slow, blocking) debugfs reads on a local copy. This keeps the
++     * lock hold short and guarantees that a concurrent
++     * sta_unassoc_rssi_measurement() on the monitor thread cannot append to the
++     * batch we are about to drain — an entry added after this point belongs to
++     * the next ROC scan, not this one. */
++    std::vector<UnassocMeasurementContext> measurements;
++    {
++        std::lock_guard<std::mutex> lock(m_pending_unassoc_mutex);
++        measurements.swap(m_pending_unassoc_measurements);
++    }
++
+     LOG(DEBUG) << "Unassoc link metric query - slave gets driver event on scan complete: "
+-                << "pending_measurements=" << m_pending_unassoc_measurements.size();
+-
+-    // Both the monitor and the ap_manager processes subscribe to the same nl80211
+-    // mlme multicast group, so the kernel delivers the ROC-expired event to both.
+-    // Only the process that initiated the ROC scan (the monitor) has pending
+-    // measurements.  If this instance has none, the event belongs to another
+-    // process — silently ignore it.  Without this guard the ap_manager pushes an
+-    // empty Unassociation_Stations_Stats event which causes the controller to
+-    // receive RCPI=32 (noise floor) for every unassoc query.
+-    if (m_pending_unassoc_measurements.empty()) {
++                << "pending_measurements=" << measurements.size();
++
++    // An empty pending list means there is no measurement to report. This happens
++    // when the query was cancelled after the ROC was triggered but before this
++    // callback ran (see sta_unassoc_rssi_measurement's failure paths), or when a
++    // duplicate ROC-expired notification arrives. Return without pushing an event:
++    // pushing an empty Unassociation_Stations_Stats makes the controller record
++    // RCPI=32 (noise floor) for every unassoc query.
++    if (measurements.empty()) {
+         LOG(DEBUG) << "process_roc_expired_event: no pending measurements — "
+-                      "ignoring ROC event (not initiated by this process)";
++                      "nothing to report for this ROC event";
+         return true;
+     }
+ 
+@@ -1533,15 +1555,15 @@ bool mon_wlan_hal_nl80211::process_roc_expired_event()
+ 
+     // Get radio info for operating class calculation
+     auto &radio_info = get_radio_info();
+-    
+-    LOG(DEBUG) << "Processing ROC expired event for radio: " 
+-               << radio_info.iface_name 
++
++    LOG(DEBUG) << "Processing ROC expired event for radio: "
++               << radio_info.iface_name
+                << ", band=" << int(radio_info.frequency_band)
+                << ", current_channel=" << int(radio_info.channel)
+                << ", bandwidth=" << int(radio_info.bandwidth);
+ 
+     // Iterate through all STAs that were pending measurement
+-    for (auto &measurement : m_pending_unassoc_measurements) {
++    for (auto &measurement : measurements) {
+         int8_t rssi = 0;
+         if (read_peer_neighbor_rssi(measurement.mac_address, rssi)) {
+             sUnassociatedStationStats new_stat;
+@@ -1591,8 +1613,7 @@ bool mon_wlan_hal_nl80211::process_roc_expired_event()
+         // Clean up by removing the peer from the debugfs list
+         remove_peer_neighbor(measurement.mac_address);
+     }
+-    // Clear the pending measurements list
+-    m_pending_unassoc_measurements.clear();
++    // The pending list was already drained into `measurements` above.
+ 
+     // Allocate buffer for the event data
+     auto msg_buff = ALLOC_SMART_BUFFER(sizeof(stats_out));
+@@ -1616,8 +1637,38 @@ bool mon_wlan_hal_nl80211::process_roc_expired_event()
+ }
+ 
+ /**
+- * @brief Initiates RSSI measurement for a list of unassociated STAs.
++ * @brief Cancels the pending unassoc measurements for the given MACs.
++ *
++ * Removes each MAC's debugfs neighbor_peer entry and drops its context from
++ * m_pending_unassoc_measurements. Only the listed MACs are touched, so contexts
++ * belonging to another, still-in-flight ROC scan are left intact. A MAC that is
++ * no longer in the list (its scan already completed and drained it) is skipped.
+  */
++void mon_wlan_hal_nl80211::drop_pending_unassoc_measurements(
++        const std::vector<std::string> &mac_addresses)
++{
++    for (const auto &mac_address : mac_addresses) {
++        bool was_pending = false;
++        {
++            std::lock_guard<std::mutex> lock(m_pending_unassoc_mutex);
++            auto it = std::find_if(m_pending_unassoc_measurements.begin(),
++                                   m_pending_unassoc_measurements.end(),
++                                   [&](const UnassocMeasurementContext &ctx) {
++                                       return ctx.mac_address == mac_address;
++                                   });
++            if (it != m_pending_unassoc_measurements.end()) {
++                m_pending_unassoc_measurements.erase(it);
++                was_pending = true;
++            }
++        }
++        /* Only undo the debugfs add if we actually owned the context; if the
++         * measurement already completed it removed the neighbor itself. */
++        if (was_pending) {
++            remove_peer_neighbor(mac_address);
++        }
++    }
++}
++
+ bool mon_wlan_hal_nl80211::sta_unassoc_rssi_measurement(
+         std::unordered_map<std::string, sUnassocStaParams> &new_list)
+ {
+@@ -1629,81 +1680,125 @@ bool mon_wlan_hal_nl80211::sta_unassoc_rssi_measurement(
+ 
+     uint8_t first_channel = 0;
+ 
+-    // Prepare all STAs for measurement
+-    for (auto &sta : new_list) {
+-        const std::string &mac_address = sta.first;
+-        uint8_t channel                = sta.second.channel;
++    /* MACs this invocation added to the pending list. The list may already hold
++     * entries from a PREVIOUS, still-in-flight ROC scan (a repeat query arriving
++     * inside the ~600ms ROC window); those belong to that scan, not to this call,
++     * so this call must neither count them as its own work nor tear them down on
++     * its error paths. Tracked by MAC rather than by index because the sleeper
++     * thread of an earlier scan can drain the list while we are not holding the
++     * lock. */
++    std::vector<std::string> added_by_this_call;
++    size_t pre_existing_count = 0;
+ 
+-        // Validate channel number
+-        if (channel == 0) {
+-            LOG(ERROR) << "Invalid channel (0) for STA: " << mac_address;
+-            continue;
+-        }
++    {
++        std::lock_guard<std::mutex> lock(m_pending_unassoc_mutex);
+ 
+-        /* Pre-check: if this MAC is already in m_pending_unassoc_measurements,
+-         * a ROC scan is already in progress for it (triggered by a previous query
+-         * that arrived within the 600ms ROC window).  Skip the echo-add entirely
+-         * to avoid the EEXIST kernel error storm — the in-flight ROC scan will
+-         * return the RSSI when it expires. */
+-        bool already_pending = std::any_of(
+-            m_pending_unassoc_measurements.begin(),
+-            m_pending_unassoc_measurements.end(),
+-            [&](const UnassocMeasurementContext &ctx) {
+-                return ctx.mac_address == mac_address;
+-            });
+-        if (already_pending) {
+-            LOG(DEBUG) << "sta_unassoc_rssi_measurement: " << mac_address
+-                       << " already in pending list — ROC scan in progress, skipping re-add";
+-            continue;
+-        }
++        pre_existing_count = m_pending_unassoc_measurements.size();
+ 
+-        // Add STA to the driver's debugfs list for monitoring
+-        bool already_exists = false;
+-        if (!add_peer_neighbor(mac_address, &already_exists)) {
+-            if (already_exists) {
+-                /* STA is currently associated on this radio — driver cannot
+-                 * measure it as an unassociated peer via ROC scan.  Skip it
+-                 * silently; the unassoc query for this STA will return RCPI=0
+-                 * (noise floor) which the steering app treats as no-measurement.
+-                 *
+-                 * Note: the "already in pending list" case (repeated query within
+-                 * the 600ms ROC window) is handled by the pre-check above, so
+-                 * EEXIST here genuinely means the STA is associated. */
+-                LOG(INFO) << "sta_unassoc_rssi_measurement: skipping " << mac_address
+-                          << " (associated peer on this radio)";
+-            } else {
+-                LOG(ERROR) << "Failed to add peer neighbor: " << mac_address;
++        // Prepare all STAs for measurement
++        for (auto &sta : new_list) {
++            const std::string &mac_address = sta.first;
++            uint8_t channel                = sta.second.channel;
++
++            // Validate channel number
++            if (channel == 0) {
++                LOG(ERROR) << "Invalid channel (0) for STA: " << mac_address;
++                continue;
+             }
+-            continue;
+-        }
+ 
+-        // Use the channel of the first valid STA for the ROC scan
+-        if (first_channel == 0) {
+-            first_channel = channel;
+-        }
++            /* Pre-check: if this MAC is already in m_pending_unassoc_measurements,
++             * a ROC scan is already in progress for it (triggered by a previous query
++             * that arrived within the 600ms ROC window).  Skip the echo-add entirely
++             * to avoid the EEXIST kernel error storm — the in-flight ROC scan will
++             * return the RSSI when it expires. */
++            bool already_pending = std::any_of(
++                m_pending_unassoc_measurements.begin(),
++                m_pending_unassoc_measurements.end(),
++                [&](const UnassocMeasurementContext &ctx) {
++                    return ctx.mac_address == mac_address;
++                });
++            if (already_pending) {
++                LOG(DEBUG) << "sta_unassoc_rssi_measurement: " << mac_address
++                           << " already in pending list — ROC scan in progress, skipping re-add";
++                continue;
++            }
+ 
+-        // Store context for this measurement
+-        UnassocMeasurementContext ctx;
+-        ctx.mac_address = mac_address;
+-        ctx.channel     = channel;
+-        ctx.start_time  = std::chrono::steady_clock::now();
+-        m_pending_unassoc_measurements.push_back(ctx);
++            // Add STA to the driver's debugfs list for monitoring
++            bool already_exists = false;
++            if (!add_peer_neighbor(mac_address, &already_exists)) {
++                if (already_exists) {
++                    /* STA is currently associated on this radio — driver cannot
++                     * measure it as an unassociated peer via ROC scan.  Skip it
++                     * silently; the unassoc query for this STA will return RCPI=0
++                     * (noise floor) which the steering app treats as no-measurement.
++                     *
++                     * Note: the "already in pending list" case (repeated query within
++                     * the 600ms ROC window) is handled by the pre-check above, so
++                     * EEXIST here genuinely means the STA is associated. */
++                    LOG(INFO) << "sta_unassoc_rssi_measurement: skipping " << mac_address
++                              << " (associated peer on this radio)";
++                } else {
++                    LOG(ERROR) << "Failed to add peer neighbor: " << mac_address;
++                }
++                continue;
++            }
++
++            // Use the channel of the first valid STA for the ROC scan
++            if (first_channel == 0) {
++                first_channel = channel;
++            }
++
++            // Store context for this measurement
++            UnassocMeasurementContext ctx;
++            ctx.mac_address = mac_address;
++            ctx.channel     = channel;
++            ctx.start_time  = std::chrono::steady_clock::now();
++            m_pending_unassoc_measurements.push_back(ctx);
++            added_by_this_call.push_back(mac_address);
++        }
+     }
+ 
+-    if (m_pending_unassoc_measurements.empty()) {
++    if (added_by_this_call.empty()) {
++        /* Nothing was added this call, so there is no new work and — critically —
++         * no channel to scan: first_channel is only ever set alongside a
++         * successful add. Testing the whole list for emptiness here instead
++         * meant that when every STA was skipped but an earlier scan was still
++         * in flight, we fell through to trigger_roc_scan(0), which failed
++         * ("invalid 2.4ghz channel: 0") and then ran the failure cleanup over
++         * the WHOLE list — deleting the in-flight scan's debugfs neighbor entry
++         * and clearing its context. The sleeper thread then found
++         * pending_measurements=0 and dropped the ROC event, so no
++         * Unassociation_Stations_Stats was ever pushed and the controller got
++         * no RCPI for the STA at all. */
++        if (pre_existing_count > 0) {
++            LOG(DEBUG) << "sta_unassoc_rssi_measurement: every requested STA is already being "
++                          "measured by an in-flight ROC scan ("
++                       << pre_existing_count
++                       << " pending) — not starting another; that scan will report the RSSI";
++            return true;
++        }
+         LOG(ERROR) << "No valid STAs to measure";
+         return false;
+     }
+ 
++    /* Invariant: first_channel is assigned for every STA appended above, so a
++     * non-empty added_by_this_call implies a valid channel. Guard it anyway
++     * rather than risk handing channel 0 to the kernel. */
++    if (first_channel == 0) {
++        LOG(ERROR) << "sta_unassoc_rssi_measurement: " << added_by_this_call.size()
++                   << " STA(s) queued but no valid scan channel resolved";
++        drop_pending_unassoc_measurements(added_by_this_call);
++        return false;
++    }
++
+     // Trigger a single ROC scan. All measurements will be based on this scan.
+     uint32_t roc_duration_ms = 100;
+     if (!trigger_roc_scan(first_channel, roc_duration_ms)) {
+         LOG(ERROR) << "Failed to trigger ROC scan on channel " << int(first_channel);
+-        // Clean up all pending measurements if ROC scan fails
+-        for (auto &measurement : m_pending_unassoc_measurements) {
+-            remove_peer_neighbor(measurement.mac_address);
+-        }
+-        m_pending_unassoc_measurements.clear();
++        /* Clean up only the measurements THIS call added. Entries from an
++         * earlier in-flight scan must survive — tearing them down here is what
++         * silently killed a good measurement that was about to complete. */
++        drop_pending_unassoc_measurements(added_by_this_call);
+         return false;
+     }
+ 
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
+index 5bd62bcc9..3598d1c56 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
+@@ -12,6 +12,8 @@
+ #include "base_wlan_hal_nl80211.h"
+ #include <bwl/mon_wlan_hal.h>
+ 
++#include <mutex>
++
+ namespace bwl {
+ namespace nl80211 {
+ 
+@@ -113,7 +115,11 @@ protected:
+          uint8_t channel;
+          std::chrono::steady_clock::time_point start_time;
+      };
++     /* Mutated by the monitor thread (sta_unassoc_rssi_measurement) and read/cleared
++      * by the detached ROC sleeper thread (process_roc_expired_event), so every
++      * access must hold m_pending_unassoc_mutex. */
+      std::vector<UnassocMeasurementContext> m_pending_unassoc_measurements;
++     std::mutex m_pending_unassoc_mutex;
+      int m_roc_timeout_timer_fd = -1;
+ 
+      // Helper functions for unassociated STA measurements
+@@ -124,6 +130,7 @@ protected:
+      bool read_peer_neighbor_rssi(const std::string &mac_address, int8_t &rssi);
+      bool trigger_roc_scan(uint8_t channel, uint32_t duration_ms);
+      bool process_roc_expired_event();
++     void drop_pending_unassoc_measurements(const std::vector<std::string> &mac_addresses);
+ };
+ 
+ } // namespace nl80211
+diff --git a/controller/nbapi/on_action.cpp b/controller/nbapi/on_action.cpp
+index 38230b395..ac76a725c 100644
+--- a/controller/nbapi/on_action.cpp
++++ b/controller/nbapi/on_action.cpp
+@@ -1812,6 +1812,11 @@ amxd_status_t unassoc_sta_rcpi_query(amxd_object_t *object, amxd_function_t *fun
+     sMacAddr sta_mac = tlvf::mac_from_string(sta_mac_str);
+     int sent_count   = 0;
+ 
++    /* (agent, operating_class) pairs this request actually registered.  Only
++     * these are re-queried afterwards — see
++     * Controller::get_unassociated_stations_stats_scoped(). */
++    std::vector<Controller::sUnassocQueryScope> query_scope;
++
+     /* Find the STA's serving radio and serving agent from the controller DB.
+      *
+      * Serving radio: excluded from the unassoc query — the STA is already
+@@ -1985,15 +1990,21 @@ amxd_status_t unassoc_sta_rcpi_query(amxd_object_t *object, amxd_function_t *fun
+                              << " agent=" << agent_mac_s << " radio=" << radio_mac_s;
+             } else {
+                 sent_count++;
++                query_scope.push_back({tlvf::mac_from_string(agent_mac_s), op_class});
+                 LOG(DEBUG) << "unassoc_sta_rcpi_query: registered in DB"
+                            << " agent=" << agent_mac_s << " radio=" << radio_mac_s;
+             }
+         }
+     }
+ 
+-    /* Fix B: send ONE broadcast covering all just-registered (agent,radio) pairs. */
++    /* Fix B: send ONE query, and only for the (agent, operating_class) pairs
++     * this request registered.  The unscoped variant walks the whole persistent
++     * unassoc DB and emits a CMDU per (agent, operating_class) in it, so one
++     * request for one STA on one band also re-queries every other registered
++     * STA on every other band — N requests turn into N*M CMDUs, each of which
++     * the agent then fans out across all its radios. */
+     if (sent_count > 0) {
+-        controller_ctx->get_unassociated_stations_stats();
++        controller_ctx->get_unassociated_stations_stats_scoped(query_scope);
+     }
+ 
+     amxc_var_clean(&value);
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 94d279f79..545966edb 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -7691,8 +7691,19 @@ bool Controller::get_unassociated_stations_stats()
+     return send_unassociated_sta_link_metrics_query_message(cmdu_tx, database);
+ }
+ 
++bool Controller::get_unassociated_stations_stats_scoped(
++    const std::vector<sUnassocQueryScope> &scope)
++{
++    if (scope.empty()) {
++        LOG(DEBUG) << "get_unassociated_stations_stats_scoped: empty scope — nothing to query";
++        return true;
++    }
++    return send_unassociated_sta_link_metrics_query_message(cmdu_tx, database, &scope);
++}
++
+ bool Controller::send_unassociated_sta_link_metrics_query_message(
+-    ieee1905_1::CmduMessageTx &cmdu_tx, db &database)
++    ieee1905_1::CmduMessageTx &cmdu_tx, db &database,
++    const std::vector<sUnassocQueryScope> *scope)
+ {
+     if (!cmdu_tx.create(0, ieee1905_1::eMessageType::UNASSOCIATED_STA_LINK_METRICS_QUERY_MESSAGE)) {
+         LOG(ERROR) << "Failed building message UNASSOCIATED_STA_LINK_METRICS_RESPONSE_MESSAGE!";
+@@ -7827,6 +7838,20 @@ bool Controller::send_unassociated_sta_link_metrics_query_message(
+     for (auto &agent : global_map) {
+ 
+         for (auto &operating_class : agent.second) {
++            if (scope) {
++                // Caller asked for specific (agent, operating_class) pairs only.
++                bool in_scope = false;
++                for (const auto &wanted : *scope) {
++                    if (wanted.agent_mac == agent.first &&
++                        wanted.operating_class == operating_class.first) {
++                        in_scope = true;
++                        break;
++                    }
++                }
++                if (!in_scope) {
++                    continue;
++                }
++            }
+             auto unassociated_sta_query =
+                 cmdu_tx.addClass<wfa_map::tlvUnassociatedStaLinkMetricsQuery>();
+             if (operating_class.second.size() == 0) {
+diff --git a/controller/src/beerocks/master/controller.h b/controller/src/beerocks/master/controller.h
+index 84c06d688..4418162e6 100644
+--- a/controller/src/beerocks/master/controller.h
++++ b/controller/src/beerocks/master/controller.h
+@@ -339,11 +339,44 @@ public:
+ 
+     /**
+      * @brief get all stats from all connected agents and update the DM.
+-     * 
++     *
+      * @return true ifsuccess, false for any issue.
+      */
+     bool get_unassociated_stations_stats();
+ 
++    /**
++     * @brief One (agent, operating_class) pair a caller wants re-queried.
++     *
++     * Used to narrow send_unassociated_sta_link_metrics_query_message() to just
++     * the pairs a single request actually touched. See
++     * get_unassociated_stations_stats_scoped().
++     */
++    struct sUnassocQueryScope {
++        sMacAddr agent_mac;
++        uint8_t operating_class;
++    };
++
++    /**
++     * @brief Re-query only the given (agent, operating_class) pairs.
++     *
++     * The unscoped get_unassociated_stations_stats() emits one CMDU per
++     * (agent, operating_class) present in the whole persistent unassoc DB, so a
++     * single caller registering one STA re-queries every other registered STA on
++     * every other band too. With an MLO client registered on two op-classes that
++     * turns N requests into N*2 CMDUs on air, each of which the agent then fans
++     * out across all its radios. Callers that know which pairs they just touched
++     * should use this instead.
++     *
++     * An empty scope sends nothing (rather than falling back to everything) —
++     * a caller that registered no pairs has nothing to ask for.
++     *
++     * @param scope (agent, operating_class) pairs to include. Duplicates are fine.
++     *
++     * @return true on success, false for any issue.
++     */
++    bool
++    get_unassociated_stations_stats_scoped(const std::vector<sUnassocQueryScope> &scope);
++
+     /*
+      * @brief Reconfig Apmld by adding/removing affiliated link.
+      *
+@@ -979,15 +1012,20 @@ private:
+     std::shared_ptr<beerocks::btl::BrokerClient> m_broker_client;
+ 
+     /**
+-     * @brief sends a message of type UNASSOCIATED_STA_LINK_METRICS_QUERY_MESSAGE, it contains list/ddata of unassociated stations 
++     * @brief sends a message of type UNASSOCIATED_STA_LINK_METRICS_QUERY_MESSAGE, it contains list/ddata of unassociated stations
+      *
+      * @param cmdu_tx CMDU message to send.
+-     * @param database 
++     * @param database
++     * @param scope If non-null, restrict the emitted CMDUs to these
++     *              (agent, operating_class) pairs; an empty scope emits nothing.
++     *              If null, emit for every pair in the unassoc DB (legacy
++     *              behavior, used by the remove-all and BML paths).
+      *
+      *  @return true on success and false otherwise.
+     */
+-    bool send_unassociated_sta_link_metrics_query_message(ieee1905_1::CmduMessageTx &cmdu_tx,
+-                                                          db &database);
++    bool send_unassociated_sta_link_metrics_query_message(
++        ieee1905_1::CmduMessageTx &cmdu_tx, db &database,
++        const std::vector<sUnassocQueryScope> *scope = nullptr);
+ 
+     int8_t local_agent_onboarding_status = -1;
+ };
+diff --git a/controller/src/beerocks/master/tasks/link_metrics_task.cpp b/controller/src/beerocks/master/tasks/link_metrics_task.cpp
+index 1c34561a9..cb872ed8d 100644
+--- a/controller/src/beerocks/master/tasks/link_metrics_task.cpp
++++ b/controller/src/beerocks/master/tasks/link_metrics_task.cpp
+@@ -587,6 +587,31 @@ bool LinkMetricsTask::handle_cmdu_1905_unassociated_station_link_metric_response
+             }
+         }
+ 
++        /* Fix: If neither op_class nor scan_capabilities channel matching
++         * resolved a radio, fall back to the radio's CURRENT operating
++         * channel (same resolution basis unassoc_sta_rcpi_query() in
++         * on_action.cpp uses to pick which radio to query). This covers
++         * radios whose scan_capabilities.operating_classes is stale or
++         * missing the reported channel/class entirely — the query was
++         * still sent to (and answered by) a real, currently-tuned radio. */
++        if (tlvf::mac_to_string(radio_mac_address) ==
++            beerocks::net::network_utils::ZERO_MAC_STRING) {
++            uint8_t response_channel = sta_metrics.channel_number;
++            for (auto &radio : (*agent)->radios) {
++                auto wifi_channel = database.get_radio_wifi_channel(radio.first);
++                if (wifi_channel.get_channel() == response_channel) {
++                    radio_mac_address = radio.first;
++                    LOG(INFO) << "Unassoc response op_class/scan_capabilities mismatch "
++                                 "(received op_class="
++                              << (int)operating_class_received << ", channel="
++                              << (int)response_channel << ") but radio "
++                              << tlvf::mac_to_string(radio.first)
++                              << " is currently tuned to that channel — accepting response";
++                    break;
++                }
++            }
++        }
++
+         if (tlvf::mac_to_string(radio_mac_address) ==
+             beerocks::net::network_utils::ZERO_MAC_STRING) {
+             LOG(ERROR) << "Agent with mac_addr: " << tlvf::mac_to_string((*agent)->al_mac)
+-- 
+2.34.1
+
