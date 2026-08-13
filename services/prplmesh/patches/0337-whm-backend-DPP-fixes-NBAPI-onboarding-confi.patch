@@ -1,0 +1,1377 @@
+From 17cfa685624a7da889d1248a651f8d53a2a1fa9a Mon Sep 17 00:00:00 2001
+From: Parimalarengan Gururajan <gururaja@qti.qualcomm.com>
+Date: Thu, 13 Aug 2026 20:41:33 +0530
+Subject: [PATCH 6/6] patch 6: whm-backend DPP fixes, NBAPI onboarding config,
+ and GW profile-3 signaling
+
+Fixes and NBAPI plumbing found while validating the previous 5 patches on
+the whm (pwhm/ambiorix) platform:
+
+- bpl_running_mode.{h,cpp} (new): tracks whether this BPL instance is
+  linked into beerocks_agent or beerocks_controller, set once at startup
+  in each main().
+- bpl_cfg.h/cfg backends: new cfg_set_onboarding_type()/
+  cfg_set_1905_security_enabled() setters, wired from NBAPI.
+- controller.odl.in/agent.odl.in, on_action.cpp, db.h/db.cpp: expose
+  Configuration.OnboardingType (WSC|DPP) and
+  Configuration.LinkEncryptionEnable on both Controller and Agent, plus a
+  new persistent Network.ProvisionDPP[] table (Alias/DPPURI) that mirrors
+  its rows into the Configurator's file-backed DPP URI cache via
+  DppConfiguratorTask::sync_provisioned_uris().
+- controller.cpp/.h: only promotes an agent to Profile-3/DPP when the
+  controller's own onboardingtype is DPP (controller_supports_dpp),
+  falling back to Profile-1 otherwise; clears stale
+  dpp_security_required/pmk_1905_valid/tk_1905_installed state (and
+  uninstalls the transport key) when an agent re-Searches without a Chirp
+  TLV, so it isn't locked out of the plaintext WSC path after switching
+  back from DPP; drops noisy per-CMDU dispatch logging.
+- dpp_configurator_task.h: shortens SESSION_TIMEOUT_SEC 30s -> 10s; adds
+  get_dpp_configurator_task() accessor on Controller.
+- agent_db.h/topology_task.cpp: adds local_controller_dpp_capable so a
+  combined Controller+Agent (GW), whose co-located agent always onboards
+  itself via WSC, can still report Multi-AP Profile-3 in its own Topology
+  Response based on its local controller's DPP capability rather than its
+  own (always-WSC) onboarding state.
+- ap_wlan_hal_whm.cpp/slave_wlan_hal_whm.cpp: drop the now-unnecessary
+  per-VAP DPP.RelayController write; rename the relay object/params to
+  WiFi.DPPRelay./RelayEnable to match the current whm datamodel, and add
+  diagnostic logging around dpp_send_frame()/SendDppFrame failures.
+
+Signed-off-by: Parimalarengan Gururajan <gururaja@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/agent_db.h           |  8 ++
+ .../beerocks/slave/beerocks_agent_main.cpp    |  2 +
+ .../src/beerocks/slave/nbapi/odl/agent.odl.in |  9 ++
+ agent/src/beerocks/slave/son_slave_thread.cpp | 17 ++--
+ .../slave/tasks/ap_autoconfiguration_task.cpp | 91 +++++++++++++++----
+ .../beerocks/slave/tasks/dpp_agent_task.cpp   | 32 ++++++-
+ .../src/beerocks/slave/tasks/dpp_agent_task.h |  2 +-
+ .../beerocks/slave/tasks/topology_task.cpp    | 34 +++++++
+ .../beerocks/bwl/include/bwl/slave_wlan_hal.h |  7 +-
+ .../beerocks/bwl/nl80211/dpp_relay_socket.cpp |  3 +-
+ .../bwl => nl80211}/dpp_relay_socket.h        |  3 +
+ .../bwl/nl80211/slave_wlan_hal_nl80211.h      |  2 +-
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   | 12 ---
+ .../beerocks/bwl/whm/slave_wlan_hal_whm.cpp   | 15 ++-
+ controller/nbapi/odl/controller.odl.in        | 38 +++++++-
+ controller/nbapi/on_action.cpp                | 70 +++++++++++++-
+ .../beerocks/master/beerocks_master_main.cpp  |  2 +
+ controller/src/beerocks/master/controller.cpp | 44 +++++++--
+ controller/src/beerocks/master/controller.h   |  8 ++
+ controller/src/beerocks/master/db/agent.h     |  8 ++
+ controller/src/beerocks/master/db/db.cpp      |  2 +
+ controller/src/beerocks/master/db/db.h        |  3 +
+ .../master/tasks/dpp_configurator_task.cpp    | 54 +++++++++--
+ .../master/tasks/dpp_configurator_task.h      | 15 ++-
+ .../beerocks/master/tasks/dpp_key_store.cpp   | 30 ++++++
+ .../src/beerocks/master/tasks/dpp_key_store.h | 14 +++
+ framework/platform/bpl/CMakeLists.txt         |  1 +
+ framework/platform/bpl/cfg/dm/bpl_cfg.cpp     | 10 ++
+ .../platform/bpl/cfg/dm/bpl_cfg_wifi.cpp      | 31 ++++++-
+ .../platform/bpl/cfg/linux/bpl_cfg_wifi.cpp   |  4 +
+ framework/platform/bpl/cfg/rdk/bpl_cfg.cpp    |  4 +
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     | 11 +++
+ .../bpl/common/utils/bpl_running_mode.cpp     | 17 ++++
+ framework/platform/bpl/include/bpl/bpl_cfg.h  | 18 ++++
+ .../bpl/include/bpl/bpl_running_mode.h        | 45 +++++++++
+ 35 files changed, 587 insertions(+), 79 deletions(-)
+ rename common/beerocks/bwl/{include/bwl => nl80211}/dpp_relay_socket.h (96%)
+ create mode 100644 framework/platform/bpl/common/utils/bpl_running_mode.cpp
+ create mode 100644 framework/platform/bpl/include/bpl/bpl_running_mode.h
+
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index b62045bcd..d272ae4f5 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -142,6 +142,14 @@ public:
+         bool local_gw;
+         bool local_controller;
+         bool local_non_prplmesh_controller;
++
++        // In combined Controller+Agent (GW) mode the co-located agent always onboards
++        // itself via WSC (see dpp_extender_config.onboarding_type), since it never needs
++        // to DPP-onboard to its own local controller. This flag instead tracks whether
++        // that local controller itself is configured as a DPP Configurator (onboardingtype
++        // UCI == "DPP"), so the GW's own agent role can still advertise Multi-AP Profile-3
++        // — matching what its controller role already does for remote/wired extenders.
++        bool local_controller_dpp_capable = false;
+         uint8_t management_mode;
+         bool certification_mode;
+         std::string certification_program = "mapr4";
+diff --git a/agent/src/beerocks/slave/beerocks_agent_main.cpp b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+index d2b79b1bc..20fe6a127 100644
+--- a/agent/src/beerocks/slave/beerocks_agent_main.cpp
++++ b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+@@ -36,6 +36,7 @@ static std::shared_ptr<beerocks::nbapi::Amxrt> guarantee = nullptr;
+ #include <mapf/common/utils.h>
+ 
+ #include <bpl/bpl_amx.h>
++#include <bpl/bpl_running_mode.h>
+ 
+ #include <easylogging++.h>
+ #ifdef ENABLE_NBAPI
+@@ -906,6 +907,7 @@ int main(int argc, char *argv[])
+         LOG(ERROR) << "Failed to initialize BPL!";
+         return false;
+     }
++    beerocks::bpl::set_running_mode(beerocks::bpl::eRunningMode::AGENT);
+     // read slave config file
+     std::string slave_config_file_path =
+         CONF_FILES_WRITABLE_PATH + std::string(BEEROCKS_AGENT) +
+diff --git a/agent/src/beerocks/slave/nbapi/odl/agent.odl.in b/agent/src/beerocks/slave/nbapi/odl/agent.odl.in
+index 7c26f76ea..0762b926c 100644
+--- a/agent/src/beerocks/slave/nbapi/odl/agent.odl.in
++++ b/agent/src/beerocks/slave/nbapi/odl/agent.odl.in
+@@ -28,6 +28,15 @@
+                         ];
+             }
+ 
++            /* Selects the onboarding mechanism (WSC or DPP) used by this Agent */
++            %persistent string OnboardingType {
++                default "WSC";
++                on action validate call check_enum [
++                            "WSC",
++                            "DPP"
++                        ];
++            }
++
+             /* Specifies the network interface to use for wired backhaul */
+             %persistent string BackhaulWireInterface {
+                 default "wan";
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 783fa6ef1..c3ce7bd4a 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -866,8 +866,10 @@ bool slave_thread::read_platform_configuration()
+             (db->device_conf.management_mode == BPL_MGMT_MODE_MULTIAP_CONTROLLER_AGENT ||
+              db->device_conf.management_mode == BPL_MGMT_MODE_NONPRPL_CONTROLLER_AGENT);
+ 
++        std::string onboarding_type = bpl::cfg_get_onboarding_type();
++        db->device_conf.local_controller_dpp_capable = (onboarding_type == "DPP");
++
+         if (!controller_and_agent) {
+-            std::string onboarding_type = bpl::cfg_get_onboarding_type();
+             if (onboarding_type == "DPP") {
+                 db->dpp_extender_config.onboarding_type = AgentDB::OnboardingType::DPP;
+             } else {
+@@ -879,6 +881,7 @@ bool slave_thread::read_platform_configuration()
+         } else {
+             db->dpp_extender_config.onboarding_type = AgentDB::OnboardingType::WSC;
+             LOG(DEBUG) << "Controller+Agent (GW) mode: local agent uses WSC onboarding"
++                       << " (local controller onboardingtype=" << onboarding_type << ")"
+                        << " Enable1905Security=" << db->dpp_extender_config.link_encryption;
+         }
+     }
+@@ -1257,12 +1260,11 @@ void slave_thread::start_dpp_tcp_relay_server()
+         return;
+     }
+ 
+-    LOG(INFO) << "DPP: own onboarding complete — starting TCP relay listener (port "
+-              << bwl::DPP_TCP_PORT << ") for downstream enrollee proxying";
++    LOG(INFO) << "DPP: own onboarding complete — starting TCP relay listener for downstream "
++                 "enrollee proxying";
+ 
+     if (!m_slave_wlan_hal || !m_slave_wlan_hal->init_dpp_relay()) {
+-        LOG(ERROR) << "DPP: failed to start TCP relay listener (port "
+-                   << bwl::DPP_TCP_PORT << ")";
++        LOG(ERROR) << "DPP: failed to start TCP relay listener";
+         return;
+     }
+ 
+@@ -6893,9 +6895,8 @@ bool slave_thread::agent_fsm()
+                 // Controller or WSC agent: request TCP relay start immediately
+                 start_dpp_tcp_relay_server();
+             } else if (is_dpp_extender) {
+-                LOG(INFO) << "DPP: extender mode — deferring TCP relay server (port "
+-                          << bwl::DPP_TCP_PORT
+-                          << ") until own onboarding completes";
++                LOG(INFO) << "DPP: extender mode — deferring TCP relay server until own "
++                             "onboarding completes";
+             }
+         }
+ 
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index fa13f92a0..b912157bf 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -1390,6 +1390,30 @@ bool ApAutoConfigurationTask::send_ap_autoconfiguration_search_message(
+         return false;
+     }
+ 
++    // DPP wired/wireless extender: advertise Profile-3 and add Chirp TLV (TASK-18b).
++    // Only when onboardingtype=DPP, bootstrap key loaded and valid.
++    // The management_mode check is intentionally omitted — the onboarding_type
++    // is already set to WSC for Controller+Agent (GW) mode in son_slave_thread.cpp.
++    // This MUST run before the Multi-AP Profile TLV is built below, otherwise the
++    // Search message that carries the Chirp TLV would still advertise the stale
++    // (pre-override) profile and the controller would never see Profile-3 on it.
++    const bool dpp_onboarding_active =
++        db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP &&
++        db->dpp_bootstrap.valid && !db->dpp_credentials.initialized; // only before onboarding completes
++
++    // Combined Controller+Agent (GW): the co-located agent always onboards itself via
++    // WSC (no bootstrap key of its own, so it must NOT add a Chirp TLV here), but its
++    // local controller may be configured as a DPP Configurator for remote/wired
++    // extenders. Advertise Profile-3 in that case too, matching the controller role.
++    const bool dpp_profile3_required =
++        dpp_onboarding_active || db->device_conf.local_controller_dpp_capable;
++
++    if (dpp_profile3_required) {
++        // Override profile to Profile-3 so controller uses DPP path
++        db->device_conf.multi_ap_profile =
++            wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_3;
++    }
++
+     const bool include_profile_tlv =
+         (db->device_conf.multi_ap_profile >
+          wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_1) ||
+@@ -1408,19 +1432,8 @@ bool ApAutoConfigurationTask::send_ap_autoconfiguration_search_message(
+         tlvProfile2MultiApProfile->profile() = db->device_conf.multi_ap_profile;
+     }
+ 
+-    // DPP wired/wireless extender: add Chirp TLV and advertise Profile-3 (TASK-18b)
+-    // Only when onboardingtype=DPP, bootstrap key loaded and valid.
+-    // The management_mode check is intentionally omitted — the onboarding_type
+-    // is already set to WSC for Controller+Agent (GW) mode in son_slave_thread.cpp.
+-    if (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP &&
+-            db->dpp_bootstrap.valid &&
+-            !db->dpp_credentials.initialized) { // only before onboarding completes
+-
+-        // 1. Override profile to Profile-3 so controller uses DPP path
+-        db->device_conf.multi_ap_profile =
+-            wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_3;
+-
+-        // 2. Add tlvDppChirpValue with bootstrap chirp hash
++    if (dpp_onboarding_active) {
++        // Add tlvDppChirpValue with bootstrap chirp hash
+         auto chirp_tlv = m_cmdu_tx.addClass<wfa_map::tlvDppChirpValue>();
+         if (chirp_tlv) {
+             chirp_tlv->flags().hash_validity               = true;
+@@ -1927,8 +1940,51 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_response(
+     }
+ 
+     auto tlvProfile2MultiApProfile = cmdu_rx.getClass<wfa_map::tlvProfile2MultiApProfile>();
++
++    // 0xA9 presence signals controller requires 1905-layer security (EasyMesh §17.1.2).
++    // Absence means link_encryption=false on controller — skip Peer Discovery + EAPOL.
++    auto tlv1905Security              = cmdu_rx.getClass<wfa_map::tlv1905LayerSecurityCapability>();
++    bool controller_has_1905_security = (tlv1905Security != nullptr);
++
+     if (tlvProfile2MultiApProfile) {
+-        db->controller_info.profile_support = tlvProfile2MultiApProfile->profile();
++        auto profile = tlvProfile2MultiApProfile->profile();
++
++        // Fallback: whether this agent stays on DPP onboarding (and whether 1905-layer
++        // security, i.e. Peer Discovery + EAPOL, is required before the DPP BSS
++        // Configuration exchange) depends on the controller's profile/0xA9 combination:
++        //   - Profile-3, or Profile-2 with 0xA9 present -> stay on DPP, with security
++        //   - Profile-3 without 0xA9                    -> stay on DPP, without security
++        //   - anything else (Profile-2 without 0xA9, or a lower profile) -> controller is
++        //     not DPP-capable enough; revert to WSC so the FSM proceeds via WSC M1 instead
++        //     of waiting forever for a DPP BSS Configuration that will never arrive.
++        if (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP &&
++            !db->dpp_credentials.initialized) {
++            bool profile_3 =
++                (profile == wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_3);
++            bool profile_2 =
++                (profile == wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_2);
++
++            if ((profile_3 || profile_2) && controller_has_1905_security) {
++                LOG(INFO) << "DPP: controller responded with profile=" << int(profile)
++                          << ", 0xA9=present — proceeding with DPP onboarding + 1905 security";
++            } else if (profile_3 && !controller_has_1905_security) {
++                LOG(INFO) << "DPP: controller responded with profile=" << int(profile)
++                          << ", 0xA9=absent — proceeding with DPP onboarding, no EAPOL";
++            } else if (profile_2 && !controller_has_1905_security) {
++                LOG(WARNING) << "DPP: controller responded with profile=" << int(profile)
++                             << ", 0xA9=absent — controller is not DPP-capable, downgrading to "
++                                "WSC onboarding";
++                db->dpp_extender_config.onboarding_type = AgentDB::OnboardingType::WSC;
++            } else {
++                LOG(WARNING) << "DPP: controller responded with profile=" << int(profile)
++                             << ", 0xA9=" << (controller_has_1905_security ? "present" : "absent")
++                             << " — controller is not DPP-capable, falling back to WSC "
++                                "onboarding";
++                db->dpp_extender_config.onboarding_type = AgentDB::OnboardingType::WSC;
++            }
++        }
++
++        db->controller_info.profile_support = profile;
+         if (db->controller_info.profile_support ==
+             wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_1) {
+             db->controller_info.profile_support =
+@@ -1943,11 +1999,8 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_response(
+         }
+     }
+ 
+-    // 0xA9 presence signals controller requires 1905-layer security (EasyMesh §17.1.2).
+-    // Absence means link_encryption=false on controller — skip Peer Discovery + EAPOL.
+-    auto tlv1905Security = cmdu_rx.getClass<wfa_map::tlv1905LayerSecurityCapability>();
+-    db->dpp_extender_config.controller_requires_1905_security = (tlv1905Security != nullptr);
+-    if (db->dpp_extender_config.controller_requires_1905_security) {
++    db->dpp_extender_config.controller_requires_1905_security = controller_has_1905_security;
++    if (controller_has_1905_security) {
+         LOG(INFO) << "DPP: 0xA9 TLV present — Peer Discovery + EAPOL will run";
+     } else {
+         LOG(INFO) << "DPP: 0xA9 TLV absent — skipping Peer Discovery + EAPOL (no encryption)";
+diff --git a/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp b/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
+index e7431c0cd..564973991 100644
+--- a/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
++++ b/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
+@@ -18,6 +18,7 @@
+ #include <tlvf/wfa_map/tlvBssConfigurationRequest.h>
+ #include <tlvf/wfa_map/tlvDppChirpValue.h>
+ #include <tlvf/wfa_map/tlvDppMessage.h>
++#include <tlvf/wfa_map/tlvProfile2MultiApProfile.h>
+ 
+ #include <openssl/bio.h>
+ #include <openssl/bn.h>
+@@ -521,10 +522,11 @@ bool DppAgentTask::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx, uint32_t /*if
+         // Drop uplink-only frames that must never appear in a downlink
+         // PROXIED_ENCAP_DPP_MESSAGE from the Controller.
+         //
+-        // Auth Response (DPP subtype 0x01), GAS Initial Request (0x0A), and
+-        // GAS Comeback Request (0x0D) are all sent FROM the Enrollee TO the
+-        // Controller.  If the Controller has no active session it may echo one
+-        // of these frames back; discard it here before any further processing.
++        // Auth Response (DPP subtype 0x01), Configuration Result (subtype 0x0B),
++        // GAS Initial Request (0x0A), and GAS Comeback Request (0x0D) are all sent
++        // FROM the Enrollee TO the Controller.  If the Controller has no active
++        // session it may echo one of these frames back; discard it here before
++        // any further processing.
+         {
+             auto encap_tlv_drop = cmdu_rx.getClass<wfa_map::tlv1905EncapDpp>();
+             if (encap_tlv_drop) {
+@@ -546,7 +548,8 @@ bool DppAgentTask::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx, uint32_t /*if
+                         return true;
+                     }
+ 
+-                    // Auth Response (DPP Public Action subtype 0x01) is uplink-only — drop it.
++                    // Auth Response (DPP Public Action subtype 0x01) and Configuration
++                    // Result (subtype 0x0B) are uplink-only — drop them.
+                     if (type_byte == WLAN_PA_VENDOR_SPECIFIC &&
+                         enc_frame_len > 1 + DPP_SUBTYPE_OFFSET) {
+                         uint8_t subtype = enc_frame[1 + DPP_SUBTYPE_OFFSET];
+@@ -558,6 +561,14 @@ bool DppAgentTask::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx, uint32_t /*if
+                                 << std::dec << ")";
+                             return true;
+                         }
++                        if (subtype == DPP_PA_CONFIGURATION_RESULT) {
++                            LOG(WARNING)
++                                << "DPP: handle_cmdu: dropping downlink Configuration Result"
++                                << " (subtype=0x0B) — Configuration Result is uplink-only"
++                                << " (mid=0x" << std::hex << cmdu_rx.getMessageId()
++                                << std::dec << ")";
++                            return true;
++                        }
+                     }
+                 }
+             }
+@@ -2060,6 +2071,17 @@ bool DppAgentTask::send_bss_configuration_request(const sMacAddr &controller_mac
+         }
+     }
+ 
++    // This message is only ever sent while onboarding via DPP, so always advertise
++    // Profile-3 here regardless of the agent's persisted multi_ap_profile value.
++    db->device_conf.multi_ap_profile =
++        wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_3;
++    auto tlvProfile2MultiApProfile = m_cmdu_tx.addClass<wfa_map::tlvProfile2MultiApProfile>();
++    if (!tlvProfile2MultiApProfile) {
++        LOG(ERROR) << "DPP: failed to add tlvProfile2MultiApProfile";
++        return false;
++    }
++    tlvProfile2MultiApProfile->profile() = db->device_conf.multi_ap_profile;
++
+     // Append the BSS Configuration Request TLV with DPP JSON object
+     const std::string req_json =
+         "{\"name\":\"prplMesh\",\"wi-fi_tech\":\"map\",\"netRole\":\"mapAgent\"}";
+diff --git a/agent/src/beerocks/slave/tasks/dpp_agent_task.h b/agent/src/beerocks/slave/tasks/dpp_agent_task.h
+index cc9f55655..e1660ab50 100644
+--- a/agent/src/beerocks/slave/tasks/dpp_agent_task.h
++++ b/agent/src/beerocks/slave/tasks/dpp_agent_task.h
+@@ -35,7 +35,7 @@ class slave_thread;
+  * Wireless relay: The raw TCP:8908 relay socket to hostapd is owned in-process by
+  * slave_thread's bwl::slave_wlan_hal (common/beerocks/bwl/include/bwl/slave_wlan_hal.h) —
+  * on the NL80211 (openwrt) backend this is backed by the shared bwl::dpp_relay_socket
+- * engine (common/beerocks/bwl/include/bwl/dpp_relay_socket.h); this task is notified of
++ * engine (common/beerocks/bwl/nl80211/dpp_relay_socket.h); this task is notified of
+  * received frames via the Dpp_Frame_Received event and sends frames back to hostapd via
+  * direct calls to slave_wlan_hal::dpp_send_frame() — no cross-process/CMDU hop is involved.
+  *
+diff --git a/agent/src/beerocks/slave/tasks/topology_task.cpp b/agent/src/beerocks/slave/tasks/topology_task.cpp
+index 7f97c185a..b516d1dfa 100644
+--- a/agent/src/beerocks/slave/tasks/topology_task.cpp
++++ b/agent/src/beerocks/slave/tasks/topology_task.cpp
+@@ -377,6 +377,40 @@ void TopologyTask::handle_topology_query(ieee1905_1::CmduMessageRx &cmdu_rx,
+                     wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_1_AS_OF_R4;
+             }
+         }
++
++        // Combined Controller+Agent (GW): the co-located agent always onboards itself
++        // via WSC (son_slave_thread.cpp forces onboarding_type=WSC in this mode), so
++        // dpp_extender_config.onboarding_type/dpp_bootstrap.valid can never reflect DPP
++        // here — the only valid signal is whether the local co-located controller is
++        // configured as a DPP Configurator (local_controller_dpp_capable).
++        // All other modes (pure/remote agent): honour this agent's own onboarding state.
++        const bool controller_and_agent =
++            (db->device_conf.management_mode == BPL_MGMT_MODE_MULTIAP_CONTROLLER_AGENT ||
++             db->device_conf.management_mode == BPL_MGMT_MODE_NONPRPL_CONTROLLER_AGENT);
++
++        const bool dpp_capable =
++            controller_and_agent
++                ? db->device_conf.local_controller_dpp_capable
++                : (db->dpp_credentials.initialized ||
++                   (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP &&
++                    db->dpp_bootstrap.valid));
++        if (dpp_capable) {
++            db->device_conf.multi_ap_profile =
++                wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_3;
++        }
++
++        LOG(DEBUG) << "DPP: topology response multi_ap_profile="
++                   << int(db->device_conf.multi_ap_profile) << " dpp_capable=" << dpp_capable
++                   << " controller_and_agent=" << controller_and_agent
++                   << " dpp_credentials.initialized=" << db->dpp_credentials.initialized
++                   << " onboarding_type="
++                   << (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP
++                           ? "DPP"
++                           : "WSC")
++                   << " dpp_bootstrap.valid=" << db->dpp_bootstrap.valid
++                   << " local_controller_dpp_capable="
++                   << db->device_conf.local_controller_dpp_capable << " dest=" << src_mac;
++
+         auto tlvProfile2MultiApProfile = m_cmdu_tx.addClass<wfa_map::tlvProfile2MultiApProfile>();
+         if (!tlvProfile2MultiApProfile) {
+             LOG(ERROR) << "addClass wfa_map::tlvProfile2MultiApProfile failed";
+diff --git a/common/beerocks/bwl/include/bwl/slave_wlan_hal.h b/common/beerocks/bwl/include/bwl/slave_wlan_hal.h
+index 8484f801c..4f5947444 100644
+--- a/common/beerocks/bwl/include/bwl/slave_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/slave_wlan_hal.h
+@@ -13,9 +13,6 @@
+ 
+ namespace bwl {
+ 
+-/** DPP TCP port (matches DPP_TCP_PORT in hostapd). */
+-static constexpr uint16_t DPP_TCP_PORT = 8908;
+-
+ /*!
+  * Hardware abstraction layer for Slave
+  * Read more about virtual inheritance: https://en.wikipedia.org/wiki/Virtual_inheritance
+@@ -55,8 +52,8 @@ public:
+     virtual int smd_set_neighbor(const void* payload, int payload_len) { return 0; }
+ 
+     /**
+-     * @brief Start the DPP-over-TCP relay listener (127.0.0.1:DPP_TCP_PORT), if supported
+-     * by this backend. No-op (returns false) on backends that don't relay DPP over TCP.
++     * @brief Start the DPP-over-TCP relay listener, if supported by this backend. No-op
++     * (returns false) on backends that don't relay DPP over TCP.
+      */
+     virtual bool init_dpp_relay() { return false; }
+ 
+diff --git a/common/beerocks/bwl/nl80211/dpp_relay_socket.cpp b/common/beerocks/bwl/nl80211/dpp_relay_socket.cpp
+index b934bc097..1c80eac0a 100644
+--- a/common/beerocks/bwl/nl80211/dpp_relay_socket.cpp
++++ b/common/beerocks/bwl/nl80211/dpp_relay_socket.cpp
+@@ -2,7 +2,8 @@
+  * SPDX-License-Identifier: ISC
+  */
+ 
+-#include <bwl/dpp_relay_socket.h>
++#include "dpp_relay_socket.h"
++
+ #include <bwl/slave_wlan_hal.h>
+ 
+ #include <easylogging++.h>
+diff --git a/common/beerocks/bwl/include/bwl/dpp_relay_socket.h b/common/beerocks/bwl/nl80211/dpp_relay_socket.h
+similarity index 96%
+rename from common/beerocks/bwl/include/bwl/dpp_relay_socket.h
+rename to common/beerocks/bwl/nl80211/dpp_relay_socket.h
+index 689692526..a3f9c0e51 100644
+--- a/common/beerocks/bwl/include/bwl/dpp_relay_socket.h
++++ b/common/beerocks/bwl/nl80211/dpp_relay_socket.h
+@@ -12,6 +12,9 @@
+ 
+ namespace bwl {
+ 
++/** DPP TCP port (matches DPP_TCP_PORT in hostapd). */
++static constexpr uint16_t DPP_TCP_PORT = 8908;
++
+ /**
+  * @brief Shared raw-socket engine for the DPP-over-TCP relay (127.0.0.1:DPP_TCP_PORT) that
+  * hostapd connects to. Platform-agnostic: has no knowledge of base_wlan_hal/HALType/BWL_TYPE.
+diff --git a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h
+index d51b74c3e..f5a40f544 100644
+--- a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h
+@@ -6,7 +6,7 @@
+ #define _BWL_SLAVE_WLAN_HAL_NL80211_H_
+ 
+ #include <bwl/slave_wlan_hal.h>
+-#include <bwl/dpp_relay_socket.h>
++#include "dpp_relay_socket.h"
+ #include <mqtt_client.h>
+ #include <vector>
+ #include <chrono>
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index 36951f6bf..40cb8b4d0 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -971,18 +971,6 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+             continue;
+         }
+ 
+-        // Add this VAP to the DPP TCP relay so hostapd dials 127.0.0.1:8908 (mirrors
+-        // ap_wlan_hal_nl80211's dpp_controller conf write for DPP-authenticated BSS
+-        // configs). pkhash stays all-zero: hostapd's TCP leg only talks to the local
+-        // relay, the real DPP bootstrap/auth exchange happens over 1905/CMDU.
+-        if (bss_info_conf.additional_auth == son::wireless_utils::eAdditionalAuth::DPP) {
+-            AmbiorixVariant dpp_obj(AMXC_VAR_ID_HTABLE);
+-            dpp_obj.add_child<bool>("RelayController", true);
+-            if (!m_ambiorix_cl.update_object(wifi_vap_path + "DPP.", dpp_obj)) {
+-                LOG(WARNING) << "Failed to set DPP.RelayController for " << wifi_vap_path;
+-            }
+-        }
+-
+         // Apply the RSN Override (MRSNO, R6.1 §17.2.105) params carried in security_ies, after
+         // the base Security ModeEnabled write. Skip for a freshly-created VAP (wildcard bssid /
+         // ifname=="new_interface") since the pWHM instance doesn't exist yet; it is (re)applied
+diff --git a/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
+index 5eea90f7a..1bc96efd5 100644
+--- a/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
+@@ -46,13 +46,13 @@ bool slave_wlan_hal_whm::init_dpp_relay()
+     }
+ 
+     if (m_dpp_path.empty() &&
+-        !m_ambiorix_cl.resolve_path(wbapi_utils::search_path_wifi() + "DPP.", m_dpp_path)) {
+-        LOG(ERROR) << "DPP: failed to resolve WiFi.DPP. object path";
++        !m_ambiorix_cl.resolve_path(wbapi_utils::search_path_wifi() + "DPPRelay.", m_dpp_path)) {
++        LOG(ERROR) << "DPP: failed to resolve WiFi.DPPRelay. object path";
+         return false;
+     }
+ 
+     AmbiorixVariant enable_map(AMXC_VAR_ID_HTABLE);
+-    enable_map.add_child("Enable", true);
++    enable_map.add_child("RelayEnable", true);
+     if (!m_ambiorix_cl.update_object(m_dpp_path, enable_map)) {
+         LOG(ERROR) << "DPP: failed to enable relay listener at " << m_dpp_path;
+         return false;
+@@ -81,7 +81,7 @@ void slave_wlan_hal_whm::stop_dpp_relay()
+ 
+     if (!m_dpp_path.empty()) {
+         AmbiorixVariant enable_map(AMXC_VAR_ID_HTABLE);
+-        enable_map.add_child("Enable", false);
++        enable_map.add_child("RelayEnable", false);
+         if (!m_ambiorix_cl.update_object(m_dpp_path, enable_map)) {
+             LOG(WARNING) << "DPP: failed to disable relay listener at " << m_dpp_path;
+         }
+@@ -128,7 +128,11 @@ void slave_wlan_hal_whm::on_dpp_ambiorix_event(AmbiorixVariant &event_data)
+ 
+ bool slave_wlan_hal_whm::dpp_send_frame(uint8_t tcp_type, const uint8_t *frame, size_t frame_len)
+ {
++    LOG(DEBUG) << "DPP: dpp_send_frame diag: m_dpp_path='" << m_dpp_path << "' amxb_fd="
++              << m_ambiorix_cl.get_fd() << " amxp_fd=" << m_ambiorix_cl.get_signal_fd();
++
+     if (m_dpp_path.empty()) {
++        LOG(ERROR) << "DPP: SendDppFrame failed - m_dpp_path is empty";
+         return false;
+     }
+ 
+@@ -137,7 +141,8 @@ bool slave_wlan_hal_whm::dpp_send_frame(uint8_t tcp_type, const uint8_t *frame,
+     args.add_child("frame", string_utils::bytes_to_hex_string(frame, frame_len));
+ 
+     if (!m_ambiorix_cl.call(m_dpp_path, "SendDppFrame", args, result)) {
+-        LOG(ERROR) << "DPP: SendDppFrame failed";
++        LOG(ERROR) << "DPP: SendDppFrame failed - amxb_fd=" << m_ambiorix_cl.get_fd()
++                   << " amxp_fd=" << m_ambiorix_cl.get_signal_fd() << " path=" << m_dpp_path;
+         return false;
+     }
+     return true;
+diff --git a/controller/nbapi/odl/controller.odl.in b/controller/nbapi/odl/controller.odl.in
+index 56bd0a67d..e40e6897a 100644
+--- a/controller/nbapi/odl/controller.odl.in
++++ b/controller/nbapi/odl/controller.odl.in
+@@ -199,6 +199,23 @@
+                         default false;
+                     }
+ 
++                    /* Selects the onboarding mechanism (WSC or DPP) used by the Controller */
++                    %persistent string OnboardingType {
++                        userflags %upc;
++                        default "WSC";
++                        on action validate call check_enum [
++                            "WSC",
++                            "DPP"
++                        ];
++                    }
++
++                    /* If enabled, 1905/EasyMesh CMDUs between Controller and Agents are
++                       AES-SIV encrypted for DPP-onboarded devices */
++                    %persistent bool LinkEncryptionEnable {
++                        userflags %upc;
++                        default false;
++                    }
++
+                     /* If enabled, client roaming is active in the optimal path task */
+                     %persistent bool ClientRoamingEnabled {
+                         userflags %upc;
+@@ -466,7 +483,7 @@
+     @DATAELEMENTS_ROOT_DM_Header@
+ 
+                 // Define controller.Network element
+-                object Network {
++                %persistent object Network {
+ 
+                     // Define string variable
+                     %read-only string ID = "0";
+@@ -491,6 +508,22 @@
+ 
+                     void AccessPointCommit();
+ 
++                    /**
++                    * DPP enrollee bootstrapping URI cache, exposed as a user-manageable table.
++                    * Backs the Configurator's file-based DPP URI cache
++                    * (/etc/prplmesh/dpp_uri) - any add/edit/remove here rewrites that file in
++                    * full, which the Configurator's file watcher then reloads.
++                    */
++                    %persistent object ProvisionDPP[] {
++                        counted with ProvisionDPPNumberOfEntries;
++
++                        // User-assigned display name for this enrollee entry
++                        %persistent string Alias = "";
++
++                        // Enrollee DPP bootstrapping URI, e.g. "DPP:V:...;K:...;;"
++                        %persistent string DPPURI = "";
++                    }
++
+                     // Global network wide enable
+                     bool Enable = true;
+ 
+@@ -778,6 +811,9 @@
+ 
+     on event "*" call event_network_group_changed
+         filter 'object matches "@DATAELEMENTS_ROOT_DM_literal@\.Network\.X_PRPLWARE-COM_Group\."';
++
++    on event "*" call event_provision_dpp_changed
++        filter 'object matches "@DATAELEMENTS_ROOT_DM_literal@\.Network\.ProvisionDPP\."';
+ }
+ 
+ include "device.odl";
+diff --git a/controller/nbapi/on_action.cpp b/controller/nbapi/on_action.cpp
+index ac76a725c..675de3028 100644
+--- a/controller/nbapi/on_action.cpp
++++ b/controller/nbapi/on_action.cpp
+@@ -2330,6 +2330,15 @@ static void event_configuration_changed(const char *const sig_name, const amxc_v
+     nbapi_config.dynamic_channel_select_task =
+         amxd_object_get_bool(configuration, "DynamicChannelSelectionTaskEnabled", nullptr);
+ 
++    char *onboarding_type = amxd_object_get_cstring_t(configuration, "OnboardingType", nullptr);
++    if (onboarding_type) {
++        nbapi_config.onboarding_type = onboarding_type;
++        free(onboarding_type);
++    }
++
++    nbapi_config.link_encryption_enable =
++        amxd_object_get_bool(configuration, "LinkEncryptionEnable", nullptr);
++
+     nbapi_config.load_balancing =
+         amxd_object_get_bool(configuration, "LoadBalancingTaskEnabled", nullptr);
+ 
+@@ -2433,6 +2442,64 @@ static void event_network_enable_changed(const char *const sig_name, const amxc_
+     access_point_commit(network_obj, nullptr, nullptr, nullptr);
+ }
+ 
++/**
++ * @brief Event handler for Network.ProvisionDPP table changes.
++ *
++ * Invoked on any add/edit/remove of a Device.WiFi.DataElements.Network.ProvisionDPP.{i}
++ * row. Rewrites the Configurator's file-backed DPP URI cache from the full, current set
++ * of DPPURI entries in the table — the table is the source of truth, the file is a mirror
++ * picked up by the Configurator's existing inotify watcher.
++ *
++ * Note: this can also fire on transient/incomplete states (e.g. instance
++ * (re)creation during datamodel restore at startup, before a persisted DPPURI
++ * value has been reapplied to the new instance). write_dpp_uris() guards
++ * against destructively truncating the mirror file to empty in that case.
++ */
++static void event_provision_dpp_changed(const char *const sig_name, const amxc_var_t *const data,
++                                        void *const priv)
++{
++    if (!g_database) {
++        LOG(ERROR) << "Can't sync ProvisionDPP, g_database is nullptr";
++        return;
++    }
++
++    auto controller_ctx = g_database->get_controller_ctx();
++    if (!controller_ctx) {
++        LOG(WARNING) << "Failed to get controller context, cannot sync ProvisionDPP.";
++        return;
++    }
++
++    auto dpp_task = controller_ctx->get_dpp_configurator_task();
++    if (!dpp_task) {
++        LOG(WARNING) << "DppConfiguratorTask not initialized, cannot sync ProvisionDPP.";
++        return;
++    }
++
++    amxd_object_t *provision_dpp_entry =
++        amxd_dm_signal_get_object(beerocks::nbapi::Amxrt::getDatamodel(), data);
++    amxd_object_t *provision_dpp =
++        provision_dpp_entry ? amxd_object_get_parent(provision_dpp_entry) : nullptr;
++
++    if (!provision_dpp) {
++        LOG(WARNING) << "Failed to get object " DATAELEMENTS_ROOT_DM ".Network.ProvisionDPP.";
++        return;
++    }
++
++    std::vector<std::string> uris;
++    amxd_object_for_each(instance, it, provision_dpp)
++    {
++        amxd_object_t *entry = amxc_llist_it_get_data(it, amxd_object_t, it);
++        std::string uri      = get_param_string(entry, "DPPURI");
++        if (!uri.empty()) {
++            uris.push_back(uri);
++        }
++    }
++
++    if (!dpp_task->sync_provisioned_uris(uris)) {
++        LOG(ERROR) << "Failed to rewrite DPP URI cache file from ProvisionDPP table.";
++    }
++}
++
+ /**
+  * @brief Send Multi-AP Policy Config Request from NBAPI
+  *
+@@ -2699,7 +2766,8 @@ std::vector<beerocks::nbapi::sEvents> get_events_list(void)
+         {"event_configuration_changed", event_configuration_changed},
+         {"event_traffic_separation_changed", event_traffic_separation_changed},
+         {"event_network_group_changed", event_network_group_changed},
+-        {"event_network_enable_changed", event_network_enable_changed}};
++        {"event_network_enable_changed", event_network_enable_changed},
++        {"event_provision_dpp_changed", event_provision_dpp_changed}};
+     return events_list;
+ }
+ 
+diff --git a/controller/src/beerocks/master/beerocks_master_main.cpp b/controller/src/beerocks/master/beerocks_master_main.cpp
+index 3ec503e14..1eaff65ec 100644
+--- a/controller/src/beerocks/master/beerocks_master_main.cpp
++++ b/controller/src/beerocks/master/beerocks_master_main.cpp
+@@ -32,6 +32,7 @@ static std::shared_ptr<beerocks::nbapi::Amxrt> guarantee = nullptr;
+ 
+ #include <bpl/bpl_amx.h>
+ #include <bpl/bpl_cfg.h>
++#include <bpl/bpl_running_mode.h>
+ 
+ #include <easylogging++.h>
+ 
+@@ -732,6 +733,7 @@ int main(int argc, char *argv[])
+         LOG(ERROR) << "Failed to initialize BPL!";
+         return false;
+     }
++    beerocks::bpl::set_running_mode(beerocks::bpl::eRunningMode::CONTROLLER);
+ 
+     // read master config file
+     std::string master_config_file_path =
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 62c8532a3..1ebe96942 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -661,13 +661,6 @@ bool Controller::handle_cmdu_from_broker(uint32_t iface_index, const sMacAddr &d
+ bool Controller::handle_cmdu_1905_1_message(const sMacAddr &src_mac,
+                                             ieee1905_1::CmduMessageRx &cmdu_rx)
+ {
+-    LOG(INFO) << "handle_cmdu_1905_1_message: src_mac=" << src_mac
+-              << " msg_type=0x" << std::hex << int(cmdu_rx.getMessageType())
+-              << " msg_id=" << std::dec << int(cmdu_rx.getMessageId())
+-              << " dpp_task=" << (m_dpp_configurator_task ? "initialized" : "null");
+-    LOG(INFO) << "handle_cmdu_1905_1_message: dispatching message_type=0x"
+-              << std::hex << int(cmdu_rx.getMessageType()) << " msg_id=" << std::dec
+-              << int(cmdu_rx.getMessageId());
+     switch (cmdu_rx.getMessageType()) {
+     case ieee1905_1::eMessageType::ACK_MESSAGE:
+         return handle_cmdu_1905_ack_message(src_mac, cmdu_rx);
+@@ -905,6 +898,13 @@ bool Controller::handle_cmdu_1905_autoconfiguration_search(const sMacAddr &src_m
+     // Read once — used both for 0xA9 TLV gate and dpp_security_required gate.
+     const bool security_enabled = beerocks::bpl::cfg_get_1905_security_enabled();
+ 
++    // Reuse onboardingtype UCI on the controller: in combined controller+agent
++    // (gateway) mode the local co-located agent always forces WSC regardless of
++    // this option (son_slave_thread.cpp), so it is otherwise unused here. We
++    // repurpose it as "is this controller willing to act as DPP Configurator
++    // for remote/wired extenders". Absent config defaults to WSC.
++    const bool controller_supports_dpp = (beerocks::bpl::cfg_get_onboarding_type() == "DPP");
++
+     auto tlvSupportedServiceOut = cmdu_tx.addClass<wfa_map::tlvSupportedService>();
+     if (!tlvSupportedServiceOut) {
+         LOG(ERROR) << "addClass wfa_map::tlvSupportedService failed";
+@@ -944,7 +944,7 @@ bool Controller::handle_cmdu_1905_autoconfiguration_search(const sMacAddr &src_m
+             (tlvProfile2MultiApProfileAgent->profile() ==
+              wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_3);
+ 
+-        if (agent_requests_profile3) {
++        if (agent_requests_profile3 && controller_supports_dpp) {
+             tlvProfile2MultiApProfileController->profile() =
+                 wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_3;
+             if (!cmdu_rx.getClass<wfa_map::tlvDppChirpValue>()) {
+@@ -955,9 +955,15 @@ bool Controller::handle_cmdu_1905_autoconfiguration_search(const sMacAddr &src_m
+                           << " — agent will onboard via DPP";
+             }
+         } else {
+-            // Profile-1 for backward compatibility with non-DPP agents
++            // Profile-1 for backward compatibility with non-DPP agents, OR
++            // controller itself is onboardingtype=WSC — tell the agent to fall back.
+             tlvProfile2MultiApProfileController->profile() =
+                 wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_1;
++            if (agent_requests_profile3) {
++                LOG(INFO) << "DPP: controller onboardingtype=WSC — downgrading to "
++                             "Profile-1 for "
++                          << al_mac;
++            }
+         }
+         auto profile2_ap_capability_tlv = cmdu_tx.addClass<wfa_map::tlvProfile2ApCapability>();
+         if (profile2_ap_capability_tlv) {
+@@ -1090,6 +1096,26 @@ bool Controller::handle_cmdu_1905_autoconfiguration_search(const sMacAddr &src_m
+ 
+     }
+ 
++    // DPP: agent re-Searching WITHOUT a chirp, but still marked from a previous DPP
++    // session as requiring 1905 security (e.g. onboardingtype was switched back to
++    // WSC and the agent restarted). Clear the stale Agent-DB flag/keys AND the
++    // transport-level TK/GTK, otherwise the upcoming plaintext WSC M1/M2 exchange is
++    // silently dropped by the 1905 security manager and by send_cmdu_to_agent().
++    if (!chirp_tlv_rx) {
++        auto stale_agent = database.m_agents.get(al_mac);
++        if (stale_agent && stale_agent->dpp_security_required) {
++            LOG(INFO) << "DPP: agent " << al_mac
++                      << " re-Searched without Chirp TLV — clearing stale DPP/1905 "
++                         "security state (dpp_security_required=false)";
++            stale_agent->dpp_security_required = false;
++            stale_agent->pmk_1905_valid         = false;
++            stale_agent->tk_1905_installed      = false;
++            if (m_broker_client) {
++                m_broker_client->install_security_key(al_mac, {}, {}, 0, false);
++            }
++        }
++    }
++
+     // Send autoconfig response FIRST (Fix 2: extender must receive response before DPP auth)
+     bool ret = son_actions::send_cmdu_to_agent(al_mac, cmdu_tx, database);
+ 
+diff --git a/controller/src/beerocks/master/controller.h b/controller/src/beerocks/master/controller.h
+index c27733a49..c7b0f01fd 100644
+--- a/controller/src/beerocks/master/controller.h
++++ b/controller/src/beerocks/master/controller.h
+@@ -392,6 +392,14 @@ public:
+     bool reconfig_apmld(const sMacAddr &al_mac, const sMacAddr &mld_mac, const sMacAddr &ruid,
+                         bool add_link);
+ 
++    /**
++     * @brief Get the DPP Configurator Task (for NBAPI ProvisionDPP sync).
++     */
++    std::shared_ptr<son::DppConfiguratorTask> get_dpp_configurator_task()
++    {
++        return m_dpp_configurator_task;
++    }
++
+     /*
+      * @brief Reconfig bStaMld by adding/removing affiliated bSta.
+      *
+diff --git a/controller/src/beerocks/master/db/agent.h b/controller/src/beerocks/master/db/agent.h
+index 5eda02ab4..96d336be3 100644
+--- a/controller/src/beerocks/master/db/agent.h
++++ b/controller/src/beerocks/master/db/agent.h
+@@ -100,6 +100,14 @@ public:
+     // 1905 Transport Key installation status (for Profile-3 DPP security)
+     bool tk_1905_installed = false;
+ 
++    // Set once this agent has completed wired DPP onboarding (Config Result or BSS
++    // Configuration Result received). Unlike the per-hash sDppSession (which is erased
++    // after SESSION_TIMEOUT_SEC of inactivity), this persists for the Agent's lifetime so a
++    // later re-chirp from an already-onboarded wired extender does not restart Auth Request.
++    // Naturally cleared on factory reset / re-onboarding, since the Agent object is removed
++    // and re-created from scratch when the device is re-discovered.
++    bool dpp_wired_onboarding_complete = false;
++
+     // 802.1Q C-TAG Traffic Separation support
+     bool traffic_separation_support = false;
+ 
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 63a5a81f6..abc33592a 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -9166,6 +9166,8 @@ bool db::update_master_configuration(const sDbNbapiConfig &nbapi_config)
+     ret_val &=
+         beerocks::bpl::cfg_set_steering_disassoc_timer_msec(config.steering_disassoc_timer_msec);
+     ret_val &= beerocks::bpl::cfg_set_daisy_chaining_disabled(config.daisy_chaining_disabled);
++    ret_val &= beerocks::bpl::cfg_set_onboarding_type(nbapi_config.onboarding_type);
++    ret_val &= beerocks::bpl::cfg_set_1905_security_enabled(nbapi_config.link_encryption_enable);
+ 
+     ret_val &= beerocks::bpl::cfg_commit_changes();
+ 
+diff --git a/controller/src/beerocks/master/db/db.h b/controller/src/beerocks/master/db/db.h
+index 195dda687..5cc535e61 100644
+--- a/controller/src/beerocks/master/db/db.h
++++ b/controller/src/beerocks/master/db/db.h
+@@ -288,6 +288,9 @@ public:
+         bool daisy_chaining_disabled;
+         int diagnostics_measurements_polling_rate_sec;
+ 
++        std::string onboarding_type;
++        bool link_encryption_enable;
++
+         int roaming_hysteresis_percent_bonus;
+         std::chrono::milliseconds steering_disassoc_timer_msec;
+         std::chrono::seconds link_metrics_request_interval_seconds;
+diff --git a/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp b/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp
+index 06e887d59..a18ad0ec0 100644
+--- a/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp
++++ b/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp
+@@ -316,8 +316,6 @@ bool DppConfiguratorTask::handle_ieee1905_1_msg(const sMacAddr &src_mac,
+                       "handle_1905_decryption_failure";
+         return handle_1905_decryption_failure(src_mac, cmdu_rx);
+     default:
+-        LOG(TRACE) << "DPP: message type 0x" << std::hex << int(cmdu_rx.getMessageType())
+-                   << " not handled by DppConfiguratorTask";
+         return false;
+     }
+ }
+@@ -352,9 +350,29 @@ bool DppConfiguratorTask::handle_chirp_notification(const sMacAddr &src_mac,
+                << " hash=" << DppCryptoHelper::to_hex(hash.data(), 8) << "...";
+ 
+     // Check if already in session
+-    if (get_session_by_hash(hash)) {
+-        LOG(DEBUG) << "DPP: session already active for this hash — ignoring duplicate chirp";
+-        return true;
++    auto *existing = get_session_by_hash(hash);
++    if (existing) {
++        if (existing->state == eDppSessionState::AUTH_REQUEST_SENT) {
++            // Mirrors handle_wired_dpp_chirp: an enrollee resending its Presence
++            // Announcement/chirp (e.g. re-chirping after not hearing an Auth Request)
++            // shouldn't be dropped forever just because a session object exists — if
++            // the Auth Request round-trip has stalled, retry it instead of ignoring
++            // every future chirp for this hash.
++            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
++                std::chrono::steady_clock::now() - existing->last_activity).count();
++            if (elapsed < 2000) {
++                LOG(DEBUG) << "DPP: chirp duplicate (same hash, " << elapsed
++                           << "ms after Auth Request) — ignoring";
++                return true;
++            }
++            LOG(INFO) << "DPP: chirp received while stuck in AUTH_REQUEST_SENT for proxy="
++                      << src_mac << " (" << elapsed << "ms) — resetting and retrying";
++            cleanup_session(hash);
++        } else {
++            LOG(DEBUG) << "DPP: session already active for this hash (state="
++                       << static_cast<int>(existing->state) << ") — ignoring duplicate chirp";
++            return true;
++        }
+     }
+ 
+     // Look up enrollee bootstrap key derived from cached DPP URI
+@@ -397,6 +415,13 @@ bool DppConfiguratorTask::handle_wired_dpp_chirp(const sMacAddr &agent_mac,
+     LOG(DEBUG) << "DPP: wired chirp from " << agent_mac
+                << " hash=" << DppCryptoHelper::to_hex(hash.data(), 8) << "...";
+ 
++    auto agent = m_database.m_agents.get(agent_mac);
++    if (agent && agent->dpp_wired_onboarding_complete) {
++        LOG(DEBUG) << "DPP: wired chirp from already-onboarded agent " << agent_mac
++                   << " — ignoring (no Auth Request restart)";
++        return true;
++    }
++
+     auto *existing = get_session_by_hash(hash);
+     if (existing) {
+         if (existing->state == eDppSessionState::AUTH_REQUEST_SENT) {
+@@ -719,6 +744,11 @@ bool DppConfiguratorTask::handle_bss_configuration_result(const sMacAddr &src_ma
+         session->state = eDppSessionState::BSS_CONFIG_SENT;
+     }
+ 
++    auto agent = m_database.m_agents.get(src_mac);
++    if (agent) {
++        agent->dpp_wired_onboarding_complete = true;
++    }
++
+     // Per EasyMesh Figure 17: controller sends Agent List after receiving BSS Config Result.
+     // The extender receives Agent List and responds with BSS Config Request.
+     LOG(INFO) << "DPP: sending Agent List after BSS Config Result from " << src_mac;
+@@ -1804,8 +1834,12 @@ bool DppConfiguratorTask::handle_config_result(sDppSession &session, const uint8
+               << " — DPP provisioning complete";
+     session.state = eDppSessionState::PROVISIONING_COMPLETE;
+ 
+-    // Mark enrollee as onboarded in DB
+-    // TODO: mark specific enrollee as onboarded when multi-enrollee list is implemented
++    if (session.is_wired) {
++        auto agent = m_database.m_agents.get(session.enrollee_mac);
++        if (agent) {
++            agent->dpp_wired_onboarding_complete = true;
++        }
++    }
+ 
+     return true;
+ }
+@@ -2301,6 +2335,9 @@ bool DppConfiguratorTask::handle_eapol_m3_as_supplicant(const sMacAddr &agent_ma
+             if (agent) {
+                 agent->dpp_security_required = false;
+                 agent->tk_1905_installed     = true;
++                if (session.is_wired) {
++                    agent->dpp_wired_onboarding_complete = true;
++                }
+             }
+         }
+     }
+@@ -2479,6 +2516,9 @@ bool DppConfiguratorTask::handle_eapol_m4(const sMacAddr &agent_mac, sDppSession
+             if (agent) {
+                 agent->dpp_security_required = false;
+                 agent->tk_1905_installed     = true;
++                if (session.is_wired) {
++                    agent->dpp_wired_onboarding_complete = true;
++                }
+                 LOG(INFO) << "DPP: 1905 link encrypted for " << agent_mac;
+             }
+         }
+diff --git a/controller/src/beerocks/master/tasks/dpp_configurator_task.h b/controller/src/beerocks/master/tasks/dpp_configurator_task.h
+index 741a1e240..f12c902f7 100644
+--- a/controller/src/beerocks/master/tasks/dpp_configurator_task.h
++++ b/controller/src/beerocks/master/tasks/dpp_configurator_task.h
+@@ -137,6 +137,17 @@ public:
+      */
+     const DppKeyStore &key_store() const { return m_keystore; }
+ 
++    /**
++     * @brief Rewrite the DPP URI cache file from the full set of NBAPI ProvisionDPP entries.
++     *
++     * Called by the Network.ProvisionDPP NBAPI event handler on any add/edit/remove of a row.
++     * The rewritten file is picked up by the existing inotify watcher, which reloads m_uri_cache.
++     */
++    bool sync_provisioned_uris(const std::vector<std::string> &uris)
++    {
++        return m_keystore.write_dpp_uris(uris);
++    }
++
+ private:
+     // -------------------------------------------------------------------------
+     // DPP Session state
+@@ -248,8 +259,8 @@ private:
+     bool m_gtk_valid             = false;
+     uint64_t m_integrity_tx_counter = 1;
+ 
+-    // Session timeout (30 seconds)
+-    static constexpr int SESSION_TIMEOUT_SEC = 30;
++    // Session timeout (10 seconds)
++    static constexpr int SESSION_TIMEOUT_SEC = 10;
+ 
+     // -------------------------------------------------------------------------
+     // task interface
+diff --git a/controller/src/beerocks/master/tasks/dpp_key_store.cpp b/controller/src/beerocks/master/tasks/dpp_key_store.cpp
+index 087244a92..65e4c5ef3 100644
+--- a/controller/src/beerocks/master/tasks/dpp_key_store.cpp
++++ b/controller/src/beerocks/master/tasks/dpp_key_store.cpp
+@@ -374,6 +374,36 @@ std::string DppKeyStore::load_dpp_uri() const
+     return load_string("/etc/prplmesh/dpp_uri");
+ }
+ 
++bool DppKeyStore::write_dpp_uris(const std::vector<std::string> &uris) const
++{
++    constexpr const char *uris_file = "/etc/prplmesh/dpp_uri";
++
++    if (uris.empty()) {
++        // An empty list here is indistinguishable from "the ProvisionDPP table hasn't
++        // finished (re)loading yet" (e.g. right after a datamodel restore, an instance can
++        // be signalled before its persisted DPPURI value is reapplied to it) vs. "the user
++        // genuinely removed the last entry". Refuse to destructively truncate a mirror file
++        // that still holds previously-persisted URIs; only allow it if the file is already
++        // empty/missing, so this call stays a harmless no-op in the startup-race case.
++        if (!load_string(uris_file).empty()) {
++            MAPF_WARN("DppKeyStore: refusing to clear non-empty " << uris_file
++                                                                   << " with an empty URI list");
++            return false;
++        }
++        return true;
++    }
++
++    std::ofstream out(uris_file, std::ios::trunc);
++    if (!out.good()) {
++        MAPF_ERR("DppKeyStore: failed to open " << uris_file << " for write");
++        return false;
++    }
++    for (const auto &uri : uris) {
++        out << uri << "\n";
++    }
++    return out.good();
++}
++
+ bool DppKeyStore::file_exists(const std::string &filename) const
+ {
+     struct stat st;
+diff --git a/controller/src/beerocks/master/tasks/dpp_key_store.h b/controller/src/beerocks/master/tasks/dpp_key_store.h
+index 1ee8ef079..e7109631b 100644
+--- a/controller/src/beerocks/master/tasks/dpp_key_store.h
++++ b/controller/src/beerocks/master/tasks/dpp_key_store.h
+@@ -10,6 +10,7 @@
+ #include <array>
+ #include <memory>
+ #include <string>
++#include <vector>
+ 
+ namespace son {
+ 
+@@ -112,6 +113,19 @@ public:
+     /** @brief Load the DPP Bootstrapping URI from /etc/prplmesh/dpp_uri. */
+     std::string load_dpp_uri() const;
+ 
++    /**
++     * @brief Rewrite /etc/prplmesh/dpp_uri from scratch with exactly the given URIs.
++     *
++     * Unlike save_dpp_uri(), this truncates the file - used by the ProvisionDPP
++     * NBAPI table sync, where the table is the source of truth for the full set.
++     *
++     * Refuses to truncate a non-empty file down to empty: an empty @p uris list
++     * is indistinguishable here from a caller having read the ProvisionDPP table
++     * before it has finished (re)loading (e.g. right after a datamodel restore),
++     * so writing it out would risk destroying a previously-persisted URI.
++     */
++    bool write_dpp_uris(const std::vector<std::string> &uris) const;
++
+     // -------------------------------------------------------------------------
+     // Connector signing
+     // -------------------------------------------------------------------------
+diff --git a/framework/platform/bpl/CMakeLists.txt b/framework/platform/bpl/CMakeLists.txt
+index 488c86f2c..b35e2248d 100644
+--- a/framework/platform/bpl/CMakeLists.txt
++++ b/framework/platform/bpl/CMakeLists.txt
+@@ -9,6 +9,7 @@ set(MODULE_PATH ${CMAKE_CURRENT_LIST_DIR})
+ set(bpl_common_sources
+     ${MODULE_PATH}/common/utils/utils_net.cpp
+     ${MODULE_PATH}/common/utils/utils.cpp
++    ${MODULE_PATH}/common/utils/bpl_running_mode.cpp
+ )
+ 
+ # Common prplmesh_db values
+diff --git a/framework/platform/bpl/cfg/dm/bpl_cfg.cpp b/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
+index 06fc7e91f..117dc004b 100644
+--- a/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
+@@ -74,6 +74,16 @@ bool cfg_set_daisy_chaining_disabled(bool daisy_chaining_disabled)
+     return set_agent_config_param("DaisyChainingDisabled", daisy_chaining_disabled);
+ }
+ 
++bool cfg_set_onboarding_type(const std::string &onboarding_type)
++{
++    return set_controller_config_param("OnboardingType", onboarding_type);
++}
++
++bool cfg_set_1905_security_enabled(bool link_encryption_enable)
++{
++    return set_controller_config_param("LinkEncryptionEnable", link_encryption_enable);
++}
++
+ bool cfg_get_client_11k_roaming(bool &eleven_k_roaming)
+ {
+     return read_controller_config_param("Client11kRoamingEnabled", eleven_k_roaming);
+diff --git a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+index bfc5133cc..38b200009 100644
+--- a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <bcl/beerocks_string_utils.h>
+ #include <bpl/bpl_cfg.h>
++#include <bpl/bpl_running_mode.h>
+ 
+ #include <mapf/common/logger.h>
+ #include <mapf/common/utils.h>
+@@ -809,9 +810,35 @@ bool bpl_cfg_get_phy_name_by_iface(const std::string & /*iface_name*/, std::stri
+     return false;
+ }
+ 
+-std::string cfg_get_onboarding_type() { return "WSC"; }
++std::string cfg_get_onboarding_type()
++{
++    std::string onboarding_type;
++    if (get_running_mode() == eRunningMode::CONTROLLER) {
++        if (read_controller_config_param("OnboardingType", onboarding_type)) {
++            return onboarding_type;
++        }
++    } else if (get_running_mode() == eRunningMode::AGENT) {
++        if (read_agent_config_param("OnboardingType", onboarding_type)) {
++            return onboarding_type;
++        }
++    }
++    return "WSC";
++}
++
++bool cfg_get_1905_security_enabled()
++{
++    // 1905-layer link encryption is a Controller-only policy decision; Agents never
++    // decide this locally, so the agent role always returns false here.
++    if (!cfg_is_master()) {
++        return false;
++    }
+ 
+-bool cfg_get_1905_security_enabled() { return true; }
++    bool link_encryption_enabled = false;
++    if (read_controller_config_param("LinkEncryptionEnable", link_encryption_enabled)) {
++        return link_encryption_enabled;
++    }
++    return false;
++}
+ 
+ } // namespace bpl
+ } // namespace beerocks
+diff --git a/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
+index 9fc625ab4..f2eb9cda1 100644
+--- a/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
+@@ -352,5 +352,9 @@ std::string cfg_get_onboarding_type() { return "WSC"; }
+ 
+ bool cfg_get_1905_security_enabled() { return true; }
+ 
++bool cfg_set_onboarding_type(const std::string &onboarding_type) { return true; }
++
++bool cfg_set_1905_security_enabled(bool link_encryption_enable) { return true; }
++
+ } // namespace bpl
+ } // namespace beerocks
+diff --git a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+index 3a05111af..eb815afe9 100644
+--- a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+@@ -1588,6 +1588,10 @@ std::string cfg_get_onboarding_type() { return "WSC"; }
+ 
+ bool cfg_get_1905_security_enabled() { return true; }
+ 
++bool cfg_set_onboarding_type(const std::string &onboarding_type) { return true; }
++
++bool cfg_set_1905_security_enabled(bool link_encryption_enable) { return true; }
++
+ bool cfg_get_dhcp_gateway_ip(std::string &gw_ip)
+ {
+     std::string cmd = "ip r | awk '/^def/{print $3}'";
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index c198d1e70..cd5425a31 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -3922,6 +3922,17 @@ bool cfg_get_1905_security_enabled(){
+     return std::string(buf) != "0";
+ }
+ 
++bool cfg_set_onboarding_type(const std::string &onboarding_type)
++{
++    return cfg_set_prplmesh_config_no_commit("onboardingtype", onboarding_type);
++}
++
++bool cfg_set_1905_security_enabled(bool link_encryption_enable)
++{
++    std::string value = std::to_string(((int)link_encryption_enable));
++    return cfg_set_prplmesh_config_no_commit("Enable1905Security", value);
++}
++
+ std::string cfg_get_dpp_bootstrap_pubkey_hash()
+ {
+     // Read the DPP URI from /etc/prplmesh/dpp_uri (first non-empty, non-comment line).
+diff --git a/framework/platform/bpl/common/utils/bpl_running_mode.cpp b/framework/platform/bpl/common/utils/bpl_running_mode.cpp
+new file mode 100644
+index 000000000..ab48462e0
+--- /dev/null
++++ b/framework/platform/bpl/common/utils/bpl_running_mode.cpp
+@@ -0,0 +1,17 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#include <bpl/bpl_running_mode.h>
++
++namespace beerocks {
++namespace bpl {
++
++static eRunningMode g_running_mode = eRunningMode::NONE;
++
++void set_running_mode(eRunningMode mode) { g_running_mode = mode; }
++
++eRunningMode get_running_mode() { return g_running_mode; }
++
++} // namespace bpl
++} // namespace beerocks
+diff --git a/framework/platform/bpl/include/bpl/bpl_cfg.h b/framework/platform/bpl/include/bpl/bpl_cfg.h
+index 58df00e9f..ff8892d6b 100644
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -851,6 +851,24 @@ std::string cfg_get_onboarding_type();
+  */
+ bool cfg_get_1905_security_enabled();
+ 
++/**
++ * @brief Set the onboarding type (Controller.Configuration.OnboardingType or
++ * Agent.Configuration.OnboardingType, depending on role).
++ *
++ * @param [in] onboarding_type "WSC" or "DPP".
++ * @return true on success, otherwise false.
++ */
++bool cfg_set_onboarding_type(const std::string &onboarding_type);
++
++/**
++ * @brief Set the 1905 link encryption enable/disable
++ * (Controller.Configuration.LinkEncryptionEnable).
++ *
++ * @param [in] link_encryption_enable true to enable, false to disable.
++ * @return true on success, otherwise false.
++ */
++bool cfg_set_1905_security_enabled(bool link_encryption_enable);
++
+ /**
+  * @brief Return the SHA-256 of the DPP bootstrap public key DER as a hex string.
+  *
+diff --git a/framework/platform/bpl/include/bpl/bpl_running_mode.h b/framework/platform/bpl/include/bpl/bpl_running_mode.h
+new file mode 100644
+index 000000000..aa51c99fb
+--- /dev/null
++++ b/framework/platform/bpl/include/bpl/bpl_running_mode.h
+@@ -0,0 +1,45 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#ifndef _BPL_RUNNING_MODE_H_
++#define _BPL_RUNNING_MODE_H_
++
++#include <stdint.h>
++
++namespace beerocks {
++namespace bpl {
++
++/**
++ * @brief Identifies which beerocks executable (process) this BPL instance is
++ * linked into. Unlike cfg_is_master(), which reflects the configured
++ * management mode (e.g. whether a controller is co-located), this reflects
++ * the literal identity of the running binary and is set exactly once, at
++ * process startup, in each executable's main().
++ */
++// enum auto-print skip
++enum class eRunningMode : uint8_t {
++    NONE,       /**< Not yet set. */
++    AGENT,      /**< Running inside the beerocks_agent process. */
++    CONTROLLER, /**< Running inside the beerocks_controller process. */
++};
++
++/**
++ * @brief Set the running mode of this process. Must be called exactly once,
++ * early in main(), before any code that depends on get_running_mode() runs.
++ *
++ * @param [in] mode eRunningMode::AGENT or eRunningMode::CONTROLLER.
++ */
++void set_running_mode(eRunningMode mode);
++
++/**
++ * @brief Get the running mode of this process, as set by set_running_mode().
++ *
++ * @return eRunningMode::NONE if set_running_mode() has not been called yet.
++ */
++eRunningMode get_running_mode();
++
++} // namespace bpl
++} // namespace beerocks
++
++#endif /* _BPL_RUNNING_MODE_H_ */
+-- 
+2.34.1
+

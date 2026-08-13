@@ -1,0 +1,2105 @@
+From 7a27594775f373d1195fd43111cda935eb6c0ae6 Mon Sep 17 00:00:00 2001
+From: Parimalarengan Gururajan <gururaja@qti.qualcomm.com>
+Date: Thu, 13 Aug 2026 20:36:25 +0530
+Subject: [PATCH 3/6] patch 3: 1905-layer security transport support
+
+Add 1905 CMDU encryption/decryption/MIC support in the transport process
+and the broker-side API to install the resulting keys:
+
+- 1905_security_manager.{h,cpp} (new): encrypts/decrypts/MICs 1905 CMDUs
+  using tlvEncryptedPayload/tlvMic, initialized with the AL MAC.
+- dpp_crypto_helper.{h,cpp} (new, transport-local): OpenSSL EVP helper
+  used by the security manager.
+- ieee1905_transport.h/.cpp: owns m_security_manager; adds
+  handle_security_key_install_message() and the SecurityKeyInstallMessage
+  transport message type/factory case.
+- broker_client.h/broker_client_impl.{h,cpp}: new
+  BrokerClient::install_security_key() API used after a successful DPP
+  4-way handshake to push TK/GTK into the transport process.
+- message_parser_stream_impl.cpp: raises the broker's max payload size to
+  16KB to accommodate large DPP BSS Config Response CMDUs.
+
+Signed-off-by: Parimalarengan Gururajan <gururaja@qti.qualcomm.com>
+---
+ .../beerocks/btl/include/btl/broker_client.h  |  24 +
+ .../btl/include/btl/broker_client_impl.h      |  17 +-
+ .../btl/source/broker_client_impl.cpp         |  40 +-
+ .../btl/source/message_parser_stream_impl.cpp |   7 +-
+ .../1905_security_manager.cpp                 | 793 ++++++++++++++++++
+ .../1905_security_manager.h                   | 297 +++++++
+ .../ieee1905_transport/CMakeLists.txt         |   6 +-
+ .../ieee1905_transport/dpp_crypto_helper.cpp  | 222 +++++
+ .../ieee1905_transport/ieee1905_transport.h   |  11 +
+ .../ieee1905_transport_local_bus.cpp          | 176 ++++
+ .../ieee1905_transport_messages.cpp           |  12 +-
+ .../ieee1905_transport_network.cpp            |   6 +
+ .../ieee1905_transport_packet_processing.cpp  |  47 +-
+ .../include/dpp_crypto_helper.h               |  63 ++
+ .../transport/ieee1905_transport_messages.h   |  59 +-
+ 15 files changed, 1753 insertions(+), 27 deletions(-)
+ create mode 100644 framework/transport/ieee1905_transport/1905_security_manager.cpp
+ create mode 100644 framework/transport/ieee1905_transport/1905_security_manager.h
+ create mode 100644 framework/transport/ieee1905_transport/dpp_crypto_helper.cpp
+ create mode 100644 framework/transport/ieee1905_transport/include/dpp_crypto_helper.h
+
+diff --git a/common/beerocks/btl/include/btl/broker_client.h b/common/beerocks/btl/include/btl/broker_client.h
+index 89251d715..441f4bdb1 100644
+--- a/common/beerocks/btl/include/btl/broker_client.h
++++ b/common/beerocks/btl/include/btl/broker_client.h
+@@ -197,6 +197,30 @@ public:
+     virtual bool forward_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx, const sMacAddr &dst_mac,
+                               const sMacAddr &src_mac, uint32_t iface_index = 0) = 0;
+ 
++    /**
++     * @brief Installs or removes 1905 security keys in the transport process.
++     *
++     * Builds a SecurityKeyInstallMessage with the provided keys and sends it to the
++     * transport process. The transport will use these keys to encrypt outgoing CMDUs
++     * and decrypt incoming CMDUs for the specified peer.
++     *
++     * This method should be called after successful DPP 4-way handshake to install
++     * the derived TK and GTK.
++     *
++     * @param peer_mac    Peer AL MAC address (agent or controller)
++     * @param tk          256-bit 1905 TK (bytes 32-63 of PTK)
++     * @param gtk         256-bit 1905 GTK (shared across all agents)
++     * @param gtk_key_id  GTK Key ID (1-3)
++     * @param install     true to install keys, false to remove
++     *
++     * @return true on success and false otherwise
++     */
++    virtual bool install_security_key(const sMacAddr &peer_mac,
++                                      const std::array<uint8_t, 32> &tk,
++                                      const std::array<uint8_t, 32> &gtk,
++                                      uint8_t gtk_key_id,
++                                      bool install = true) = 0;
++
+ protected:
+     /**
+      * @brief Notifies a CMDU-received event.
+diff --git a/common/beerocks/btl/include/btl/broker_client_impl.h b/common/beerocks/btl/include/btl/broker_client_impl.h
+index 68174e3cf..f3a291c7b 100644
+--- a/common/beerocks/btl/include/btl/broker_client_impl.h
++++ b/common/beerocks/btl/include/btl/broker_client_impl.h
+@@ -24,12 +24,14 @@ namespace btl {
+ 
+ class BrokerClientImpl : public BrokerClient {
+     /**
+-     * Size of the buffer to store messages exchanged with broker server
++     * Size of the buffer to store messages exchanged with broker server.
++     * Sized larger than kMaxFrameLength to accommodate large DPP BSS Config Response
++     * messages (~11KB for 3-radio extenders with 4 SSIDs each).
+      */
+     static constexpr size_t broker_buffer_size =
+         sizeof(beerocks::transport::messages::CmduXxMessage::Metadata) +
+         sizeof(beerocks::transport::messages::Message::Header) +
+-        beerocks::transport::messages::Message::kMaxFrameLength;
++        16384; // Larger than kMaxFrameLength=8192 for DPP BSS Config Response
+ 
+ public:
+     /**
+@@ -97,6 +99,17 @@ public:
+     bool forward_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx, const sMacAddr &dst_mac,
+                       const sMacAddr &src_mac, uint32_t iface_index = 0) override;
+ 
++    /**
++     * @brief Installs or removes 1905 security keys in the transport process.
++     *
++     * @see BrokerClient::install_security_key()
++     */
++    bool install_security_key(const sMacAddr &peer_mac,
++                              const std::array<uint8_t, 32> &tk,
++                              const std::array<uint8_t, 32> &gtk,
++                              uint8_t gtk_key_id,
++                              bool install = true) override;
++
+ private:
+     /**
+      * @brief Handles the read event in a client socket connected to the server socket.
+diff --git a/common/beerocks/btl/source/broker_client_impl.cpp b/common/beerocks/btl/source/broker_client_impl.cpp
+index 9098cdd91..ef5c372eb 100644
+--- a/common/beerocks/btl/source/broker_client_impl.cpp
++++ b/common/beerocks/btl/source/broker_client_impl.cpp
+@@ -14,6 +14,9 @@
+ 
+ #include <easylogging++.h>
+ 
++#include <array>
++#include <algorithm>
++
+ namespace beerocks {
+ 
+ namespace btl {
+@@ -167,6 +170,25 @@ bool BrokerClientImpl::forward_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx, const sM
+     return send_cmdu_message(cmdu_rx, dst_mac, src_mac, iface_index);
+ }
+ 
++bool BrokerClientImpl::install_security_key(const sMacAddr &peer_mac,
++                                            const std::array<uint8_t, 32> &tk,
++                                            const std::array<uint8_t, 32> &gtk,
++                                            uint8_t gtk_key_id, bool install)
++{
++    using namespace beerocks::transport::messages;
++
++    SecurityKeyInstallMessage msg;
++    auto *metadata = msg.metadata();
++
++    tlvf::mac_to_array(peer_mac, metadata->peer_mac);
++    std::copy(tk.begin(), tk.end(), metadata->tk);
++    std::copy(gtk.begin(), gtk.end(), metadata->gtk);
++    metadata->gtk_key_id = gtk_key_id;
++    metadata->install    = install;
++
++    return send_message(msg);
++}
++
+ void BrokerClientImpl::handle_read(int fd)
+ {
+     // Read available bytes into buffer
+@@ -216,18 +238,20 @@ void BrokerClientImpl::handle_message(const beerocks::transport::messages::Messa
+     auto cmdu_rx_msg =
+         reinterpret_cast<const beerocks::transport::messages::CmduRxMessage *>(&message);
+ 
+-    // Buffer to hold CMDU received
+-    uint8_t cmdu_rx_buffer[message::MESSAGE_BUFFER_LENGTH];
+-
+-    // Check if CMDU fits into buffer
++    // Buffer to hold CMDU received.
++    // Use dynamic allocation to handle large CMDUs (e.g. DPP BSS Config Response ~11KB).
+     size_t cmdu_length = cmdu_rx_msg->metadata()->length;
+     uint8_t *cmdu_data = cmdu_rx_msg->data();
+-    if (sizeof(cmdu_rx_buffer) < cmdu_length) {
+-        LOG(DEBUG) << "Buffer size (" << sizeof(cmdu_rx_buffer) << ") is less than CMDU length ("
+-                   << cmdu_length << ")";
++
++    static constexpr size_t MAX_CMDU_RX_SIZE = 16384;
++    if (cmdu_length > MAX_CMDU_RX_SIZE) {
++        LOG(ERROR) << "CMDU too large: " << cmdu_length << " > " << MAX_CMDU_RX_SIZE;
+         return;
+     }
+ 
++    std::vector<uint8_t> cmdu_rx_buffer_vec(cmdu_length);
++    uint8_t *cmdu_rx_buffer = cmdu_rx_buffer_vec.data();
++
+     // Verify CMDU
+     if (!CmduUtils::verify_cmdu(cmdu_data, cmdu_length)) {
+         LOG(ERROR) << "Failed verifying CMDU!";
+@@ -240,7 +264,7 @@ void BrokerClientImpl::handle_message(const beerocks::transport::messages::Messa
+     std::copy_n(cmdu_data, cmdu_length, cmdu_rx_buffer);
+ 
+     // Parse CMDU
+-    ieee1905_1::CmduMessageRx cmdu_rx(cmdu_rx_buffer, sizeof(cmdu_rx_buffer));
++    ieee1905_1::CmduMessageRx cmdu_rx(cmdu_rx_buffer, cmdu_length);
+     if (!cmdu_rx.parse()) {
+         LOG(ERROR) << "Failed parsing CMDU!";
+         LOG(DEBUG) << "hex_dump (" << cmdu_length << " bytes):" << std::endl
+diff --git a/common/beerocks/btl/source/message_parser_stream_impl.cpp b/common/beerocks/btl/source/message_parser_stream_impl.cpp
+index 917f24ff3..19db45b0b 100644
+--- a/common/beerocks/btl/source/message_parser_stream_impl.cpp
++++ b/common/beerocks/btl/source/message_parser_stream_impl.cpp
+@@ -54,11 +54,12 @@ MessageParserStreamImpl::parse_message(beerocks::net::Buffer &buffer)
+         return nullptr;
+     }
+ 
+-    // Validate payload length
++    // Validate payload length — allow up to 16KB for large DPP BSS Config Response messages
+     size_t payload_length = header->len;
+-    if (payload_length > beerocks::transport::messages::Message::kMaxFrameLength) {
++    static constexpr size_t kBrokerMaxPayloadLength = 16384;
++    if (payload_length > kBrokerMaxPayloadLength) {
+         LOG(ERROR) << "Message length is greater than maximum length: " << payload_length << " > "
+-                   << beerocks::transport::messages::Message::kMaxFrameLength;
++                   << kBrokerMaxPayloadLength;
+         discard_invalid_data();
+         return nullptr;
+     }
+diff --git a/framework/transport/ieee1905_transport/1905_security_manager.cpp b/framework/transport/ieee1905_transport/1905_security_manager.cpp
+new file mode 100644
+index 000000000..348d886c2
+--- /dev/null
++++ b/framework/transport/ieee1905_transport/1905_security_manager.cpp
+@@ -0,0 +1,793 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#include "1905_security_manager.h"
++#include "include/dpp_crypto_helper.h"
++
++#include <mapf/common/logger.h>
++#include <tlvf/wfa_map/tlvEncryptedPayload.h>
++#include <tlvf/wfa_map/tlvMic.h>
++#include <tlvf/tlvftypes.h>
++
++#include <cstring>
++#include <iomanip>
++
++namespace son {
++
++// ============================================================================
++// Exception message types — never encrypted per EasyMesh §13.3.2
++// ============================================================================
++
++bool Ieee1905SecurityManager::is_exception_message(ieee1905_1::eMessageType msg_type)
++{
++    switch (msg_type) {
++    case ieee1905_1::eMessageType::AP_AUTOCONFIGURATION_SEARCH_MESSAGE:
++    case ieee1905_1::eMessageType::AP_AUTOCONFIGURATION_RESPONSE_MESSAGE:
++    case ieee1905_1::eMessageType::DIRECT_ENCAP_DPP_MESSAGE:
++    case ieee1905_1::eMessageType::IEEE1905_ENCAP_EAPOL_MESSAGE:
++        return true;
++    default:
++        return false;
++    }
++}
++
++// ============================================================================
++// Constructor
++// ============================================================================
++
++Ieee1905SecurityManager::Ieee1905SecurityManager(const sMacAddr &controller_al_mac)
++    : m_controller_al_mac(controller_al_mac)
++{
++    m_gtk.fill(0);
++}
++
++// ============================================================================
++// Key installation
++// ============================================================================
++
++void Ieee1905SecurityManager::install_agent_keys(const sMacAddr &agent_mac,
++                                                   const std::array<uint8_t, 32> &tk,
++                                                   const std::array<uint8_t, 32> &gtk,
++                                                   uint8_t gtk_key_id)
++{
++    auto &state            = m_agent_states[agent_mac];
++    state.tk               = tk;
++    state.has_tk           = true;
++    state.security_enabled = true;
++    state.enc_tx_counter   = 1;
++    state.enc_rx_counter   = 0;
++    state.int_rx_counter   = 0;
++    state.decrypt_fail_count = 0;
++
++    // Install GTK (shared across all Agents)
++    m_gtk          = gtk;
++    m_gtk_key_id   = gtk_key_id;
++    m_gtk_valid    = true;
++    m_integrity_tx_counter = 1;
++
++    // Log TK for debugging (first 16 bytes only for security)
++    LOG(ERROR) << "1905Security: TK for " << tlvf::mac_to_string(agent_mac) << " = "
++               << std::hex << std::setfill('0')
++               << std::setw(2) << (int)tk[0]
++               << std::setw(2) << (int)tk[1]
++               << std::setw(2) << (int)tk[2]
++               << std::setw(2) << (int)tk[3]
++               << std::setw(2) << (int)tk[4]
++               << std::setw(2) << (int)tk[5]
++               << std::setw(2) << (int)tk[6]
++               << std::setw(2) << (int)tk[7]
++               << std::setw(2) << (int)tk[8]
++               << std::setw(2) << (int)tk[9]
++               << std::setw(2) << (int)tk[10]
++               << std::setw(2) << (int)tk[11]
++               << std::setw(2) << (int)tk[12]
++               << std::setw(2) << (int)tk[13]
++               << std::setw(2) << (int)tk[14]
++               << std::setw(2) << (int)tk[15]
++               << "..." << std::dec;
++
++    LOG(INFO) << "1905Security: keys installed for Agent " << tlvf::mac_to_string(agent_mac);
++}
++
++void Ieee1905SecurityManager::remove_agent(const sMacAddr &agent_mac)
++{
++    m_agent_states.erase(agent_mac);
++    LOG(INFO) << "1905Security: security state removed for Agent " << tlvf::mac_to_string(agent_mac);
++}
++
++// ============================================================================
++// Query methods
++// ============================================================================
++
++bool Ieee1905SecurityManager::is_security_enabled(const sMacAddr &agent_mac) const
++{
++    auto it = m_agent_states.find(agent_mac);
++    return (it != m_agent_states.end()) && it->second.security_enabled;
++}
++
++bool Ieee1905SecurityManager::has_tk(const sMacAddr &agent_mac) const
++{
++    auto it = m_agent_states.find(agent_mac);
++    return (it != m_agent_states.end()) && it->second.has_tk;
++}
++
++// ============================================================================
++// Utility helpers
++// ============================================================================
++
++std::vector<uint8_t> Ieee1905SecurityManager::encode_counter(uint64_t counter)
++{
++    // Encode as 6 bytes big-endian (48-bit counter) - network byte order
++    // This matches IEEE 1905.1 spec and third-party implementation
++    std::vector<uint8_t> out(6);
++    out[0] = (counter >> 40) & 0xFF;
++    out[1] = (counter >> 32) & 0xFF;
++    out[2] = (counter >> 24) & 0xFF;
++    out[3] = (counter >> 16) & 0xFF;
++    out[4] = (counter >> 8) & 0xFF;
++    out[5] = counter & 0xFF;
++    return out;
++}
++
++std::vector<uint8_t> Ieee1905SecurityManager::collect_tlvs(const uint8_t *buf, size_t buf_len)
++{
++    if (!buf || buf_len < 8) return {};
++
++    // CMDU header is 8 bytes; TLVs start after header
++    const uint8_t *tlv_start = buf + 8;
++    size_t tlv_len           = buf_len - 8;
++
++    // Find End of Message TLV (type=0, length=0) and exclude it
++    size_t end_offset = tlv_len;
++    size_t offset     = 0;
++    while (offset + 3 <= tlv_len) {
++        uint8_t tlv_type = tlv_start[offset];
++        uint16_t tlv_length =
++            (static_cast<uint16_t>(tlv_start[offset + 1]) << 8) | tlv_start[offset + 2];
++        if (tlv_type == 0 && tlv_length == 0) {
++            end_offset = offset;
++            break;
++        }
++        offset += 3 + tlv_length;
++    }
++
++    return std::vector<uint8_t>(tlv_start, tlv_start + end_offset);
++}
++
++std::vector<uint8_t> Ieee1905SecurityManager::collect_tlvs(ieee1905_1::CmduMessageTx &cmdu_tx)
++{
++    return collect_tlvs(cmdu_tx.getMessageBuff(), cmdu_tx.getMessageLength());
++}
++
++std::vector<uint8_t> Ieee1905SecurityManager::get_cmdu_header_6bytes(
++    ieee1905_1::CmduMessageTx &cmdu_tx)
++{
++    const uint8_t *buf = cmdu_tx.getMessageBuff();
++    if (!buf) return {};
++    // Use raw packet bytes as-is for AD1
++    // The agent uses the raw wire format (little-endian as stored by prplMesh)
++    return std::vector<uint8_t>(buf, buf + 6);
++}
++
++std::vector<uint8_t> Ieee1905SecurityManager::get_cmdu_header_6bytes(
++    ieee1905_1::CmduMessageRx &cmdu_rx)
++{
++    const uint8_t *buf = cmdu_rx.getMessageBuff();
++    if (!buf) return {};
++    // Use raw packet bytes as-is for AD1
++    // The agent uses the raw wire format (little-endian as stored by prplMesh)
++    return std::vector<uint8_t>(buf, buf + 6);
++}
++
++// ============================================================================
++// Outgoing: encrypt_cmdu_if_needed (unicast)
++// ============================================================================
++
++bool Ieee1905SecurityManager::encrypt_cmdu_if_needed(const sMacAddr &dst_mac,
++                                                       ieee1905_1::eMessageType msg_type,
++                                                       uint8_t *buf,
++                                                       size_t msg_len,
++                                                       size_t buf_capacity,
++                                                       size_t &new_len)
++{
++    new_len = msg_len; // default: no change
++
++    // Exception messages are never encrypted
++    if (is_exception_message(msg_type)) {
++        return true;
++    }
++
++    // Check if security is enabled and TK is available for this Agent
++    if (!is_security_enabled(dst_mac) || !has_tk(dst_mac)) {
++        return true; // send plaintext
++    }
++
++    if (!buf || msg_len < 8) {
++        LOG(ERROR) << "1905Security: invalid buffer for encryption";
++        return false;
++    }
++
++    auto &state = m_agent_states[dst_mac];
++
++    // 1. Collect all TLVs (excluding End of Message TLV) from the actual message
++    std::vector<uint8_t> plaintext = collect_tlvs(buf, msg_len);
++    LOG(ERROR) << "1905Security: encrypt msg_len=" << msg_len
++               << " msg_type=0x" << std::hex << static_cast<uint16_t>(msg_type) << std::dec
++               << " plaintext=" << plaintext.size() << "B for " << dst_mac;
++
++    // Per EasyMesh §13.3.2, TLV-less messages (e.g. AP_CAPABILITY_QUERY) still get wrapped in
++    // an Encrypted Payload TLV once the TK is available — AES-SIV over an empty plaintext is
++    // well-defined (RFC 5297), so there is no reason to send these plaintext.
++
++    // 2. Build AAD per EasyMesh §13.3.2:
++    //    AD1 = first 6 octets of 1905 CMDU (as-is, per spec)
++    //    AD2 = Encryption TX Counter (6 bytes, from Encrypted Payload TLV)
++    //    AD3 = Source 1905 AL MAC Address
++    //    AD4 = Destination 1905 AL MAC Address
++    std::vector<uint8_t> ad1(buf, buf + 6);
++    std::vector<uint8_t> ad2 = encode_counter(state.enc_tx_counter);
++    std::vector<uint8_t> ad3(m_controller_al_mac.oct,
++                              m_controller_al_mac.oct + sizeof(m_controller_al_mac.oct));
++    std::vector<uint8_t> ad4(dst_mac.oct, dst_mac.oct + sizeof(dst_mac.oct));
++
++    // 3. AES-SIV encrypt
++    std::vector<uint8_t> ciphertext = DppCryptoHelper::aes_siv_encrypt(
++        state.tk.data(), 32, plaintext, {ad1, ad2, ad3, ad4});
++
++    if (ciphertext.empty()) {
++        LOG(ERROR) << "1905Security: AES-SIV encrypt failed for " << dst_mac;
++        return false;
++    }
++
++    // 4. Build new CMDU: header(8) + EncPayload TLV(3+6+6+6+2+ciphertext) + EOM(3)
++    // TLV value = counter(6) + srcMAC(6) + dstMAC(6) + aes_siv_length(2) + aes_siv(N)
++    uint16_t aes_siv_len = static_cast<uint16_t>(ciphertext.size());
++    size_t enc_tlv_value_size = 6 + 6 + 6 + 2 + ciphertext.size();
++    size_t total_size         = 8 + 3 + enc_tlv_value_size + 3;
++
++    if (total_size > buf_capacity) {
++        LOG(ERROR) << "1905Security: encrypted CMDU too large for buffer ("
++                   << total_size << " > " << buf_capacity << ")";
++        return false;
++    }
++
++    // Work from a local copy so the original AD1 bytes aren't clobbered
++    std::vector<uint8_t> new_cmdu(total_size);
++    memcpy(new_cmdu.data(), buf, 8); // copy CMDU header
++
++    size_t offset = 8;
++    new_cmdu[offset++] = 0xAC;
++    new_cmdu[offset++] = (enc_tlv_value_size >> 8) & 0xFF;
++    new_cmdu[offset++] = enc_tlv_value_size & 0xFF;
++
++    memcpy(new_cmdu.data() + offset, ad2.data(), 6); offset += 6; // TX counter
++    memcpy(new_cmdu.data() + offset, m_controller_al_mac.oct, 6); offset += 6; // src
++    memcpy(new_cmdu.data() + offset, dst_mac.oct, 6);             offset += 6; // dst
++    // aes_siv_length (2 bytes, big-endian)
++    new_cmdu[offset++] = (aes_siv_len >> 8) & 0xFF;
++    new_cmdu[offset++] = aes_siv_len & 0xFF;
++    memcpy(new_cmdu.data() + offset, ciphertext.data(), ciphertext.size());
++    offset += ciphertext.size();
++
++    // End of Message TLV
++    new_cmdu[offset++] = 0x00;
++    new_cmdu[offset++] = 0x00;
++    new_cmdu[offset++] = 0x00;
++
++    memcpy(buf, new_cmdu.data(), total_size);
++    new_len = total_size;
++
++    // 5. Increment TX counter
++    state.enc_tx_counter++;
++
++    LOG(ERROR) << "1905Security: encrypted CMDU for " << tlvf::mac_to_string(dst_mac)
++               << " counter=" << (state.enc_tx_counter - 1)
++               << " plaintext=" << plaintext.size() << "B ciphertext=" << total_size << "B";
++    return true;
++}
++
++// ============================================================================
++// Outgoing: add_mic_if_needed (multicast/relayed)
++// ============================================================================
++
++bool Ieee1905SecurityManager::add_mic_if_needed(ieee1905_1::CmduMessageTx &cmdu_tx)
++{
++    if (!m_gtk_valid) {
++        return true; // no GTK yet, send without MIC
++    }
++
++    // 1. Add MIC TLV (before End of Message TLV)
++    auto mic_tlv = cmdu_tx.addClass<wfa_map::tlvMic>();
++    if (!mic_tlv) {
++        LOG(ERROR) << "1905Security: failed to add tlvMic";
++        return false;
++    }
++
++    // Set MIC TLV fields
++    mic_tlv->flags().ieee1905_gtk_key_id = m_gtk_key_id & 0x03;
++    mic_tlv->flags().mic_version         = 0; // Version 1
++    {
++        auto counter_bytes = encode_counter(m_integrity_tx_counter);
++        mic_tlv->set_integrity_transmission_counter(counter_bytes.data(), counter_bytes.size());
++    }
++    mic_tlv->source_1905_al_mac_address() = m_controller_al_mac;
++
++    // 2. Compute HMAC-SHA256:
++    //    message_array = [first 6 octets of CMDU] +
++    //                    [first 13 octets of MIC TLV value] +
++    //                    [all TLVs except MIC TLV]
++    std::vector<uint8_t> cmdu_header = get_cmdu_header_6bytes(cmdu_tx);
++    std::vector<uint8_t> all_tlvs    = collect_tlvs(cmdu_tx);
++
++    // Build MIC TLV first 13 bytes: flags(1) + Integrity_TX_Counter(6) + Source_AL_MAC(6)
++    // Per spec: first 13 octets of MIC TLV Value
++    std::vector<uint8_t> mic_tlv_prefix(13, 0);
++    mic_tlv_prefix[0] = static_cast<uint8_t>((m_gtk_key_id & 0x03) << 6); // bits 7-6
++    // bits 5-4 = MIC version 0x00, bits 3-0 = reserved
++    {
++        auto counter_bytes = encode_counter(m_integrity_tx_counter);
++        memcpy(mic_tlv_prefix.data() + 1, counter_bytes.data(), 6);
++    }
++    memcpy(mic_tlv_prefix.data() + 7, m_controller_al_mac.oct, 6);
++
++    // Concatenate: CMDU_header + MIC_TLV_prefix + all_TLVs
++    std::vector<uint8_t> message_array;
++    message_array.insert(message_array.end(), cmdu_header.begin(), cmdu_header.end());
++    message_array.insert(message_array.end(), mic_tlv_prefix.begin(), mic_tlv_prefix.end());
++    message_array.insert(message_array.end(), all_tlvs.begin(), all_tlvs.end());
++
++    // 3. Compute HMAC-SHA256(GTK, message_array)
++    uint8_t mic_value[32];
++    if (!DppCryptoHelper::hmac_sha256(m_gtk.data(), 32,
++                                       message_array.data(), message_array.size(),
++                                       mic_value)) {
++        LOG(ERROR) << "1905Security: HMAC-SHA256 for MIC failed";
++        return false;
++    }
++
++    // 4. Set MIC value in TLV
++    if (!mic_tlv->alloc_mic(32)) {
++        LOG(ERROR) << "1905Security: failed to allocate MIC buffer";
++        return false;
++    }
++    memcpy(mic_tlv->mic(), mic_value, 32);
++
++    // 5. Increment integrity TX counter
++    m_integrity_tx_counter++;
++
++    LOG(DEBUG) << "1905Security: MIC added to multicast CMDU";
++    return true;
++}
++
++// ============================================================================
++// Incoming: verify_mic_if_needed
++// ============================================================================
++
++bool Ieee1905SecurityManager::verify_mic_if_needed(const sMacAddr &src_mac,
++                                                     ieee1905_1::CmduMessageRx &cmdu_rx,
++                                                     const uint8_t raw_header6[6],
++                                                     size_t msg_len,
++                                                     const std::vector<uint8_t> &raw_msg)
++{
++    auto mic_tlv  = cmdu_rx.getClass<wfa_map::tlvMic>();
++    auto msg_type = cmdu_rx.getMessageType();
++
++    // Exception messages never carry MIC — pass through regardless of security state.
++    // This allows AP_AUTOCONFIGURATION_SEARCH (and other exception types) from a
++    // rebooted agent to reach the controller and trigger re-onboarding even when the
++    // old security state is still installed.
++    if (is_exception_message(msg_type)) {
++        return true;
++    }
++
++    if (!mic_tlv) {
++        // No MIC TLV present
++        if (is_security_enabled(src_mac)) {
++            // Expected MIC but not present — discard
++            LOG(WARNING) << "1905Security: expected MIC TLV from security-enabled Agent "
++                         << src_mac << " but not found — discarding";
++            return false;
++        }
++        // Plaintext OK (security not enabled for this Agent)
++        return true;
++    }
++
++    // MIC TLV present — verify it
++    if (!m_gtk_valid) {
++        LOG(WARNING) << "1905Security: MIC TLV present but no GTK available — discarding";
++        return false;
++    }
++
++    // Check integrity RX counter (must be strictly increasing)
++    auto it = m_agent_states.find(src_mac);
++    if (it != m_agent_states.end()) {
++        uint64_t rx_counter = decode_counter(mic_tlv->integrity_transmission_counter());
++        if (rx_counter <= it->second.int_rx_counter) {
++            LOG(WARNING) << "1905Security: MIC replay detected from "
++                         << tlvf::mac_to_string(src_mac)
++                         << " rx_counter=" << rx_counter
++                         << " last=" << it->second.int_rx_counter;
++            return false;
++        }
++    }
++
++    // Recompute HMAC-SHA256 and compare
++    // Use raw (wire) header bytes — parse() byte-swaps multi-byte fields in-place
++    std::vector<uint8_t> cmdu_header(raw_header6, raw_header6 + 6);
++
++    // Build MIC TLV prefix (13 bytes) from received TLV
++    std::vector<uint8_t> mic_tlv_prefix(13, 0);
++    mic_tlv_prefix[0] = static_cast<uint8_t>((mic_tlv->flags().ieee1905_gtk_key_id & 0x03) << 6);
++    // Copy the raw 6-byte counter directly from the TLV
++    memcpy(mic_tlv_prefix.data() + 1, mic_tlv->integrity_transmission_counter(), 6);
++    const auto &src_al_mac = mic_tlv->source_1905_al_mac_address();
++    memcpy(mic_tlv_prefix.data() + 7, src_al_mac.oct, 6);
++
++    // Get all TLVs from raw message bytes (pre-parse, no byte-swap corruption), excluding MIC TLV
++    // Use raw_msg (saved before parse()) so TLV lengths are in wire (big-endian) format
++    const uint8_t *buf = raw_msg.data();
++    size_t raw_len     = raw_msg.size();
++
++    // Find actual message end by scanning raw TLVs
++    size_t msg_end = raw_len;
++    if (raw_len > 8) {
++        size_t off = 8;
++        while (off + 3 <= raw_len) {
++            uint8_t  t = buf[off];
++            uint16_t l = (static_cast<uint16_t>(buf[off+1]) << 8) | buf[off+2];
++            off += 3 + l;
++            if (t == 0 && l == 0) { msg_end = off; break; }
++        }
++    }
++
++    // Build all_tlvs: walk raw bytes, exclude MIC TLV (0xAB)
++    std::vector<uint8_t> all_tlvs;
++    if (msg_end > 8) {
++        const uint8_t *tlv_ptr = buf + 8;
++        const uint8_t *end_ptr = buf + msg_end;
++        while (tlv_ptr + 3 <= end_ptr) {
++            uint8_t  t = tlv_ptr[0];
++            uint16_t l = (static_cast<uint16_t>(tlv_ptr[1]) << 8) | tlv_ptr[2];
++            size_t tlv_total = 3 + l;
++            if (t != 0xAB) {
++                all_tlvs.insert(all_tlvs.end(), tlv_ptr, tlv_ptr + tlv_total);
++            }
++            tlv_ptr += tlv_total;
++            if (t == 0 && l == 0) break;
++        }
++    }
++
++    std::vector<uint8_t> message_array;
++    message_array.insert(message_array.end(), cmdu_header.begin(), cmdu_header.end());
++    message_array.insert(message_array.end(), mic_tlv_prefix.begin(), mic_tlv_prefix.end());
++    message_array.insert(message_array.end(), all_tlvs.begin(), all_tlvs.end());
++
++    LOG(ERROR) << "1905Security: MIC dbg"
++               << " hdr=" << std::hex << std::setfill('0')
++               << std::setw(2)<<(int)cmdu_header[0]<<std::setw(2)<<(int)cmdu_header[1]
++               << std::setw(2)<<(int)cmdu_header[2]<<std::setw(2)<<(int)cmdu_header[3]
++               << std::setw(2)<<(int)cmdu_header[4]<<std::setw(2)<<(int)cmdu_header[5]
++               << " pfx[0:2]=" << std::setw(2)<<(int)mic_tlv_prefix[0]
++               << std::setw(2)<<(int)mic_tlv_prefix[1]<<std::setw(2)<<(int)mic_tlv_prefix[2]
++               << " tlvs[0:5]=" << std::setw(2)<<(int)all_tlvs[0]<<std::setw(2)<<(int)all_tlvs[1]
++               << std::setw(2)<<(int)all_tlvs[2]<<std::setw(2)<<(int)all_tlvs[3]
++               << std::setw(2)<<(int)all_tlvs[4]<<std::setw(2)<<(int)all_tlvs[5]
++               << " tlv_sz=" << std::dec << all_tlvs.size()
++               << " raw_len=" << raw_len << " msg_end=" << msg_end;
++
++    uint8_t computed_mic[32];
++    if (!DppCryptoHelper::hmac_sha256(m_gtk.data(), 32,
++                                       message_array.data(), message_array.size(),
++                                       computed_mic)) {
++        LOG(ERROR) << "1905Security: HMAC-SHA256 computation failed for MIC verification";
++        return false;
++    }
++
++    // Compare computed MIC with received MIC
++    if (mic_tlv->mic_length() < 32 ||
++        memcmp(computed_mic, mic_tlv->mic(), 32) != 0) {
++        LOG(ERROR) << "1905Security: MIC verification FAILED from " << src_mac
++                   << " msg_array_len=" << message_array.size()
++                   << " all_tlvs_len=" << all_tlvs.size()
++                   << " GTK[0-3]=" << std::hex << std::setfill('0')
++                   << std::setw(2) << (int)m_gtk[0] << std::setw(2) << (int)m_gtk[1]
++                   << std::setw(2) << (int)m_gtk[2] << std::setw(2) << (int)m_gtk[3]
++                   << " received_mic[0-3]=" << std::setw(2) << (int)mic_tlv->mic()[0]
++                   << std::setw(2) << (int)mic_tlv->mic()[1]
++                   << std::setw(2) << (int)mic_tlv->mic()[2]
++                   << std::setw(2) << (int)mic_tlv->mic()[3]
++                   << " computed_mic[0-3]=" << std::setw(2) << (int)computed_mic[0]
++                   << std::setw(2) << (int)computed_mic[1]
++                   << std::setw(2) << (int)computed_mic[2]
++                   << std::setw(2) << (int)computed_mic[3]
++                   << std::dec;
++        return false;
++    }
++
++    // Update integrity RX counter
++    if (it != m_agent_states.end()) {
++        it->second.int_rx_counter = decode_counter(mic_tlv->integrity_transmission_counter());
++    }
++
++    LOG(DEBUG) << "1905Security: MIC verified OK from " << tlvf::mac_to_string(src_mac);
++    return true;
++}
++
++// ============================================================================
++// Incoming: decrypt_cmdu_if_needed
++// ============================================================================
++
++bool Ieee1905SecurityManager::decrypt_cmdu_if_needed(const sMacAddr &src_mac,
++                                                       ieee1905_1::CmduMessageRx &cmdu_rx,
++                                                       const uint8_t raw_header6[6],
++                                                       size_t &new_msg_len_out)
++{
++    // Read message type from the raw wire bytes (big-endian, bytes 2-3 of 1905 header).
++    // cmdu_rx.getMessageType() returns a byte-swapped value on little-endian after parse().
++    auto msg_type = static_cast<ieee1905_1::eMessageType>(
++        (static_cast<uint16_t>(raw_header6[2]) << 8) | raw_header6[3]);
++    auto enc_tlv  = cmdu_rx.getClass<wfa_map::tlvEncryptedPayload>();
++
++    if (enc_tlv) {
++        // Encrypted Payload TLV IS present — decrypt it
++
++        // Check if we have a TK for this Agent
++        if (!has_tk(src_mac)) {
++            LOG(WARNING) << "1905Security: Encrypted Payload TLV present but no TK for "
++                         << src_mac << " — discarding";
++            return false;
++        }
++
++        auto &state = m_agent_states[src_mac];
++
++        // Check encryption RX counter (must be strictly increasing)
++        uint64_t rx_counter = decode_counter(enc_tlv->encryption_transmission_counter());
++        if (rx_counter <= state.enc_rx_counter) {
++            LOG(WARNING) << "1905Security: encryption replay detected from "
++                         << tlvf::mac_to_string(src_mac)
++                         << " rx_counter=" << rx_counter
++                         << " last=" << state.enc_rx_counter;
++            return false;
++        }
++
++        // Verify destination AL MAC matches us
++        const auto &dst_mac = enc_tlv->destination_1905_al_mac_address();
++        if (memcmp(dst_mac.oct, m_controller_al_mac.oct, 6) != 0) {
++            LOG(WARNING) << "1905Security: Encrypted Payload TLV destination mismatch — discarding";
++            return false;
++        }
++
++        // Build AAD per EasyMesh §13.3.3:
++        // AD1 = first 6 octets of the received 1905 CMDU (raw wire bytes, not post-parse)
++        std::vector<uint8_t> ad1(raw_header6, raw_header6 + 6);
++        std::vector<uint8_t> ad2 = encode_counter(rx_counter);
++
++        const auto &src_al_mac = enc_tlv->source_1905_al_mac_address();
++        std::vector<uint8_t> ad3(src_al_mac.oct, src_al_mac.oct + 6);
++        std::vector<uint8_t> ad4(dst_mac.oct, dst_mac.oct + 6);
++
++        LOG(ERROR) << "1905Security: Decrypting from " << tlvf::mac_to_string(src_mac)
++                   << " rx_counter=" << rx_counter
++                   << " AD1=" << std::hex << std::setfill('0')
++                   << std::setw(2) << (int)ad1[0] << std::setw(2) << (int)ad1[1]
++                   << std::setw(2) << (int)ad1[2] << std::setw(2) << (int)ad1[3]
++                   << std::setw(2) << (int)ad1[4] << std::setw(2) << (int)ad1[5]
++                   << std::dec;
++
++        // Get ciphertext from TLV
++        size_t ct_len = enc_tlv->aes_siv_length();
++        if (ct_len < 16) {
++            LOG(ERROR) << "1905Security: ciphertext too short from " << src_mac;
++            return false;
++        }
++        std::vector<uint8_t> ciphertext(enc_tlv->aes_siv(), enc_tlv->aes_siv() + ct_len);
++
++        // AES-SIV decrypt
++        std::vector<uint8_t> plaintext;
++        bool decrypt_ok = DppCryptoHelper::aes_siv_decrypt(
++            state.tk.data(), 32, ciphertext, {ad1, ad2, ad3, ad4}, plaintext);
++
++        if (!decrypt_ok) {
++            LOG(WARNING) << "1905Security: AES-SIV decrypt FAILED from " << src_mac;
++            handle_decryption_failure(src_mac);
++            return false;
++        }
++
++        // Inject plaintext TLVs back into the raw buffer:
++        // Replace the entire payload with: CMDU_header(8) + plaintext_TLVs + EOM(3)
++        uint8_t *raw = cmdu_rx.getMessageBuff();
++        size_t   raw_capacity = cmdu_rx.getMessageBuffLength();
++        size_t   new_msg_len  = 8 + plaintext.size() + 3; // header + TLVs + EOM
++
++        if (new_msg_len > raw_capacity) {
++            LOG(ERROR) << "1905Security: decrypted CMDU too large for buffer ("
++                       << new_msg_len << " > " << raw_capacity << ")";
++            return false;
++        }
++
++        // Header stays in place (first 8 bytes unchanged), overwrite TLV region
++        memcpy(raw + 8, plaintext.data(), plaintext.size());
++        // EOM TLV
++        raw[8 + plaintext.size() + 0] = 0x00;
++        raw[8 + plaintext.size() + 1] = 0x00;
++        raw[8 + plaintext.size() + 2] = 0x00;
++
++        // Return the new length — caller sets msg.metadata()->length.
++        // Do NOT call cmdu_rx.parse() here: the broker will re-parse with the updated length.
++        new_msg_len_out = new_msg_len;
++
++        // Update RX counter
++        state.enc_rx_counter = rx_counter;
++
++        LOG(ERROR) << "1905Security: decrypted CMDU from " << tlvf::mac_to_string(src_mac)
++                   << " counter=" << rx_counter
++                   << " plaintext=" << plaintext.size() << "B new_len=" << new_msg_len;
++        return true;
++
++    } else {
++        // No Encrypted Payload TLV
++
++        // Exception messages (AP_AUTOCONF_SEARCH/RESPONSE, DIRECT_ENCAP_DPP, ENCAP_EAPOL)
++        // are never encrypted and must always pass through regardless of security state.
++        if (is_exception_message(msg_type)) {
++            return true;
++        }
++
++        if (is_security_enabled(src_mac)) {
++            // Expected encryption but not present — discard
++            LOG(WARNING) << "1905Security: expected Encrypted Payload TLV from "
++                         << tlvf::mac_to_string(src_mac) << " but not found — discarding";
++            return false;
++        }
++
++        // Plaintext OK (security not enabled for this Agent)
++        return true;
++    }
++}
++
++// ============================================================================
++// Decryption failure handling
++// ============================================================================
++
++void Ieee1905SecurityManager::handle_decryption_failure(const sMacAddr &agent_mac)
++{
++    auto it = m_agent_states.find(agent_mac);
++    if (it == m_agent_states.end()) return;
++
++    it->second.decrypt_fail_count++;
++
++    // Per EasyMesh §13.3.3: if counter exceeds dfCounterThreshold, trigger rekey
++    // The threshold is configured per-Agent via DPP Configuration Object
++    // Default threshold = 5 (from design §7.3.2)
++    static constexpr uint16_t DEFAULT_DECRYPT_FAIL_THRESHOLD = 5;
++
++    if (it->second.decrypt_fail_count >= DEFAULT_DECRYPT_FAIL_THRESHOLD) {
++        LOG(WARNING) << "1905Security: Decryption Failure Counter exceeded threshold for "
++                     << tlvf::mac_to_string(agent_mac)
++                     << " (count=" << it->second.decrypt_fail_count << ")"
++                     << " — caller should send 1905 Decryption Failure message and trigger rekey";
++        // Reset counter to avoid repeated warnings
++        it->second.decrypt_fail_count = 0;
++    } else {
++        LOG(DEBUG) << "1905Security: decryption failure #" << it->second.decrypt_fail_count
++                   << " from " << tlvf::mac_to_string(agent_mac);
++    }
++}
++
++// ============================================================================
++// decode_counter — 6-byte big-endian to uint64_t
++// ============================================================================
++
++uint64_t Ieee1905SecurityManager::decode_counter(const uint8_t *bytes)
++{
++    if (!bytes) return 0;
++    // Decode big-endian (network byte order per IEEE 1905.1 spec)
++    return (static_cast<uint64_t>(bytes[0]) << 40) |
++           (static_cast<uint64_t>(bytes[1]) << 32) |
++           (static_cast<uint64_t>(bytes[2]) << 24) |
++           (static_cast<uint64_t>(bytes[3]) << 16) |
++           (static_cast<uint64_t>(bytes[4]) << 8)  |
++            static_cast<uint64_t>(bytes[5]);
++}
++
++// ============================================================================
++// add_mic_to_buffer — directly insert MIC TLV into raw CMDU buffer
++// ============================================================================
++
++size_t Ieee1905SecurityManager::add_mic_to_buffer(uint8_t *buf, size_t len, size_t maxlen)
++{
++    LOG(ERROR) << "1905Security: add_mic_to_buffer called len=" << len
++               << " gtk_valid=" << m_gtk_valid;
++    if (!m_gtk_valid) {
++        return len; // no GTK yet, send without MIC
++    }
++
++    if (!buf || len < 8) return 0;
++
++    // MIC TLV layout: type(1) + length(2) + flags(1) + counter(6) + mac(6) + mic_length(2) + mic(32) = 50 bytes
++    static constexpr size_t   MIC_TLV_SIZE      = 50;
++    static constexpr uint8_t  MIC_TLV_TYPE      = 0xAB;
++    static constexpr uint16_t MIC_TLV_VALUE_LEN = 47; // 1 + 6 + 6 + 2 + 32
++
++    if (len + MIC_TLV_SIZE > maxlen) {
++        LOG(ERROR) << "1905Security: not enough space in buffer for MIC TLV";
++        return 0;
++    }
++
++    // Find the End-of-Message TLV (type=0, length=0).
++    // TLVs start after the 8-byte CMDU header.
++    const uint8_t *tlv_start = buf + 8;
++    size_t tlv_len   = len - 8;
++    size_t eom_offset = tlv_len; // position of EOM relative to tlv_start
++
++    size_t offset = 0;
++    while (offset + 3 <= tlv_len) {
++        uint8_t  tlv_type   = tlv_start[offset];
++        // TLV length is big-endian (network byte order per IEEE 1905.1)
++        uint16_t tlv_length = (static_cast<uint16_t>(tlv_start[offset + 1]) << 8) |
++                               static_cast<uint16_t>(tlv_start[offset + 2]);
++        if (tlv_type == 0 && tlv_length == 0) {
++            eom_offset = offset;
++            break;
++        }
++        offset += 3 + tlv_length;
++    }
++
++    // Build the first 13 bytes of the MIC TLV value for the HMAC input:
++    // flags(1) + Integrity_TX_Counter(6) + Source_AL_MAC(6)
++    std::vector<uint8_t> mic_tlv_prefix(13, 0);
++    mic_tlv_prefix[0] = static_cast<uint8_t>((m_gtk_key_id & 0x03) << 6);
++    {
++        auto counter_bytes = encode_counter(m_integrity_tx_counter);
++        memcpy(mic_tlv_prefix.data() + 1, counter_bytes.data(), 6);
++    }
++    memcpy(mic_tlv_prefix.data() + 7, m_controller_al_mac.oct, 6);
++
++    // Per spec §13.2.2: message_array = [first 6 octets of CMDU] +
++    //                                   [first 13 octets of MIC TLV value] +
++    //                                   [all TLVs including EOM, but NOT the MIC TLV]
++    std::vector<uint8_t> message_array;
++    message_array.reserve(6 + 13 + eom_offset + 3);
++    message_array.insert(message_array.end(), buf, buf + 6);
++    message_array.insert(message_array.end(), mic_tlv_prefix.begin(), mic_tlv_prefix.end());
++    message_array.insert(message_array.end(), tlv_start, tlv_start + eom_offset + 3);
++
++    // Compute HMAC-SHA256(GTK, message_array)
++    uint8_t mic_value[32];
++    if (!DppCryptoHelper::hmac_sha256(m_gtk.data(), 32,
++                                       message_array.data(), message_array.size(),
++                                       mic_value)) {
++        LOG(ERROR) << "1905Security: HMAC-SHA256 for MIC failed";
++        return 0;
++    }
++
++    // Insert the MIC TLV before the End-of-Message TLV.
++    // Move the EOM TLV (3 bytes) forward to make room.
++    uint8_t *eom_pos = buf + 8 + eom_offset;
++    memmove(eom_pos + MIC_TLV_SIZE, eom_pos, 3);
++
++    // Write the MIC TLV
++    uint8_t *mic_pos = eom_pos;
++    mic_pos[0] = MIC_TLV_TYPE;
++    mic_pos[1] = (MIC_TLV_VALUE_LEN >> 8) & 0xFF;
++    mic_pos[2] = MIC_TLV_VALUE_LEN & 0xFF;
++    mic_pos[3] = static_cast<uint8_t>((m_gtk_key_id & 0x03) << 6); // Flags
++    {
++        auto counter_bytes = encode_counter(m_integrity_tx_counter);
++        memcpy(mic_pos + 4, counter_bytes.data(), 6); // Integrity TX Counter
++    }
++    memcpy(mic_pos + 10, m_controller_al_mac.oct, 6); // Source 1905 AL MAC Address
++    // mic_length (2 bytes, BE) = 32
++    mic_pos[16] = 0x00;
++    mic_pos[17] = 0x20;
++    memcpy(mic_pos + 18, mic_value, 32);               // MIC
++
++    m_integrity_tx_counter++;
++
++    LOG(DEBUG) << "1905Security: MIC TLV (0xAB) inserted into multicast CMDU buffer";
++    return len + MIC_TLV_SIZE;
++}
++
++
++} // namespace son
+diff --git a/framework/transport/ieee1905_transport/1905_security_manager.h b/framework/transport/ieee1905_transport/1905_security_manager.h
+new file mode 100644
+index 000000000..cbca497c9
+--- /dev/null
++++ b/framework/transport/ieee1905_transport/1905_security_manager.h
+@@ -0,0 +1,297 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#ifndef _1905_SECURITY_MANAGER_H_
++#define _1905_SECURITY_MANAGER_H_
++
++#include <tlvf/CmduMessageRx.h>
++#include <tlvf/CmduMessageTx.h>
++#include <tlvf/common/sMacAddr.h>
++#include <tlvf/ieee_1905_1/eMessageType.h>
++
++#include <array>
++#include <set>
++#include <string>
++#include <unordered_map>
++#include <tlvf/tlvftypes.h>
++
++namespace son {
++
++/**
++ * @brief 1905-Layer Security Manager
++ *
++ * Provides transparent AES-SIV encryption/decryption and HMAC-SHA256 MIC
++ * for ALL Controller 1905 CMDUs, as specified in EasyMesh §13.
++ *
++ * This class is called from the CMDU send/receive pipeline so that all
++ * Controller tasks (Channel Selection, Client Steering, AP Metrics, etc.)
++ * benefit from 1905 security transparently — without each task needing to
++ * know about encryption.
++ *
++ * Architecture (per EasyMesh §16 design):
++ *
++ *   DppConfiguratorTask  →  generates keys, installs into Ieee1905SecurityManager
++ *   ChannelSelectionTask →  builds CMDU (plaintext)
++ *   ClientSteeringTask   →  builds CMDU (plaintext)
++ *            ↓
++ *   son_actions::send_cmdu_to_agent()
++ *            ↓
++ *   Ieee1905SecurityManager::encrypt_cmdu_if_needed()   ← encrypt if needed
++ *            ↓
++ *   Transport → Remote Agent
++ *
++ *   Remote Agent → Transport → Controller::handle_cmdu()
++ *            ↓
++ *   Ieee1905SecurityManager::verify_mic_if_needed()     ← verify MIC
++ *   Ieee1905SecurityManager::decrypt_cmdu_if_needed()   ← decrypt if needed
++ *            ↓
++ *   Route to appropriate handler task
++ *
++ * Decision rules (per EasyMesh §16.2):
++ *
++ * OUTGOING UNICAST:
++ *   IF msg_type NOT in exception list
++ *   AND dst_mac has security_enabled AND has TK
++ *   → AES-SIV encrypt all TLVs → wrap in Encrypted Payload TLV (0xAC)
++ *
++ * OUTGOING MULTICAST:
++ *   IF GTK available → add MIC TLV (0xAB)
++ *
++ * INCOMING:
++ *   IF Encrypted Payload TLV (0xAC) present:
++ *     IF msg_type is DIRECT_ENCAP_DPP or IEEE1905_ENCAP_EAPOL → process plaintext
++ *     ELSE IF has TK → AES-SIV decrypt
++ *     ELSE → DISCARD
++ *   IF no Encrypted Payload TLV:
++ *     IF src_mac security_enabled → DISCARD
++ *     ELSE → process plaintext
++ *   IF MIC TLV (0xAB) present → verify HMAC-SHA256; DISCARD if fail
++ */
++class Ieee1905SecurityManager {
++public:
++    /**
++     * @brief Constructor.
++     * @param controller_al_mac  Controller's AL MAC address (used in MIC/encryption AAD)
++     */
++    explicit Ieee1905SecurityManager(const sMacAddr &controller_al_mac);
++
++    // -------------------------------------------------------------------------
++    // Key installation (called by DppConfiguratorTask after 4-way handshake M4)
++    // -------------------------------------------------------------------------
++
++    /**
++     * @brief Install per-Agent TK and shared GTK after successful 4-way handshake.
++     *
++     * Called by DppConfiguratorTask after EAPOL M4 is verified.
++     *
++     * @param agent_mac    Agent AL MAC address
++     * @param tk           256-bit 1905 TK (bytes 32-63 of PTK)
++     * @param gtk          256-bit 1905 GTK (shared across all Agents)
++     * @param gtk_key_id   GTK Key ID (1-3)
++     */
++    void install_agent_keys(const sMacAddr &agent_mac,
++                             const std::array<uint8_t, 32> &tk,
++                             const std::array<uint8_t, 32> &gtk,
++                             uint8_t gtk_key_id);
++
++    /**
++     * @brief Remove security state for an Agent (e.g., on disconnect).
++     */
++    void remove_agent(const sMacAddr &agent_mac);
++
++    // -------------------------------------------------------------------------
++    // Outgoing CMDU processing (called from send path)
++    // -------------------------------------------------------------------------
++
++    /**
++     * @brief Encrypt a unicast CMDU if security is enabled for the destination.
++     *
++     * Per EasyMesh §13.3.2:
++     * - Skips exception messages (AP_AUTOCONFIG_SEARCH/RESPONSE, DIRECT_ENCAP_DPP,
++     *   IEEE1905_ENCAP_EAPOL)
++     * - If dst_mac has security enabled AND has TK: AES-SIV encrypt all TLVs,
++     *   replace with Encrypted Payload TLV (0xAC)
++     *
++     * @param dst_mac   Destination Agent AL MAC
++     * @param msg_type  Message type (for exception check)
++     * @param cmdu_tx   CMDU to encrypt in-place
++     * @return true on success (or if encryption not needed)
++     */
++    bool encrypt_cmdu_if_needed(const sMacAddr &dst_mac,
++                                 ieee1905_1::eMessageType msg_type,
++                                 uint8_t *buf,
++                                 size_t msg_len,
++                                 size_t buf_capacity,
++                                 size_t &new_len);
++
++    /**
++     * @brief Add MIC TLV to a multicast/relayed CMDU if GTK is available.
++     *
++     * Per EasyMesh §13.2.2:
++     * - Computes HMAC-SHA256(GTK, [CMDU_header_6B | MIC_TLV_first_13B | all_TLVs])
++     * - Inserts MIC TLV (0xAB) before End of Message TLV
++     *
++     * @param cmdu_tx   CMDU to add MIC to
++     * @return true on success (or if MIC not needed)
++     */
++    bool add_mic_if_needed(ieee1905_1::CmduMessageTx &cmdu_tx);
++
++    // -------------------------------------------------------------------------
++    // Incoming CMDU processing (called from receive path)
++    // -------------------------------------------------------------------------
++
++    /**
++     * @brief Verify MIC TLV in an incoming CMDU if present.
++     *
++     * Per EasyMesh §13.2.3:
++     * - If MIC TLV (0xAB) present: verify HMAC-SHA256; return false if fail
++     * - If no MIC TLV and sender security-enabled: return false (discard)
++     * - If no MIC TLV and sender not security-enabled: return true (plaintext OK)
++     *
++     * @param src_mac   Source Agent AL MAC
++     * @param cmdu_rx   Received CMDU
++     * @return true if MIC is valid (or not required), false if should be discarded
++     */
++    bool verify_mic_if_needed(const sMacAddr &src_mac,
++                               ieee1905_1::CmduMessageRx &cmdu_rx,
++                               const uint8_t raw_header6[6],
++                               size_t msg_len,
++                               const std::vector<uint8_t> &raw_msg);
++
++    /**
++     * @brief Decrypt an incoming CMDU if it contains an Encrypted Payload TLV.
++     *
++     * Per EasyMesh §13.3.3:
++     * - If Encrypted Payload TLV (0xAC) present:
++     *   - Exception messages (DIRECT_ENCAP_DPP, IEEE1905_ENCAP_EAPOL): process plaintext
++     *   - If has TK: AES-SIV decrypt; replace Encrypted Payload TLV with plaintext TLVs
++     *   - If no TK: return false (discard)
++     * - If no Encrypted Payload TLV:
++     *   - If src_mac security-enabled: return false (discard — expected encryption)
++     *   - Else: return true (plaintext OK)
++     *
++     * @param src_mac   Source Agent AL MAC
++     * @param cmdu_rx   Received CMDU (modified in-place on successful decryption)
++     * @return true if decryption succeeded (or not needed), false if should be discarded
++     */
++    bool decrypt_cmdu_if_needed(const sMacAddr &src_mac,
++                                 ieee1905_1::CmduMessageRx &cmdu_rx,
++                                 const uint8_t raw_header6[6],
++                                 size_t &new_msg_len_out);
++
++    // -------------------------------------------------------------------------
++    // Decryption failure handling
++    // -------------------------------------------------------------------------
++
++    /**
++     * @brief Handle a decryption failure for a specific Agent.
++     *
++     * Increments the Decryption Failure Counter. If it exceeds the threshold,
++     * logs a warning (caller should trigger rekey via 1905 Rekey Request).
++     *
++     * @param agent_mac  Agent that sent the undecryptable message
++     */
++    void handle_decryption_failure(const sMacAddr &agent_mac);
++
++    // -------------------------------------------------------------------------
++    // Query methods
++    // -------------------------------------------------------------------------
++
++    /** @brief Returns true if 1905 security is enabled for the given Agent. */
++    bool is_security_enabled(const sMacAddr &agent_mac) const;
++
++    /** @brief Returns true if a 1905 TK is installed for the given Agent. */
++    bool has_tk(const sMacAddr &agent_mac) const;
++
++    /** @brief Returns true if the 1905 GTK is available. */
++    bool has_gtk() const { return m_gtk_valid; }
++
++    /** @brief Get the current GTK Key ID. */
++    uint8_t gtk_key_id() const { return m_gtk_key_id; }
++
++    /**
++     * @brief Add MIC TLV directly to a raw CMDU buffer if GTK is available.
++     *
++     * Inserts the MIC TLV (0xAB) immediately before the End-of-Message TLV.
++     * The buffer must have at least 48 bytes of extra capacity beyond @p len.
++     * This avoids the CmduMessageTx wrapping issue where addClass() writes at
++     * offset 0 (overwriting the CMDU header) when m_class_vector is empty.
++     *
++     * @param buf    Pointer to the CMDU buffer
++     * @param len    Current length of the CMDU data in the buffer
++     * @param maxlen Maximum capacity of the buffer (must be >= len + 48)
++     * @return New length of the CMDU data after MIC addition, or 0 on failure
++     */
++    size_t add_mic_to_buffer(uint8_t *buf, size_t len, size_t maxlen);
++
++
++private:
++    // -------------------------------------------------------------------------
++    // Per-Agent security state
++    // -------------------------------------------------------------------------
++
++    struct sAgentSecurityState {
++        std::array<uint8_t, 32> tk;              // 1905 TK (256-bit)
++        uint64_t enc_tx_counter    = 1;          // Encryption TX counter (strictly increasing)
++        uint64_t enc_rx_counter    = 0;          // Encryption RX counter (strictly increasing)
++        uint64_t int_rx_counter    = 0;          // Integrity RX counter (strictly increasing)
++        uint16_t decrypt_fail_count = 0;         // Decryption failure counter
++        bool security_enabled      = false;      // true after DPP onboarding + 4-way handshake
++        bool has_tk                = false;      // true after TK is installed
++    };
++
++    std::unordered_map<sMacAddr, sAgentSecurityState> m_agent_states;
++
++    // -------------------------------------------------------------------------
++    // Shared GTK (distributed to all Agents by Controller)
++    // -------------------------------------------------------------------------
++
++    std::array<uint8_t, 32> m_gtk;
++    uint8_t m_gtk_key_id         = 1;
++    bool m_gtk_valid             = false;
++    uint64_t m_integrity_tx_counter = 1;  // Integrity TX counter for MIC
++
++    // -------------------------------------------------------------------------
++    // Controller identity
++    // -------------------------------------------------------------------------
++
++    sMacAddr m_controller_al_mac;
++
++    // -------------------------------------------------------------------------
++    // Exception message types (never encrypted per EasyMesh §13.3.2)
++    // -------------------------------------------------------------------------
++
++    static bool is_exception_message(ieee1905_1::eMessageType msg_type);
++
++    // -------------------------------------------------------------------------
++    // Internal helpers
++    // -------------------------------------------------------------------------
++
++    /**
++     * @brief Collect all TLVs from a CMDU (excluding End of Message TLV).
++     * @return Serialized TLV bytes
++     */
++    static std::vector<uint8_t> collect_tlvs(const uint8_t *buf, size_t buf_len);
++    static std::vector<uint8_t> collect_tlvs(ieee1905_1::CmduMessageTx &cmdu_tx);
++
++    /**
++     * @brief Get the first 6 bytes of the CMDU header (for AAD).
++     */
++    static std::vector<uint8_t> get_cmdu_header_6bytes(ieee1905_1::CmduMessageTx &cmdu_tx);
++    static std::vector<uint8_t> get_cmdu_header_6bytes(ieee1905_1::CmduMessageRx &cmdu_rx);
++
++    /**
++     * @brief Encode a 48-bit counter as 6 bytes (big-endian).
++     */
++    static std::vector<uint8_t> encode_counter(uint64_t counter);
++
++    /**
++     * @brief Decode a 6-byte big-endian counter to uint64_t.
++     */
++    static uint64_t decode_counter(const uint8_t *bytes);
++};
++
++} // namespace son
++
++#endif // _1905_SECURITY_MANAGER_H_
+diff --git a/framework/transport/ieee1905_transport/CMakeLists.txt b/framework/transport/ieee1905_transport/CMakeLists.txt
+index 5da4ecaee..93efde7ba 100644
+--- a/framework/transport/ieee1905_transport/CMakeLists.txt
++++ b/framework/transport/ieee1905_transport/CMakeLists.txt
+@@ -3,12 +3,14 @@ add_library(ieee1905_transport_lib
+     ieee1905_transport_broker.cpp 
+     ieee1905_transport_network.cpp 
+     ieee1905_transport_local_bus.cpp 
+-    ieee1905_transport_packet_processing.cpp)
++    ieee1905_transport_packet_processing.cpp
++    dpp_crypto_helper.cpp
++    1905_security_manager.cpp)
+ 
+ set_target_properties(ieee1905_transport_lib PROPERTIES VERSION ${prplmesh_VERSION} SOVERSION ${prplmesh_VERSION_MAJOR})
+ target_link_libraries(ieee1905_transport_lib 
+     PUBLIC bpl bcl tlvf btlvf ieee1905_transport_messages mapfcommon
+-    PRIVATE elpp pcap)
++    PRIVATE elpp pcap crypto)
+ target_include_directories(ieee1905_transport_lib PUBLIC include/)
+ 
+ add_library(ieee1905_transport_messages ieee1905_transport_messages.cpp)
+diff --git a/framework/transport/ieee1905_transport/dpp_crypto_helper.cpp b/framework/transport/ieee1905_transport/dpp_crypto_helper.cpp
+new file mode 100644
+index 000000000..360fcdc71
+--- /dev/null
++++ b/framework/transport/ieee1905_transport/dpp_crypto_helper.cpp
+@@ -0,0 +1,222 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#include "include/dpp_crypto_helper.h"
++
++#include <mapf/common/logger.h>
++
++#include <openssl/evp.h>
++#include <openssl/err.h>
++#include <openssl/params.h>
++
++#include <cstring>
++#include <algorithm>
++
++// RFC 5297 AES-SIV helpers
++// K1 = key[0..15], K2 = key[16..31]
++// S2V produces the SIV by: CMAC each component individually with dbl+xor chaining.
++
++// OMAC1/CMAC using EVP_MAC (OpenSSL 3.x API, replaces deprecated CMAC_CTX_*)
++static bool omac1_aes128(const uint8_t *k1, const uint8_t *data, size_t len, uint8_t out[16])
++{
++    EVP_MAC *mac = EVP_MAC_fetch(nullptr, "CMAC", nullptr);
++    if (!mac) return false;
++
++    EVP_MAC_CTX *ctx = EVP_MAC_CTX_new(mac);
++    EVP_MAC_free(mac);
++    if (!ctx) return false;
++
++    OSSL_PARAM params[] = {
++        OSSL_PARAM_construct_utf8_string("cipher", const_cast<char *>("AES-128-CBC"), 0),
++        OSSL_PARAM_construct_end()
++    };
++    if (EVP_MAC_init(ctx, k1, 16, params) != 1 ||
++        EVP_MAC_update(ctx, data, len) != 1) {
++        EVP_MAC_CTX_free(ctx);
++        return false;
++    }
++    size_t out_len = 16;
++    bool ok = (EVP_MAC_final(ctx, out, &out_len, 16) == 1) && out_len == 16;
++    EVP_MAC_CTX_free(ctx);
++    return ok;
++}
++
++// dbl: shift left by 1 in GF(2^128) with polynomial x^128 + x^7 + x^2 + x + 1
++static void dbl_block(uint8_t b[16])
++{
++    int carry = b[0] & 0x80;
++    for (int i = 0; i < 15; i++)
++        b[i] = static_cast<uint8_t>((b[i] << 1) | (b[i + 1] >> 7));
++    b[15] = static_cast<uint8_t>((b[15] << 1) ^ (carry ? 0x87 : 0x00));
++}
++
++static void xor_block(uint8_t *a, const uint8_t *b, size_t len)
++{
++    for (size_t i = 0; i < len; i++) a[i] ^= b[i];
++}
++
++// S2V per RFC 5297 §2.4
++// aad[] are AD1..ADn, last element is plaintext P
++static bool s2v(const uint8_t *k1,
++                const std::vector<std::vector<uint8_t>> &aad,
++                const std::vector<uint8_t> &plaintext,
++                uint8_t siv[16])
++{
++    static const uint8_t zero16[16] = {};
++    uint8_t d[16];
++
++    // D = OMAC(K1, <zero>)
++    if (!omac1_aes128(k1, zero16, 16, d)) return false;
++
++    // For each AD component: D = dbl(D) xor OMAC(K1, AD_i)
++    for (const auto &ad : aad) {
++        uint8_t tmp[16];
++        if (!omac1_aes128(k1, ad.data(), ad.size(), tmp)) return false;
++        dbl_block(d);
++        xor_block(d, tmp, 16);
++    }
++
++    // Final component = plaintext P
++    if (plaintext.size() >= 16) {
++        // xorend: XOR D into the last 16 bytes of P, then OMAC
++        std::vector<uint8_t> buf(plaintext);
++        xor_block(buf.data() + buf.size() - 16, d, 16);
++        if (!omac1_aes128(k1, buf.data(), buf.size(), siv)) return false;
++    } else {
++        // pad P to 16 bytes: P || 0x80 || 0x00...
++        uint8_t pad[16] = {};
++        memcpy(pad, plaintext.data(), plaintext.size());
++        pad[plaintext.size()] = 0x80;
++        dbl_block(d);
++        xor_block(d, pad, 16);
++        if (!omac1_aes128(k1, d, 16, siv)) return false;
++    }
++    return true;
++}
++
++static bool aes_ctr_crypt(const uint8_t *k2, const uint8_t iv[16],
++                           const uint8_t *in, uint8_t *out, size_t len)
++{
++    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
++    if (!ctx) return false;
++    if (EVP_EncryptInit_ex(ctx, EVP_aes_128_ctr(), nullptr, k2, iv) != 1) {
++        EVP_CIPHER_CTX_free(ctx);
++        return false;
++    }
++    int outl = 0, finl = 0;
++    if (EVP_EncryptUpdate(ctx, out, &outl, in, static_cast<int>(len)) != 1 ||
++        EVP_EncryptFinal_ex(ctx, out + outl, &finl) != 1) {
++        EVP_CIPHER_CTX_free(ctx);
++        return false;
++    }
++    EVP_CIPHER_CTX_free(ctx);
++    return true;
++}
++
++std::vector<uint8_t> DppCryptoHelper::aes_siv_encrypt(const uint8_t *key, size_t key_len,
++                                                       const std::vector<uint8_t> &plaintext,
++                                                       const std::vector<std::vector<uint8_t>> &aad)
++{
++    if (!key || key_len != 32) {
++        LOG(ERROR) << "DppCryptoHelper: Invalid key for AES-SIV encrypt (expected 32 bytes)";
++        return {};
++    }
++
++    const uint8_t *k1 = key;
++    const uint8_t *k2 = key + 16;
++
++    // Step 1: SIV = S2V(K1, AD1..ADn, P)
++    uint8_t siv[16];
++    if (!s2v(k1, aad, plaintext, siv)) {
++        LOG(ERROR) << "DppCryptoHelper: S2V failed";
++        return {};
++    }
++
++    // Step 2: CTR-encrypt P using IV = SIV with bits 63 and 31 cleared
++    uint8_t ctr_iv[16];
++    memcpy(ctr_iv, siv, 16);
++    ctr_iv[8] &= 0x7F;
++    ctr_iv[12] &= 0x7F;
++
++    std::vector<uint8_t> result(16 + plaintext.size());
++    memcpy(result.data(), siv, 16);
++
++    if (!aes_ctr_crypt(k2, ctr_iv, plaintext.data(), result.data() + 16, plaintext.size())) {
++        LOG(ERROR) << "DppCryptoHelper: AES-CTR encrypt failed";
++        return {};
++    }
++    return result;
++}
++
++bool DppCryptoHelper::aes_siv_decrypt(const uint8_t *key, size_t key_len,
++                                       const std::vector<uint8_t> &ciphertext,
++                                       const std::vector<std::vector<uint8_t>> &aad,
++                                       std::vector<uint8_t> &plaintext)
++{
++    if (!key || key_len != 32) {
++        LOG(ERROR) << "DppCryptoHelper: Invalid key for AES-SIV decrypt (expected 32 bytes)";
++        return false;
++    }
++    if (ciphertext.size() < 16) {
++        LOG(ERROR) << "DppCryptoHelper: Ciphertext too short for AES-SIV decrypt";
++        return false;
++    }
++
++    const uint8_t *k1 = key;
++    const uint8_t *k2 = key + 16;
++    const uint8_t *siv = ciphertext.data();
++    size_t ct_len      = ciphertext.size() - 16;
++
++    // Step 1: CTR-decrypt using IV = SIV with bits 63 and 31 cleared
++    uint8_t ctr_iv[16];
++    memcpy(ctr_iv, siv, 16);
++    ctr_iv[8] &= 0x7F;
++    ctr_iv[12] &= 0x7F;
++
++    std::vector<uint8_t> decrypted(ct_len);
++    if (!aes_ctr_crypt(k2, ctr_iv, ciphertext.data() + 16, decrypted.data(), ct_len)) {
++        LOG(ERROR) << "DppCryptoHelper: AES-CTR decrypt failed";
++        return false;
++    }
++
++    // Step 2: Recompute SIV and verify
++    uint8_t check[16];
++    if (!s2v(k1, aad, decrypted, check)) {
++        LOG(ERROR) << "DppCryptoHelper: S2V verification failed";
++        return false;
++    }
++
++    if (memcmp(check, siv, 16) != 0) {
++        LOG(ERROR) << "DppCryptoHelper: SIV verification failed - authentication tag mismatch";
++        return false;
++    }
++
++    plaintext = std::move(decrypted);
++    return true;
++}
++
++bool DppCryptoHelper::hmac_sha256(const uint8_t *key, size_t key_len,
++                                  const uint8_t *data, size_t data_len,
++                                  uint8_t *out)
++{
++    if (!key || !data || !out) {
++        LOG(ERROR) << "DppCryptoHelper: Invalid parameters for HMAC-SHA256";
++        return false;
++    }
++
++    // HMAC-SHA256 using EVP_Q_mac (OpenSSL 3.x API, replaces deprecated HMAC())
++    size_t out_len = 32;
++    if (!EVP_Q_mac(nullptr, "HMAC", nullptr, "SHA256", nullptr,
++                   key, key_len, data, data_len, out, 32, &out_len)) {
++        LOG(ERROR) << "DppCryptoHelper: HMAC-SHA256 computation failed";
++        return false;
++    }
++
++    if (out_len != 32) {
++        LOG(ERROR) << "DppCryptoHelper: Unexpected HMAC output length: " << out_len;
++        return false;
++    }
++
++    return true;
++}
+\ No newline at end of file
+diff --git a/framework/transport/ieee1905_transport/ieee1905_transport.h b/framework/transport/ieee1905_transport/ieee1905_transport.h
+index 3cf963c0e..e9e24980a 100644
+--- a/framework/transport/ieee1905_transport/ieee1905_transport.h
++++ b/framework/transport/ieee1905_transport/ieee1905_transport.h
+@@ -17,6 +17,7 @@
+ #include <bcl/network/interface_state_manager.h>
+ 
+ #include "ieee1905_transport_broker.h"
++#include "1905_security_manager.h"
+ 
+ #include <tlvf/tlvftypes.h>
+ 
+@@ -410,6 +411,7 @@ private:
+         messages::InterfaceConfigurationRequestMessage &msg);
+     void handle_al_mac_addr_configuration_message(messages::AlMacAddressConfigurationMessage &msg);
+     void handle_vlan_configuration_request_message(messages::VlanConfigurationRequestMessage &msg);
++    void handle_security_key_install_message(messages::SecurityKeyInstallMessage &msg);
+     bool send_packet_to_broker(Packet &packet);
+     uint16_t get_next_message_id();
+ 
+@@ -437,6 +439,15 @@ private:
+     void write_to_pcap(const uint8_t *data, size_t len, const sMacAddr &src, const sMacAddr &dst,
+                        bool is_tx);
+     void close_pcap_capture();
++
++    //
++    // 1905 SECURITY SUPPORT
++    //
++    /**
++     * 1905-layer security manager for encryption/decryption.
++     * Initialized when AL MAC address is set.
++     */
++    std::unique_ptr<son::Ieee1905SecurityManager> m_security_manager;
+ };
+ 
+ inline std::ostream &operator<<(std::ostream &os, const Ieee1905Transport::Packet &m)
+diff --git a/framework/transport/ieee1905_transport/ieee1905_transport_local_bus.cpp b/framework/transport/ieee1905_transport/ieee1905_transport_local_bus.cpp
+index 0ba910cc3..217f3e372 100644
+--- a/framework/transport/ieee1905_transport/ieee1905_transport_local_bus.cpp
++++ b/framework/transport/ieee1905_transport/ieee1905_transport_local_bus.cpp
+@@ -11,7 +11,9 @@
+ #include <arpa/inet.h>
+ #include <chrono>
+ #include <cstring>
++#include <iomanip>
+ #include <net/if.h>
++#include <vector>
+ 
+ namespace beerocks {
+ namespace transport {
+@@ -41,6 +43,11 @@ void Ieee1905Transport::handle_broker_pollin_event(std::unique_ptr<messages::Mes
+         MAPF_DBG("received VlanConfigurationRequestMessage message:" << std::endl
+                                                                      << *vlan_configuration_msg);
+         handle_vlan_configuration_request_message(*vlan_configuration_msg);
++    } else if (auto *security_key_install_msg =
++                   dynamic_cast<SecurityKeyInstallMessage *>(msg.get())) {
++        MAPF_DBG("received SecurityKeyInstallMessage message:" << std::endl
++                                                               << *security_key_install_msg);
++        handle_security_key_install_message(*security_key_install_msg);
+     } else {
+         // should never receive messages which we are not subscribed to
+         MAPF_WARN("received un-expected message:" << std::endl << *msg);
+@@ -96,6 +103,71 @@ void Ieee1905Transport::handle_broker_cmdu_tx_message(CmduTxMessage &msg)
+         }
+     }
+ 
++    // Apply 1905-layer security if enabled (ENCRYPTION/MIC).
++    // Only apply security operations when keys are actually installed.
++    // During initial onboarding no keys exist yet, so we must skip security
++    // to avoid corrupting the packet (CmduMessageTx wrapping an existing buffer
++    // has an empty m_class_vector, so getMessageLength() returns 0 which would
++    // truncate the packet and cause verify_packet() to drop it).
++    if (m_security_manager && packet.ether_type == ETH_P_1905_1) {
++        bool is_multicast = ETHER_IS_MULTICAST(packet.dst.oct);
++
++        if (is_multicast) {
++            // Only add MIC when GTK is available (keys have been installed after DPP)
++            MAPF_ERR("1905Security: multicast to " << packet.dst << " has_gtk=" << m_security_manager->has_gtk());
++            if (m_security_manager->has_gtk()) {
++                // Use add_mic_to_buffer to directly manipulate the raw buffer.
++                // CmduMessageTx wrapping an existing buffer has empty m_class_vector,
++                // so addClass() writes at offset 0 (overwriting the CMDU header) and
++                // getMessageLength() returns 0 — both corrupt the packet.
++                // Instead: resize the frame to make room for the MIC TLV (48 bytes),
++                // then directly insert it before the End-of-Message TLV.
++                static constexpr size_t MIC_TLV_SIZE = 50; // type(1)+len(2)+flags(1)+counter(6)+mac(6)+mic_length(2)+mic(32)
++                size_t original_len = packet.payload.iov_len;
++
++                // Resize the frame to accommodate the MIC TLV
++                msg.metadata()->length = original_len + MIC_TLV_SIZE;
++                uint8_t *new_buf = msg.data(); // resizes the underlying vector
++                packet.payload.iov_base = new_buf; // update pointer (may have been reallocated)
++
++                size_t new_len = m_security_manager->add_mic_to_buffer(
++                    new_buf, original_len, original_len + MIC_TLV_SIZE);
++                if (new_len == 0) {
++                    MAPF_WARN("Failed to add MIC to multicast CMDU to " << packet.dst);
++                    // Restore original length
++                    msg.metadata()->length  = original_len;
++                    packet.payload.iov_len  = original_len;
++                    packet.payload.iov_base = msg.data();
++                } else {
++                    packet.payload.iov_len = new_len;
++                    msg.metadata()->length = new_len;
++                }
++            }
++        } else {
++            // Only encrypt when a TK is installed for this destination
++            if (m_security_manager->is_security_enabled(packet.dst)) {
++                size_t original_len  = packet.payload.iov_len;
++                size_t buf_capacity  = original_len + 256; // room for Encrypted Payload TLV overhead
++                msg.metadata()->length = buf_capacity;
++                uint8_t *buf = msg.data(); // resize underlying vector
++                packet.payload.iov_base = buf;
++
++                size_t new_len = 0;
++                auto msg_type  = static_cast<ieee1905_1::eMessageType>(msg.metadata()->msg_type);
++                if (!m_security_manager->encrypt_cmdu_if_needed(
++                        packet.dst, msg_type, buf, original_len, buf_capacity, new_len)) {
++                    MAPF_ERR("1905Security: encryption failed for CMDU to " << packet.dst);
++                    msg.metadata()->length  = original_len;
++                    packet.payload.iov_len  = original_len;
++                    packet.payload.iov_base = msg.data();
++                } else {
++                    packet.payload.iov_len = new_len;
++                    msg.metadata()->length = new_len;
++                }
++            }
++        }
++    }
++
+     // Write to PCAP if enabled (TX direction)
+     if (m_pcap_enabled) {
+         write_to_pcap((uint8_t *)packet.payload.iov_base, packet.payload.iov_len, packet.src,
+@@ -186,6 +258,32 @@ void Ieee1905Transport::handle_vlan_configuration_request_message(
+                                                                   "selection.");
+ }
+ 
++void Ieee1905Transport::handle_security_key_install_message(SecurityKeyInstallMessage &msg)
++{
++    if (!m_security_manager) {
++        MAPF_ERR("Security manager not initialized (AL MAC not set yet)");
++        return;
++    }
++
++    auto *metadata = msg.metadata();
++    sMacAddr peer_mac = tlvf::mac_from_array(metadata->peer_mac);
++
++    if (metadata->install) {
++        // Install keys
++        std::array<uint8_t, 32> tk;
++        std::array<uint8_t, 32> gtk;
++        std::copy_n(metadata->tk, 32, tk.begin());
++        std::copy_n(metadata->gtk, 32, gtk.begin());
++
++        m_security_manager->install_agent_keys(peer_mac, tk, gtk, metadata->gtk_key_id);
++        MAPF_INFO("Installed 1905 security keys for peer: " << peer_mac);
++    } else {
++        // Remove keys
++        m_security_manager->remove_agent(peer_mac);
++        MAPF_INFO("Removed 1905 security keys for peer: " << peer_mac);
++    }
++}
++
+ bool Ieee1905Transport::send_packet_to_broker(Packet &packet)
+ {
+     // Create and fill an CmduRxMessage to be sent to the broker
+@@ -212,6 +310,84 @@ bool Ieee1905Transport::send_packet_to_broker(Packet &packet)
+         msg.metadata()->relay    = 0;
+     }
+ 
++    // Apply 1905-layer security if enabled (DECRYPTION/MIC VERIFICATION).
++    // Only apply security operations when keys are actually installed to avoid
++    // corrupting message lengths (CmduMessageRx without parse() has empty
++    // m_class_vector, so getMessageLength() returns 0).
++    if (m_security_manager && packet.ether_type == ETH_P_1905_1) {
++        bool is_multicast = ETHER_IS_MULTICAST(packet.dst.oct);
++
++        if (is_multicast) {
++            // Only verify MIC when GTK is available (keys have been installed after DPP)
++            if (m_security_manager->has_gtk()) {
++                // Save raw header bytes and message length BEFORE parse() byte-swaps fields
++                uint8_t raw_header6[6];
++                memcpy(raw_header6, msg.data(), 6);
++                size_t raw_msg_len = msg.metadata()->length;
++                // Save entire raw message before parse corrupts TLV length bytes in-place
++                std::vector<uint8_t> raw_msg(static_cast<uint8_t*>(msg.data()),
++                                             static_cast<uint8_t*>(msg.data()) + raw_msg_len);
++
++                ieee1905_1::CmduMessageRx cmdu_rx(msg.data(), msg.metadata()->length);
++                cmdu_rx.parse();
++                bool mic_ok = m_security_manager->verify_mic_if_needed(
++                        packet.src, cmdu_rx, raw_header6, raw_msg_len, raw_msg);
++
++                // Restore raw bytes — parse() byte-swaps TLV lengths in-place, which
++                // corrupts the buffer forwarded to the broker downstream.
++                memcpy(msg.data(), raw_msg.data(), raw_msg_len);
++                msg.metadata()->length = raw_msg_len;
++
++                if (!mic_ok) {
++                    MAPF_WARN("MIC verification failed for multicast CMDU from " << packet.src);
++                    return false; // Discard message
++                }
++            }
++        } else {
++            // Only decrypt when security is enabled for this source
++            if (m_security_manager->is_security_enabled(packet.src)) {
++                // Save raw header bytes BEFORE parse() byte-swaps multi-byte fields
++                uint8_t raw_header6[6];
++                memcpy(raw_header6, msg.data(), 6);
++                // Save the full 8-byte CMDU header (parse() swaps it in-place)
++                uint8_t raw_header8[8];
++                memcpy(raw_header8, msg.data(), 8);
++                // Save the entire raw message — parse() also byte-swaps TLV length fields
++                size_t orig_len = msg.metadata()->length;
++                std::vector<uint8_t> raw_msg_backup(
++                    static_cast<uint8_t*>(msg.data()),
++                    static_cast<uint8_t*>(msg.data()) + orig_len);
++
++                ieee1905_1::CmduMessageRx cmdu_rx(msg.data(), msg.metadata()->length);
++                cmdu_rx.parse();
++                size_t new_msg_len = orig_len;
++                if (!m_security_manager->decrypt_cmdu_if_needed(
++                        packet.src, cmdu_rx, raw_header6, new_msg_len)) {
++                    MAPF_WARN("Decryption failed for unicast CMDU from " << packet.src);
++                    return false; // Discard message
++                }
++
++                if (new_msg_len != orig_len) {
++                    // Decryption happened — buffer has plaintext TLVs; restore header only
++                    memcpy(msg.data(), raw_header8, 8);
++                    msg.metadata()->length = new_msg_len;
++                } else {
++                    // No decryption (exception message) — restore full raw bytes that parse() corrupted
++                    memcpy(msg.data(), raw_msg_backup.data(), orig_len);
++                    msg.metadata()->length = orig_len;
++                }
++
++                // msg_type from wire bytes (big-endian bytes 2-3)
++                msg.metadata()->msg_type = (static_cast<uint16_t>(raw_header8[2]) << 8) |
++                                            raw_header8[3];
++                MAPF_ERR("1905Security: forwarding decrypted msg_type=0x"
++                         << std::hex << msg.metadata()->msg_type
++                         << " len=" << std::dec << msg.metadata()->length
++                         << " from " << packet.src);
++            }
++        }
++    }
++
+     // // Write to PCAP if enabled (RX direction)
+     // if (m_pcap_enabled) {
+     //     write_to_pcap((uint8_t *)packet.payload.iov_base, packet.payload.iov_len, packet.src,
+diff --git a/framework/transport/ieee1905_transport/ieee1905_transport_messages.cpp b/framework/transport/ieee1905_transport/ieee1905_transport_messages.cpp
+index d6c28fd7d..203cf6c0a 100644
+--- a/framework/transport/ieee1905_transport/ieee1905_transport_messages.cpp
++++ b/framework/transport/ieee1905_transport/ieee1905_transport_messages.cpp
+@@ -47,6 +47,9 @@ create_transport_message(Type type, std::initializer_list<messages::Message::Fra
+     case messages::Type::VlanConfigurationRequestMessage:
+         return std::unique_ptr<messages::VlanConfigurationRequestMessage>{
+             new messages::VlanConfigurationRequestMessage(frame)};
++    case messages::Type::SecurityKeyInstallMessage:
++        return std::unique_ptr<messages::SecurityKeyInstallMessage>{
++            new messages::SecurityKeyInstallMessage(frame)};
+     default:
+         LOG(WARNING) << "Received unknown message type: " << int(type);
+         return std::unique_ptr<messages::Message>{new messages::Message(Type::Invalid, frame)};
+@@ -100,10 +103,13 @@ std::unique_ptr<Message> read_transport_message(Socket &sd)
+         return nullptr;
+     }
+ 
+-    // Validate message length
+-    if (header.len > messages::Message::kMaxFrameLength) {
++    // Validate message length — allow up to 16KB for large DPP BSS Config Response messages
++    // (kMaxFrameLength=8192 reflects the max Ethernet frame, but the broker UDS path
++    // supports larger payloads that get fragmented by the transport layer).
++    static constexpr uint32_t kBrokerMaxFrameLength = 16384;
++    if (header.len > kBrokerMaxFrameLength) {
+         LOG(ERROR) << "Message length is too large: " << header.len << " > "
+-                   << messages::Message::kMaxFrameLength;
++                   << kBrokerMaxFrameLength;
+ 
+         discard_pending_bytes();
+         return nullptr;
+diff --git a/framework/transport/ieee1905_transport/ieee1905_transport_network.cpp b/framework/transport/ieee1905_transport/ieee1905_transport_network.cpp
+index afff1dcbe..0d644a68b 100755
+--- a/framework/transport/ieee1905_transport/ieee1905_transport_network.cpp
++++ b/framework/transport/ieee1905_transport/ieee1905_transport_network.cpp
+@@ -594,6 +594,12 @@ void Ieee1905Transport::set_al_mac_addr(const uint8_t *addr)
+ 
+     std::copy_n(addr, ETH_ALEN, al_mac_addr_);
+ 
++    // Initialize 1905 security manager with our AL MAC address
++    sMacAddr al_mac;
++    std::copy_n(addr, ETH_ALEN, al_mac.oct);
++    m_security_manager = std::make_unique<son::Ieee1905SecurityManager>(al_mac);
++    MAPF_INFO("1905 Security Manager initialized with AL MAC: " << al_mac);
++
+     // refresh packet filtering on all active interfaces to use the new AL MAC address
+     for (auto it = network_interfaces_.begin(); it != network_interfaces_.end(); ++it) {
+         auto &network_interface = it->second;
+diff --git a/framework/transport/ieee1905_transport/ieee1905_transport_packet_processing.cpp b/framework/transport/ieee1905_transport/ieee1905_transport_packet_processing.cpp
+index f33b2110f..ef8eb9bb6 100644
+--- a/framework/transport/ieee1905_transport/ieee1905_transport_packet_processing.cpp
++++ b/framework/transport/ieee1905_transport/ieee1905_transport_packet_processing.cpp
+@@ -338,7 +338,10 @@ bool Ieee1905Transport::de_fragment_packet(Packet &packet)
+         return false;
+     }
+ 
+-    // Only count end of message TLV for the last fragment
++    // Only count end of message TLV for the last fragment.
++    // For non-last fragments, walk TLVs to trim trailing padding/EOM bytes.
++    // A TLV whose declared size exceeds the fragment's remaining bytes is valid —
++    // it spans into the next fragment. In that case, copy the full fragment as-is.
+     if (ch->GetLastFragmentIndicator() == 0) {
+         Tlv *tlv          = reinterpret_cast<Tlv *>((uint8_t *)packet.payload.iov_base +
+                                            sizeof(Ieee1905CmduHeader));
+@@ -347,9 +350,14 @@ bool Ieee1905Transport::de_fragment_packet(Packet &packet)
+         // Find EOM TLV in the fragment
+         while (tlv->type() != 0) {
+             if (tlv->size() > tlvsLength) {
+-                // This can only happen if one of the TLVs is corrupt
+-                MAPF_ERR("Found corrupt TLV! Dropping the fragment.");
+-                return false;
++                // TLV spans into the next fragment — this is valid for large TLVs
++                // (e.g. tlvDppMessage carrying a GAS Config Response > MTU).
++                // Do not trim: copy the entire fragment body as-is.
++                MAPF_DBG("TLV size " << tlv->size()
++                         << " exceeds remaining fragment bytes " << tlvsLength
++                         << " — large TLV spans fragment boundary, copying full fragment");
++                tlvsLength = 0; // keep fragmentTlvsLength unchanged
++                break;
+             }
+ 
+             tlvsLength -= tlv->size();
+@@ -444,9 +452,34 @@ bool Ieee1905Transport::fragment_and_send_packet_to_network_interface(unsigned i
+                 return false;
+             }
+             if (nextTlv->size() > kIeee1905FragmentationThreashold) {
+-                // this TLV is too large to fit in any fragment
+-                MAPF_WARN("bad packet format - oversized TLV found.");
+-                return false;
++                // TLV is larger than one fragment.
++                // Split ALL remaining content (oversized TLV + any following TLVs + EOM)
++                // as raw bytes
++                // The last chunk gets LAST=1; no separate fragments needed for trailing TLVs.
++                auto *hdr              = reinterpret_cast<Ieee1905CmduHeader *>(buf);
++                const uint8_t *rawData = reinterpret_cast<const uint8_t *>(firstTlvInFragment);
++                size_t totalBytes      = static_cast<size_t>(remainingPacketLength);
++                size_t sent            = 0;
++
++                while (sent < totalBytes) {
++                    size_t chunkSize = std::min(totalBytes - sent,
++                                                (size_t)kIeee1905FragmentationThreashold);
++                    bool isLastFrag  = (sent + chunkSize >= totalBytes);
++
++                    std::copy_n(rawData + sent, chunkSize, buf + sizeof(Ieee1905CmduHeader));
++                    hdr->fragmentId = static_cast<uint8_t>(fragmentId);
++                    hdr->SetLastFragmentIndicator(isLastFrag ? 1 : 0);
++
++                    fragment_packet.payload.iov_base = buf;
++                    fragment_packet.payload.iov_len  = sizeof(Ieee1905CmduHeader) + chunkSize;
++                    if (!send_packet_to_network_interface(if_index, fragment_packet)) {
++                        MAPF_ERR("Failed to send oversized TLV fragment " << fragmentId);
++                        return false;
++                    }
++                    sent += chunkSize;
++                    fragmentId++;
++                }
++                return true;
+             }
+             if (int(nextTlv->size()) > remainingPacketLength) {
+                 MAPF_WARN("bad packet format - TLV exceeds packet bounds.");
+diff --git a/framework/transport/ieee1905_transport/include/dpp_crypto_helper.h b/framework/transport/ieee1905_transport/include/dpp_crypto_helper.h
+new file mode 100644
+index 000000000..924f15c9c
+--- /dev/null
++++ b/framework/transport/ieee1905_transport/include/dpp_crypto_helper.h
+@@ -0,0 +1,63 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#ifndef _TRANSPORT_DPP_CRYPTO_HELPER_H_
++#define _TRANSPORT_DPP_CRYPTO_HELPER_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++/**
++ * @brief Helper class for DPP cryptographic operations
++ *
++ * Provides AES-SIV encryption/decryption and HMAC-SHA256 functions
++ * required for 1905 security layer implementation.
++ */
++class DppCryptoHelper {
++public:
++    /**
++     * @brief Encrypt data using AES-SIV (RFC 5297)
++     *
++     * @param key Encryption key (32 bytes for AES-256)
++     * @param key_len Length of the key in bytes
++     * @param plaintext Data to encrypt
++     * @param aad Vector of Additional Authenticated Data (AAD) components
++     * @return Encrypted ciphertext with SIV prepended, or empty vector on failure
++     */
++    static std::vector<uint8_t> aes_siv_encrypt(const uint8_t *key, size_t key_len,
++                                                 const std::vector<uint8_t> &plaintext,
++                                                 const std::vector<std::vector<uint8_t>> &aad);
++
++    /**
++     * @brief Decrypt data using AES-SIV (RFC 5297)
++     *
++     * @param key Decryption key (32 bytes for AES-256)
++     * @param key_len Length of the key in bytes
++     * @param ciphertext Data to decrypt (includes SIV)
++     * @param aad Vector of Additional Authenticated Data (AAD) components
++     * @param[out] plaintext Decrypted plaintext on success (may be empty for a 0-TLV message)
++     * @return true if authentication succeeded and plaintext is valid, false on auth failure
++     */
++    static bool aes_siv_decrypt(const uint8_t *key, size_t key_len,
++                                 const std::vector<uint8_t> &ciphertext,
++                                 const std::vector<std::vector<uint8_t>> &aad,
++                                 std::vector<uint8_t> &plaintext);
++
++    /**
++     * @brief Compute HMAC-SHA256
++     *
++     * @param key HMAC key
++     * @param key_len Length of the key in bytes
++     * @param data Data to authenticate
++     * @param data_len Length of the data in bytes
++     * @param out Output buffer for HMAC (must be at least 32 bytes)
++     * @return true on success, false on failure
++     */
++    static bool hmac_sha256(const uint8_t *key, size_t key_len,
++                           const uint8_t *data, size_t data_len,
++                           uint8_t *out);
++};
++
++#endif // _TRANSPORT_DPP_CRYPTO_HELPER_H_
+\ No newline at end of file
+diff --git a/framework/transport/ieee1905_transport/include/mapf/transport/ieee1905_transport_messages.h b/framework/transport/ieee1905_transport/include/mapf/transport/ieee1905_transport_messages.h
+index 1742ef73f..35f1031a1 100644
+--- a/framework/transport/ieee1905_transport/include/mapf/transport/ieee1905_transport_messages.h
++++ b/framework/transport/ieee1905_transport/include/mapf/transport/ieee1905_transport_messages.h
+@@ -44,7 +44,8 @@ enum class Type {
+     CmduTxConfirmationMessage            = 4,
+     InterfaceConfigurationRequestMessage = 5,
+     AlMacAddressConfigurationMessage     = 6,
+-    VlanConfigurationRequestMessage      = 7
++    VlanConfigurationRequestMessage      = 7,
++    SecurityKeyInstallMessage            = 8
+ };
+ // Enum AutoPrint generated code snippet begining- DON'T EDIT!
+ // clang-format off
+@@ -58,6 +59,7 @@ static const char *Type_str(Type enum_value) {
+     case Type::InterfaceConfigurationRequestMessage: return "Type::InterfaceConfigurationRequestMessage";
+     case Type::AlMacAddressConfigurationMessage:     return "Type::AlMacAddressConfigurationMessage";
+     case Type::VlanConfigurationRequestMessage:      return "Type::VlanConfigurationRequestMessage";
++    case Type::SecurityKeyInstallMessage:            return "Type::SecurityKeyInstallMessage";
+     }
+     static std::string out_str = std::to_string(int(enum_value));
+     return out_str.c_str();
+@@ -73,9 +75,11 @@ public:
+ 
+     class Frame {
+     public:
++        // Max frame size for broker UDS path (larger than kMaxFrameLength for DPP)
++        static constexpr size_t kBrokerMaxFrameLength = 16384;
+         explicit Frame(size_t len, const void *init_data = nullptr)
+             : data_(std::make_shared<std::vector<uint8_t>>(
+-                  (len < kMaxFrameLength) ? len : kMaxFrameLength))
++                  (len < kBrokerMaxFrameLength) ? len : kBrokerMaxFrameLength))
+         {
+             if (init_data)
+                 set_data(init_data, len);
+@@ -568,6 +572,57 @@ public:
+     }
+ };
+ 
++class SecurityKeyInstallMessage : public Message {
++    static const uint8_t kVersion = 0;
++
++public:
++    struct Metadata {
++        uint8_t version = kVersion;
++        uint8_t peer_mac[ETH_ALEN] = {0}; // Peer AL MAC (agent or controller)
++        uint8_t tk[32]             = {0}; // 256-bit TK (1905 Temporal Key)
++        uint8_t gtk[32]            = {0}; // 256-bit GTK (1905 Group Temporal Key)
++        uint8_t gtk_key_id         = 0;   // GTK Key ID (1-3)
++        bool install               = false; // true=install, false=remove
++    };
++
++    explicit SecurityKeyInstallMessage(std::initializer_list<Frame> frames = {})
++        : Message(Type::SecurityKeyInstallMessage, frames)
++    {
++        // maximum one frame is allowed (if none are given we will allocate one below)
++        mapf_assert(this->frames().size() <= 1);
++
++        if (this->frames().empty()) {
++            Message::Frame frame(sizeof(Metadata));
++            Add(frame);
++        } else if (this->frames().back().len() < sizeof(Metadata)) {
++            this->frames().back().set_size(sizeof(Metadata));
++        }
++    }
++
++    Metadata *metadata() const { return reinterpret_cast<Metadata *>(frames().back().data()); };
++
++    virtual std::ostream &print(std::ostream &os) const override
++    {
++        Message::print(os);
++
++        std::stringstream ss;
++        Metadata *m = metadata();
++        ss << " metadata:" << std::endl;
++        ss << " version    : " << (unsigned)m->version << std::endl;
++        ss << " peer_mac   : " << std::hex << std::setfill('0') << std::setw(2)
++           << (unsigned)m->peer_mac[0] << ":" << std::hex << std::setfill('0') << std::setw(2)
++           << (unsigned)m->peer_mac[1] << ":" << std::hex << std::setfill('0') << std::setw(2)
++           << (unsigned)m->peer_mac[2] << ":" << std::hex << std::setfill('0') << std::setw(2)
++           << (unsigned)m->peer_mac[3] << ":" << std::hex << std::setfill('0') << std::setw(2)
++           << (unsigned)m->peer_mac[4] << ":" << std::hex << std::setfill('0') << std::setw(2)
++           << (unsigned)m->peer_mac[5] << std::endl;
++        ss << " gtk_key_id : " << (unsigned)m->gtk_key_id << std::endl;
++        ss << " install    : " << m->install << std::endl;
++
++        return os << ss.str();
++    }
++};
++
+ /**
+  * @brief Create a message of the given type with provided frame.
+  *
+-- 
+2.34.1
+
