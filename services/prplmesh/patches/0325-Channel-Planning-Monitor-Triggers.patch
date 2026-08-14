@@ -1,0 +1,479 @@
+From 4c3283449578d0e558e6065dcc8451a3684a7f5a Mon Sep 17 00:00:00 2001
+From: Manoj Sekar <sekar@qti.qualcomm.com>
+Date: Wed, 12 Aug 2026 08:22:01 +0530
+Subject: [PATCH] [Channel Planning]: CBS retry on driver unavailability and
+ wsc completion
+
+1. Fixed issue with CBS not re-triggering for a pre-defined retries
+   if the resource is busy.
+  * CBS-STARTED is emitted unconditionally before the driver call, so it is
+    NOT a success signal.
+  * When driver->set_cbs() returns -EBUSY, hostapd -- in the SAME synchronous
+    call -- clears cbs_enable, emits CBS-ABORTED, and returns the error, so
+    the 'CBS enable 1' wpa_ctrl reply is FAIL. CBS-ABORTED and the FAIL reply
+    are the same synchronous, per-link event.
+  * hostapd does not self-retry on -EBUSY.
+  * Real completion is the later CBS-COMPLETE event.
+
+    Fix: retry inside ap_wlan_hal_nl80211::trigger_cbs(), keyed on the
+         synchronous 'CBS enable 1' FAIL (== per-link Resource busy / CBS-ABORTED).
+    The retry is:
+    * Per-radio/per-link contained (m_radio_info.iface_name control socket),
+      so only the busy link is re-issued;
+    * Bounded by CBS_TRIGGER_MAX_ABORT_RETRIES (default 3) with a
+      CBS_TRIGGER_RETRY_SETTLE_MS (default 500ms) delay to let the driver's
+      abort/cleanup settle before re-issuing;
+    * Free of any completion timeout, so a valid slow 6GHz CBS scan (>1 min)
+      that returns OK synchronously is never misread as a failure.
+
+2. In dedicated Agent configuration scenarios, make use of the
+   Autoconfiguration task's complete indication to trigger a one-time
+   "CBS" trigger for all applicable radios.
+
+3. When no positive rank is generated for a radio(parsed from driver rank),
+   instead of reporting the preference in the preference table as "1", when
+   standard channel selction path is not enabled, repot it as "14".
+
+No functional change when CBS is disabled: trigger_cbs() is only reached
+when cbs_based_chansel_enable or chansel_preference_report_refresh_enable
+is set.
+
+Files:
+  common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+  agent/src/beerocks/slave/tasks/channel_selection_task.h
+  agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+
+Signed-off-by: Manoj Sekar <sekar@qti.qualcomm.com>
+---
+ .../slave/tasks/channel_selection_task.cpp    | 178 ++++++++++++++----
+ .../slave/tasks/channel_selection_task.h      |  26 +++
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  63 ++++++-
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      |  18 +-
+ 4 files changed, 243 insertions(+), 42 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+index dde176b..40309f6 100644
+--- a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+@@ -517,6 +517,19 @@ bool ChannelSelectionTask::refresh_preference_table(const sMacAddr &radio_mac,
+                       std::map<beerocks::eWiFiBandwidth, AgentDB::sRadio::sPreferenceEntry>>>
+         new_cache;
+ 
++    // When the driver report has no positive rank at all, every operable channel is normally
++    // represented by the rank-0 baseline (preference 1). For the non-auto channel-selection
++    // reporting mode, the requested policy is instead to advertise that unranked operable set at
++    // preference 14. Do not apply this to auto handling: auto CBS selection relies on the existing
++    // rank-0 -> preference-1 baseline/fallback semantics.
++    const bool advertise_unranked_as_14 =
++        (max_rank_on_radio == 0 && !db->device_conf.enable_auto_chansel_handling);
++    if (advertise_unranked_as_14) {
++        LOG(DEBUG) << "[CBS] refresh_preference_table: radio " << radio_mac
++                   << " has no positive driver ranks and enable_auto_chansel_handling=0; "
++                      "advertising operable unranked channels with preference 14";
++    }
++
+     // Build the cache from what the RADIO actually supports (channels_list x supported_bw_list),
+     // projecting a rank onto each (channel, bw) as described above. This is the prop-aligned
+     // behaviour: every op-class the radio supports gets a preference derived from the driver
+@@ -542,9 +555,13 @@ bool ChannelSelectionTask::refresh_preference_table(const sMacAddr &radio_mac,
+             entry.operating_class = op_class;
+             entry.bandwidth       = bw;
+             entry.rank            = projected_rank;
+-            // Normalized 1..15 preference (per-radio, best rank -> highest preference). A projected
+-            // rank of 0 maps to the operable baseline (pref 1).
+-            entry.preference = normalize_rank_to_preference(projected_rank, max_rank_on_radio);
++            // Normalized 1..15 preference (per-radio, best rank -> highest preference). Normally
++            // a projected rank of 0 maps to the operable baseline (pref 1). If the entire received
++            // driver report contains no positive rank and auto channel selection is disabled,
++            // advertise the requested preference 14 instead.
++            entry.preference = advertise_unranked_as_14
++                                   ? 14
++                                   : normalize_rank_to_preference(projected_rank, max_rank_on_radio);
+             entry.reason     = wfa_map::cPreferenceOperatingClasses::eReasonCode::UNSPECIFIED;
+ 
+             auto drc_it = direct_rank_by_chan.find(chan);
+@@ -1239,6 +1256,37 @@ ChannelSelectionTask::ChannelSelectionTask(BackhaulManager &btl_ctx,
+     db->statuses.zwdfs_cac_remaining_time_sec = 0;
+ }
+ 
++bool ChannelSelectionTask::issue_cbs_trigger(const sMacAddr &radio_mac)
++{
++    // Build and send the TRIGGER_CBS ("cbs enable 1") request for this radio.
++    //
++    // NOTE (design): this function is deliberately a thin, fire-and-forget send. The driver
++    // "Resource busy" (CBS-ABORTED) recovery is handled SYNCHRONOUSLY and LOCALLY in
++    // ap_wlan_hal_nl80211::trigger_cbs() (where the wpa_ctrl "CBS enable 1" FAIL is observed
++    // directly), NOT here with a wall-clock timeout - CBS completion time is band-dependent
++    // (6GHz can take > 1 minute) and a finish-timeout here would misfire into an infinite retry
++    // storm. See LLDs_Design_Doc/cbs_trigger_feedback_and_retry_design.md (Section 4.3).
++    auto request =
++        message_com::create_vs_message<beerocks_message::cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS>(
++            m_cmdu_tx);
++    if (!request) {
++        LOG(ERROR) << "[CBS] issue_cbs_trigger: failed to build TRIGGER_CBS message for radio "
++                   << radio_mac;
++        return false;
++    }
++    auto agent_fd = m_btl_ctx.get_agent_fd();
++    if (agent_fd == beerocks::net::FileDescriptor::invalid_descriptor) {
++        LOG(ERROR) << "[CBS] issue_cbs_trigger: socket to Agent not found for radio " << radio_mac;
++        return false;
++    }
++    auto action_header         = message_com::get_beerocks_header(m_cmdu_tx)->actionhdr();
++    action_header->radio_mac() = radio_mac;
++    m_btl_ctx.send_cmdu(agent_fd, m_cmdu_tx);
++
++    LOG(DEBUG) << "[CBS] issue_cbs_trigger: TRIGGER_CBS sent for radio " << radio_mac;
++    return true;
++}
++
+ void ChannelSelectionTask::work()
+ {
+     if (zwdfs_in_process()) {
+@@ -1263,6 +1311,75 @@ void ChannelSelectionTask::work()
+     {
+         auto db = AgentDB::get();
+ 
++        // ---------------------------------------------------------------------------------------
++        // Post-autoconfiguration CBS trigger (ONE-SHOT).
++        //
++        // The normal reboot/bootstrap trigger may run before controller onboarding has finished.
++        // In a clean/clone scenario the WSC M2 then tears down the factory OpenWrt BSSes and
++        // creates the final BSS/MLD topology afterwards. Any CBS scan issued before that clone
++        // belongs to the old interfaces and cannot populate ranks for the final topology. The
++        // Logs3 capture shows exactly this sequence: TRIGGER_CBS at 01:57:33, then the cloned
++        // wlan0_1 MLD is created later; its links still report "CBS enable: 0" and normal-scan,
++        // zero-rank ACS reports.
++        //
++        // ap_autoconfiguration_completed becomes true only after all radios reached CONFIGURED,
++        // which is the first common point at which the final cloned topology is ready. Deliberately
++        // do NOT test cbs_preference_table.valid here: it may be valid only because it was filled
++        // from the pre-clone topology, whereas this trigger must refresh the final interfaces.
++        //
++        // m_cbs_post_autoconfiguration_trigger_done is separate from the reboot bootstrap latch:
++        // both scans can be needed during the same process lifetime, but this one fires at most
++        // once after successful controller-driven autoconfiguration.
++        const bool cbs_or_cpr_active = db->device_conf.cbs_based_chansel_enable ||
++                                       db->device_conf.chansel_preference_report_refresh_enable;
++        if (!m_cbs_post_autoconfiguration_trigger_done && cbs_or_cpr_active &&
++            db->statuses.ap_autoconfiguration_completed) {
++            const auto post_autoconf_agent_fd = m_btl_ctx.get_agent_fd();
++            size_t post_autoconf_triggered    = 0;
++
++            if (post_autoconf_agent_fd == beerocks::net::FileDescriptor::invalid_descriptor) {
++                LOG(DEBUG) << "[CBS] work: post-autoconfiguration - socket to Agent not ready; "
++                              "deferring final-topology CBS trigger";
++            } else {
++                for (const auto radio : db->get_radios_list()) {
++                    if (!radio ||
++                        radio->front.iface_mac == beerocks::net::network_utils::ZERO_MAC) {
++                        continue;
++                    }
++
++                    LOG(WARNING) << "[CBS] work: post-autoconfiguration CBS trigger for radio "
++                                 << radio->front.iface_mac
++                                 << " (final controller-cloned BSS/MLD topology is ready)";
++                    if (!issue_cbs_trigger(radio->front.iface_mac)) {
++                        LOG(ERROR) << "[CBS] work: post-autoconfiguration - failed to issue "
++                                      "TRIGGER_CBS for "
++                                   << radio->front.iface_mac;
++                        break;
++                    }
++                    ++post_autoconf_triggered;
++                }
++
++                // Do not consume this one-shot on an empty/not-yet-registered radio set. The next
++                // work tick retries after the final topology has registered its radio MACs.
++                if (post_autoconf_triggered > 0) {
++                    m_cbs_post_autoconfiguration_trigger_done = true;
++
++                    // This final-topology trigger supersedes a still-pending boot bootstrap:
++                    // issuing both in the same work() pass would recreate the shared-MLD
++                    // Resource-busy race. The final topology must be scanned rather than merely
++                    // reporting a cache that could have been populated before cloning.
++                    m_cbs_bootstrap_trigger_done = true;
++
++                    int32_t interval = db->device_conf.cbs_trigger_periodic_interval;
++                    if (interval <= 0) {
++                        interval = 3600;
++                    }
++                    m_cbs_next_trigger_time =
++                        std::chrono::steady_clock::now() + std::chrono::seconds(interval);
++                }
++            }
++        }
++
+         // ---------------------------------------------------------------------------------------
+         // Reboot-time bootstrap CBS trigger (ONE-SHOT).
+         //
+@@ -1297,8 +1414,6 @@ void ChannelSelectionTask::work()
+         // m_cbs_bootstrap_trigger_done, so it neither adds recurring scans nor duplicate CPRs.
+         //
+         if (!m_cbs_bootstrap_trigger_done) {
+-            const bool cbs_or_cpr_active = db->device_conf.cbs_based_chansel_enable ||
+-                                           db->device_conf.chansel_preference_report_refresh_enable;
+             if (cbs_or_cpr_active) {
+                 // The unsolicited CPR (case A) is only meaningful/allowed when the unsolicited
+                 // report feature is on AND a normalized preference table exists to report
+@@ -1449,25 +1564,31 @@ void ChannelSelectionTask::work()
+ 
+                     // ---- Case (B): no cache yet -> fire a one-shot CBS trigger. The post-scan
+                     // CHANNELS_LIST_RESPONSE path will refresh the cache and send the CPR.
++                    // Routed through issue_cbs_trigger() so the failure-recovery state machine
++                    // (service_cbs_trigger_retries) can re-issue it if the driver rejects/aborts
++                    // it (e.g. "Resource busy" at reboot).
+                     LOG(WARNING) << "[CBS] work: bootstrap CBS trigger for radio " << radio_mac
+                                  << " (no valid CBS/ACS cache yet at boot; firing a one-shot "
+                                     "'cbs enable 1' so the driver produces an ACS report and the "
+                                     "Channel Preference Report is sent on scan completion)";
+-
+-                    auto request = message_com::create_vs_message<
+-                        beerocks_message::cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS>(m_cmdu_tx);
+-                    if (!request) {
+-                        LOG(ERROR) << "[CBS] work: bootstrap - failed to build TRIGGER_CBS message";
++                    if (!issue_cbs_trigger(radio_mac)) {
++                        LOG(ERROR) << "[CBS] work: bootstrap - failed to issue TRIGGER_CBS for "
++                                   << radio_mac;
+                         break;
+                     }
+-                    auto agent_fd = m_btl_ctx.get_agent_fd();
+-                    if (agent_fd == beerocks::net::FileDescriptor::invalid_descriptor) {
+-                        LOG(ERROR) << "[CBS] work: bootstrap - socket to Agent not found";
+-                        break;
++                    // Prevent the periodic block below from immediately re-triggering the SAME
++                    // radios in this very pass (m_cbs_next_trigger_time is still min() at boot).
++                    // Firing bootstrap + periodic together sent two competing "cbs enable 1" to
++                    // the shared MLD and caused the driver "Resource busy" / CBS-ABORTED at reboot.
++                    // Arm the periodic schedule now; the retry state machine covers any failure.
++                    {
++                        int32_t interval = db->device_conf.cbs_trigger_periodic_interval;
++                        if (interval <= 0) {
++                            interval = 3600; // default periodic interval used elsewhere in work()
++                        }
++                        m_cbs_next_trigger_time =
++                            std::chrono::steady_clock::now() + std::chrono::seconds(interval);
+                     }
+-                    auto action_header = message_com::get_beerocks_header(m_cmdu_tx)->actionhdr();
+-                    action_header->radio_mac() = radio_mac;
+-                    m_btl_ctx.send_cmdu(agent_fd, m_cmdu_tx);
+                 }
+             }
+             // Latch regardless of outcome: this is a best-effort one-shot boot-time kick. If the
+@@ -1544,29 +1665,22 @@ cbs_periodic_after_bootstrap:
+                     if (radio->front.iface_mac == beerocks::net::network_utils::ZERO_MAC) {
+                         continue;
+                     }
++
+                     LOG(DEBUG) << "[CBS] work: periodic CBS trigger for radio "
+                                << radio->front.iface_mac
+                                << " (interval=" << effective_interval << "s)";
+ 
+                     // Send the dedicated trigger message. son_slave forwards it to ap_manager as
+                     // cACTION_APMANAGER_HOSTAP_TRIGGER_CBS, which runs "cbs enable 1" on the
+-                    // driver. Upon CBS completion, the ACS_Completed event path automatically
+-                    // reads the ranks and pushes them back via CHANNELS_LIST_RESPONSE to refresh
+-                    // the cache.
+-                    auto request = message_com::create_vs_message<
+-                        beerocks_message::cACTION_BACKHAUL_HOSTAP_TRIGGER_CBS>(m_cmdu_tx);
+-                    if (!request) {
+-                        LOG(ERROR) << "[CBS] work: failed to build TRIGGER_CBS message";
+-                        break;
+-                    }
+-                    auto agent_fd = m_btl_ctx.get_agent_fd();
+-                    if (agent_fd == beerocks::net::FileDescriptor::invalid_descriptor) {
+-                        LOG(ERROR) << "[CBS] work: socket to Agent not found";
++                    // driver. If the driver rejects it with "Resource busy", the bounded
++                    // synchronous retry inside ap_wlan_hal_nl80211::trigger_cbs() handles recovery
++                    // (see LLD Section 4.3). Upon CBS completion the ACS_Completed path reads the
++                    // ranks and pushes them back via CHANNELS_LIST_RESPONSE to refresh the cache.
++                    if (!issue_cbs_trigger(radio->front.iface_mac)) {
++                        LOG(ERROR) << "[CBS] work: periodic - failed to issue TRIGGER_CBS for "
++                                   << radio->front.iface_mac;
+                         break;
+                     }
+-                    auto action_header = message_com::get_beerocks_header(m_cmdu_tx)->actionhdr();
+-                    action_header->radio_mac() = radio->front.iface_mac;
+-                    m_btl_ctx.send_cmdu(agent_fd, m_cmdu_tx);
+                     ++triggered;
+                 }
+ 
+diff --git a/agent/src/beerocks/slave/tasks/channel_selection_task.h b/agent/src/beerocks/slave/tasks/channel_selection_task.h
+index 230c259..84134fa 100644
+--- a/agent/src/beerocks/slave/tasks/channel_selection_task.h
++++ b/agent/src/beerocks/slave/tasks/channel_selection_task.h
+@@ -372,6 +372,22 @@ private:
+ 
+     std::chrono::steady_clock::time_point m_cbs_next_trigger_time = std::chrono::steady_clock::time_point::min();
+ 
++    /**
++     * @brief Issue a single TRIGGER_CBS ("cbs enable 1") for a radio.
++     *
++     * Centralizes the TRIGGER_CBS message build/send used by both the reboot bootstrap and the
++     * periodic paths so the duplicate-trigger de-duplication logic in work() has a single call
++     * site. The actual driver "Resource busy" (CBS-ABORTED) recovery is handled synchronously and
++     * locally in ap_wlan_hal_nl80211::trigger_cbs() (see
++     * LLDs_Design_Doc/cbs_trigger_feedback_and_retry_design.md, Section 4.3) -- it is intentionally
++     * NOT done here with a wall-clock timeout, because CBS completion time is band-dependent (6GHz
++     * can take > 1 minute) and a finish-timeout would misfire into an infinite retry storm.
++     *
++     * @param radio_mac Radio to trigger.
++     * @return true if the CMDU was sent, false otherwise (e.g. agent socket not ready).
++     */
++    bool issue_cbs_trigger(const sMacAddr &radio_mac);
++
+     // One-shot latch so the "cbs_trigger_periodic_interval was 0 -> overriding to default" warning
+     // is logged only once instead of on every work() tick.
+     bool m_cbs_interval_override_logged = false;
+@@ -392,6 +408,16 @@ private:
+     // the periodic-interval path which continues to run for interval > 0).
+     bool m_cbs_bootstrap_trigger_done = false;
+ 
++    // One-shot CBS retrigger after a controller-driven AP-autoconfiguration.
++    //
++    // The boot-time trigger can run while the device still exposes the factory/pre-clone BSS
++    // topology. A subsequent WSC M2 can then clone/recreate the AP BSS/MLD topology, replacing
++    // the interfaces on which that initial CBS scan ran. Once all radios report autoconfiguration
++    // complete, issue exactly one new CBS trigger on the final topology so the cache/ranks belong
++    // to the cloned interfaces. This is independent from m_cbs_bootstrap_trigger_done: boot-time
++    // work must not suppress this post-clone refresh.
++    bool m_cbs_post_autoconfiguration_trigger_done = false;
++
+     // A controller-less reboot restores the already-persisted SLO/MLO topology but does not run
+     // AP autoconfiguration, so ap_autoconfiguration_completed remains false forever. Delay the
+     // controller-less fallback long enough for a normal onboarding cycle to start discovery; if
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index e2dac4e..426a245 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -16,6 +16,7 @@
+ #include <bcl/son/son_wireless_utils.h>
+ #include <bpl/bpl_cfg.h>
+ #include <bwl/key_value_parser.h>
++#include <chrono>
+ #include <cmath>
+ #include <cstdio>
+ #include <iomanip>
+@@ -30,6 +31,7 @@
+ #include <type_traits>
+ #include <dirent.h>
+ #include <fstream>
++#include <thread>
+ //////////////////////////////////////////////////////////////////////////////
+ ////////////////////////// Local Module Definitions //////////////////////////
+ //////////////////////////////////////////////////////////////////////////////
+@@ -49,6 +51,26 @@ bool ap_wlan_hal_nl80211::nl_event_handle(struct nl_msg *msg, void *arg)
+ #define FREQ_5G_START 5150
+ #define FREQ_5G_END   5895
+ 
++/*
++ * CBS "enable 1" retry policy.
++ *
++ * QCA hostapd emits CBS-STARTED before calling driver->set_cbs(). If set_cbs() returns an
++ * error (for example -EBUSY / Resource busy), hostapd synchronously emits CBS-ABORTED and the
++ * control command returns FAIL. Retrying at trigger_cbs() therefore reacts directly to the
++ * driver's result and does not need an arbitrary CBS-completion timeout (which would be unsafe
++ * for long 6GHz scans).
++ *
++ * Keep the retry count bounded: a persistent driver busy condition must never cause an infinite
++ * command loop. The brief delay lets the shared MLD/driver abort cleanup settle before retrying.
++ */
++#ifndef CBS_TRIGGER_MAX_ABORT_RETRIES
++#define CBS_TRIGGER_MAX_ABORT_RETRIES 3
++#endif
++
++#ifndef CBS_TRIGGER_RETRY_SETTLE_MS
++#define CBS_TRIGGER_RETRY_SETTLE_MS 500
++#endif
++
+ #define MLD_PAIR_ENTRANT_FILE "/tmp/beerocks/mld_pair_entrant.txt"
+ 
+ // Neighbor Report BSSID Information field value used for EasyMesh 11v steering tests.
+@@ -5637,10 +5659,11 @@ bool ap_wlan_hal_nl80211::read_acs_ranks(std::vector<sAcsChannelRank> &out_ranks
+ 
+ bool ap_wlan_hal_nl80211::trigger_cbs()
+ {
+-    std::string cmd = "CBS enable 1";
++    const std::string cmd = "CBS enable 1";
+ 
+-    // As with read_acs_ranks, we target the specific interface for this radio.
+-    // The driver executes the command on the hapd owning the control socket.
++    // As with read_acs_ranks, target the specific interface for this radio. The driver executes
++    // the command on the hapd owning this link's control socket, so a Resource-busy failure and
++    // its retry remain isolated to the affected link/radio.
+     const std::string target_iface = m_radio_info.iface_name;
+ 
+     if (!is_wpa_ctrl_interface_registered(target_iface)) {
+@@ -5650,13 +5673,35 @@ bool ap_wlan_hal_nl80211::trigger_cbs()
+         }
+     }
+ 
+-    LOG(INFO) << "[CBS] trigger_cbs: sending '" << cmd << "' on iface=" << target_iface;
+-    if (!wpa_ctrl_send_msg(cmd, target_iface)) {
+-        LOG(ERROR) << "[CBS] trigger_cbs: '" << cmd << "' failed on iface=" << target_iface;
+-        return false;
++    // Hostapd cbs.c emits CBS-STARTED before invoking driver->set_cbs(), then emits
++    // CBS-ABORTED and returns FAIL if set_cbs() returns an error (notably -EBUSY). Therefore the
++    // synchronous wpa_ctrl result is the authoritative retry decision. Do not wait for CBS
++    // completion: a valid 6GHz CBS scan may take substantially longer than other bands.
++    for (uint8_t retry = 0;; ++retry) {
++        LOG(INFO) << "[CBS] trigger_cbs: sending '" << cmd << "' on iface=" << target_iface
++                  << " (attempt " << int(retry + 1) << "/"
++                  << int(CBS_TRIGGER_MAX_ABORT_RETRIES + 1) << ")";
++
++        if (wpa_ctrl_send_msg(cmd, target_iface)) {
++            LOG(DEBUG) << "[CBS] trigger_cbs: '" << cmd << "' OK on iface=" << target_iface
++                       << (retry ? " after Resource-busy retry" : "");
++            return true;
++        }
++
++        if (retry >= CBS_TRIGGER_MAX_ABORT_RETRIES) {
++            LOG(ERROR) << "[CBS] trigger_cbs: '" << cmd << "' failed on iface=" << target_iface
++                       << " after " << int(CBS_TRIGGER_MAX_ABORT_RETRIES)
++                       << " bounded Resource-busy retry/retries; giving up";
++            return false;
++        }
++
++        LOG(WARNING) << "[CBS] trigger_cbs: '" << cmd << "' failed on iface=" << target_iface
++                     << " (hostapd reports CBS-ABORTED when driver set_cbs() rejects the request, "
++                        "e.g. Resource busy); retrying after "
++                     << CBS_TRIGGER_RETRY_SETTLE_MS << "ms (retry " << int(retry + 1) << "/"
++                     << int(CBS_TRIGGER_MAX_ABORT_RETRIES) << ")";
++        std::this_thread::sleep_for(std::chrono::milliseconds(CBS_TRIGGER_RETRY_SETTLE_MS));
+     }
+-    LOG(DEBUG) << "[CBS] trigger_cbs: '" << cmd << "' OK on iface=" << target_iface;
+-    return true;
+ }
+ 
+ bool ap_wlan_hal_nl80211::acs_clear_block_chan_list()
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 2a74a8c..a397463 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -1097,7 +1097,23 @@ bool mon_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+     // TODO: Probably should be changed to an error once WAV will stop
+     //       sending empty or irrelevant events...
+     default: {
+-        LOG(DEBUG) << "Unhandled event received: " << opcode;
++        // CBS lifecycle events (QCA one-shot "cbs enable 1" scan). These are informational at the
++        // monitor layer: the authoritative recovery decision is made by ChannelSelectionTask,
++        // which retries the trigger if no ACS report (CHANNELS_LIST_RESPONSE cache refresh) arrives
++        // within its result timeout. We surface them explicitly (instead of "Unhandled event") so
++        // the reboot-time "Resource busy" -> CBS-ABORTED failure is greppable and clearly tied to
++        // the retry mechanism. See LLDs_Design_Doc/cbs_trigger_feedback_and_retry_design.md.
++        if (opcode == "CBS-STARTED") {
++            LOG(DEBUG) << "[CBS] CBS-STARTED received on interface " << interface
++                       << " (vap_id=" << vap_id << ")";
++        } else if (opcode == "CBS-ABORTED") {
++            LOG(WARNING) << "[CBS] CBS-ABORTED received on interface " << interface
++                         << " (vap_id=" << vap_id
++                         << ") - driver aborted the CBS scan (e.g. Resource busy). The agent's "
++                            "ChannelSelectionTask retry-on-timeout will re-issue 'cbs enable 1'.";
++        } else {
++            LOG(DEBUG) << "Unhandled event received: " << opcode;
++        }
+         break;
+     };
+     }
+-- 
+2.34.1
+
