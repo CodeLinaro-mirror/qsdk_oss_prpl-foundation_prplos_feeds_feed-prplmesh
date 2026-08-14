@@ -1,0 +1,234 @@
+From ecbe37a369cc94b44eb396fd89461674fdb7d9cd Mon Sep 17 00:00:00 2001
+From: Manoj Sekar <sekar@qti.qualcomm.com>
+Date: Fri, 14 Aug 2026 15:55:40 +0530
+Subject: [PATCH] QSDK-CP: agent/bwl: fix cross-band vht_center_frequency
+ (5530) on 2.4GHz radio and downstream FREQ_TYPE=255 failures
+
+On MLO platforms several links (2.4/5/6 GHz) share a single base netdev and a
+shared/global hostapd control socket. Two independent code paths copied a
+co-located 5/6 GHz link's center frequency onto a 2.4 GHz radio's
+m_radio_info.vht_center_freq without any band check, and one agent path then
+assumed a wrong band when the resulting WifiChannel came out empty. The net
+effect on a 2.4 GHz radio (phy00.0, channel 6) was a reported
+vht_center_frequency=5530 and a cascade of FREQ_UNKNOWN (255) failures.
+
+Observed symptoms (all the same root cause):
+  ap_manager.cpp   CSA_Finished: channel = 6 ... vht_center_frequency = 5530
+  beerocks_wifi_channel.cpp  WIFI_CHANNEL CREATION ... FREQ_TYPE: 255 (chan 1..11)
+  son_wireless_utils.cpp     Unknown freq type 255, must be 2.4GHz/5GHz/6GHz
+  son_wireless_utils.cpp     Invalid freq type Unknown Frequency, wifiChannel is empty
+  dynamic_channel_selection_r2_task.cpp  All channels set to highest preference
+                                         due to empty operating classes list
+  dynamic_channel_selection_r2_task.cpp  Preference for radio ... (empty)
+
+Causal chain:
+  1. A CTRL-EVENT-CHANNEL-SWITCH / GET_INTERFACE for a 5GHz link is delivered to
+     the 2.4GHz radio's HAL over the shared socket; its cf1 (=5530) is stored
+     verbatim into vht_center_freq and reported on CSA_Finished/ACS_Completed.
+  2. son_slave builds radio->wifi_channel from (channel=6, center=5530);
+     which_freq_type(5530)=5G does not match channel 6, so WifiChannel fails
+     validation and becomes empty (m_freq_type = FREQ_UNKNOWN).
+  3. The backhaul/controller then read radio->wifi_channel.get_freq_type()
+     = FREQ_UNKNOWN (255) and pass it into WifiChannel()/which_freq_type(),
+     producing the "FREQ_TYPE: 255"/"Unknown freq type 255"/empty-WifiChannel
+     logs, op_class=0 for every 2.4GHz (channel,bw), an empty operating-class
+     list, and an empty channel-preference set for the 2.4GHz radio.
+
+This is NOT a CBS/CPR defect and NOT a hostapd defect: base hostapd's
+vht_oper_centr_freq_seg0_idx is 0 for a plain 2.4GHz AP and the QCA
+ctrl_iface_extn.c STATUS never emits it. The wrong value is introduced purely
+in the prplMesh nl80211 HAL center-frequency handling; the "255" logs are its
+downstream effect.
+
+Fixes:
+
+1) common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+   process_nl80211_event() Event::CTRL_Channel_Switch [authoritative]:
+   Band-guard the hostapd-reported cf1 before storing it. Only accept cf1 when
+   which_freq_type(cf1) matches this radio's frequency_band (5GL/5GH normalized
+   to 5G; FREQ_UNKNOWN radio band accepts as before). For a mismatched
+   (cross-band) cf1, fall back to the primary freq for 20MHz (always band-correct
+   for a 2.4GHz radio, e.g. 2437 for ch6) and log a WARNING; wider bandwidths
+   keep the band-correct value from refresh_radio_info(). This is the path that
+   produced the persistent CSA_Finished vht_center_frequency=5530 on 2.4GHz.
+
+2) common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+   refresh_radio_info():
+   Band-guard the Priority-1 nl80211 GET_INTERFACE center frequency
+   (if_info.frequency_center1) with the same rule, covering the ACS/refresh
+   path that also seeds vht_center_freq. Cross-band values are ignored (DEBUG
+   log) and the correct center is derived from channel_to_vht_center_freq().
+
+3) agent/src/beerocks/slave/tasks/channel_selection_task.cpp [defensive]:
+   - refresh_preference_table(): when radio->wifi_channel is empty
+     (FREQ_UNKNOWN), fall back to radio->frequency_band before feeding freq_type
+     into WifiChannel(chan, freq_type, bw), so the preference-table rebuild never
+     constructs channels with FREQ_UNKNOWN.
+   - select_next_channel(): on an empty wifi_channel use radio->frequency_band
+     instead of blindly assuming FREQ_5G (which mis-attributed a 2.4GHz radio to
+     5G and rejected all its channels); fall back to 5G only if the band is
+     genuinely unknown.
+
+Effect:
+  - 2.4GHz radios no longer report a 5/6GHz vht_center_frequency (phy00.0
+    CSA_Finished now shows the 2.4GHz center, e.g. 2437 for ch6).
+  - radio->wifi_channel for a 2.4GHz radio resolves to FREQ_24G, so the
+    "FREQ_TYPE: 255", "Unknown freq type 255" and "wifiChannel is empty" logs
+    stop for channels 1..14.
+  - The controller's dynamic_channel_selection_r2_task receives populated 2.4GHz
+    operating classes / preferences instead of the "empty operating classes
+    list" / empty-preference fallback.
+
+Files changed:
+  common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+  common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+  agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+
+Notes:
+  - The dynamic_channel_selection_r2_task.cpp / son_wireless_utils.cpp "255"
+    messages run in the controller and are downstream EFFECTS of the agent
+    emitting the wrong center/band; they are resolved by these agent-side fixes.
+    No controller-side change is required.
+  - build_acs_list()'s Active-ACS branch still assumes 5G on an empty
+    wifi_channel (logged, active_acs_chansel_enable-only path); it can be given
+    the same radio->frequency_band fallback if Active-ACS is used on 2.4GHz.
+
+Signed-off-by: Manoj Sekar <sekar@qti.qualcomm.com>
+---
+ .../slave/tasks/channel_selection_task.cpp    | 30 ++++++++++++--
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 40 ++++++++++++++++++-
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     | 18 ++++++++-
+ 3 files changed, 81 insertions(+), 7 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+index 40309f6..8bb534d 100644
+--- a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+@@ -269,7 +269,18 @@ bool ChannelSelectionTask::refresh_preference_table(const sMacAddr &radio_mac,
+         return false;
+     }
+ 
+-    const auto freq_type = radio->wifi_channel.get_freq_type();
++    auto freq_type = radio->wifi_channel.get_freq_type();
++    if (freq_type == beerocks::eFreqType::FREQ_UNKNOWN) {
++        // radio->wifi_channel can be empty (FREQ_UNKNOWN) when its center frequency could not be
++        // resolved (e.g. a transient wrong/zero center freq made WifiChannel construction fall
++        // back to an empty channel). Fall back to the radio's known frequency band so downstream
++        // WifiChannel(chan, freq_type, bw) construction does not receive FREQ_UNKNOWN (which yields
++        // center_freq=0 -> are_params_valid() fails -> empty channel + the "FREQ_TYPE: 255" log).
++        freq_type = radio->frequency_band;
++        LOG(DEBUG) << "[CBS] refresh_preference_table: radio " << radio_mac
++                   << " wifi_channel is empty (FREQ_UNKNOWN); falling back to radio frequency_band "
++                   << int(freq_type);
++    }
+ 
+     // Filter incoming ranks by this radio's frequency band.
+     // In MLO (multi-link) setups, the HAL may sometimes deliver an ACS report containing
+@@ -3775,9 +3786,20 @@ ChannelSelectionTask::sSelectedChannel ChannelSelectionTask::select_next_channel
+     }
+ 
+     auto freq_type = radio->wifi_channel.get_freq_type();
+-    if (radio->wifi_channel.is_empty()) {
+-        LOG(WARNING) << "wifi channel is empty";
+-        freq_type = beerocks::FREQ_5G;
++    if (radio->wifi_channel.is_empty() || freq_type == beerocks::eFreqType::FREQ_UNKNOWN) {
++        // wifi_channel can be empty (FREQ_UNKNOWN) when its center frequency could not be resolved.
++        // Prefer the radio's known frequency_band instead of blindly assuming 5G: forcing 5G on a
++        // 2.4GHz radio makes get_operating_class_by_channel()/WifiChannel() reject every 2.4GHz
++        // channel and also emits the "FREQ_TYPE: 255"/wrong-band constructions. Only fall back to
++        // 5G if the band is genuinely unknown.
++        if (radio->frequency_band != beerocks::eFreqType::FREQ_UNKNOWN) {
++            freq_type = radio->frequency_band;
++            LOG(WARNING) << "wifi channel is empty; using radio frequency_band "
++                         << beerocks::utils::convert_frequency_type_to_string(freq_type);
++        } else {
++            freq_type = beerocks::FREQ_5G;
++            LOG(WARNING) << "wifi channel is empty and radio frequency_band is unknown; assuming 5G";
++        }
+     } else {
+         LOG(WARNING) << "freq_type: "
+                      << beerocks::utils::convert_frequency_type_to_string(freq_type);
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 426a245..1cc6fbc 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -6862,7 +6862,45 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+         m_radio_info.bandwidth =
+             beerocks::utils::convert_bandwidth_to_enum(wpa_bw_to_beerocks_bw(bandwidth));
+         m_radio_info.channel_ext_above  = beerocks::string_utils::stoi(parsed_obj["ch_offset"]);
+-        m_radio_info.vht_center_freq    = beerocks::string_utils::stoi(parsed_obj["cf1"]);
++
++        // Band-guard the hostapd-reported center frequency (cf1). On MLO platforms the
++        // CTRL-EVENT-CHANNEL-SWITCH is relayed for every link over the shared/global hostapd
++        // socket, so a 2.4GHz radio can receive an event whose cf1 belongs to a co-located
++        // 5/6GHz link (e.g. cf1=5530 on 2.4GHz channel 6). Writing that verbatim into
++        // vht_center_freq makes fill_cs_params() report a 5GHz center on the 2.4GHz radio's
++        // CSA_Finished/ACS_Completed notification (and later makes son_slave build an empty
++        // FREQ_UNKNOWN WifiChannel). Only accept cf1 when it belongs to this radio's own band;
++        // otherwise derive the correct center from the (already band-correct) primary freq below.
++        {
++            const int cf1 = beerocks::string_utils::stoi(parsed_obj["cf1"]);
++            const int primary_freq = beerocks::string_utils::stoi(parsed_obj["freq"]);
++            const auto radio_band  = m_radio_info.frequency_band;
++            const auto cf1_band    = son::wireless_utils::which_freq_type(cf1);
++            // Normalize 5GL/5GH to 5G for the comparison.
++            auto norm_band = [](beerocks::eFreqType b) {
++                return (b == beerocks::eFreqType::FREQ_5GL || b == beerocks::eFreqType::FREQ_5GH)
++                           ? beerocks::eFreqType::FREQ_5G
++                           : b;
++            };
++            if (cf1 > 0 &&
++                (radio_band == beerocks::eFreqType::FREQ_UNKNOWN ||
++                 norm_band(cf1_band) == norm_band(radio_band))) {
++                m_radio_info.vht_center_freq = cf1;
++            } else {
++                // cf1 is cross-band (or unknown). Fall back to the primary frequency for 20MHz,
++                // which is always correct for this radio's band; wider bandwidths keep whatever
++                // refresh_radio_info() derived (band-correct) rather than a leaked cross-band cf1.
++                if (m_radio_info.bandwidth == beerocks::eWiFiBandwidth::BANDWIDTH_20 &&
++                    primary_freq > 0) {
++                    m_radio_info.vht_center_freq = primary_freq;
++                }
++                LOG(WARNING) << "CTRL_Channel_Switch: ignoring cross-band cf1=" << cf1
++                             << " (band " << int(cf1_band) << ") on radio band "
++                             << int(radio_band) << " iface=" << m_radio_info.iface_name
++                             << " -> vht_center_freq=" << m_radio_info.vht_center_freq;
++            }
++        }
++
+         m_radio_info.is_dfs_channel     = beerocks::string_utils::stoi(parsed_obj["dfs"]);
+         m_radio_info.last_csa_sw_reason = ChanSwReason::Unknown;
+         if (son::wireless_utils::which_freq_type(m_radio_info.vht_center_freq) ==
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index e842e71..49cbd10 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -851,9 +851,23 @@ bool base_wlan_hal_nl80211::refresh_radio_info()
+                     break;
+                 }
+             }
+-            // Always use nl80211 center frequency as it's more reliable
+-            if (if_info.frequency_center1 > 0) {
++            // Always use nl80211 center frequency as it's more reliable, BUT only when it
++            // belongs to this radio's own band. On MLO platforms several links (2.4/5/6 GHz)
++            // share a single base netdev (e.g. wlan0_link0/1/2 all map to wlan0), so a
++            // GET_INTERFACE on the shared base interface can return a co-located link's
++            // center frequency (e.g. a 5 GHz 5530) and wrongly attribute it to a 2.4 GHz
++            // radio. Guard against that cross-band leak here.
++            if (if_info.frequency_center1 > 0 &&
++                (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_UNKNOWN ||
++                 son::wireless_utils::which_freq_type(if_info.frequency_center1) ==
++                     m_radio_info.frequency_band)) {
+                 m_radio_info.vht_center_freq = if_info.frequency_center1;
++            } else if (if_info.frequency_center1 > 0) {
++                LOG(DEBUG) << "Ignoring nl80211 center freq " << if_info.frequency_center1
++                           << " (band " << son::wireless_utils::which_freq_type(
++                                                if_info.frequency_center1)
++                           << ") - does not match radio band " << m_radio_info.frequency_band
++                           << " on iface " << m_radio_info.iface_name;
+             }
+         }
+ 
+-- 
+2.34.1
+
