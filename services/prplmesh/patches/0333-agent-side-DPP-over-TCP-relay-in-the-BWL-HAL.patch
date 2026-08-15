@@ -1,0 +1,1175 @@
+From 029e734cc7f5d52077927b7c9cfc227052586159 Mon Sep 17 00:00:00 2001
+From: Parimalarengan Gururajan <gururaja@qti.qualcomm.com>
+Date: Thu, 13 Aug 2026 20:33:18 +0530
+Subject: [PATCH 2/6] patch 2: agent-side DPP-over-TCP relay in the BWL/HAL
+ layer
+
+Add the HAL plumbing that lets hostapd relay DPP frames to/from the agent
+over a local TCP socket (127.0.0.1:8908):
+
+- slave_wlan_hal.h: new Event::Dpp_* values and init_dpp_relay()/
+  stop_dpp_relay()/dpp_send_frame()/is_dpp_client_connected() virtuals.
+- dpp_relay_socket.{h,cpp} (new): platform-agnostic raw-socket engine for
+  the relay listener, driven by the owning HAL backend's event loop.
+- nl80211 backend: wires dpp_relay_socket into slave_wlan_hal_nl80211's
+  fd-based event loop; ap_wlan_hal_nl80211 writes dpp_controller /
+  dpp_configurator_connectivity into hostapd config for DPP-AKM VAPs.
+- whm backend: mirrors the same behavior via ambiorix WiFi.DPP. object
+  events instead of a raw socket.
+- ap_manager.cpp: handles Event::DPP_CREDENTIALS_READY, writing wireless
+  extender credentials from wpa_supplicant to tmpfs for son_slave_thread.
+
+Signed-off-by: Parimalarengan Gururajan <gururaja@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 |  32 ++
+ common/beerocks/bwl/include/bwl/ap_wlan_hal.h |   2 +
+ .../bwl/include/bwl/base_wlan_hal_types.h     |  10 +
+ .../bwl/include/bwl/dpp_relay_socket.h        |  86 ++++++
+ .../beerocks/bwl/include/bwl/slave_wlan_hal.h |  44 ++-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  73 ++++-
+ .../beerocks/bwl/nl80211/dpp_relay_socket.cpp | 278 ++++++++++++++++++
+ .../bwl/nl80211/slave_wlan_hal_nl80211.cpp    | 113 +++++++
+ .../bwl/nl80211/slave_wlan_hal_nl80211.h      |  15 +
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   |  12 +
+ .../beerocks/bwl/whm/slave_wlan_hal_whm.cpp   | 182 +++++++-----
+ common/beerocks/bwl/whm/slave_wlan_hal_whm.h  |  39 +--
+ 12 files changed, 792 insertions(+), 94 deletions(-)
+ create mode 100644 common/beerocks/bwl/include/bwl/dpp_relay_socket.h
+ create mode 100644 common/beerocks/bwl/nl80211/dpp_relay_socket.cpp
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 034fa3b48..3b3920712 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -4587,6 +4587,38 @@ bool ApManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+         encap_1905_dpp_tlv->set_dest_sta_mac(dpp_configuration_request->enrollee_mac);
+         send_cmdu(cmdu_tx);
+     } break;
++    case Event::DPP_CREDENTIALS_READY: {
++        // TASK-27: Wireless extender — wpa_supplicant finished DPP config exchange.
++        // Write credentials to tmpfs so son_slave_thread (separate process) can read them.
++        LOG(INFO) << "DPP: DPP_CREDENTIALS_READY — writing wireless credentials to tmpfs";
++        auto creds = static_cast<bwl::sACTION_APMANAGER_DPP_CREDENTIALS_READY *>(data);
++
++        // Write connector
++        {
++            FILE *f = fopen("/tmp/prplmesh_dpp_connector", "w");
++            if (f) { fputs(creds->connector_1905, f); fclose(f); }
++            else { LOG(ERROR) << "DPP: failed to write /tmp/prplmesh_dpp_connector"; }
++        }
++        // Write NAK private key (binary DER)
++        {
++            FILE *f = fopen("/tmp/prplmesh_dpp_nak", "wb");
++            if (f) { fwrite(creds->nak_private_der, 1, creds->nak_private_der_len, f); fclose(f); }
++            else { LOG(ERROR) << "DPP: failed to write /tmp/prplmesh_dpp_nak"; }
++        }
++        // Write c-sign-key JWK
++        {
++            FILE *f = fopen("/tmp/prplmesh_dpp_csign", "w");
++            if (f) { fputs(creds->c_sign_key_jwk, f); fclose(f); }
++            else { LOG(ERROR) << "DPP: failed to write /tmp/prplmesh_dpp_csign"; }
++        }
++        // Write marker file last — son_slave_thread polls for this
++        {
++            FILE *f = fopen("/tmp/prplmesh_dpp_creds_ready", "w");
++            if (f) { fputs("1", f); fclose(f); }
++            else { LOG(ERROR) << "DPP: failed to write /tmp/prplmesh_dpp_creds_ready"; }
++        }
++        LOG(INFO) << "DPP: wireless credentials written to /tmp/prplmesh_dpp_creds_ready";
++    } break;
+     // Unhandled events
+     default:
+         LOG(ERROR) << "Unhandled event: " << int(event);
+diff --git a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+index dd6ba1aec..4779f084f 100644
+--- a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+@@ -81,6 +81,8 @@ public:
+         DPP_PRESENCE_ANNOUNCEMENT,
+         DPP_AUTHENTICATION_RESPONSE,
+         DPP_CONFIGURATION_REQUEST,
++        // TASK-27: Wireless extender credential events (from wpa_supplicant ctrl events)
++        DPP_CREDENTIALS_READY, /**< All 3 DPP credentials received from wpa_supplicant */
+ 
+         Interface_Connected_OK,
+         Interface_Reconnected_OK,
+diff --git a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+index 7a4bfe651..23a4cdf2b 100644
+--- a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
++++ b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+@@ -467,6 +467,16 @@ typedef struct {
+     sMacAddr enrollee_mac;
+ } sACTION_APMANAGER_DPP_CONFIGURATION_REQUEST;
+ 
++/** TASK-27: Carries 1905-layer DPP credentials received from wpa_supplicant ctrl events.
++ *  Populated by ap_manager when DPP-1905-CONNECTOR + DPP-NET-ACCESS-KEY + DPP-C-SIGN-KEY
++ *  are all received. Sent to son_slave_thread to populate AgentDB::dpp_credentials. */
++typedef struct {
++    char connector_1905[2048];  ///< DPP-1905-CONNECTOR JWS (netRole=mapAgent)
++    uint8_t nak_private_der[128]; ///< DPP-NET-ACCESS-KEY decoded from hex DER
++    uint16_t nak_private_der_len;
++    char c_sign_key_jwk[512]; ///< DPP-C-SIGN-KEY as JWK JSON string
++} sACTION_APMANAGER_DPP_CREDENTIALS_READY;
++
+ typedef struct {
+     sClientAssociationParams params;
+ } sACTION_APMANAGER_CLIENT_ASSOCIATED_NOTIFICATION;
+diff --git a/common/beerocks/bwl/include/bwl/dpp_relay_socket.h b/common/beerocks/bwl/include/bwl/dpp_relay_socket.h
+new file mode 100644
+index 000000000..689692526
+--- /dev/null
++++ b/common/beerocks/bwl/include/bwl/dpp_relay_socket.h
+@@ -0,0 +1,86 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#ifndef _BWL_DPP_RELAY_SOCKET_H_
++#define _BWL_DPP_RELAY_SOCKET_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <vector>
++
++namespace bwl {
++
++/**
++ * @brief Shared raw-socket engine for the DPP-over-TCP relay (127.0.0.1:DPP_TCP_PORT) that
++ * hostapd connects to. Platform-agnostic: has no knowledge of base_wlan_hal/HALType/BWL_TYPE.
++ * A backend (e.g. slave_wlan_hal_nl80211) owns an instance of this class and drives it by
++ * registering its fd (get_fd()) with the event loop and calling process_events() on readiness.
++ */
++class dpp_relay_socket {
++public:
++    enum class Event { Invalid = 0, ClientConnected, ClientDisconnected, FrameReceived };
++
++    using event_cb_t =
++        std::function<void(Event event, uint8_t tcp_type, const std::vector<uint8_t> &frame)>;
++
++    explicit dpp_relay_socket(event_cb_t cb);
++    ~dpp_relay_socket();
++
++    /**
++     * @brief Bind and listen on 127.0.0.1:DPP_TCP_PORT.
++     */
++    bool init();
++
++    /**
++     * @brief Close the listening socket and any active client connection.
++     */
++    void stop();
++
++    /**
++     * @brief Returns the listening fd (bound/listening socket), or -1 if not initialized.
++     * Should be monitored for readiness at all times while initialized, independently of
++     * whether a client is currently connected — this is what lets a new connection attempt
++     * be accept()ed (and rejected, per the single-Enrollee policy) instead of completing the
++     * TCP handshake at the kernel level while nobody calls accept() on it.
++     */
++    int get_listen_fd() const;
++
++    /**
++     * @brief Returns the active client fd, or -1 if no client is currently connected.
++     */
++    int get_client_fd() const;
++
++    /**
++     * @brief Process readiness on the given fd — dispatches to accept() handling if @p fd is
++     * the listening fd, or to client read handling if @p fd is the active client fd.
++     */
++    bool process_events(int fd);
++
++    /**
++     * @brief Send a raw DPP frame to the active client connection.
++     */
++    bool send_frame(uint8_t tcp_type, const uint8_t *frame, size_t frame_len);
++
++    /**
++     * @brief Returns true if a client is currently connected.
++     */
++    bool is_client_connected() const;
++
++private:
++    bool handle_accept();
++    bool handle_client_read();
++    void close_client();
++    void reassemble_frames(std::vector<std::pair<uint8_t, std::vector<uint8_t>>> &out_frames);
++    void dispatch_frames(const std::vector<std::pair<uint8_t, std::vector<uint8_t>>> &frames);
++
++    event_cb_t m_cb;
++    int m_server_fd = -1;
++    int m_client_fd = -1;
++    std::vector<uint8_t> m_rx_buf;
++};
++
++} // namespace bwl
++
++#endif // _BWL_DPP_RELAY_SOCKET_H_
+diff --git a/common/beerocks/bwl/include/bwl/slave_wlan_hal.h b/common/beerocks/bwl/include/bwl/slave_wlan_hal.h
+index 98279bd32..8484f801c 100644
+--- a/common/beerocks/bwl/include/bwl/slave_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/slave_wlan_hal.h
+@@ -7,8 +7,15 @@
+ 
+ #include "base_wlan_hal.h"
+ 
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
+ namespace bwl {
+ 
++/** DPP TCP port (matches DPP_TCP_PORT in hostapd). */
++static constexpr uint16_t DPP_TCP_PORT = 8908;
++
+ /*!
+  * Hardware abstraction layer for Slave
+  * Read more about virtual inheritance: https://en.wikipedia.org/wiki/Virtual_inheritance
+@@ -25,7 +32,18 @@ public:
+         Unregister_Ext_Event_Fd,
+ 
+         // SMD Events
+-        SMD_Roaming_Completed
++        SMD_Roaming_Completed,
++
++        // DPP-over-TCP relay events
++        Dpp_Client_Connected,
++        Dpp_Client_Disconnected,
++        Dpp_Frame_Received,
++    };
++
++    /** Payload pushed via event_queue_push() for Event::Dpp_Frame_Received. */
++    struct sDppFrameEvent {
++        uint8_t tcp_type;
++        std::vector<uint8_t> frame;
+     };
+ 
+     // Public methods:
+@@ -35,6 +53,30 @@ public:
+     virtual bool reattach() { return true; }
+     virtual void run_fsm() { return; }
+     virtual int smd_set_neighbor(const void* payload, int payload_len) { return 0; }
++
++    /**
++     * @brief Start the DPP-over-TCP relay listener (127.0.0.1:DPP_TCP_PORT), if supported
++     * by this backend. No-op (returns false) on backends that don't relay DPP over TCP.
++     */
++    virtual bool init_dpp_relay() { return false; }
++
++    /**
++     * @brief Stop the DPP-over-TCP relay listener, if it was started.
++     */
++    virtual void stop_dpp_relay() {}
++
++    /**
++     * @brief Send a raw DPP frame to hostapd on the active relay connection.
++     */
++    virtual bool dpp_send_frame(uint8_t tcp_type, const uint8_t *frame, size_t frame_len)
++    {
++        return false;
++    }
++
++    /**
++     * @brief Returns true if hostapd is currently connected to the DPP relay.
++     */
++    virtual bool is_dpp_client_connected() const { return false; }
+ };
+ 
+ // Slave HAL factory types
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 770715aaa..bf398a466 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -4423,6 +4423,37 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+         return false;
+     }
+ 
++    // If this device onboards via DPP, configure hostapd's native DPP-over-TCP relay so
++    // this radio can forward an over-the-air DPP Auth Request to the local DPP TCP listener
++    // (DppAgentTask, 127.0.0.1:8908) — needed for downstream/cascaded enrollee relay. Written
++    // under this radio's own interface= section (base_interface), not the head, and once per
++    // radio (every radio gets its own interface= section here).
++    if (beerocks::bpl::cfg_get_onboarding_type() == "DPP") {
++        // pkhash is all-zeros for now — hostapd only relays a DPP Auth Request whose
++        // R-Bootstrap-Key-Hash attribute matches this value exactly. Real matching requires
++        // the actual bootstrap key hash (see cfg_get_dpp_bootstrap_pubkey_hash()) — follow-up.
++        static const std::string zero_pkhash(64, '0');
++        std::string dpp_controller_value = "ipaddr=127.0.0.1 pkhash=" + zero_pkhash;
++        if (base_conf.get_vap_value(base_interface, "dpp_controller") != dpp_controller_value ||
++            base_conf.get_vap_value(base_interface, "dpp_configurator_connectivity") != "1") {
++            bool ok =
++                base_conf.set_create_vap_value(base_interface, "dpp_controller",
++                                                dpp_controller_value) &&
++                base_conf.set_create_vap_value(base_interface, "dpp_configurator_connectivity",
++                                                1);
++            if (ok) {
++                base_conf.store("");
++                LOG(INFO) << "DPP: added dpp_controller/dpp_configurator_connectivity "
++                             "to hostapd config for "
++                          << m_radio_info.iface_name;
++            } else {
++                LOG(WARNING) << "DPP: failed to set dpp_controller/"
++                                 "dpp_configurator_connectivity in hostapd config for "
++                             << m_radio_info.iface_name;
++            }
++        }
++    }
++
+     m_radio_info.hostapd_radio_config = base_conf.get_hostapd_radio_config();
+ 
+     // generate BSSID pool
+@@ -4918,6 +4949,19 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                     }
+                 }
+ 
++                // If this BSS config's AKM is DPP (or the DPP-equivalent OUI), configure
++                // hostapd's native DPP-over-TCP relay for this VAP — needed in both gateway
++                // and extender roles, since a DPP Auth Request may arrive on any DPP-AKM BSS
++                // and must be relayed to the local DPP TCP listener (DppAgentTask,
++                // 127.0.0.1:8908). Non-DPP VAPs on the same radio are left untouched.
++                if (beerocks::bpl::cfg_get_onboarding_type() == "DPP" &&
++                    bss_it.additional_auth == son::wireless_utils::eAdditionalAuth::DPP) {
++                    static const std::string zero_pkhash(64, '0');
++                    conf.set_create_vap_value(vap_id, "dpp_controller",
++                                              "ipaddr=127.0.0.1 pkhash=" + zero_pkhash);
++                    conf.set_create_vap_value(vap_id, "dpp_configurator_connectivity", 1);
++                }
++
+                 // finally enable the vap (remove any previously set start_disabled)
+                 conf.set_create_vap_value(vap_id, "start_disabled", "");
+ 
+@@ -5044,7 +5088,9 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                     }
+ 
+                     if (bss_name_changed == true) {
+-                        add_mld_link(bss,vap_info.bss,bss_it,bridge_ifname);
++                        if (!add_mld_link(bss,vap_info.bss,bss_it,bridge_ifname)) {
++                            LOG(ERROR) << "add_mld_link failed for bss=" << bss;
++                        }
+                     } else {
+                         if (bss_it.teardown) {
+                             // Hostapd can only process one LINK_REMOVE at a time.
+@@ -7538,8 +7584,13 @@ bool ap_wlan_hal_nl80211::add_mld_link(std::string &new_iface,std::string &prev_
+ 
+     parsed_obj_map_t reply;
+ 
++    // Do not retry MLD_ADD_LINK on failure: a failed attempt can leave a stale kernel
++    // debugfs link-<id> entry for this MLD (observed via hostapd's own log: "MLD: Failed
++    // to add link 1 in MLD wlan2_1" followed by "debugfs: Directory 'link-1' ... already
++    // present!" on the next attempt), which then blocks every subsequent identical retry
++    // with the same failure — retrying only compounds the problem instead of resolving it.
+     cmd << "MLD_ADD_LINK bss_config=" <<m_radio_info.phy_name<< ":" <<conf_path;
+-    if (!wpa_ctrl_send_msg(cmd.str(),new_iface)) {
++    if (!wpa_ctrl_send_msg(cmd.str(), new_iface)) {
+         LOG(ERROR) << "Failed to add link to the BSS: " << new_iface;
+         return false;
+     }
+@@ -8351,6 +8402,19 @@ bool ap_wlan_hal_nl80211::create_new_hostapd_conf_file(std::string &ifname, son:
+     // set dummy config_id value to generate correct config_id
+     conf.set_create_vap_value(vap_id,"config_id", "1234567890abcdef");
+ 
++    // If this BSS config's AKM is DPP (or the DPP-equivalent OUI), configure hostapd's
++    // native DPP-over-TCP relay for this VAP (see update_vap_credentials() for the
++    // equivalent per-VAP write on existing radios). Without this, a VAP created here (via
++    // add_bss()/add_mld_link(), each with its own conf file) never advertises the DPP CCE
++    // IE and never relays DPP Auth Request frames to DppAgentTask (127.0.0.1:8908).
++    if (beerocks::bpl::cfg_get_onboarding_type() == "DPP" &&
++        bss_conf.additional_auth == son::wireless_utils::eAdditionalAuth::DPP) {
++        static const std::string zero_pkhash(64, '0');
++        conf.set_create_vap_value(vap_id, "dpp_controller",
++                                  "ipaddr=127.0.0.1 pkhash=" + zero_pkhash);
++        conf.set_create_vap_value(vap_id, "dpp_configurator_connectivity", 1);
++    }
++
+     if (!conf.store(vap_id)) {
+         LOG(ERROR) << "Failed to store the hostapd configuration!";
+         return false;
+@@ -8919,8 +8983,11 @@ bool ap_wlan_hal_nl80211::handle_mld_reconfig(std::string target_ssid, int8_t ml
+                 return false;
+             }
+             std::stringstream cmd;
++            // Do not retry on failure — see add_mld_link() for why: a failed MLD_ADD_LINK
++            // can leave a stale kernel debugfs link-<id> entry that blocks every
++            // subsequent identical retry.
+             cmd << "MLD_ADD_LINK bss_config=" <<m_radio_info.phy_name<< ":" <<conf_path;
+-            if (!wpa_ctrl_send_msg(cmd.str(),mld_iface)) {
++            if (!wpa_ctrl_send_msg(cmd.str(), mld_iface)) {
+                 LOG(ERROR) << "Failed to add link to the BSS: " << mld_iface;
+                 return false;
+             }
+diff --git a/common/beerocks/bwl/nl80211/dpp_relay_socket.cpp b/common/beerocks/bwl/nl80211/dpp_relay_socket.cpp
+new file mode 100644
+index 000000000..b934bc097
+--- /dev/null
++++ b/common/beerocks/bwl/nl80211/dpp_relay_socket.cpp
+@@ -0,0 +1,278 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#include <bwl/dpp_relay_socket.h>
++#include <bwl/slave_wlan_hal.h>
++
++#include <easylogging++.h>
++
++#include <arpa/inet.h>
++#include <cerrno>
++#include <cstring>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++namespace bwl {
++
++namespace {
++/** Maximum DPP TCP frame payload size (sanity check). */
++constexpr uint32_t DPP_MAX_FRAME_LEN = 8192;
++} // namespace
++
++dpp_relay_socket::dpp_relay_socket(event_cb_t cb) : m_cb(std::move(cb)) {}
++
++dpp_relay_socket::~dpp_relay_socket() { stop(); }
++
++bool dpp_relay_socket::init()
++{
++    if (m_server_fd >= 0) {
++        return true;
++    }
++
++    m_server_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
++    if (m_server_fd < 0) {
++        LOG(ERROR) << "DPP: failed to create TCP server socket: " << strerror(errno);
++        return false;
++    }
++
++    int opt = 1;
++    ::setsockopt(m_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
++
++    struct sockaddr_in addr = {};
++    addr.sin_family         = AF_INET;
++    addr.sin_addr.s_addr    = htonl(INADDR_LOOPBACK); // 127.0.0.1
++    addr.sin_port           = htons(DPP_TCP_PORT);
++
++    if (::bind(m_server_fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0) {
++        LOG(ERROR) << "DPP: bind to 127.0.0.1:" << DPP_TCP_PORT << " failed: " << strerror(errno);
++        ::close(m_server_fd);
++        m_server_fd = -1;
++        return false;
++    }
++
++    if (::listen(m_server_fd, 5) < 0) {
++        LOG(ERROR) << "DPP: listen failed: " << strerror(errno);
++        ::close(m_server_fd);
++        m_server_fd = -1;
++        return false;
++    }
++
++    LOG(INFO) << "DPP: TCP server listening on 127.0.0.1:" << DPP_TCP_PORT
++              << " (fd=" << m_server_fd << ")";
++    return true;
++}
++
++void dpp_relay_socket::stop()
++{
++    close_client();
++
++    if (m_server_fd >= 0) {
++        ::close(m_server_fd);
++        m_server_fd = -1;
++        LOG(INFO) << "DPP: TCP server socket closed";
++    }
++}
++
++int dpp_relay_socket::get_listen_fd() const { return m_server_fd; }
++
++int dpp_relay_socket::get_client_fd() const { return m_client_fd; }
++
++bool dpp_relay_socket::process_events(int fd)
++{
++    LOG(DEBUG) << "DPP: process_events fd=" << fd << " (server_fd=" << m_server_fd
++               << ", client_fd=" << m_client_fd << ")";
++    if (fd == m_server_fd) {
++        return handle_accept();
++    }
++    if (fd == m_client_fd) {
++        return handle_client_read();
++    }
++    LOG(DEBUG) << "DPP: process_events fd=" << fd << " matches neither server nor client fd";
++    return false;
++}
++
++bool dpp_relay_socket::send_frame(uint8_t tcp_type, const uint8_t *frame, size_t frame_len)
++{
++    if (m_client_fd < 0) {
++        LOG(ERROR) << "DPP: send_frame() called but no active TCP connection";
++        return false;
++    }
++
++    // Build TCP frame: [4-byte length BE][1-byte type][raw frame]
++    uint32_t payload_len = static_cast<uint32_t>(1 + frame_len);
++
++    std::vector<uint8_t> buf;
++    buf.reserve(4 + 1 + frame_len);
++
++    buf.push_back(static_cast<uint8_t>((payload_len >> 24) & 0xFF));
++    buf.push_back(static_cast<uint8_t>((payload_len >> 16) & 0xFF));
++    buf.push_back(static_cast<uint8_t>((payload_len >> 8) & 0xFF));
++    buf.push_back(static_cast<uint8_t>(payload_len & 0xFF));
++    buf.push_back(tcp_type);
++    buf.insert(buf.end(), frame, frame + frame_len);
++
++    size_t written = 0;
++    while (written < buf.size()) {
++        ssize_t ret = ::write(m_client_fd, buf.data() + written, buf.size() - written);
++        if (ret < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            LOG(ERROR) << "DPP: write() to hostapd TCP socket failed: " << strerror(errno);
++            close_client();
++            return false;
++        }
++        written += static_cast<size_t>(ret);
++    }
++
++    LOG(DEBUG) << "DPP: sent " << buf.size() << " bytes to hostapd"
++               << " (type=0x" << std::hex << static_cast<int>(tcp_type) << std::dec
++               << ", frame_len=" << frame_len << ")";
++    return true;
++}
++
++bool dpp_relay_socket::is_client_connected() const { return m_client_fd >= 0; }
++
++bool dpp_relay_socket::handle_accept()
++{
++    struct sockaddr_in peer_addr = {};
++    socklen_t peer_len           = sizeof(peer_addr);
++
++    int client_fd = ::accept4(m_server_fd, reinterpret_cast<struct sockaddr *>(&peer_addr),
++                               &peer_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
++
++    if (client_fd < 0) {
++        if (errno == EAGAIN || errno == EWOULDBLOCK) {
++            LOG(DEBUG) << "DPP: handle_accept: spurious wakeup on server_fd=" << m_server_fd;
++            return true; // spurious wakeup
++        }
++        LOG(ERROR) << "DPP: accept() failed: " << strerror(errno) << ", restarting relay";
++        stop();
++        return init();
++    }
++
++    // Single-Enrollee policy: reject new connections if one is already active.
++    if (m_client_fd >= 0) {
++        LOG(WARNING) << "DPP: Rejecting new connection (fd=" << client_fd
++                     << ") — session already active on fd=" << m_client_fd;
++        ::close(client_fd);
++        return true;
++    }
++
++    m_client_fd = client_fd;
++    m_rx_buf.clear();
++
++    LOG(INFO) << "DPP: hostapd connected to relay (fd=" << m_client_fd << ")";
++    if (m_cb) {
++        m_cb(Event::ClientConnected, 0, {});
++    }
++    return true;
++}
++
++/** Loops on read() until EAGAIN or an actual disconnect/error is observed. A single read()
++ * is not enough: hostapd sends its final frame and closes the socket immediately afterward
++ * (dpp_tcp.c's on_tcp_tx_complete_remove path), so the data and the EOF routinely arrive in
++ * the same readiness notification. Stopping after one successful read (as before) drained the
++ * frame but left the peer's FIN unobserved, so m_client_fd was never closed and every
++ * subsequent connection attempt was rejected forever by the single-Enrollee check below. */
++bool dpp_relay_socket::handle_client_read()
++{
++    uint8_t tmp[4096];
++    bool disconnected = false;
++
++    while (true) {
++        ssize_t n = ::read(m_client_fd, tmp, sizeof(tmp));
++
++        if (n > 0) {
++            LOG(DEBUG) << "DPP: handle_client_read fd=" << m_client_fd << " read() returned " << n;
++            m_rx_buf.insert(m_rx_buf.end(), tmp, tmp + n);
++            continue;
++        }
++
++        if (n == 0) {
++            LOG(INFO) << "DPP: hostapd closed TCP connection (fd=" << m_client_fd << ")";
++            disconnected = true;
++            break;
++        }
++
++        if (errno == EAGAIN || errno == EWOULDBLOCK) {
++            break; // no more data for now
++        }
++        LOG(ERROR) << "DPP: read() error: " << strerror(errno);
++        disconnected = true;
++        break;
++    }
++
++    std::vector<std::pair<uint8_t, std::vector<uint8_t>>> frames;
++    reassemble_frames(frames);
++    LOG(DEBUG) << "DPP: handle_client_read reassembled " << frames.size() << " complete frame(s), "
++               << m_rx_buf.size() << " byte(s) remaining in rx buffer";
++    dispatch_frames(frames);
++
++    if (disconnected) {
++        close_client();
++        LOG(INFO) << "DPP: hostapd disconnected from relay";
++        if (m_cb) {
++            m_cb(Event::ClientDisconnected, 0, {});
++        }
++    }
++    return true;
++}
++
++void dpp_relay_socket::close_client()
++{
++    LOG(DEBUG) << "DPP: close_client fd=" << m_client_fd;
++    if (m_client_fd >= 0) {
++        ::close(m_client_fd);
++        m_client_fd = -1;
++        m_rx_buf.clear();
++        LOG(INFO) << "DPP: TCP client connection closed";
++    }
++}
++
++/** Reassemble complete [4B BE len][1B type][frame] frames out of m_rx_buf. */
++void dpp_relay_socket::reassemble_frames(
++    std::vector<std::pair<uint8_t, std::vector<uint8_t>>> &out_frames)
++{
++    while (m_rx_buf.size() >= 5) { // minimum: 4-byte length + 1-byte type
++
++        uint32_t payload_len = (static_cast<uint32_t>(m_rx_buf[0]) << 24) |
++                               (static_cast<uint32_t>(m_rx_buf[1]) << 16) |
++                               (static_cast<uint32_t>(m_rx_buf[2]) << 8) |
++                               (static_cast<uint32_t>(m_rx_buf[3]));
++
++        if (payload_len == 0 || payload_len > DPP_MAX_FRAME_LEN) {
++            LOG(ERROR) << "DPP: invalid frame length=" << payload_len << ", discarding buffer";
++            m_rx_buf.clear();
++            break;
++        }
++
++        if (m_rx_buf.size() < 4 + payload_len) {
++            break; // partial frame, wait for more data
++        }
++
++        uint8_t type_byte        = m_rx_buf[4];
++        const uint8_t *raw_frame = m_rx_buf.data() + 5;
++        size_t raw_frame_len     = payload_len - 1;
++
++        out_frames.emplace_back(type_byte,
++                                 std::vector<uint8_t>(raw_frame, raw_frame + raw_frame_len));
++
++        m_rx_buf.erase(m_rx_buf.begin(), m_rx_buf.begin() + 4 + payload_len);
++    }
++}
++
++void dpp_relay_socket::dispatch_frames(
++    const std::vector<std::pair<uint8_t, std::vector<uint8_t>>> &frames)
++{
++    if (!m_cb) {
++        return;
++    }
++    for (const auto &frame : frames) {
++        m_cb(Event::FrameReceived, frame.first, frame.second);
++    }
++}
++
++} // namespace bwl
+diff --git a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp
+index 17fa5dab9..63beeb5e0 100644
+--- a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp
+@@ -109,14 +109,127 @@ int slave_wlan_hal_nl80211::smd_set_neighbor(const void* payload, int payload_le
+ 
+ bool slave_wlan_hal_nl80211::process_ext_events(int fd)
+ {
++    if (m_dpp_socket &&
++        (fd == m_dpp_socket->get_listen_fd() || fd == m_dpp_socket->get_client_fd())) {
++        LOG(DEBUG) << "DPP: process_ext_events routing fd=" << fd << " to dpp_relay_socket";
++        bool ok = m_dpp_socket->process_events(fd);
++        sync_dpp_fd_registration();
++        return ok;
++    }
++
+     if (mqtt_client && fd == mqtt_client->get_fd()) {
+         // Readable event on the MQTT socket — always process to consume incoming data.
+         mqtt_client->process();
+         return true;
+     }
++
++    LOG(DEBUG) << "DPP: process_ext_events fd=" << fd
++               << " matched neither dpp socket (listen_fd="
++               << (m_dpp_socket ? m_dpp_socket->get_listen_fd() : -1)
++               << ", client_fd=" << (m_dpp_socket ? m_dpp_socket->get_client_fd() : -1)
++               << ") nor mqtt client (fd=" << (mqtt_client ? mqtt_client->get_fd() : -1) << ")";
+     return false;
+ }
+ 
++bool slave_wlan_hal_nl80211::init_dpp_relay()
++{
++    if (!m_dpp_socket) {
++        m_dpp_socket = std::make_unique<dpp_relay_socket>(
++            [this](dpp_relay_socket::Event event, uint8_t tcp_type,
++                   const std::vector<uint8_t> &frame) {
++                on_dpp_socket_event(event, tcp_type, frame);
++            });
++    }
++
++    if (!m_dpp_socket->init()) {
++        return false;
++    }
++
++    sync_dpp_fd_registration();
++    return true;
++}
++
++void slave_wlan_hal_nl80211::stop_dpp_relay()
++{
++    if (!m_dpp_socket) {
++        return;
++    }
++
++    m_dpp_socket->stop();
++    sync_dpp_fd_registration();
++    m_dpp_socket.reset();
++}
++
++bool slave_wlan_hal_nl80211::dpp_send_frame(uint8_t tcp_type, const uint8_t *frame,
++                                             size_t frame_len)
++{
++    return m_dpp_socket && m_dpp_socket->send_frame(tcp_type, frame, frame_len);
++}
++
++bool slave_wlan_hal_nl80211::is_dpp_client_connected() const
++{
++    return m_dpp_socket && m_dpp_socket->is_client_connected();
++}
++
++void slave_wlan_hal_nl80211::on_dpp_socket_event(dpp_relay_socket::Event event, uint8_t tcp_type,
++                                                  const std::vector<uint8_t> &frame)
++{
++    switch (event) {
++    case dpp_relay_socket::Event::FrameReceived:
++        event_queue_push(Event::Dpp_Frame_Received,
++                          std::make_shared<sDppFrameEvent>(sDppFrameEvent{tcp_type, frame}));
++        break;
++    case dpp_relay_socket::Event::ClientConnected:
++        event_queue_push(Event::Dpp_Client_Connected);
++        break;
++    case dpp_relay_socket::Event::ClientDisconnected:
++        event_queue_push(Event::Dpp_Client_Disconnected);
++        break;
++    default:
++        break;
++    }
++}
++
++void slave_wlan_hal_nl80211::sync_dpp_fd_registration()
++{
++    // The listening fd and the active client fd (if any) are independent and must both stay
++    // registered with the event loop at all times — this is what lets handle_accept() run (and
++    // reject extra connections per the single-Enrollee policy) even while a client is already
++    // connected, instead of new connection attempts completing the TCP handshake at the kernel
++    // level and piling up in the listen backlog unseen.
++    int new_listen_fd = m_dpp_socket ? m_dpp_socket->get_listen_fd() : -1;
++    int new_client_fd = m_dpp_socket ? m_dpp_socket->get_client_fd() : -1;
++    LOG(DEBUG) << "DPP: sync_dpp_fd_registration listen_fd " << m_dpp_listen_fd_registered
++               << " -> " << new_listen_fd << ", client_fd " << m_dpp_client_fd_registered << " -> "
++               << new_client_fd;
++
++    if (new_listen_fd != m_dpp_listen_fd_registered) {
++        if (m_dpp_listen_fd_registered >= 0) {
++            LOG(DEBUG) << "DPP: unregistering listen ext event fd=" << m_dpp_listen_fd_registered;
++            event_queue_push(Event::Unregister_Ext_Event_Fd,
++                              std::make_shared<int>(m_dpp_listen_fd_registered));
++        }
++        if (new_listen_fd >= 0) {
++            LOG(DEBUG) << "DPP: registering listen ext event fd=" << new_listen_fd;
++            event_queue_push(Event::Register_Ext_Event_Fd, std::make_shared<int>(new_listen_fd));
++        }
++        m_dpp_listen_fd_registered = new_listen_fd;
++    }
++
++    if (new_client_fd != m_dpp_client_fd_registered) {
++        if (m_dpp_client_fd_registered >= 0) {
++            LOG(DEBUG) << "DPP: unregistering client ext event fd=" << m_dpp_client_fd_registered;
++            event_queue_push(Event::Unregister_Ext_Event_Fd,
++                              std::make_shared<int>(m_dpp_client_fd_registered));
++        }
++        if (new_client_fd >= 0) {
++            LOG(DEBUG) << "DPP: registering client ext event fd=" << new_client_fd;
++            event_queue_push(Event::Register_Ext_Event_Fd, std::make_shared<int>(new_client_fd));
++        }
++        m_dpp_client_fd_registered = new_client_fd;
++    }
++}
++
+ bool slave_wlan_hal_nl80211::reattach()
+ {
+     if (!mqtt_client) {
+diff --git a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h
+index 687821b3a..d51b74c3e 100644
+--- a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h
+@@ -6,9 +6,11 @@
+ #define _BWL_SLAVE_WLAN_HAL_NL80211_H_
+ 
+ #include <bwl/slave_wlan_hal.h>
++#include <bwl/dpp_relay_socket.h>
+ #include <mqtt_client.h>
+ #include <vector>
+ #include <chrono>
++#include <memory>
+ 
+ namespace bwl {
+ namespace nl80211 {
+@@ -43,6 +45,12 @@ public:
+     virtual void run_fsm() override;
+     virtual int smd_set_neighbor(const void* payload, int payload_len) override;
+ 
++    // DPP-over-TCP relay
++    bool init_dpp_relay() override;
++    void stop_dpp_relay() override;
++    bool dpp_send_frame(uint8_t tcp_type, const uint8_t *frame, size_t frame_len) override;
++    bool is_dpp_client_connected() const override;
++
+ protected:
+     bool event_queue_push(slave_wlan_hal::Event event, std::shared_ptr<void> data = {})
+     {
+@@ -54,9 +62,16 @@ private:
+     void register_fd(int fd);
+     void unregister_fd(int fd);
+     void subscribe_to_smd_events();
++    void on_dpp_socket_event(dpp_relay_socket::Event event, uint8_t tcp_type,
++                              const std::vector<uint8_t> &frame);
++    void sync_dpp_fd_registration();
+ 
+     std::unique_ptr<beerocks::mqttapi::MQTTClient> mqtt_client;
+     std::chrono::steady_clock::time_point m_last_loop_run_time;
++
++    std::unique_ptr<dpp_relay_socket> m_dpp_socket;
++    int m_dpp_listen_fd_registered = -1;
++    int m_dpp_client_fd_registered = -1;
+ };
+ 
+ } // namespace nl80211
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index 40cb8b4d0..36951f6bf 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -971,6 +971,18 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+             continue;
+         }
+ 
++        // Add this VAP to the DPP TCP relay so hostapd dials 127.0.0.1:8908 (mirrors
++        // ap_wlan_hal_nl80211's dpp_controller conf write for DPP-authenticated BSS
++        // configs). pkhash stays all-zero: hostapd's TCP leg only talks to the local
++        // relay, the real DPP bootstrap/auth exchange happens over 1905/CMDU.
++        if (bss_info_conf.additional_auth == son::wireless_utils::eAdditionalAuth::DPP) {
++            AmbiorixVariant dpp_obj(AMXC_VAR_ID_HTABLE);
++            dpp_obj.add_child<bool>("RelayController", true);
++            if (!m_ambiorix_cl.update_object(wifi_vap_path + "DPP.", dpp_obj)) {
++                LOG(WARNING) << "Failed to set DPP.RelayController for " << wifi_vap_path;
++            }
++        }
++
+         // Apply the RSN Override (MRSNO, R6.1 §17.2.105) params carried in security_ies, after
+         // the base Security ModeEnabled write. Skip for a freshly-created VAP (wildcard bssid /
+         // ifname=="new_interface") since the pWHM instance doesn't exist yet; it is (re)applied
+diff --git a/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
+index 0fdb36b80..5eea90f7a 100644
+--- a/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
+@@ -4,110 +4,146 @@
+ 
+ #include "slave_wlan_hal_whm.h"
+ 
++#include <bcl/beerocks_string_utils.h>
+ #include <bcl/beerocks_utils.h>
+ #include <bcl/network/network_utils.h>
+ #include <easylogging++.h>
+ 
+ using namespace beerocks;
++using namespace beerocks::wbapi;
+ 
+ namespace bwl {
+ namespace whm {
+ 
++// NOTE: Since *base_wlan_hal_whm* inherits *base_wlan_hal* virtually, we
++//       need to explicitly call it from any deriving class.
+ slave_wlan_hal_whm::slave_wlan_hal_whm(const std::string &iface_name, hal_event_cb_t callback,
+-                                   const bwl::hal_conf_t &hal_conf)
+-    : base_wlan_hal(bwl::HALType::Slave, iface_name, IfaceType::Intel, callback, hal_conf)
++                                      const bwl::hal_conf_t &hal_conf)
++    : base_wlan_hal(bwl::HALType::Slave, iface_name, IfaceType::Intel, callback, hal_conf),
++      base_wlan_hal_whm(bwl::HALType::Slave, iface_name, callback, hal_conf)
+ {
++    // Unlike ap_wlan_hal_whm, the ambiorix fds are not registered here - DPP relay is only
++    // activated once init_dpp_relay() is explicitly called (mirrors slave_wlan_hal_nl80211's
++    // lazy-init shape, where m_dpp_socket doesn't exist until then either).
+     m_fds_ext_events.clear();
+-    m_filtered_events.insert({});
+ }
+ 
+-slave_wlan_hal_whm::~slave_wlan_hal_whm()
+-{
+-    detach();
+-}
+-
+-bool slave_wlan_hal_whm::process_ext_events(int fd)
+-{
+-    return true;
+-}
++slave_wlan_hal_whm::~slave_wlan_hal_whm() { stop_dpp_relay(); }
+ 
+-HALState slave_wlan_hal_whm::attach(bool)
+-{
+-    return (m_hal_state = HALState::Uninitialized);
+-}
+-
+-bool slave_wlan_hal_whm::detach()
++const std::string slave_wlan_hal_whm::get_iface_from_fd(int fd)
+ {
+-    return true;
++    LOG(TRACE) << __func__ << " - NOT IMPLEMENTED";
++    return get_iface_name();
+ }
+ 
+-bool slave_wlan_hal_whm::refresh_radio_info()
++bool slave_wlan_hal_whm::init_dpp_relay()
+ {
+-    return true;
+-}
++    int amx_fd  = m_ambiorix_cl.get_fd();
++    int amxp_fd = m_ambiorix_cl.get_signal_fd();
++    if (amx_fd < 0 || amxp_fd < 0) {
++        LOG(ERROR) << "DPP: ambiorix client fd unavailable, cannot start relay";
++        return false;
++    }
+ 
+-bool slave_wlan_hal_whm::ping()
+-{
+-    return true;
+-}
++    if (m_dpp_path.empty() &&
++        !m_ambiorix_cl.resolve_path(wbapi_utils::search_path_wifi() + "DPP.", m_dpp_path)) {
++        LOG(ERROR) << "DPP: failed to resolve WiFi.DPP. object path";
++        return false;
++    }
+ 
+-bool slave_wlan_hal_whm::reassociate()
+-{
+-    return true;
+-}
++    AmbiorixVariant enable_map(AMXC_VAR_ID_HTABLE);
++    enable_map.add_child("Enable", true);
++    if (!m_ambiorix_cl.update_object(m_dpp_path, enable_map)) {
++        LOG(ERROR) << "DPP: failed to enable relay listener at " << m_dpp_path;
++        return false;
++    }
+ 
+-bool slave_wlan_hal_whm::refresh_vaps_info(int id)
+-{
+-    return true;
+-}
++    subscribe_to_dpp_events();
+ 
+-bool slave_wlan_hal_whm::get_vap_status(
+-    const std::__cxx11::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list)
+-{
++    event_queue_push(Event::Register_Ext_Event_Fd, std::make_shared<int>(amx_fd));
++    event_queue_push(Event::Register_Ext_Event_Fd, std::make_shared<int>(amxp_fd));
++    m_fds_ext_events = {amx_fd, amxp_fd};
+     return true;
+ }
+ 
+-bool slave_wlan_hal_whm::update_mld_status(
+-    const std::__cxx11::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list)
++void slave_wlan_hal_whm::stop_dpp_relay()
+ {
+-    return true;
+-}
+-
+-bool slave_wlan_hal_whm::process_nl_events()
+-{
+-    return true;
+-}
++    for (int fd : m_fds_ext_events) {
++        event_queue_push(Event::Unregister_Ext_Event_Fd, std::make_shared<int>(fd));
++    }
++    m_fds_ext_events.clear();
+ 
+-bool slave_wlan_hal_whm::get_channel_utilization(uint8_t& channel_utilization)
+-{
+-    channel_utilization = 0;
++    if (m_dpp_event_handler && !m_dpp_path.empty()) {
++        m_ambiorix_cl.unsubscribe_from_object_event(m_dpp_event_handler);
++    }
++    m_dpp_event_handler.reset();
++    m_dpp_client_connected = false;
++
++    if (!m_dpp_path.empty()) {
++        AmbiorixVariant enable_map(AMXC_VAR_ID_HTABLE);
++        enable_map.add_child("Enable", false);
++        if (!m_ambiorix_cl.update_object(m_dpp_path, enable_map)) {
++            LOG(WARNING) << "DPP: failed to disable relay listener at " << m_dpp_path;
++        }
++    }
++}
++
++void slave_wlan_hal_whm::subscribe_to_dpp_events()
++{
++    m_dpp_event_handler               = std::make_shared<sAmbiorixEventHandler>();
++    m_dpp_event_handler->event_type   = "DppFrameReceived";
++    m_dpp_event_handler->callback_fn  = [this](AmbiorixVariant &event_data) {
++        on_dpp_ambiorix_event(event_data);
++    };
++    std::string filter =
++        "(path matches '" + m_dpp_path + "$') && (notification == 'DppFrameReceived')";
++    m_ambiorix_cl.subscribe_to_object_event(m_dpp_path, m_dpp_event_handler, filter);
++}
++
++void slave_wlan_hal_whm::on_dpp_ambiorix_event(AmbiorixVariant &event_data)
++{
++    std::string state;
++    if (event_data.read_child(state, "state")) {
++        if (state == "connected") {
++            m_dpp_client_connected = true;
++            event_queue_push(Event::Dpp_Client_Connected);
++        } else if (state == "disconnected") {
++            m_dpp_client_connected = false;
++            event_queue_push(Event::Dpp_Client_Disconnected);
++        }
++        return;
++    }
++
++    std::string frame_hex;
++    uint8_t tcp_type = 0;
++    if (!event_data.read_child(frame_hex, "frame") ||
++        !event_data.read_child(tcp_type, "tcpType")) {
++        return;
++    }
++
++    auto frame = string_utils::hex_to_bytes<std::vector<uint8_t>>(frame_hex);
++    event_queue_push(Event::Dpp_Frame_Received,
++                     std::make_shared<sDppFrameEvent>(sDppFrameEvent{tcp_type, frame}));
++}
++
++bool slave_wlan_hal_whm::dpp_send_frame(uint8_t tcp_type, const uint8_t *frame, size_t frame_len)
++{
++    if (m_dpp_path.empty()) {
++        return false;
++    }
++
++    AmbiorixVariant args(AMXC_VAR_ID_HTABLE), result;
++    args.add_child("tcpType", tcp_type);
++    args.add_child("frame", string_utils::bytes_to_hex_string(frame, frame_len));
++
++    if (!m_ambiorix_cl.call(m_dpp_path, "SendDppFrame", args, result)) {
++        LOG(ERROR) << "DPP: SendDppFrame failed";
++        return false;
++    }
+     return true;
+ }
+ 
+-const std::string slave_wlan_hal_whm::get_iface_from_fd(int fd)
+-{
+-    return "";
+-}
+-
+-std::string slave_wlan_hal_whm::get_radio_mac()
+-{
+-    return "";
+-}
+-
+-sMacAddr slave_wlan_hal_whm::get_bsta_mld_mac()
+-{
+-    return sMacAddr();
+-}
+-
+-sMacAddr slave_wlan_hal_whm::get_ap_mld_mac()
+-{
+-    return sMacAddr();
+-}
+-
+-bool slave_wlan_hal_whm::set(const std::string& param, const std::string& value, int vap_id)
+-{
+-    return true;
+-}
++bool slave_wlan_hal_whm::is_dpp_client_connected() const { return m_dpp_client_connected; }
+ 
+ } // namespace whm
+ 
+diff --git a/common/beerocks/bwl/whm/slave_wlan_hal_whm.h b/common/beerocks/bwl/whm/slave_wlan_hal_whm.h
+index 7b70bf798..e39ae4604 100644
+--- a/common/beerocks/bwl/whm/slave_wlan_hal_whm.h
++++ b/common/beerocks/bwl/whm/slave_wlan_hal_whm.h
+@@ -5,36 +5,41 @@
+ #ifndef _BWL_SLAVE_WLAN_HAL_WHM_H_
+ #define _BWL_SLAVE_WLAN_HAL_WHM_H_
+ 
++#include "base_wlan_hal_whm.h"
+ #include <bwl/slave_wlan_hal.h>
+ #include <vector>
+ 
+ namespace bwl {
+ namespace whm {
+ 
+-class slave_wlan_hal_whm : public virtual slave_wlan_hal {
++class slave_wlan_hal_whm : public base_wlan_hal_whm, public virtual slave_wlan_hal {
+ public:
+     explicit slave_wlan_hal_whm(const std::string& iface_name,
+                                base_wlan_hal::hal_event_cb_t callback,
+                                const hal_conf_t& hal_conf);
+     virtual ~slave_wlan_hal_whm();
+ 
+-    // Inherited from base_wlan_hal
+-    virtual HALState attach(bool block) override;
+-    virtual bool detach() override;
+-    virtual bool refresh_radio_info() override;
+-    virtual bool ping() override;
+-    virtual bool reassociate() override;
+-    virtual bool refresh_vaps_info(int id = beerocks::IFACE_RADIO_ID) override;
+-    virtual bool get_vap_status(const std::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list) override;
+-    virtual bool update_mld_status(const std::list<son::wireless_utils::sBssInfoConf>& bss_info_conf_list) override;
+-    virtual bool process_nl_events() override;
+-    virtual bool get_channel_utilization(uint8_t& channel_utilization) override;
+     virtual const std::string get_iface_from_fd(int fd) override;
+-    virtual std::string get_radio_mac() override;
+-    virtual sMacAddr get_bsta_mld_mac() override;
+-    virtual sMacAddr get_ap_mld_mac() override;
+-    virtual bool set(const std::string& param, const std::string& value, int vap_id) override;
+-    virtual bool process_ext_events(int fd = 0) override;
++
++    // DPP-over-TCP relay
++    bool init_dpp_relay() override;
++    void stop_dpp_relay() override;
++    bool dpp_send_frame(uint8_t tcp_type, const uint8_t *frame, size_t frame_len) override;
++    bool is_dpp_client_connected() const override;
++
++protected:
++    bool event_queue_push(slave_wlan_hal::Event event, std::shared_ptr<void> data = {})
++    {
++        return base_wlan_hal::event_queue_push(int(event), data);
++    }
++
++private:
++    void subscribe_to_dpp_events();
++    void on_dpp_ambiorix_event(beerocks::wbapi::AmbiorixVariant &event_data);
++
++    std::shared_ptr<beerocks::wbapi::sAmbiorixEventHandler> m_dpp_event_handler;
++    std::string m_dpp_path;
++    bool m_dpp_client_connected = false;
+ };
+ 
+ } // namespace whm
+-- 
+2.34.1
+
