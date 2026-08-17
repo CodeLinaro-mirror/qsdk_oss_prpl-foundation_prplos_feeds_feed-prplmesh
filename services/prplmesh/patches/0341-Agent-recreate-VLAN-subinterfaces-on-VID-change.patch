@@ -1,0 +1,496 @@
+From 3d7395317f223a4697f5c3eb260fbc1b726a5aa8 Mon Sep 17 00:00:00 2001
+From: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+Date: Fri, 14 Aug 2026 22:56:31 +0530
+Subject: [PATCH] Agent: recreate VLAN subinterfaces on VID change instead of
+ in-place retag
+
+Change the VID-only traffic separation config-change path in
+TrunkPortPlumbing8021q from an in-place retag to a destroy+recreate of
+only the affected subinterface(s). Previously, when a private/guest
+VLAN ID changed but the bridges/trunk-set stayed the same, the existing
+VLAN subinterface was retagged in place (kernel VLAN ID changed via
+set_vlan_interface_id(), then renamed via rename_interface()) without
+detaching it from its bridge, to avoid an STP re-convergence. This is
+replaced with an explicit remove-from-bridge, delete, create new VLAN
+subinterface with the new VID, and re-add to the same bridge -
+mirroring the create path already used when subinterfaces are built
+from scratch, but scoped to just the subinterface(s) whose VID
+actually changed. Private and guest roles are evaluated and touched
+independently, so if only one VID changes, the other subinterface is
+left completely untouched. This intentionally re-triggers STP on the
+affected bridge port; that trade-off is accepted in favor of always
+ending up with a subinterface name/VID pair that is verifiably
+consistent, rather than a partially-applied in-place retag.
+retag_subifaces() is renamed to recreate_changed_subifaces() so its
+name matches its new behaviour.
+
+network_utils::set_vlan_interface_id() and rename_interface() are
+removed - both were introduced only for the in-place retag and have no
+remaining callers.
+
+Signed-off-by: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+---
+ .../backhaul_manager/backhaul_manager.cpp     |  29 ++++
+ .../slave/tasks/traffic_separation_task.cpp   |  33 ++++-
+ .../trunk_port_plumbing_8021q.cpp             | 135 ++++++++++++------
+ .../trunk_port_plumbing_8021q.h               |   9 +-
+ .../bcl/include/bcl/network/network_utils.h   |  25 ----
+ .../bcl/source/network/network_utils.cpp      |  76 ----------
+ 6 files changed, 155 insertions(+), 152 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index da8941848..ae6f889e4 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -2747,6 +2747,19 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+                          << ", hidden_ssid=" << hidden_ssid;
+         }
+ 
++        // MLO: identify the primary bSTA anchor as early as possible, so that
++        // mlo_primary_bsta_iface is available to any code that needs it (e.g.
++        // traffic_separation_task's trunk-port selection). See the matching else
++        // branch further below for the full VLAN-ID-change handling.
++        auto connected_msg = static_cast<bwl::sACTION_BACKHAUL_CONNECTED_NOTIFICATION *>(data);
++        if (connected_msg && connected_msg->multi_ap_primary_vlan_id != 0 &&
++            db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wireless &&
++            iface != db->backhaul.selected_iface_name &&
++            db->backhaul.mlo_primary_bsta_iface.empty()) {
++            db->backhaul.mlo_primary_bsta_iface = iface;
++            LOG(INFO) << "MLO: identified primary bSTA anchor iface=" << iface;
++        }
++
+         // Try adding wireless backhaul STA interface to the bridge in case there is no
+         // entity (hostapd) that adds it automaticaly.
+         auto bridge        = db->bridge.iface_name;
+@@ -2770,6 +2783,22 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+             send_cmdu_to_broker(cmdu_tx, db->controller_info.bridge_mac, db->bridge.mac);
+         }
+ 
++        if ((FSM_IS_IN_STATE(OPERATIONAL) || FSM_IS_IN_STATE(CONNECTED)) &&
++            db->traffic_separation.ts_applied) {
++            auto request = message_com::create_vs_message<
++                beerocks_message::cACTION_BACKHAUL_APPLY_VLAN_POLICY_REQUEST>(cmdu_tx);
++            if (!request) {
++                LOG(ERROR) << "Failed to build APPLY_VLAN_POLICY_REQUEST message";
++            } else {
++                if (!send_cmdu(m_agent_fd, cmdu_tx)) {
++                    LOG(ERROR) << "Failed to send cACTION_BACKHAUL_APPLY_VLAN_POLICY_REQUEST";
++                } else {
++                    LOG(DEBUG) << "Sent cACTION_BACKHAUL_APPLY_VLAN_POLICY_REQUEST for iface="
++                               << iface << " (backhaul FSM in Connected or Operational)";
++                }
++            }
++        }
++
+         // TODO: Need to unite WAIT_WPS and WIRELESS_ASSOCIATE_4ADDR_WAIT handling
+         if (FSM_IS_IN_STATE(WAIT_WPS) || FSM_IS_IN_STATE(WIRELESS_ASSOCIATE_4ADDR_WAIT) ||
+             FSM_IS_IN_STATE(WIRELESS_WAIT_FOR_RECONNECT) ||
+diff --git a/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp b/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
+index 0139fc375..bb7cbbfed 100644
+--- a/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
++++ b/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
+@@ -345,6 +345,23 @@ bool TrafficSeparationTask::reset()
+     // traffic loss on the live trunk.
+     if (m_mgr->is_applied() && matches_last_applied(cfg, trunks)) {
+         LOG(DEBUG) << "TS config/ports unchanged since last apply, skipping rebuild";
++
++        // Config/ports didn't change, but a reconnect on an existing trunk (e.g. the same
++        // bSTA iface re-associating, or its parent netdev being torn down and recreated -
++        // see TrunkPortPlumbing8021q::apply()'s "already applied" handling) may have
++        // destroyed its VLAN subinterfaces without changing anything matches_last_applied()
++        // compares. Re-run add_trunk_port() for every trunk so the per-trunk recovery check
++        // can run: it is a cheap no-op when a trunk's subinterfaces are still intact, and
++        // only rebuilds the one trunk whose subinterfaces are actually gone.
++        bool success = true;
++        for (const auto &trunk : trunks) {
++            if (!m_mgr->add_trunk_port(trunk)) {
++                LOG(ERROR) << "add_trunk_port failed during skip-rebuild recovery iface="
++                           << trunk.iface_name;
++                success = false;
++            }
++        }
++
+         // Config/ports didn't change, but a BSS's vap_type classification may
+         // have been resolved (e.g. GUEST) since the last apply - re-check
+         // bridge membership even though the VLAN/trunk rebuild is skipped.
+@@ -355,16 +372,17 @@ bool TrafficSeparationTask::reset()
+         if (db->device_conf.ts_persistence_enabled) {
+             m_mgr->persist_bridge_assignments();
+         }
+-        return true;
++        return success;
+     }
+ 
+     // If only the VLAN IDs changed (e.g. primary VID learned early from the
+     // backhaul association response, guest VID initially defaulted and later
+     // corrected once the TS policy TLV is processed) with the trunk port set
+-    // unchanged, retag the existing VLAN subinterfaces in place instead of a
+-    // full clear_policies() + rebuild. If the retag fails, m_last_applied_*
+-    // is left untouched here and only gets updated once the full rebuild
+-    // below succeeds, so a failed retag can't leave stale cached state.
++    // unchanged, destroy and recreate just the changed VLAN subinterface(s) on
++    // each trunk instead of a full clear_policies() + rebuild of every managed
++    // trunk/access port. If that fails, m_last_applied_* is left untouched here
++    // and only gets updated once the full rebuild below succeeds, so a failed
++    // recreate can't leave stale cached state.
+     if (m_mgr->is_applied() && only_vids_changed(cfg, trunks)) {
+         if (!ensure_transport_primary_vlan(primary_vid)) {
+             LOG(ERROR) << "failed to set transport primary_vlan_id=" << primary_vid;
+@@ -372,14 +390,15 @@ bool TrafficSeparationTask::reset()
+         }
+ 
+         if (m_mgr->reapply_config(cfg)) {
+-            LOG(DEBUG) << "TS VLAN IDs changed, retagged in place without full rebuild";
++            LOG(DEBUG) << "TS VLAN IDs changed, subinterfaces recreated with new VID "
++                          "(trunk-level rebuild only, no full manager rebuild)";
+             m_last_applied_valid  = true;
+             m_last_applied_cfg    = cfg;
+             m_last_applied_trunks = trunks;
+             return true;
+         }
+ 
+-        LOG(WARNING) << "in-place VID retag failed, falling back to full rebuild";
++        LOG(WARNING) << "VID-only subinterface recreation failed, falling back to full rebuild";
+     }
+ 
+     if (!ensure_transport_primary_vlan(primary_vid)) {
+diff --git a/agent/src/beerocks/slave/traffic_separation/trunk_port_plumbing_8021q.cpp b/agent/src/beerocks/slave/traffic_separation/trunk_port_plumbing_8021q.cpp
+index 4922c29dc..38f683c8c 100644
+--- a/agent/src/beerocks/slave/traffic_separation/trunk_port_plumbing_8021q.cpp
++++ b/agent/src/beerocks/slave/traffic_separation/trunk_port_plumbing_8021q.cpp
+@@ -39,8 +39,9 @@ bool TrunkPortPlumbing8021q::apply(const sTrafficSeparationConfig &cfg)
+ 
+     // If TS is applied and config is unchanged -> do nothing (unless subinterfaces are gone).
+     // If config changed -> clear old plumbing first, unless only the VLAN IDs changed
+-    // and the bridges/mode are the same, in which case retag in place (see below) to
+-    // avoid tearing down live bridge ports and forcing an STP re-convergence.
++    // and the bridges/mode are the same, in which case only the changed subinterface(s)
++    // are destroyed and recreated (see below) - the raw trunk iface's own bridge
++    // membership and every other managed trunk/access port are left untouched.
+     if (m_is_applied) {
+         if (m_last_cfg == cfg) {
+             // Verify VLAN subinterfaces still exist. They may have been destroyed if the
+@@ -50,24 +51,46 @@ bool TrunkPortPlumbing8021q::apply(const sTrafficSeparationConfig &cfg)
+                  network_utils::linux_iface_exists(m_private_subiface)) &&
+                 (m_guest_subiface.empty() ||
+                  network_utils::linux_iface_exists(m_guest_subiface));
+-            if (subifaces_ok) {
++
++            // Verify the raw trunk parent is still detached from any bridge. A tagged
++            // trunk's raw iface must never sit in a bridge alongside its own VLAN
++            // subinterfaces - if it does (e.g. a bare-reconnect fallback elsewhere
++            // re-added it), the subiface-existence check above alone would miss it,
++            // since it only inspects the subifaces, not the raw parent.
++            const bool raw_iface_stray_in_bridge =
++                !m_trunk.is_untagged_mode && !m_trunk.is_ethernet &&
++                !network_utils::linux_iface_get_host_bridge(m_trunk.iface_name).empty();
++
++            if (subifaces_ok && !raw_iface_stray_in_bridge) {
+                 LOG(DEBUG) << "trunk=" << m_trunk.iface_name << " has already TS policies applied.";
+                 return true;
+             }
+-            LOG(DEBUG) << "trunk=" << m_trunk.iface_name
+-                       << " VLAN subinterfaces missing, re-applying TS policies.";
++            if (raw_iface_stray_in_bridge) {
++                LOG(WARNING) << "trunk=" << m_trunk.iface_name
++                             << " raw iface unexpectedly present in a bridge, destroying and "
++                                "recreating its VLAN subinterfaces";
++            } else {
++                LOG(DEBUG) << "trunk=" << m_trunk.iface_name
++                           << " VLAN subinterfaces missing, re-applying TS policies.";
++            }
++            // Fall through to the clear()+rebuild below (same path used when
++            // subifaces are missing). clear() and the rebuild that follows only
++            // touch this instance's own m_private_subiface/m_guest_subiface, so
++            // this destroys and recreates VLAN interfaces for this trunk only.
+         } else if (!m_trunk.is_untagged_mode && m_last_cfg.private_bridge == cfg.private_bridge &&
+                    m_last_cfg.guest_bridge == cfg.guest_bridge &&
+                    (m_last_cfg.private_vid != cfg.private_vid ||
+                     m_last_cfg.guest_vid != cfg.guest_vid)) {
+-            if (retag_subifaces(cfg)) {
++            if (recreate_changed_subifaces(cfg)) {
+                 m_last_cfg = cfg;
+                 LOG(DEBUG) << "trunk=" << m_trunk.iface_name
+-                           << " retagged VLAN subinterfaces in place (no bridge rebuild)";
++                           << " recreated changed VLAN subinterface(s) without a full manager "
++                              "rebuild (raw trunk iface and manager-wide policies untouched)";
+                 return true;
+             }
+             LOG(WARNING) << "trunk=" << m_trunk.iface_name
+-                         << " in-place retag failed, falling back to clear+recreate";
++                         << " VID-only subinterface recreation failed, falling back to "
++                            "clear+recreate";
+         } else {
+             LOG(DEBUG) << "Clearing and applying new policies.";
+         }
+@@ -156,57 +179,89 @@ bool TrunkPortPlumbing8021q::apply(const sTrafficSeparationConfig &cfg)
+     return true;
+ }
+ 
+-bool TrunkPortPlumbing8021q::retag_subifaces(const sTrafficSeparationConfig &cfg)
++bool TrunkPortPlumbing8021q::recreate_changed_subifaces(const sTrafficSeparationConfig &cfg)
+ {
+-    // Both subifaces must still exist to retag in place; if either is gone
+-    // (e.g. parent interface was torn down/recreated), let the caller fall
+-    // back to the normal clear+recreate path.
++    // Both subifaces must still exist for the changed one(s) to be recreated; if
++    // either is gone (e.g. parent interface was torn down/recreated), let the caller
++    // fall back to the normal clear+recreate path.
+     if ((!m_private_subiface.empty() &&
+          !network_utils::linux_iface_exists(m_private_subiface)) ||
+         (!m_guest_subiface.empty() && !network_utils::linux_iface_exists(m_guest_subiface))) {
+         return false;
+     }
+ 
+-    // Retag the VLAN ID, then rename the interface to match (e.g. "w0.492" ->
+-    // "w0.4092"), so the interface name never diverges from the VID it now
+-    // carries. The rename does not affect bridge membership or STP state (see
+-    // network_utils::rename_interface()); a failed rename is only cosmetic
+-    // and does not need to roll back the (already functional) VID change. If
+-    // it fails, m_private_subiface/m_guest_subiface keep the old name even
+-    // though the kernel-level VID has already changed on that interface.
++    // Destroy and recreate only the subinterface(s) whose VID actually changed - the
++    // other role (if unchanged) is left completely untouched. This intentionally
++    // detaches the recreated subinterface from its bridge and re-adds it, so its
++    // bridge port re-traverses STP (disabled->listening->learning->forwarding); that
++    // trade-off is accepted here in exchange for always ending up with a subinterface
++    // name/VID pair that is fully consistent (no partially-applied in-place retag).
+     if (!m_private_subiface.empty() && m_last_cfg.private_vid != cfg.private_vid) {
+-        if (!network_utils::set_vlan_interface_id(m_private_subiface, cfg.private_vid)) {
+-            LOG(ERROR) << "failed to retag iface=" << m_private_subiface
+-                       << " to vid=" << cfg.private_vid;
++        const auto old_subiface = m_private_subiface;
++        const auto bridge       = network_utils::linux_iface_get_host_bridge(old_subiface);
++
++        if (!bridge.empty() && !network_utils::linux_remove_iface_from_bridge(bridge, old_subiface)) {
++            LOG(WARNING) << "failed to remove iface=" << old_subiface << " from bridge=" << bridge
++                         << " before recreating it, continuing (deleting the iface removes it "
++                            "from the bridge regardless)";
++        }
++        network_utils::delete_interface(old_subiface);
++        m_private_subiface.clear();
++
++        const auto new_subiface =
++            network_utils::create_vlan_interface(m_trunk.iface_name, cfg.private_vid);
++        if (new_subiface.empty()) {
++            LOG(ERROR) << "failed to recreate private subiface for trunk="
++                       << m_trunk.iface_name << " vid=" << cfg.private_vid;
+             return false;
+         }
+ 
+-        const auto new_name =
+-            network_utils::build_vlan_interface_name(m_trunk.iface_name, cfg.private_vid);
+-        if (!new_name.empty() &&
+-            network_utils::rename_interface(m_private_subiface, new_name)) {
+-            m_private_subiface = new_name;
+-        } else if (!new_name.empty()) {
+-            LOG(WARNING) << "failed to rename iface=" << m_private_subiface << " to " << new_name
+-                        << ", keeping old name (VID retag already applied)";
++        network_utils::set_interface_state(new_subiface, true);
++        if (!bridge.empty() && !network_utils::linux_add_iface_to_bridge(bridge, new_subiface)) {
++            LOG(ERROR) << "failed to add recreated iface=" << new_subiface
++                       << " to bridge=" << bridge;
++            network_utils::delete_interface(new_subiface);
++            return false;
+         }
++
++        m_private_subiface = new_subiface;
++        LOG(DEBUG) << "trunk=" << m_trunk.iface_name << " recreated private subiface="
++                   << old_subiface << " -> " << new_subiface << " vid=" << cfg.private_vid
++                   << " bridge=" << bridge;
+     }
+ 
+     if (!m_guest_subiface.empty() && m_last_cfg.guest_vid != cfg.guest_vid) {
+-        if (!network_utils::set_vlan_interface_id(m_guest_subiface, cfg.guest_vid)) {
+-            LOG(ERROR) << "failed to retag iface=" << m_guest_subiface
+-                       << " to vid=" << cfg.guest_vid;
++        const auto old_subiface = m_guest_subiface;
++        const auto bridge       = network_utils::linux_iface_get_host_bridge(old_subiface);
++
++        if (!bridge.empty() && !network_utils::linux_remove_iface_from_bridge(bridge, old_subiface)) {
++            LOG(WARNING) << "failed to remove iface=" << old_subiface << " from bridge=" << bridge
++                         << " before recreating it, continuing (deleting the iface removes it "
++                            "from the bridge regardless)";
++        }
++        network_utils::delete_interface(old_subiface);
++        m_guest_subiface.clear();
++
++        const auto new_subiface =
++            network_utils::create_vlan_interface(m_trunk.iface_name, cfg.guest_vid);
++        if (new_subiface.empty()) {
++            LOG(ERROR) << "failed to recreate guest subiface for trunk=" << m_trunk.iface_name
++                       << " vid=" << cfg.guest_vid;
+             return false;
+         }
+ 
+-        const auto new_name =
+-            network_utils::build_vlan_interface_name(m_trunk.iface_name, cfg.guest_vid);
+-        if (!new_name.empty() && network_utils::rename_interface(m_guest_subiface, new_name)) {
+-            m_guest_subiface = new_name;
+-        } else if (!new_name.empty()) {
+-            LOG(WARNING) << "failed to rename iface=" << m_guest_subiface << " to " << new_name
+-                        << ", keeping old name (VID retag already applied)";
++        network_utils::set_interface_state(new_subiface, true);
++        if (!bridge.empty() && !network_utils::linux_add_iface_to_bridge(bridge, new_subiface)) {
++            LOG(ERROR) << "failed to add recreated iface=" << new_subiface
++                       << " to bridge=" << bridge;
++            network_utils::delete_interface(new_subiface);
++            return false;
+         }
++
++        m_guest_subiface = new_subiface;
++        LOG(DEBUG) << "trunk=" << m_trunk.iface_name << " recreated guest subiface="
++                   << old_subiface << " -> " << new_subiface << " vid=" << cfg.guest_vid
++                   << " bridge=" << bridge;
+     }
+ 
+     return true;
+diff --git a/agent/src/beerocks/slave/traffic_separation/trunk_port_plumbing_8021q.h b/agent/src/beerocks/slave/traffic_separation/trunk_port_plumbing_8021q.h
+index d252f25cd..bd0186493 100644
+--- a/agent/src/beerocks/slave/traffic_separation/trunk_port_plumbing_8021q.h
++++ b/agent/src/beerocks/slave/traffic_separation/trunk_port_plumbing_8021q.h
+@@ -50,13 +50,14 @@ public:
+ 
+ private:
+     /**
+-     * @brief Retag existing VLAN subinterfaces to match new VIDs in @a cfg, without
+-     * detaching them from their bridges.
++     * @brief Destroy and recreate the VLAN subinterface(s) whose VID differs from
++     * @a cfg, re-adding each new subinterface to the same bridge the old one was in.
++     * Subinterfaces whose VID is unchanged are left untouched.
+      *
+      * @param cfg New traffic separation configuration (bridges must be unchanged).
+-     * @return true on success, false if subinterfaces are missing or retag failed.
++     * @return true on success, false if subinterfaces are missing or recreation failed.
+      */
+-    bool retag_subifaces(const sTrafficSeparationConfig &cfg);
++    bool recreate_changed_subifaces(const sTrafficSeparationConfig &cfg);
+ 
+     /**
+      * @brief Trunk that is managed by current object
+diff --git a/common/beerocks/bcl/include/bcl/network/network_utils.h b/common/beerocks/bcl/include/bcl/network/network_utils.h
+index 19bfbbc68..a02051b03 100644
+--- a/common/beerocks/bcl/include/bcl/network/network_utils.h
++++ b/common/beerocks/bcl/include/bcl/network/network_utils.h
+@@ -280,31 +280,6 @@ public:
+     static std::string create_vlan_interface(const std::string &iface, uint16_t vid,
+                                              const std::string &suffix = {});
+ 
+-    /**
+-     * @brief Retags an existing VLAN interface with a new VLAN ID, in place.
+-     *
+-     * Unlike delete + create_vlan_interface(), this does not detach the
+-     * interface from its bridge, so the bridge port is not torn down and
+-     * does not have to re-traverse STP listening/learning states.
+-     *
+-     * @param vlan_iface Existing VLAN interface name (e.g. "wlan0.sta1.20").
+-     * @param new_vid New VLAN ID to apply.
+-     * @return true on success, false on error.
+-     */
+-    static bool set_vlan_interface_id(const std::string &vlan_iface, uint16_t new_vid);
+-
+-    /**
+-     * @brief Renames an existing network interface.
+-     *
+-     * Bridge membership and link state are tracked by kernel ifindex, not by
+-     * name, so renaming a bridge port does not detach it or affect STP state.
+-     *
+-     * @param old_name Current interface name.
+-     * @param new_name Desired new interface name.
+-     * @return true on success, false on error (e.g. if @a new_name is already in use).
+-     */
+-    static bool rename_interface(const std::string &old_name, const std::string &new_name);
+-
+     /**
+      * @brief Deletes network interface.
+      *
+diff --git a/common/beerocks/bcl/source/network/network_utils.cpp b/common/beerocks/bcl/source/network/network_utils.cpp
+index 64589fcb0..8c2e7b01f 100644
+--- a/common/beerocks/bcl/source/network/network_utils.cpp
++++ b/common/beerocks/bcl/source/network/network_utils.cpp
+@@ -1538,82 +1538,6 @@ std::string network_utils::create_vlan_interface(const std::string &iface, uint1
+     return new_iface_name;
+ }
+ 
+-bool network_utils::set_vlan_interface_id(const std::string &vlan_iface, uint16_t new_vid)
+-{
+-    if (vlan_iface.empty()) {
+-        LOG(ERROR) << "vlan_iface is empty!";
+-        return false;
+-    }
+-
+-    if (new_vid < net::MIN_VLAN_ID || new_vid > net::MAX_VLAN_ID) {
+-        LOG(ERROR) << "Given VID is invalid: " << new_vid;
+-        return false;
+-    }
+-
+-    if (!linux_iface_exists(vlan_iface)) {
+-        LOG(ERROR) << "vlan_iface=" << vlan_iface << " does not exist";
+-        return false;
+-    }
+-
+-    // Command example:
+-    // ip link set wlan0.sta1.20 type vlan id 30
+-    std::string cmd;
+-    cmd.reserve(64);
+-    cmd.assign("ip link set ")
+-        .append(vlan_iface)
+-        .append(" type vlan id ")
+-        .append(std::to_string(new_vid));
+-
+-    if (beerocks::os_utils::system_call(cmd) != 0) {
+-        LOG(ERROR) << "Failed to retag iface=" << vlan_iface << " to vid=" << new_vid;
+-        return false;
+-    }
+-
+-    return true;
+-}
+-
+-bool network_utils::rename_interface(const std::string &old_name, const std::string &new_name)
+-{
+-    if (old_name.empty() || new_name.empty()) {
+-        LOG(ERROR) << "old_name/new_name must not be empty!";
+-        return false;
+-    }
+-
+-    if (old_name == new_name) {
+-        return true;
+-    }
+-
+-    if (!linux_iface_exists(old_name)) {
+-        LOG(ERROR) << "old_name=" << old_name << " does not exist";
+-        return false;
+-    }
+-
+-    if (linux_iface_exists(new_name)) {
+-        LOG(ERROR) << "new_name=" << new_name << " already exists";
+-        return false;
+-    }
+-
+-    // Bridge port membership and link state are keyed by ifindex, not name, so
+-    // renaming a live/forwarding bridge port does not detach it and does not
+-    // affect its current bridge/STP state. The interface is intentionally left
+-    // up during the rename.
+-    //
+-    // Command example:
+-    // ip link set wlan0.sta1.492 name wlan0.sta1.4092
+-    std::string cmd;
+-    cmd.reserve(64);
+-    cmd.assign("ip link set ").append(old_name).append(" name ").append(new_name);
+-
+-    beerocks::os_utils::system_call(cmd);
+-
+-    if (!linux_iface_exists(new_name)) {
+-        LOG(ERROR) << "Failed to rename iface '" << old_name << "' to '" << new_name << "'";
+-        return false;
+-    }
+-
+-    return true;
+-}
+-
+ void network_utils::delete_interface(const std::string &iface)
+ {
+     if (iface.empty()) {
+-- 
+2.34.1
+
