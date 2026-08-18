@@ -1,0 +1,107 @@
+From 74285aa6234c9e335d26988425d98ae4fc618ddc Mon Sep 17 00:00:00 2001
+From: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+Date: Thu, 13 Aug 2026 14:31:21 +0530
+Subject: [PATCH] Fix Topology Display In Ethernet Daisy Chains
+
+Signed-off-by: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+---
+ .../src/beerocks/master/db/network_map.cpp    | 55 ++++++++++++++++---
+ 1 file changed, 47 insertions(+), 8 deletions(-)
+
+diff --git a/controller/src/beerocks/master/db/network_map.cpp b/controller/src/beerocks/master/db/network_map.cpp
+index 92c5d88c0..b7ee55984 100644
+--- a/controller/src/beerocks/master/db/network_map.cpp
++++ b/controller/src/beerocks/master/db/network_map.cpp
+@@ -220,8 +220,8 @@ std::ptrdiff_t network_map::fill_bml_node_data(db &database, std::string node_ma
+     return 0;
+ }
+ 
+-auto process_backhaul = [](db &database, std::shared_ptr<Station> backhaul, BML_NODE *node,
+-                           bool is_gateway) {
++auto process_backhaul = [](db &database, std::shared_ptr<Agent> agent,
++                           std::shared_ptr<Station> backhaul, BML_NODE *node, bool is_gateway) {
+ 
+     // Gracefully return if the agent is a gateway - gateways don't have backhaul connections
+     if (is_gateway) {
+@@ -256,9 +256,32 @@ auto process_backhaul = [](db &database, std::shared_ptr<Station> backhaul, BML_
+         } else if (backhaul->get_eth_switch()) {
+             tlvf::mac_from_string(node->parent_bssid,
+                                   tlvf::mac_to_string(backhaul->get_eth_switch()->mac));
+-            tlvf::mac_from_string(node->parent_bridge,
+-                                  tlvf::mac_to_string(database.get_eth_switch_parent_agent(
+-                                      backhaul->get_eth_switch()->mac)));
++
++            // Prefer the graph-inferred wired parent (topology_task BFS over the real
++            // IEEE1905 Ethernet-neighbor graph) over the join-time placeholder, which
++            // always defaults to the GW's LAN switch and cannot reflect daisy-chaining.
++            sMacAddr parent_bridge_mac =
++                database.get_eth_switch_parent_agent(backhaul->get_eth_switch()->mac);
++            if (agent->backhaul.backhaul_iface_type == beerocks::IFACE_TYPE_ETHERNET) {
++                auto inferred_parent = agent->backhaul.parent_agent.lock();
++                if (inferred_parent) {
++                    LOG(DEBUG) << "Using graph-inferred wired parent "
++                               << inferred_parent->al_mac << " for " << agent->al_mac
++                               << " (placeholder was " << parent_bridge_mac << ")";
++                    parent_bridge_mac = inferred_parent->al_mac;
++
++                    // node->parent_bssid (not parent_bridge) is what the BML CLI actually
++                    // uses to nest agents (beerocks_cli_bml.cpp matches it against eachgit sho
++                    // parent's own computed Ethernet-switch MAC). Recompute it here so the
++                    // graph-inferred parent is reflected in the tree, not just in
++                    // parent_bridge which the CLI never reads.
++                    sMacAddr inferred_parent_eth_sw_mac =
++                        network_utils::get_eth_sw_mac_from_bridge_mac(inferred_parent->al_mac);
++                    tlvf::mac_from_string(node->parent_bssid,
++                                          tlvf::mac_to_string(inferred_parent_eth_sw_mac));
++                }
++            }
++            tlvf::mac_from_string(node->parent_bridge, tlvf::mac_to_string(parent_bridge_mac));
+         }
+     }
+ };
+@@ -408,7 +431,7 @@ std::ptrdiff_t network_map::fill_bml_agent_data(db &database, std::shared_ptr<Ag
+     // remote bridge
+     tlvf::mac_from_string(node->data.gw_ire.backhaul_mac, tlvf::mac_to_string(agent->parent_mac));
+ 
+-    process_backhaul(database, database.get_station(agent->parent_mac), node, agent->is_gateway);
++    process_backhaul(database, agent, database.get_station(agent->parent_mac), node, agent->is_gateway);
+ 
+     network_utils::ipv4_from_string(node->ip_v4, agent->ipv4);
+     string_utils::copy_string(node->name, agent->name.c_str(), sizeof(node->name));
+@@ -424,7 +447,7 @@ std::ptrdiff_t network_map::fill_bml_agent_data(db &database, std::shared_ptr<Ag
+         }
+         tlvf::mac_to_array(radio.first, node->data.gw_ire.radio[i].radio_mac);
+         //Useful for scenarios where radio mac address and the station interface mac address are same.
+-        process_backhaul(database, database.get_station(radio.first), node, agent->is_gateway);
++        process_backhaul(database, agent, database.get_station(radio.first), node, agent->is_gateway);
+ 
+         unsigned vap_id = 0;
+         for (const auto &bss : radio.second->bsses) {
+@@ -481,7 +504,23 @@ std::ptrdiff_t network_map::fill_bml_agent_data(db &database, std::shared_ptr<Ag
+     }
+     auto station = database.get_station(agent->parent_mac);
+     if (station) {
+-    process_backhaul(database, station, node, agent->is_gateway);
++    process_backhaul(database, agent, station, node, agent->is_gateway);
++    } else if (agent->backhaul.backhaul_iface_type == beerocks::IFACE_TYPE_ETHERNET &&
++               agent->backhaul.parent_agent.lock()) {
++    // No Station object was created for agent->parent_mac (common for intermediate
++    // daisy-chain agents), so process_backhaul can't run its normal lookup. Synthesize
++    // parent_bssid/parent_bridge directly from the graph-inferred wired parent instead
++    // of skipping backhaul processing entirely, which left these agents unparented in
++    // the BML CLI tree.
++    auto inferred_parent = agent->backhaul.parent_agent.lock();
++    LOG(DEBUG) << "No station for parent MAC "
++               << tlvf::mac_to_string(agent->parent_mac) << ", using graph-inferred wired "
++               << "parent " << inferred_parent->al_mac << " for " << agent->al_mac;
++    node->isWiFiBH = false;
++    sMacAddr inferred_parent_eth_sw_mac =
++        network_utils::get_eth_sw_mac_from_bridge_mac(inferred_parent->al_mac);
++    tlvf::mac_from_string(node->parent_bssid, tlvf::mac_to_string(inferred_parent_eth_sw_mac));
++    tlvf::mac_from_string(node->parent_bridge, tlvf::mac_to_string(inferred_parent->al_mac));
+     } else {
+     LOG(WARNING) << "Parent station not found for MAC "
+                  << tlvf::mac_to_string(agent->parent_mac)
+-- 
+2.34.1
+
