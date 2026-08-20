@@ -1,0 +1,926 @@
+From 224bdef46b9586b3d2800cc5da8139e31c1c475b Mon Sep 17 00:00:00 2001
+From: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+Date: Wed, 19 Aug 2026 10:17:46 +0530
+Subject: [PATCH] prplMesh: fix MLO per-link STA metrics and MLD data model
+ tracking
+
+Per-link metrics for MLO clients were wrong at every stage of the path, and
+the resulting absence of a valid per-link SNR left steering permanently
+blocked with "no SNR measurement".
+
+- nl80211: NL80211_ATTR_MAC is not a dump-side filter, so a GET_STATION dump
+  returns every station on the netdev. get_sta_info() overwrote sta_info on
+  each message and returned whichever station came last in the dump, so all
+  links of all MLDs resolved to the same station. Match the requested MAC and
+  return false when it is absent, so callers emit RCPI=220 ("not measured")
+  rather than a borrowed reading.
+
+- agent: the station table is keyed by MLD MAC only, with the per-link
+  breakdown nested under NL80211_ATTR_MLO_LINKS, so per-link queries by
+  affiliated-link MAC never matched. Key the query by MLD MAC and keep
+  passing the per-link interface name, whose encoded link ID selects the
+  nested block.
+
+- agent: TLV 0xa2 summed every per-monitor report of the same MLD MAC, but
+  each monitor reports the MLD-wide aggregate, multiplying every counter by
+  the affiliated-link count. Dedup per query round instead, with the state
+  spanning all handle_ap_metrics_response() calls in the round rather than
+  only the BSS iterations within one call.
+
+- agent: the legacy branch of process_client_association() erased the
+  associated_sta_mlds entry, so an MLO client reclassified as SLO lost its
+  MLD tracking and TLV 0x96 fell back to aggregate emission. Add
+  erase_mlo_entry to AgentDB::erase_client(), defaulting to true, and pass
+  false there.
+
+- agent: m_radio_mac is overwritten with the AP MLD MAC on MLO "_link<N>"
+  monitor interfaces, but radio_uid must always be the physical radio MAC.
+  Keep it in m_physical_radio_mac for the Metric Reporting Policy gate and
+  Profile-2 Radio Metrics.
+
+- controller: a STAMLD instance was only pruned when the Topology Response
+  carried an AssociatedStaMldConfigurationReport, which an agent the client
+  has roamed away from never sends, leaving a stale duplicate under the
+  previous agent. Drop registrations held under a different AP MLD before
+  creating the live instance, and reconcile on every Topology Response,
+  pruning only STA MLDs the database independently agrees have left.
+
+- controller: STAMLD_ADDED fired only for newly-created instances, so a STA
+  steering back to a previously-visited AP reused the instance and left
+  qmesh-lib's path DB stale, blocking the per-link SNR getter. Fire it
+  unconditionally; db_add_sta_mld() updates in place and is idempotent.
+
+- controller: dm_set_sta_link_metrics() resolved the radio via
+  get_radio_by_bssid(), which fails for an AP MLD MAC since that is never
+  registered as a standalone BSS. Fall back to matching the MLD MAC against
+  each agent's ap_mlds and resolving the radio from the first affiliated AP.
+
+Debug logging on this path is retained deliberately while it is still under
+investigation.
+
+Signed-off-by: Sureshkumar <suresure@qti.qualcomm.com>
+Signed-off-by: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 |   6 +
+ .../fronthaul_manager/monitor/monitor.cpp     |  28 +++-
+ .../fronthaul_manager/monitor/monitor.h       |  14 +-
+ agent/src/beerocks/slave/agent_db.cpp         |   7 +-
+ agent/src/beerocks/slave/agent_db.h           |   9 +-
+ agent/src/beerocks/slave/son_slave_thread.cpp |  11 +-
+ .../tasks/link_metrics_collection_task.cpp    | 149 +++++++++---------
+ .../tasks/link_metrics_collection_task.h      |  19 +--
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |   4 +
+ .../bwl/shared/nl80211_client_impl.cpp        |  80 +++++++++-
+ controller/src/beerocks/master/db/db.cpp      | 129 ++++++++++++++-
+ .../beerocks/master/tasks/topology_task.cpp   |  71 ++++++++-
+ 12 files changed, 413 insertions(+), 114 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index a1b2c0066..b7efbaa33 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -3421,6 +3421,10 @@ bool ApManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+         std::string client_mac = tlvf::mac_to_string(msg->params.mac);
+ 
+         LOG(INFO) << "STA_Connected mac = " << client_mac << " BSSID = " << msg->params.bssid;
++        LOG(DEBUG) << "STA_Connected DBG(a): mac=" << client_mac
++                   << " is_mlo=" << int(msg->params.is_mlo)
++                   << " num_affiliated_sta=" << int(msg->params.num_affiliated_sta)
++                   << " vap_id=" << int(msg->params.vap_id);
+ 
+         auto notification = message_com::create_vs_message<
+             beerocks_message::cACTION_APMANAGER_CLIENT_ASSOCIATED_NOTIFICATION>(cmdu_tx);
+@@ -3485,6 +3489,8 @@ bool ApManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+ 
+         if (m_mlo_sta_registry) {
+             m_mlo_sta_registry->set_affiliated(msg->params.mac, msg->params.is_mlo);
++            LOG(DEBUG) << "STA_Connected DBG(a): registry set_affiliated mac=" << client_mac
++                       << " is_mlo=" << int(msg->params.is_mlo);
+         }
+ 
+         send_cmdu(cmdu_tx);
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+index f4f7232cb..c254950a7 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+@@ -79,6 +79,10 @@ Monitor::Monitor(const std::string &monitor_iface_,
+     } else {
+         m_radio_mac = tlvf::mac_from_string(radio_mac);
+     }
++    // m_physical_radio_mac must stay the physical radio's own MAC even for MLO "_link<N>"
++    // interfaces (see thread_init(), where m_radio_mac itself gets overwritten with the AP
++    // MLD MAC). Seed it here from the same ioctl lookup; refreshed below for the UCI fallback.
++    m_physical_radio_mac = m_radio_mac;
+ 
+     auto radio_node = mon_db.get_radio_node();
+     radio_node->set_iface(monitor_iface);
+@@ -119,7 +123,8 @@ Monitor::Monitor(const std::string &monitor_iface_,
+         std::string uci_mac;
+         if (beerocks::bpl::bpl_cfg_get_radio_mac_by_phy(monitor_iface, uci_mac) &&
+             !uci_mac.empty()) {
+-            m_radio_mac = tlvf::mac_from_string(uci_mac);
++            m_radio_mac          = tlvf::mac_from_string(uci_mac);
++            m_physical_radio_mac = m_radio_mac;
+             LOG(INFO) << "Got radio MAC from UCI for phy " << monitor_iface << ": " << m_radio_mac;
+         } else {
+             LOG(WARNING) << "No macaddr in UCI for phy " << monitor_iface
+@@ -464,7 +469,8 @@ bool Monitor::monitor_fsm()
+             if (m_radio_mac == beerocks::net::network_utils::ZERO_MAC) {
+                 std::string hal_radio_mac = mon_wlan_hal->get_radio_mac();
+                 if (!hal_radio_mac.empty()) {
+-                    m_radio_mac = tlvf::mac_from_string(hal_radio_mac);
++                    m_radio_mac          = tlvf::mac_from_string(hal_radio_mac);
++                    m_physical_radio_mac = m_radio_mac;
+                     LOG(INFO) << "Updated m_radio_mac from HAL API post-attach: " << m_radio_mac
+                               << " for interface " << monitor_iface;
+                 } else {
+@@ -1099,8 +1105,13 @@ bool Monitor::create_ap_metrics_response(uint16_t mid, const std::vector<sMacAdd
+                     }
+                 }
+ 
+-                if (m_mlo_sta_registry &&
+-                    m_mlo_sta_registry->is_affiliated(tlvf::mac_from_string(sta_mac))) {
++                bool sta_is_affiliated = m_mlo_sta_registry &&
++                                         m_mlo_sta_registry->is_affiliated(
++                                             tlvf::mac_from_string(sta_mac));
++                LOG(DEBUG) << "AP_Metrics_Response DBG(a): sta=" << sta_mac
++                           << " registry_present=" << (m_mlo_sta_registry ? "yes" : "no")
++                           << " is_affiliated=" << (sta_is_affiliated ? "true" : "false");
++                if (sta_is_affiliated) {
+                     if (!mon_stats.add_affiliated_sta_metrics(cmdu_tx, *sta_node)) {
+                         LOG(ERROR) << "Failed to add Affiliated STA metrics tlv";
+                         return false;
+@@ -1115,7 +1126,7 @@ bool Monitor::create_ap_metrics_response(uint16_t mid, const std::vector<sMacAdd
+         }
+     }
+ 
+-    if (!mon_stats.add_radio_metrics(cmdu_tx, m_radio_mac, *mon_db.get_radio_node())) {
++    if (!mon_stats.add_radio_metrics(cmdu_tx, m_physical_radio_mac, *mon_db.get_radio_node())) {
+         LOG(ERROR) << "Failed to add radio metrics.";
+         return false;
+     }
+@@ -2223,9 +2234,12 @@ void Monitor::handle_multi_ap_policy_config_request(ieee1905_1::CmduMessageRx &c
+             auto metrics_reporting_conf = std::get<1>(tuple);
+ 
+             /**
+-             * Skip configurations not addressed to this radio
++             * Skip configurations not addressed to this radio. radio_uid is always the
++             * controller's view of this radio's physical MAC (never an MLD MAC), so compare
++             * against m_physical_radio_mac - not m_radio_mac, which thread_init() overwrites
++             * with the AP MLD MAC for MLO "_link<N>" monitor interfaces.
+              */
+-            if (metrics_reporting_conf.radio_uid != m_radio_mac) {
++            if (metrics_reporting_conf.radio_uid != m_physical_radio_mac) {
+                 continue;
+             }
+ 
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.h b/agent/src/beerocks/fronthaul_manager/monitor/monitor.h
+index e6eca3cb4..bbaf4e78d 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.h
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.h
+@@ -116,10 +116,22 @@ private:
+     /**
+      * MAC address of the radio interface that this monitor instance operates on.
+      * It is obtained by getting the MAC address of the monitor interface provided as parameter in
+-     * constructor.
++     * constructor. For an MLO "_link<N>" monitor interface, thread_init() overwrites this with
++     * the AP MLD MAC instead (needed for nl80211 per-link lookups such as get_bss_link_name()) -
++     * see m_physical_radio_mac below for the value that must stay physical-radio-scoped.
+      */
+     sMacAddr m_radio_mac;
+ 
++    /**
++     * Physical radio MAC address, distinct from m_radio_mac for MLO "_link<N>" monitor
++     * interfaces. The controller's radio_uid (Metric Reporting Policy TLV, and the radio_uid
++     * this agent reports back in Profile-2 Radio Metrics) is always the physical radio's own
++     * MAC - never an MLD MAC - so any comparison/report against the controller's radio_uid must
++     * use this member, not m_radio_mac. Equal to m_radio_mac except when m_radio_mac has been
++     * overwritten with an MLD MAC in thread_init().
++     */
++    sMacAddr m_physical_radio_mac;
++
+     std::string monitor_iface;
+ 
+     /**
+diff --git a/agent/src/beerocks/slave/agent_db.cpp b/agent/src/beerocks/slave/agent_db.cpp
+index 3874efd8c..3825a3edc 100644
+--- a/agent/src/beerocks/slave/agent_db.cpp
++++ b/agent/src/beerocks/slave/agent_db.cpp
+@@ -130,7 +130,7 @@ const AgentDB::sRadio *AgentDB::get_radio_by_mac(const sMacAddr &mac, eMacType m
+     return radio_it == m_radios.end() ? nullptr : &(*radio_it);
+ }
+ 
+-void AgentDB::erase_client(const sMacAddr &client_mac, sMacAddr bssid)
++void AgentDB::erase_client(const sMacAddr &client_mac, sMacAddr bssid, bool erase_mlo_entry)
+ {
+ 
+     if (bssid != net::network_utils::ZERO_MAC) {
+@@ -150,7 +150,10 @@ void AgentDB::erase_client(const sMacAddr &client_mac, sMacAddr bssid)
+         }
+     }
+ 
+-    // Always remove MLO client entry if present independent from bssid argument
++    if (!erase_mlo_entry) {
++        return;
++    }
++
+     auto mld_it = associated_sta_mlds.find(client_mac);
+     if (mld_it != associated_sta_mlds.end()) {
+         LOG(DEBUG) << "Removing MLO client from associated_sta_mlds: STA MLD=" << client_mac
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index fc66e608a..400b30887 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -727,13 +727,18 @@ public:
+      * @brief Erase client from associated_clients list.
+      * If @a bssid is given, then remove client only from its radio, otherwise remove from all
+      * radios.
+-     * Also removes MLO client entry from associated_sta_mlds if present independent from bssid argument.
+      *
+      * @param client_mac The client MAC address.
+      * @param bssid The bssid that the client will be removed from its radio. Defaults to ZERO_MAC
+      *              to remove from all radios.
++     * @param erase_mlo_entry If true (default), also erase the matching associated_sta_mlds
++     *              entry, if present. Callers that are merely reclassifying an existing MLO
++     *              client's association (e.g. a subsequent notification resolved as legacy)
++     *              must pass false, so a live MLD entry is not destroyed by an unrelated
++     *              association-bookkeeping call.
+      */
+-    void erase_client(const sMacAddr &client_mac, sMacAddr bssid = net::network_utils::ZERO_MAC);
++    void erase_client(const sMacAddr &client_mac, sMacAddr bssid = net::network_utils::ZERO_MAC,
++                       bool erase_mlo_entry = true);
+ 
+     /**
+      * @brief Get the MAC address (or bssid) of an AP based on the ruid and ssid.
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 1df2e01f6..6b856c96f 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -3099,10 +3099,13 @@ bool slave_thread::process_client_association(
+         } else {
+             // Erase client details to clear any previous association information.
+             // This is needed during steering and roaming operations to ensure clean state.
+-            // Note: This erase operation is NOT applicable for MLO clients - we do not delete
+-            // MLO station entries from associated_sta_mlds when MLO station associates,
+-            // as MLO clients maintain their association across multiple links.
+-            db->erase_client(client_mac);
++            // Note: erase_mlo_entry=false - this erase operation is NOT applicable for MLO
++            // clients. Do not delete MLO station entries from associated_sta_mlds just
++            // because a subsequent notification for the same client_mac was classified as
++            // legacy (e.g. an MLO->SLO steer) - MLO clients maintain their association
++            // across multiple links, and the associated_sta_mlds entry is only cleaned up
++            // by the disconnect handler once all affiliated links are actually gone.
++            db->erase_client(client_mac, net::network_utils::ZERO_MAC, /*erase_mlo_entry=*/false);
+ 
+             radio->associated_clients.emplace(
+                 client_mac, AgentDB::sRadio::sClient{bssid, notification_in->association_frame_length(),
+diff --git a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+index c16b31347..ea1831535 100644
+--- a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+@@ -1143,11 +1143,11 @@ bool LinkMetricsCollectionTask::send_ap_metric_query_message(
+     ap_metric_queries.clear();
+     pending_responses = 0;
+ 
+-    /* New query round starting for this mid — reset the TLV 0x96 dedup set
+-     * and the TLV 0xa2 accumulator so stale data from a previous round can't
+-     * suppress a fresh TLV, or get summed into this round's totals. */
++    /* New query round starting for this mid — reset the TLV 0x96 and TLV 0xa2
++     * dedup sets so stale data from a previous round can't suppress a fresh
++     * TLV. */
+     m_collected_link_sta_macs.clear();
+-    m_traffic_stats_accumulator.clear();
++    m_collected_traffic_sta_macs.clear();
+ 
+     for (const auto radio : db->get_radios_list()) {
+         if (!radio) {
+@@ -1313,20 +1313,19 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+ 
+     LOG(INFO) << "Found AP_Metrics_Query map for MID : " << std::hex << mid_index;
+ 
+-    /* TLV 0x96 dedup set / TLV 0xa2 accumulator are members
+-     * (m_collected_link_sta_macs, m_traffic_stats_accumulator), NOT locals,
++    /* TLV 0x96 / TLV 0xa2 dedup sets are members
++     * (m_collected_link_sta_macs, m_collected_traffic_sta_macs), NOT locals,
+      * because they must persist across every handle_ap_metrics_response()
+      * call in this query round — one call per radio/monitor — not just
+      * across the BSS iterations within a single call.  Otherwise an MLO STA
+      * reported by 2 monitors in the same round gets deduped independently in
+      * each call and still ends up duplicated in m_ap_metric_response (e.g. 2
+-     * links x 2 monitor calls = 4 TLV 0x96 instead of 2), and each monitor's
+-     * TLV 0xa2 only carries that monitor's own link -- summing across calls
+-     * is required to reach the true MLD-level aggregate.
++     * links x 2 monitor calls = 4 TLV 0x96 instead of 2), and its TLV 0xa2
++     * MLD-level aggregate is emitted once per monitor instead of once.
+      * They are cleared alongside m_ap_metric_response: at the start of a new
+      * query round and once the round completes. */
+-    auto &collected_link_sta_macs   = m_collected_link_sta_macs;
+-    auto &traffic_stats_accumulator = m_traffic_stats_accumulator;
++    auto &collected_link_sta_macs    = m_collected_link_sta_macs;
++    auto &collected_traffic_sta_macs = m_collected_traffic_sta_macs;
+ 
+     for (const auto &ap_metrics_tlv : ap_metrics_tlv_list) {
+         wfa_map::tlvApExtendedMetrics *ap_extended_metrics_tlv     = 0;
+@@ -1412,59 +1411,50 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+         /* Associated STA Traffic Stats (TLV 0xa2) — MLD-level aggregate stats.
+          * One TLV 0xa2 per MLD STA across all BSS iterations/monitor calls.
+          *
+-         * Each monitor only reports the traffic it observes on its own
+-         * BSS/link, so for an MLO STA present on multiple monitors, the
+-         * per-monitor reports are partial views tagged with the same MLD
+-         * MAC. traffic_stats_accumulator sums the per-field counters across
+-         * every monitor call in this round so the emitted TLV reflects the
+-         * true MLD-level aggregate instead of just the first monitor seen. */
++         * Every monitor an MLO STA is present on reports the *same* complete
++         * MLD-level aggregate, because the driver keeps a single station entry
++         * per MLD, keyed by MLD MAC, whose top-level NL80211_ATTR_STA_INFO
++         * already holds the MLD-wide totals (the per-link breakdown lives in
++         * the nested NL80211_ATTR_MLO_LINKS, and is reported separately in
++         * TLV 0xe4).  The per-monitor reports are therefore duplicates, not
++         * partial views: keep the first and drop the rest.  Summing them
++         * scales every counter by the number of affiliated links.
++         * Deduplication is handled by collected_traffic_sta_macs declared
++         * above, which spans the whole query round. */
+ 
+         std::vector<sStaTrafficStats> traffic_stats_response;
+ 
+-        {
+-            auto sta_traffic_list = cmdu_rx.getClassList<wfa_map::tlvAssociatedStaTrafficStats>();
+-            for (const auto &sta_traffic : sta_traffic_list) {
+-                if (!sta_traffic) {
+-                    LOG(ERROR) << "Failed to get class list for tlvAssociatedStaTrafficStats";
+-                    continue;
+-                }
++        for (const auto &sta_traffic :
++             cmdu_rx.getClassList<wfa_map::tlvAssociatedStaTrafficStats>()) {
++            if (!sta_traffic) {
++                LOG(ERROR) << "Failed to get class list for tlvAssociatedStaTrafficStats";
++                continue;
++            }
+ 
+-                const sMacAddr &sta_mac = sta_traffic->sta_mac();
+-
+-                auto assoc_client = radio->associated_clients.find(sta_mac);
+-                if (assoc_client != radio->associated_clients.end() &&
+-                    (assoc_client->second.bssid == metric.bssid ||
+-                     (bss_apmld_mac != net::network_utils::ZERO_MAC &&
+-                      assoc_client->second.bssid == bss_apmld_mac))) {
+-                    auto acc_it = traffic_stats_accumulator.find(sta_mac);
+-                    if (acc_it == traffic_stats_accumulator.end()) {
+-                        /* First monitor report for this STA MAC this round */
+-                        sStaTrafficStats stats{
+-                            sta_mac,
+-                            sta_traffic->byte_sent(),
+-                            sta_traffic->byte_received(),
+-                            sta_traffic->packets_sent(),
+-                            sta_traffic->packets_received(),
+-                            sta_traffic->tx_packets_error(),
+-                            sta_traffic->rx_packets_error(),
+-                            sta_traffic->retransmission_count(),
+-                        };
+-                        traffic_stats_accumulator.emplace(sta_mac, stats);
+-                        traffic_stats_response.push_back(stats);
+-                    } else {
+-                        /* Additional monitor report for a STA MAC already seen
+-                         * this round (MLO STA on another link) — sum into the
+-                         * existing accumulated entry rather than discarding it. */
+-                        sStaTrafficStats &acc = acc_it->second;
+-                        acc.byte_sent += sta_traffic->byte_sent();
+-                        acc.byte_received += sta_traffic->byte_received();
+-                        acc.packets_sent += sta_traffic->packets_sent();
+-                        acc.packets_received += sta_traffic->packets_received();
+-                        acc.tx_packets_error += sta_traffic->tx_packets_error();
+-                        acc.rx_packets_error += sta_traffic->rx_packets_error();
+-                        acc.retransmission_count += sta_traffic->retransmission_count();
+-                    }
+-                }
++            const sMacAddr &sta_mac = sta_traffic->sta_mac();
++
++            /* Skip if already collected (dedup for MLO STAs reported on
++             * multiple BSSes and across monitor calls in the same round) */
++            if (collected_traffic_sta_macs.count(sta_mac)) {
++                continue;
++            }
++
++            auto assoc_client = radio->associated_clients.find(sta_mac);
++            if (assoc_client != radio->associated_clients.end() &&
++                (assoc_client->second.bssid == metric.bssid ||
++                 (bss_apmld_mac != net::network_utils::ZERO_MAC &&
++                  assoc_client->second.bssid == bss_apmld_mac))) {
++                traffic_stats_response.push_back({
++                    sta_mac,
++                    sta_traffic->byte_sent(),
++                    sta_traffic->byte_received(),
++                    sta_traffic->packets_sent(),
++                    sta_traffic->packets_received(),
++                    sta_traffic->tx_packets_error(),
++                    sta_traffic->rx_packets_error(),
++                    sta_traffic->retransmission_count(),
++                });
++                collected_traffic_sta_macs.insert(sta_mac);
+             }
+         }
+ 
+@@ -1562,8 +1552,15 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+                      * traffic and would misrepresent an idle link's real RSSI. */
+                     const std::string link_iface = get_link_iface_by_bssid(db, aff_sta.bssid);
+                     sPerLinkStaInfo   link_info;
++                    /* Look the station up by its *MLD* MAC, not by the
++                     * affiliated-link MAC: the driver's station table on the
++                     * base netdev is keyed by MLD MAC only, and the per-link
++                     * breakdown lives in that single entry's nested
++                     * NL80211_ATTR_MLO_LINKS. get_sta_info() selects the right
++                     * nested link using the link ID encoded in link_iface, so
++                     * passing the link MAC here matches no dump entry at all. */
+                     const bool got_link_info = get_link_sta_info_nl80211(
+-                        link_iface, aff_sta.affiliated_sta_mac, link_info);
++                        link_iface, mld_info_ptr->mld_config.sta_mld_mac, link_info);
+ 
+                     int  link_signal_dbm  = 0;
+                     bool link_signal_used = false;
+@@ -1589,7 +1586,13 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+                     }
+                     LOG(DEBUG) << "TLV 0x96: affiliated_sta=" << aff_sta.affiliated_sta_mac
+                                << " bssid=" << aff_sta.bssid << " iface=" << link_iface
++                               << " key=" << mld_info_ptr->mld_config.sta_mld_mac
++                               << " nl80211=" << (got_link_info ? "ok" : "QUERY_FAILED")
+                                << " signal=" << link_signal_dbm << " dBm"
++                               << " sig=" << int(link_info.signal_dbm)
++                               << " sig_valid=" << link_info.signal_valid
++                               << " sig_avg=" << int(link_info.signal_avg_dbm)
++                               << " sig_avg_valid=" << link_info.signal_avg_valid
+                                << " rcpi=" << int(per_link_info.sta_measured_uplink_rcpi_dbm_enc);
+ 
+                     link_metrics_response.push_back({aff_sta.affiliated_sta_mac, per_link_info});
+@@ -1779,16 +1782,7 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+         ap_extended_metrics_tlv->multicast_bytes_received() =
+             response.extended_metric.multicast_bytes_received;
+ 
+-        for (auto &stat_snapshot : response.sta_traffic_stats) {
+-            /* response.sta_traffic_stats holds a snapshot captured the first
+-             * time this STA MAC was seen in the round; for an MLO STA seen on
+-             * multiple monitors, later calls sum their counters into
+-             * m_traffic_stats_accumulator instead of updating this snapshot.
+-             * Look up the final, fully-summed totals by MAC before emitting. */
+-            auto acc_it = m_traffic_stats_accumulator.find(stat_snapshot.sta_mac);
+-            const sStaTrafficStats &stat =
+-                (acc_it != m_traffic_stats_accumulator.end()) ? acc_it->second : stat_snapshot;
+-
++        for (auto &stat : response.sta_traffic_stats) {
+             auto sta_traffic_response_tlv =
+                 m_cmdu_tx.addClass<wfa_map::tlvAssociatedStaTrafficStats>();
+ 
+@@ -2040,8 +2034,11 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+                     const std::string link_iface_e4 =
+                         get_link_iface_by_bssid(db, aff_sta.bssid);
+                     sPerLinkStaInfo link_info_e4;
+-                    if (get_link_sta_info_nl80211(link_iface_e4, aff_sta.affiliated_sta_mac,
+-                                                  link_info_e4)) {
++                    /* Keyed by MLD MAC, per-link block selected by the link ID
++                     * in link_iface_e4 — see the TLV 0x96 site above. */
++                    const bool got_link_info_e4 = get_link_sta_info_nl80211(
++                        link_iface_e4, mld_info_ptr->mld_config.sta_mld_mac, link_info_e4);
++                    if (got_link_info_e4) {
+                         link_tx_bytes   = link_info_e4.tx_bytes;
+                         link_rx_bytes   = link_info_e4.rx_bytes;
+                         link_tx_packets = link_info_e4.tx_packets;
+@@ -2061,8 +2058,10 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+                     affiliated_sta_metrics_tlv->packets_received()    = link_rx_packets;
+                     affiliated_sta_metrics_tlv->packets_sent_errors() = link_tx_failed;
+                     LOG(DEBUG) << "TLV 0xe4: affiliated_sta=" << aff_sta.affiliated_sta_mac
+-                               << " mld_mac=" << stat.sta_mac
++                               << " mld_mac=" << mld_info_ptr->mld_config.sta_mld_mac
++                               << " stat_sta_mac=" << stat.sta_mac
+                                << " iface=" << link_iface_e4
++                               << " nl80211=" << (got_link_info_e4 ? "ok" : "QUERY_FAILED")
+                                << " tx_bytes=" << link_tx_bytes
+                                << " rx_bytes=" << link_rx_bytes
+                                << " tx_pkts=" << link_tx_packets
+@@ -2119,7 +2118,7 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+     m_ap_metric_response.clear();
+     m_radio_ap_metric_response.clear();
+     m_collected_link_sta_macs.clear();
+-    m_traffic_stats_accumulator.clear();
++    m_collected_traffic_sta_macs.clear();
+ 
+     LOG(DEBUG) << "Sending AP_METRICS_RESPONSE_MESSAGE, mid=" << std::hex << mid;
+     m_btl_ctx.send_cmdu_to_controller({}, m_cmdu_tx);
+diff --git a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.h b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.h
+index 3e0223329..20655b7c6 100644
+--- a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.h
++++ b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.h
+@@ -316,21 +316,22 @@ private:
+ 
+     std::vector<sApMetricsResponse> m_ap_metric_response;
+ 
+-    /* TLV 0x96 dedup set / TLV 0xa2 accumulator — scoped to the lifetime of a
+-     * single AP_METRICS query round (same lifetime as m_ap_metric_response),
++    /* TLV 0x96 / TLV 0xa2 dedup sets — scoped to the lifetime of a single
++     * AP_METRICS query round (same lifetime as m_ap_metric_response),
+      * NOT to a single handle_ap_metrics_response() call. A round consists of
+      * one handle_ap_metrics_response() call per radio/monitor; an MLO STA can
+      * be reported by more than one monitor in the same round, so per-call
+      * locals would let each call emit its own duplicate set of TLVs.
+      *
+-     * For TLV 0xa2, each monitor only sees the traffic on its own BSS/link,
+-     * so a plain presence-check would keep the first monitor's partial report
+-     * and silently drop the rest -- the emitted stats would not match the
+-     * true MLD-level aggregate. m_traffic_stats_accumulator instead sums the
+-     * per-field counters across every monitor call for the same STA MAC; the
+-     * final emission loop reads the summed totals back out of this map. */
++     * For TLV 0xa2 every monitor an MLO STA is present on reports the *same*
++     * complete MLD-level aggregate, not just the traffic on its own link: the
++     * driver keeps a single station entry per MLD, keyed by MLD MAC, whose
++     * top-level NL80211_ATTR_STA_INFO already holds the MLD-wide totals (the
++     * per-link breakdown lives in the nested NL80211_ATTR_MLO_LINKS).  The
++     * reports are therefore duplicates and must be deduplicated -- summing
++     * them scales every counter by the number of affiliated links. */
+     std::unordered_set<sMacAddr> m_collected_link_sta_macs;
+-    std::unordered_map<sMacAddr, sStaTrafficStats> m_traffic_stats_accumulator;
++    std::unordered_set<sMacAddr> m_collected_traffic_sta_macs;
+ 
+     struct sRadioMetrics {
+         sMacAddr radio_uid;
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 510ff2e0d..717e81de1 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -6101,6 +6101,10 @@ void ap_wlan_hal_nl80211::detect_mlo_client(
+         if (mlo_it != sta_reply.end() && mlo_it->second == "yes") {
+             is_mlo = true;
+         }
++        LOG(DEBUG) << "detect_mlo_client DBG(a): sta_mac=" << sta_mac << " interface=" << interface
++                   << " vap_id=" << vap_id << " MLO_field="
++                   << (mlo_it != sta_reply.end() ? mlo_it->second : "<absent>")
++                   << " resolved_is_mlo=" << (is_mlo ? "true" : "false");
+ 
+         if (is_mlo) {
+             // For MLO clients, override BSSID with AP MLD MAC
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.cpp b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+index e8f6670fd..641c909ac 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -1148,7 +1148,23 @@ bool nl80211_client_impl::get_sta_info(const std::string &interface_name,
+         return false;
+     }
+ 
+-    return m_socket.get()->send_receive_msg(
++    /* NLM_F_DUMP makes the kernel return *every* station on the netdev:
++     * nl80211_dump_station() keys only off NL80211_ATTR_IFINDEX and the dump
++     * cursor, so the NL80211_ATTR_MAC put below is NOT a request-side filter.
++     * The response handler is therefore invoked once per associated station and
++     * must discard the entries belonging to other stations itself — otherwise
++     * the last station in the dump overwrites sta_info and every caller gets
++     * that one station's stats no matter which MAC it asked for (symptom: all
++     * associated MLDs reporting identical per-link RCPI and byte counters). */
++    bool sta_found = false;
++    /* DEBUG: number of station entries the dump actually returned, so a
++     * "not found" can be attributed to an empty dump (no station associated on
++     * this netdev at all - e.g. the BSSID was mapped to the wrong base
++     * interface) rather than to a key mismatch against entries that are
++     * present. */
++    int dump_entries = 0;
++
++    const bool msg_ok = m_socket.get()->send_receive_msg(
+         NL80211_CMD_GET_STATION, NLM_F_DUMP,
+         [&](struct nl_msg *msg) -> bool {
+             nla_put_u32(msg, NL80211_ATTR_IFINDEX, iface_index);
+@@ -1167,6 +1183,56 @@ bool nl80211_client_impl::get_sta_info(const std::string &interface_name,
+                 return;
+             }
+ 
++            /* Keep only the dump entry for the station that was asked for (see
++             * the NLM_F_DUMP comment above). */
++            if (!tb[NL80211_ATTR_MAC] || nla_len(tb[NL80211_ATTR_MAC]) < ETH_ALEN) {
++                LOG(DEBUG) << "NL80211_ATTR_MAC attribute is missing, skipping dump entry";
++                return;
++            }
++            sMacAddr dump_sta_mac;
++            tlvf::mac_from_array(static_cast<const uint8_t *>(nla_data(tb[NL80211_ATTR_MAC])),
++                                 dump_sta_mac);
++            ++dump_entries;
++            if (dump_sta_mac != sta_mac_address) {
++                /* DEBUG: report what the station dump actually contains. A 100%
++                 * miss rate on affiliated-link MACs means the driver keys its
++                 * station table by MLD MAC only, in which case the per-link
++                 * data (if any) lives in this entry's NL80211_ATTR_MLO_LINKS.
++                 * Logging the nested link IDs distinguishes "wrong lookup key,
++                 * per-link data is present" from "driver exposes no per-link
++                 * breakdown at all". */
++                std::string mlo_dbg = "mlo_links=absent";
++                if (tb[NL80211_ATTR_MLO_LINKS]) {
++                    mlo_dbg              = "mlo_links=[";
++                    struct nlattr *attrs = nullptr;
++                    struct nlattr *link[NL80211_ATTR_MAX + 1];
++                    int ret              = 0;
++                    bool first           = true;
++                    nla_for_each_nested(attrs, tb[NL80211_ATTR_MLO_LINKS], ret) {
++                        if (nla_parse_nested(link, NL80211_ATTR_MAX, attrs, NULL)) {
++                            continue;
++                        }
++                        if (!link[NL80211_ATTR_MLO_LINK_ID]) {
++                            continue;
++                        }
++                        if (!first) {
++                            mlo_dbg += ",";
++                        }
++                        first = false;
++                        mlo_dbg +=
++                            "id" + std::to_string(nla_get_u8(link[NL80211_ATTR_MLO_LINK_ID]));
++                        mlo_dbg += link[NL80211_ATTR_STA_INFO] ? "(sta_info)" : "(no_sta_info)";
++                    }
++                    mlo_dbg += "]";
++                }
++                LOG(DEBUG) << "STA dump entry on '" << interface_name << "' (base_interface: "
++                           << base_interface << "): entry_mac=" << dump_sta_mac
++                           << " requested=" << sta_mac_address << " MISMATCH, " << mlo_dbg
++                           << " flat_sta_info=" << (tb[NL80211_ATTR_STA_INFO] ? "yes" : "no");
++                return;
++            }
++            sta_found = true;
++
+             struct nlattr *sta_info_attr = tb[NL80211_ATTR_STA_INFO];
+ 
+             /* MLO AP: the kernel always fills the flat NL80211_ATTR_STA_INFO
+@@ -1365,6 +1431,18 @@ bool nl80211_client_impl::get_sta_info(const std::string &interface_name,
+                 LOG(DEBUG) << "NL80211_STA_INFO_RX_BITRATE attribute is missing";
+             }
+         });
++
++    /* A successful netlink transaction that did not contain the requested
++     * station is a failure for the caller: reporting success here would hand
++     * back an all-zero (or stale-looking) sta_info that callers cannot
++     * distinguish from a real reading. */
++    if (msg_ok && !sta_found) {
++        LOG(DEBUG) << "STA " << sta_mac_address << " not found in station dump of interface '"
++                   << interface_name << "' (base_interface: " << base_interface
++                   << "), dump_entries=" << dump_entries;
++    }
++
++    return msg_ok && sta_found;
+ }
+ 
+ bool nl80211_client_impl::get_survey_info(const std::string &interface_name,
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 63a5a81f6..38119c5dd 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -6738,12 +6738,51 @@ bool db::dm_set_sta_link_metrics(const sMacAddr &sta_mac, uint32_t downlink_est_
+      * since their per-link lookup keys on this MAC matching a specific
+      * link's own address, never the MLD MAC. */
+     if (ret_val) {
+-        auto bss_mac = tlvf::mac_from_string(station->parent_mac);
+-        auto radio   = get_radio_by_bssid(bss_mac);
++        auto bss_mac              = tlvf::mac_from_string(station->parent_mac);
++        auto radio                = get_radio_by_bssid(bss_mac);
++        sMacAddr event_agent_mac  = beerocks::net::network_utils::ZERO_MAC;
++
++        if (radio) {
++            event_agent_mac = get_bss_parent_agent(bss_mac);
++        } else {
++            /* bss_mac may be an AP MLD MAC (not a per-link affiliated BSSID)
++             * for MLO STAs associated to a remote RE agent.  The AP MLD MAC
++             * is never registered as a standalone BSS entry, so
++             * get_radio_by_bssid() returns nullptr.
++             *
++             * Fall back: scan all agents' ap_mlds for an AP MLD whose MLD
++             * MAC equals bss_mac, then resolve the radio via the first
++             * affiliated AP's RUID.  This gives us a valid radio + agent
++             * so the AssocStaLinkMetrics vendor event can be fired. */
++            for (const auto &agent_pair : m_agents) {
++                const auto &agent  = agent_pair.second;
++                auto ap_mld_it     = agent->ap_mlds.find(bss_mac);
++                if (ap_mld_it == agent->ap_mlds.end()) {
++                    continue;
++                }
++                const auto &ap_mld = ap_mld_it->second;
++                if (ap_mld.affiliated_aps.empty()) {
++                    continue;
++                }
++                const auto &affl_ap = ap_mld.affiliated_aps.begin()->second;
++                radio = get_radio_by_uid(affl_ap.ruid);
++                if (radio) {
++                    event_agent_mac = agent->al_mac;
++                    LOG(DEBUG) << "dm_set_sta_link_metrics: resolved AP MLD MAC "
++                               << bss_mac << " -> radio " << radio->radio_uid
++                               << " agent " << event_agent_mac;
++                    break;
++                }
++            }
++        }
++
+         if (radio) {
+-            auto agent_al_mac = get_bss_parent_agent(bss_mac);
+             dm_trigger_assoc_sta_link_metrics_event(sta_mac, target_dm_path, bss_mac,
+-                                                    radio->radio_uid, agent_al_mac);
++                                                    radio->radio_uid, event_agent_mac);
++        } else {
++            LOG(WARNING) << "dm_set_sta_link_metrics: could not resolve radio for bss_mac="
++                         << bss_mac << " sta_mac=" << sta_mac
++                         << " — AssocStaLinkMetrics event not fired";
+         }
+     }
+ 
+@@ -10631,6 +10670,63 @@ bool db::update_assoc_sta_mld(
+         return true;
+     }
+ 
++    /* Drop any STAMLD object for this STA MLD that is still registered under a
++     * DIFFERENT AP MLD -- typically the AP MLD of the agent the client just
++     * roamed away from.
++     *
++     * A STA MLD is associated to exactly one AP MLD at a time, so the report
++     * being processed here is proof that every other registration is stale.
++     * Without this prune the stale object survives indefinitely: the only other
++     * removal path (topology_task's keep_new reconciliation) is scoped to the
++     * reporting agent, so it never fires for an agent that no longer sees the
++     * client at all.  The leftover Device.{i}.APMLD.{j}.STAMLD.{k} instance then
++     * coexists with the live one for the same MLD MAC, and DM consumers that key
++     * STA MLDs on the MLD MAC alone (qmesh-lib) resolve to the wrong device --
++     * reporting affiliated BSSIDs of an agent the client is not associated to.
++     *
++     * Pruning before the live instance is created/refreshed below keeps the event
++     * order sane for consumers: STAMLD_REMOVED (stale) precedes STAMLD_ADDED (live). */
++    for (auto &other_agent_entry : m_agents) {
++        auto &other_agent = other_agent_entry.second;
++        if (!other_agent) {
++            continue;
++        }
++        for (auto &other_ap_mld_entry : other_agent->ap_mlds) {
++            if (other_agent->al_mac == agent.al_mac && other_ap_mld_entry.first == ap_mld_mac) {
++                continue;
++            }
++
++            auto stale_sta_mld = other_ap_mld_entry.second.sta_mlds.get(sta_mld_mac);
++            if (!stale_sta_mld) {
++                continue;
++            }
++
++            if (!stale_sta_mld->dm_path.empty()) {
++                const auto stale_dm_path = stale_sta_mld->dm_path;
++                LOG(WARNING) << "Pruning stale STAMLD instance " << stale_dm_path
++                             << " for STA MLD " << sta_mld_mac << " (was on agent "
++                             << other_agent->al_mac << " ap_mld=" << other_ap_mld_entry.first
++                             << "), now reported on agent " << agent.al_mac
++                             << " ap_mld=" << ap_mld_mac;
++
++                if (!dm_remove_sta_mld(sta_mld_mac, stale_dm_path, other_ap_mld_entry.first,
++                                       other_agent->al_mac)) {
++                    LOG(ERROR) << "Failed to remove stale STAMLD instance " << stale_dm_path;
++                }
++                stale_sta_mld->dm_path.clear();
++
++                auto stale_station = m_stations.get(sta_mld_mac);
++                if (stale_station &&
++                    stale_station->sta_mld_configuration.dm_path == stale_dm_path) {
++                    stale_station->sta_mld_configuration.dm_path.clear();
++                    stale_station->sta_mld_configuration.affiliated_stas.clear();
++                }
++            }
++
++            other_ap_mld_entry.second.sta_mlds.erase(sta_mld_mac);
++        }
++    }
++
+     // Reuse STAMLD object by MLD MAC, create DM instance only when missing.
+     auto sta_mld = ap_mld.sta_mlds.add(sta_mld_mac);
+     if (!sta_mld) {
+@@ -10649,9 +10745,28 @@ bool db::update_assoc_sta_mld(
+     }
+     std::string sta_mld_instance_path = sta_mld->dm_path;
+ 
+-    if (sta_mld_newly_created) {
+-        dm_trigger_sta_mld_added_event(sta_mld_mac, sta_mld_instance_path, ap_mld_mac,
+-                                       agent.al_mac);
++    /* Always fire STAMLD_ADDED — for both newly-created AND reused STAMLD instances.
++     *
++     * Background: qmesh-lib maintains an internal DB of STAMLD paths (db_add_sta_mld).
++     * When the STA steers away from an AP, STAMLD_REMOVED fires and qmesh-lib removes
++     * the STAMLD path from its DB.  When the STA steers back to the same AP, the STAMLD
++     * DM instance already exists (sta_mld->dm_path is not empty), so previously only
++     * newly-created instances fired STAMLD_ADDED.  As a result, qmesh-lib's DB was never
++     * updated for the reused instance — db_get_sta_mld_path() failed, causing
++     * qmesh_get_assoc_sta_mld_config() to return false, est_apply_assoc_sta_mld_config()
++     * to print "no config available", affiliated STA paths to remain unpopulated, the
++     * per-link getter to fail, and the BreachMonitor to be permanently blocked.
++     *
++     * Fix: fire STAMLD_ADDED unconditionally so qmesh-lib always re-populates its DB
++     * with the current STAMLD path, regardless of whether the DM instance is new or reused.
++     * dm_trigger_sta_mld_added_event() is idempotent from qmesh-lib's perspective —
++     * db_add_sta_mld() updates the path in place if the entry already exists. */
++    dm_trigger_sta_mld_added_event(sta_mld_mac, sta_mld_instance_path, ap_mld_mac,
++                                   agent.al_mac);
++    if (!sta_mld_newly_created) {
++        LOG(INFO) << "STAMLD_ADDED re-fired for reused instance: sta_mld=" << sta_mld_mac
++                  << " ap_mld=" << ap_mld_mac << " path=" << sta_mld_instance_path
++                  << " (qmesh-lib DB re-sync after steer/roam back to same AP)";
+     }
+ 
+     // Update data model STA MLD parameters.
+diff --git a/controller/src/beerocks/master/tasks/topology_task.cpp b/controller/src/beerocks/master/tasks/topology_task.cpp
+index 6473ebce3..48fde404e 100644
+--- a/controller/src/beerocks/master/tasks/topology_task.cpp
++++ b/controller/src/beerocks/master/tasks/topology_task.cpp
+@@ -708,9 +708,12 @@ bool topology_task::handle_topology_response(const sMacAddr &src_mac,
+         return false;
+     }
+ 
+-    if (cmdu_rx.getClass<wfa_map::tlvAssociatedStaMldConfigurationReport>()) {
+-        handle_assoc_sta_mld_configuration_tlv(cmdu_rx, *agent);
+-    }
++    /* Always reconcile: an agent that no longer serves any MLO client sends a
++     * TOPOLOGY_RESPONSE with NO tlvAssociatedStaMldConfigurationReport at all, and
++     * that absence is exactly the case in which its leftover STAMLD instances have
++     * to be removed.  Gating this call on the TLV being present leaked a STAMLD
++     * object for every client that roamed off an agent. */
++    handle_assoc_sta_mld_configuration_tlv(cmdu_rx, *agent);
+ 
+     // Parse MLD Structure TLVs (0xe3): log the MLD structure reported by the agent.
+     // The authoritative MLD data is already stored via tlvAgentApMldConfiguration (0xe0)
+@@ -743,17 +746,54 @@ bool topology_task::handle_topology_response(const sMacAddr &src_mac,
+     return true;
+ }
+ 
++/**
++ * @brief Tell whether the controller database has positive evidence that the STA MLD
++ *        @a sta_mld_mac is no longer served by the agent @a agent_al_mac.
++ *
++ * Used to decide whether a STAMLD instance may be pruned on the strength of an
++ * *absent* Associated STA MLD Configuration Report.  Returns false whenever the
++ * database cannot tell, so an inconclusive database never causes a removal.
++ */
++static bool sta_mld_left_agent(son::db &database, const sMacAddr &sta_mld_mac,
++                               const sMacAddr &agent_al_mac)
++{
++    // The STA object is removed on disassociation, so its absence is proof the
++    // client is no longer associated here.
++    auto station = database.get_station(sta_mld_mac);
++    if (!station) {
++        return true;
++    }
++
++    auto bss = station->get_bss();
++    if (!bss) {
++        return true;
++    }
++
++    auto bss_agent = database.get_agent_by_bssid(bss->bssid);
++    if (!bss_agent) {
++        // Serving BSS cannot be attributed to an agent - inconclusive.
++        return false;
++    }
++
++    return bss_agent->al_mac != agent_al_mac;
++}
++
+ void topology_task::handle_assoc_sta_mld_configuration_tlv(ieee1905_1::CmduMessageRx &cmdu_rx,
+                                                            Agent &agent)
+ {
+-    LOG(DEBUG) << "Received tlvAssociatedStaMldConfigurationReport from " << agent.al_mac;
++    const auto assoc_sta_mld_conf_tlv_list =
++        cmdu_rx.getClassList<wfa_map::tlvAssociatedStaMldConfigurationReport>();
++    const bool reports_present = !assoc_sta_mld_conf_tlv_list.empty();
++
++    if (reports_present) {
++        LOG(DEBUG) << "Received tlvAssociatedStaMldConfigurationReport from " << agent.al_mac;
++    }
+ 
+     for (auto &ap_mld : agent.ap_mlds) {
+         ap_mld.second.sta_mlds.keep_new_prepare();
+     }
+ 
+-    for (const auto &assoc_sta_mld_conf_tlv :
+-         cmdu_rx.getClassList<wfa_map::tlvAssociatedStaMldConfigurationReport>()) {
++    for (const auto &assoc_sta_mld_conf_tlv : assoc_sta_mld_conf_tlv_list) {
+         if (!assoc_sta_mld_conf_tlv) {
+             LOG(ERROR) << "Invalid Associated STA MLD Configuration Report TLV";
+             continue;
+@@ -798,6 +838,25 @@ void topology_task::handle_assoc_sta_mld_configuration_tlv(ieee1905_1::CmduMessa
+         }
+     }
+ 
++    /* When the TOPOLOGY_RESPONSE carried no report at all, "no STA MLDs on this
++     * agent" is an inference rather than a statement by the agent.  Only act on it
++     * for STA MLDs the controller database independently agrees have left this
++     * agent; anything else (a report racing ahead of the agent's own MLD bookkeeping,
++     * or an agent that omits the TLV altogether) keeps its instance, so the DM does
++     * not churn STAMLD indices on every topology poll. */
++    if (!reports_present) {
++        for (auto &ap_mld : agent.ap_mlds) {
++            for (const auto &sta_mld : ap_mld.second.sta_mlds) {
++                if (!sta_mld.second) {
++                    continue;
++                }
++                if (!sta_mld_left_agent(database, sta_mld.second->mac, agent.al_mac)) {
++                    ap_mld.second.sta_mlds.keep_new(sta_mld.first);
++                }
++            }
++        }
++    }
++
+     for (auto &ap_mld : agent.ap_mlds) {
+         auto removed_sta_mlds = ap_mld.second.sta_mlds.keep_new_remove_old();
+         for (const auto &removed_sta_mld : removed_sta_mlds) {
+-- 
+2.34.1
+
