@@ -1,0 +1,1322 @@
+From 6b358077fc2d01a6f87a98172d312e70bbe6d269 Mon Sep 17 00:00:00 2001
+From: Sonali Naresh <sonanare@qti.qualcomm.com>
+Date: Thu, 20 Aug 2026 08:53:32 +0530
+Subject: [PATCH] Failed  Connection Message Changes for R6.1
+
+Signed-off-by: Sonali Naresh <sonanare@qti.qualcomm.com>
+---
+ .../bcl/include/bcl/son/son_wireless_utils.h  | 338 ++++++++++++++++++
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 111 ++++--
+ .../bwl/nl80211/ap_wlan_hal_nl80211.h         |  32 ++
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   | 123 +------
+ controller/nbapi/on_action.cpp                | 115 +-----
+ .../platform/bpl/cfg/dm/bpl_cfg_wifi.cpp      | 115 +-----
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     | 252 ++++++++-----
+ 7 files changed, 649 insertions(+), 437 deletions(-)
+
+diff --git a/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h b/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
+index 2efe55b..678836e 100644
+--- a/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
++++ b/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
+@@ -960,6 +960,344 @@ private:
+ 
+     // clang-format on
+ };
++
++// ---------------------------------------------------------------------------
++// WPA3-Personal-Compatibility (MRSNO, Wi-Fi EasyMesh R6.1 §17.2.105 / RSN Overriding)
++// "SecurityIEs" wire-format builder + parser — single source of truth.
++//
++// This is the ONE place that knows the exact RSN Override vendor-element byte layout
++// (RSNOE 0x29 / RSNO2E 0x2A / RSNXOE 0x2B) and the WPA3-PCM SecurityIEs blob
++// (RSNE + RSNOE/RSNO2E + RSNXOE). It lives here, next to sBssInfoConf (which owns
++// security_ies), so every producer/consumer that already depends on son_wireless_utils.h
++// shares the identical bytes:
++//   - controller/nbapi/on_action.cpp                    (Controller / NBAPI)
++//   - framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp    (PrplOS / Ambiorix DM backend)
++//   - framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp   (OpenWrt / UCI backend)
++//   - common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp       (WHM parser)
++//
++// A future spec correction (e.g. a different RSNXOE capability byte, a new AKM/cipher,
++// or a configurable MFP policy) is therefore applied in exactly one place.
++namespace rsn_ie_utils {
++
++// --- Wire constants -------------------------------------------------------
++// WFA OUI (50:6F:9A) used by the RSN Override vendor-specific elements.
++constexpr uint8_t kWfaOui0 = 0x50;
++constexpr uint8_t kWfaOui1 = 0x6F;
++constexpr uint8_t kWfaOui2 = 0x9A;
++
++// RSN Override vendor element OUI types.
++constexpr uint8_t kOuiTypeRsnoe  = 0x29; // RSN Override Element        (override 1, AKM8)
++constexpr uint8_t kOuiTypeRsno2e = 0x2A; // RSN Override 2 Element      (override 2, AKM24)
++constexpr uint8_t kOuiTypeRsnxoe = 0x2B; // RSNX Override Element
++
++// 00-0F-AC suite selector OUI (IEEE 802.11).
++constexpr uint8_t kRsnSuiteOui0 = 0x00;
++constexpr uint8_t kRsnSuiteOui1 = 0x0F;
++constexpr uint8_t kRsnSuiteOui2 = 0xAC;
++
++// AKM suite selector last byte (00-0F-AC:<akm>).
++constexpr uint8_t kAkmPsk       = 0x02; // WPA-PSK
++constexpr uint8_t kAkmSae       = 0x08; // SAE                 (AKM8)
++constexpr uint8_t kAkmSaeExtKey = 0x18; // SAE-EXT-KEY         (AKM24)
++
++// Pairwise/Group cipher suite selector last byte (00-0F-AC:<cipher>).
++constexpr uint8_t kCipherCcmp       = 0x04; // CCMP-128
++constexpr uint8_t kCipherGcmp       = 0x08; // GCMP-128
++constexpr uint8_t kCipherGcmp256    = 0x09; // GCMP-256
++constexpr uint8_t kCipherCcmp256    = 0x0A; // CCMP-256
++constexpr uint8_t kCipherBipCmac128 = 0x06; // BIP-CMAC-128 (group management)
++
++// RSN Capabilities low byte bits.
++constexpr uint8_t kRsnCapMfpc = 0x80; // Management Frame Protection Capable
++constexpr uint8_t kRsnCapMfpr = 0x40; // Management Frame Protection Required
++
++// RSN Capabilities low byte for MFPC + MFPR (WPA3-PCM baseline: MFP required).
++constexpr uint8_t kRsnCapsMfpRequired = kRsnCapMfpc | kRsnCapMfpr; // 0xC0
++
++// Extended RSN Capabilities byte advertising SAE-H2E, carried by the trailing RSNXOE.
++constexpr uint8_t kRsnxeSaeH2eCap = 0x20;
++
++// --- MFP <-> RSN-capabilities helpers -------------------------------------
++// hostapd/pWHM "rsn_override_mfp" token: "2"=required, "1"=capable/optional, "0"=disabled.
++inline uint8_t rsn_mfp_token_to_caps_low_byte(const std::string &mfp)
++{
++    if (mfp == "2") {
++        return kRsnCapMfpc | kRsnCapMfpr; // 0xC0 (required)
++    } else if (mfp == "1") {
++        return kRsnCapMfpc; // 0x80 (capable/optional)
++    }
++    return 0x00; // disabled
++}
++
++inline std::string rsn_caps_low_byte_to_mfp_token(uint8_t caps_low)
++{
++    if (caps_low & kRsnCapMfpr) {
++        return "2"; // MFP required
++    } else if (caps_low & kRsnCapMfpc) {
++        return "1"; // MFP capable/optional
++    }
++    return "0"; // MFP disabled
++}
++
++// --- Builder --------------------------------------------------------------
++/**
++ * @brief Append one RSN Override vendor-specific element (RSNOE 0x29 / RSNO2E 0x2A) carrying a
++ *        single-AKM, single-pairwise RSN body with the given RSN-capabilities low byte.
++ *
++ * Element layout (30-byte vendor payload):
++ *   DD 1E  50 6F 9A <oui_type>
++ *   Version(2) GroupData(4=CCMP) PWCount(2=1) PW(4) AKMCount(2=1) AKM(4)
++ *   RSNCaps(2: low=caps_low, high=0) PMKIDCount(2=0) GroupMgmt(4=BIP-CMAC-128)
++ */
++inline void append_rsn_override_element(std::vector<uint8_t> &out, uint8_t oui_type, uint8_t akm,
++                                        uint8_t pairwise, uint8_t caps_low = kRsnCapsMfpRequired)
++{
++    out.push_back(0xDD);           // Element ID: Vendor-Specific
++    out.push_back(0x1E);           // Length = 30
++    out.push_back(kWfaOui0);       // WFA OUI
++    out.push_back(kWfaOui1);
++    out.push_back(kWfaOui2);
++    out.push_back(oui_type);       // 0x29 (RSNOE) or 0x2A (RSNO2E)
++    out.push_back(0x01);           // Version
++    out.push_back(0x00);
++    out.push_back(kRsnSuiteOui0);  // Group Data Cipher Suite = 00-0F-AC-04 (CCMP)
++    out.push_back(kRsnSuiteOui1);
++    out.push_back(kRsnSuiteOui2);
++    out.push_back(kCipherCcmp);
++    out.push_back(0x01);           // Pairwise Cipher Suite Count = 1
++    out.push_back(0x00);
++    out.push_back(kRsnSuiteOui0);  // Pairwise Cipher Suite = 00-0F-AC-<pairwise>
++    out.push_back(kRsnSuiteOui1);
++    out.push_back(kRsnSuiteOui2);
++    out.push_back(pairwise);
++    out.push_back(0x01);           // AKM Suite Count = 1
++    out.push_back(0x00);
++    out.push_back(kRsnSuiteOui0);  // AKM Suite = 00-0F-AC-<akm>
++    out.push_back(kRsnSuiteOui1);
++    out.push_back(kRsnSuiteOui2);
++    out.push_back(akm);
++    out.push_back(caps_low);       // RSN Capabilities (low byte carries MFPC/MFPR)
++    out.push_back(0x00);           // RSN Capabilities (high byte)
++    out.push_back(0x00);           // PMKID Count = 0
++    out.push_back(0x00);
++    out.push_back(kRsnSuiteOui0);  // Group Management Cipher Suite = 00-0F-AC-06 (BIP-CMAC-128)
++    out.push_back(kRsnSuiteOui1);
++    out.push_back(kRsnSuiteOui2);
++    out.push_back(kCipherBipCmac128);
++}
++
++/**
++ * @brief Append the WPA3-PCM baseline primary RSNE (SAE / CCMP / MFP required).
++ * Layout: 30 1A Version(2) GroupData(4=CCMP) PWCount(2=1) PW(4=CCMP) AKMCount(2=1) AKM(4=SAE)
++ *         RSNCaps(2=MFPC+MFPR) PMKIDCount(2=0) GroupMgmt(4=BIP-CMAC-128)
++ */
++inline void append_wpa3_pcm_primary_rsne(std::vector<uint8_t> &out)
++{
++    out.push_back(0x30);           // Element ID: RSNE
++    out.push_back(0x1A);           // Length = 26
++    out.push_back(0x01);           // Version
++    out.push_back(0x00);
++    out.push_back(kRsnSuiteOui0);  // Group Data Cipher Suite = 00-0F-AC-04 (CCMP)
++    out.push_back(kRsnSuiteOui1);
++    out.push_back(kRsnSuiteOui2);
++    out.push_back(kCipherCcmp);
++    out.push_back(0x01);           // Pairwise Cipher Suite Count = 1
++    out.push_back(0x00);
++    out.push_back(kRsnSuiteOui0);  // Pairwise Cipher Suite = 00-0F-AC-04 (CCMP)
++    out.push_back(kRsnSuiteOui1);
++    out.push_back(kRsnSuiteOui2);
++    out.push_back(kCipherCcmp);
++    out.push_back(0x01);           // AKM Suite Count = 1
++    out.push_back(0x00);
++    out.push_back(kRsnSuiteOui0);  // AKM Suite = 00-0F-AC-08 (SAE)
++    out.push_back(kRsnSuiteOui1);
++    out.push_back(kRsnSuiteOui2);
++    out.push_back(kAkmSae);
++    out.push_back(kRsnCapsMfpRequired); // RSN Capabilities low byte = MFPC+MFPR
++    out.push_back(0x00);           // RSN Capabilities high byte
++    out.push_back(0x00);           // PMKID Count = 0
++    out.push_back(0x00);
++    out.push_back(kRsnSuiteOui0);  // Group Management Cipher Suite = 00-0F-AC-06
++    out.push_back(kRsnSuiteOui1);
++    out.push_back(kRsnSuiteOui2);
++    out.push_back(kCipherBipCmac128);
++}
++
++/**
++ * @brief Append the trailing RSNXOE (0x2B) advertising SAE-H2E capability.
++ * Layout: DD 05 50 6F 9A 2B 20
++ */
++inline void append_rsnxoe_sae_h2e(std::vector<uint8_t> &out)
++{
++    out.push_back(0xDD);
++    out.push_back(0x05);           // Length = 5
++    out.push_back(kWfaOui0);
++    out.push_back(kWfaOui1);
++    out.push_back(kWfaOui2);
++    out.push_back(kOuiTypeRsnxoe); // OUI type: RSNXOE
++    out.push_back(kRsnxeSaeH2eCap);// Extended RSN Capabilities: SAE-H2E
++}
++
++/**
++ * @brief Build the spec-compliant WPA3-PCM SecurityIEs blob for a given AKM combination.
++ *
++ *   include_akm8=1, include_akm24=0 -> RSNE + RSNOE(AKM8)                + RSNXOE
++ *   include_akm8=0, include_akm24=1 -> RSNE + RSNO2E(AKM24)              + RSNXOE
++ *   include_akm8=1, include_akm24=1 -> RSNE + RSNOE(AKM8) + RSNO2E(AKM24) + RSNXOE
++ * Returns an empty vector when neither AKM is requested.
++ */
++inline std::vector<uint8_t> build_wpa3_pcm_security_ies(bool include_akm8, bool include_akm24)
++{
++    std::vector<uint8_t> out;
++    if (!include_akm8 && !include_akm24) {
++        return out;
++    }
++
++    append_wpa3_pcm_primary_rsne(out);
++
++    if (include_akm8) {
++        // RSNOE (0x29): AKM = SAE (0x08), pairwise = CCMP (0x04).
++        append_rsn_override_element(out, kOuiTypeRsnoe, kAkmSae, kCipherCcmp);
++    }
++    if (include_akm24) {
++        // RSNO2E (0x2A): AKM = SAE-EXT-KEY (0x18), pairwise = GCMP-256 (0x09).
++        append_rsn_override_element(out, kOuiTypeRsno2e, kAkmSaeExtKey, kCipherGcmp256);
++    }
++
++    append_rsnxoe_sae_h2e(out);
++    return out;
++}
++
++// --- Parser ---------------------------------------------------------------
++/**
++ * @brief Map a 4-byte 00-0F-AC:xx AKM suite selector to a hostapd/pWHM key_mgmt token.
++ */
++inline std::string rsn_akm_selector_to_token(const uint8_t *sel)
++{
++    if (sel[0] != kRsnSuiteOui0 || sel[1] != kRsnSuiteOui1 || sel[2] != kRsnSuiteOui2) {
++        return {};
++    }
++    switch (sel[3]) {
++    case kAkmPsk:       return "WPA-PSK";
++    case kAkmSae:       return "SAE";
++    case kAkmSaeExtKey: return "SAE-EXT-KEY";
++    default:            return {};
++    }
++}
++
++/**
++ * @brief Map a 4-byte 00-0F-AC:xx cipher suite selector to a hostapd/pWHM pairwise token.
++ */
++inline std::string rsn_pairwise_selector_to_token(const uint8_t *sel)
++{
++    if (sel[0] != kRsnSuiteOui0 || sel[1] != kRsnSuiteOui1 || sel[2] != kRsnSuiteOui2) {
++        return {};
++    }
++    switch (sel[3]) {
++    case kCipherCcmp:    return "CCMP";
++    case kCipherGcmp256: return "GCMP-256";
++    case kCipherGcmp:    return "GCMP";
++    case kCipherCcmp256: return "CCMP-256";
++    default:             return {};
++    }
++}
++
++/**
++ * @brief Extract the AKM/pairwise/MFP tokens from one RSN Override vendor element body.
++ * @param body Points at the bytes AFTER the WFA OUI(3) + OUI type(1) (i.e. "Version" onward).
++ *             Layout mirrors append_rsn_override_element().
++ * @return true if both AKM and pairwise tokens were recognized.
++ */
++inline bool parse_rsn_override_body(const uint8_t *body, size_t len, std::string &akm_token,
++                                    std::string &pairwise_token, std::string &mfp_token)
++{
++    // Need at least up to the RSN Capabilities low byte (offset 20) — body of 26 bytes.
++    if (len < 26) {
++        return false;
++    }
++    // Pairwise Cipher Suite selector at offset 6..9, AKM Suite selector at offset 14..17.
++    pairwise_token         = rsn_pairwise_selector_to_token(body + 6);
++    akm_token              = rsn_akm_selector_to_token(body + 14);
++    const uint8_t caps_low = body[20]; // RSN Capabilities low byte (MFPC bit7 / MFPR bit6)
++    mfp_token              = rsn_caps_low_byte_to_mfp_token(caps_low);
++    return !akm_token.empty() && !pairwise_token.empty();
++}
++
++/**
++ * @brief Decoded RSN Override parameters for one override slot (RSNOE or RSNO2E).
++ */
++struct sRsnOverride {
++    bool present = false;
++    std::string key_mgmt;  ///< e.g. "SAE" / "SAE-EXT-KEY"
++    std::string pairwise;  ///< e.g. "CCMP" / "GCMP-256"
++    std::string mfp;       ///< "2" / "1" / "0"
++};
++
++/**
++ * @brief Scan a full SecurityIEs blob and decode override-1 (RSNOE 0x29) and override-2
++ *        (RSNO2E 0x2A) into hostapd/pWHM rsn_override_* tokens.
++ */
++inline void parse_security_ies_overrides(const std::vector<uint8_t> &security_ies,
++                                         sRsnOverride &override1, sRsnOverride &override2)
++{
++    override1 = sRsnOverride{};
++    override2 = sRsnOverride{};
++
++    size_t i = 0;
++    while (i + 2 <= security_ies.size()) {
++        const uint8_t eid = security_ies[i];
++        const uint8_t len = security_ies[i + 1];
++        if (i + 2 + static_cast<size_t>(len) > security_ies.size()) {
++            break; // malformed / truncated
++        }
++        const uint8_t *elem_body = &security_ies[i + 2];
++        if (eid == 0xDD && len >= 4 && elem_body[0] == kWfaOui0 && elem_body[1] == kWfaOui1 &&
++            elem_body[2] == kWfaOui2) {
++            const uint8_t oui_type = elem_body[3];
++            const uint8_t *ov      = elem_body + 4;                 // RSN body (after OUI + type)
++            const size_t ov_len    = static_cast<size_t>(len) - 4;
++            if (oui_type == kOuiTypeRsnoe) {
++                override1.present = parse_rsn_override_body(ov, ov_len, override1.key_mgmt,
++                                                            override1.pairwise, override1.mfp);
++            } else if (oui_type == kOuiTypeRsno2e) {
++                override2.present = parse_rsn_override_body(ov, ov_len, override2.key_mgmt,
++                                                            override2.pairwise, override2.mfp);
++            }
++        }
++        i += 2 + static_cast<size_t>(len);
++    }
++}
++
++/**
++ * @brief Convenience: report which AKM override elements a SecurityIEs blob carries.
++ */
++inline void security_ies_akm_presence(const std::vector<uint8_t> &security_ies, bool &has_akm8,
++                                       bool &has_akm24)
++{
++    has_akm8  = false;
++    has_akm24 = false;
++    size_t i  = 0;
++    while (i + 2 <= security_ies.size()) {
++        const uint8_t eid = security_ies[i];
++        const uint8_t len = security_ies[i + 1];
++        if (i + 2 + static_cast<size_t>(len) > security_ies.size()) {
++            break;
++        }
++        if (eid == 0xDD && len >= 4 && security_ies[i + 2] == kWfaOui0 &&
++            security_ies[i + 3] == kWfaOui1 && security_ies[i + 4] == kWfaOui2) {
++            const uint8_t oui_type = security_ies[i + 5];
++            if (oui_type == kOuiTypeRsnoe) {
++                has_akm8 = true;
++            } else if (oui_type == kOuiTypeRsno2e) {
++                has_akm24 = true;
++            }
++        }
++        i += 2 + static_cast<size_t>(len);
++    }
++}
++
++} // namespace rsn_ie_utils
++
+ } // namespace son
+ 
+ #endif
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index b5eda93..d70b633 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -5174,6 +5174,8 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                         }
+                     }
+                 }
++                // Enable hostapd reporting of connection failures
++                conf.set_create_vap_value(vap_id, "report_connection_failures", "1");
+ 
+                 // If this BSS config's AKM is DPP (or the DPP-equivalent OUI), configure
+                 // hostapd's native DPP-over-TCP relay for this VAP — needed in both gateway
+@@ -6807,6 +6809,79 @@ bool ap_wlan_hal_nl80211::start_wps_pbc()
+     return true;
+ }
+ 
++// Resolve the RSNA bit for a BSS from its hostapd "wpa" bitfield: bit1 (0x2) is
++// dot11RSNAEnabled (WPA2/WPA3/SAE); bit0-only (WPA1) or unset is not RSNA. This is the
++// single expensive path (one hostapd config read) and is invoked at BSS bring-up.
++void ap_wlan_hal_nl80211::cache_bss_rsna_status(int vap_id)
++{
++    if (!check_vap_id(vap_id)) {
++        return;
++    }
++    std::string bssid_str = m_radio_info.available_vaps[vap_id].mac;
++    if (bssid_str.empty()) {
++        return;
++    }
++    std::transform(bssid_str.begin(), bssid_str.end(), bssid_str.begin(), ::tolower);
++
++    bool uses_rsna = false;
++    prplmesh::hostapd::Configuration hapd_conf = load_hostapd_config(m_radio_info.iface_name, "");
++    if (hapd_conf) {
++        const std::string vap_key = hapd_conf.get_vap_by_bssid(bssid_str);
++        if (!vap_key.empty()) {
++            const std::string wpa_str = hapd_conf.get_vap_value(vap_key, "wpa");
++            const int wpa_bits        = wpa_str.empty() ? 0 : beerocks::string_utils::stoi(wpa_str);
++            uses_rsna                 = (wpa_bits & 0x2) != 0;
++            LOG(DEBUG) << "cache_bss_rsna_status: VAP=" << vap_key << " bssid=" << bssid_str
++                       << " wpa=" << wpa_str << " -> bss_uses_rsna=" << uses_rsna;
++        } else {
++            LOG(DEBUG) << "cache_bss_rsna_status: BSSID=" << bssid_str
++                       << " not found in hostapd config; caching non-RSNA";
++        }
++    } else {
++        LOG(DEBUG) << "cache_bss_rsna_status: failed to load hostapd config for "
++                   << m_radio_info.iface_name << "; caching non-RSNA for " << bssid_str;
++    }
++    m_bss_rsna_cache[bssid_str] = uses_rsna;
++}
++
++// Cached lookup used on the CTRL-EVENT-CONNECTION-FAIL hot path. Returns the memoised RSNA
++// flag; on a cache miss (BSS not yet warmed), performs a one-time lazy load and stores it,
++// so the synchronous hostapd config read happens at most once per BSS rather than once per
++// failure event (important under an auth-failure storm).
++bool ap_wlan_hal_nl80211::get_bss_uses_rsna_cached(const std::string &bssid_str)
++{
++    std::string key = bssid_str;
++    std::transform(key.begin(), key.end(), key.begin(), ::tolower);
++
++    auto it = m_bss_rsna_cache.find(key);
++    if (it != m_bss_rsna_cache.end()) {
++        return it->second;
++    }
++
++    // Lazy fallback: BSS was not warmed at AP_ENABLED (e.g. race or missed event).
++    bool uses_rsna = false;
++    prplmesh::hostapd::Configuration hapd_conf = load_hostapd_config(m_radio_info.iface_name, "");
++    if (hapd_conf) {
++        const std::string vap_key = hapd_conf.get_vap_by_bssid(key);
++        if (!vap_key.empty()) {
++            const std::string wpa_str = hapd_conf.get_vap_value(vap_key, "wpa");
++            const int wpa_bits        = wpa_str.empty() ? 0 : beerocks::string_utils::stoi(wpa_str);
++            uses_rsna                 = (wpa_bits & 0x2) != 0;
++            LOG(DEBUG) << "get_bss_uses_rsna_cached: lazy load VAP=" << vap_key
++                       << " bssid=" << key << " wpa=" << wpa_str
++                       << " -> bss_uses_rsna=" << uses_rsna;
++        } else {
++            LOG(DEBUG) << "get_bss_uses_rsna_cached: BSSID=" << key
++                       << " not found in hostapd config; assuming non-RSNA";
++        }
++    } else {
++        LOG(DEBUG) << "get_bss_uses_rsna_cached: failed to load hostapd config for "
++                   << m_radio_info.iface_name << "; assuming non-RSNA for " << key;
++    }
++    m_bss_rsna_cache[key] = uses_rsna;
++    return uses_rsna;
++}
++
+ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+ {
+     // Filter out empty events
+@@ -7298,30 +7373,11 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+         }
+ 
+         // EasyMesh R6.1 §8: the RSN Diagnostic Report TLV is only sent for RSNA BSSes.
+-        // Determine RSNA from the hostapd "wpa" bitfield for this VAP: bit1 (0x2) is
+-        // dot11RSNAEnabled (WPA2/WPA3/SAE); bit0-only (WPA1) or unset is not RSNA.
+-        msg->bss_uses_rsna = false;
+-        {
+-            const std::string bssid_str = tlvf::mac_to_string(msg->bssid);
+-            prplmesh::hostapd::Configuration hapd_conf =
+-                load_hostapd_config(m_radio_info.iface_name, "");
+-            if (hapd_conf) {
+-                const std::string conn_fail_vap_id = hapd_conf.get_vap_by_bssid(bssid_str);
+-                if (!conn_fail_vap_id.empty()) {
+-                    const std::string wpa_str = hapd_conf.get_vap_value(conn_fail_vap_id, "wpa");
+-                    const int wpa_bits = wpa_str.empty() ? 0 : beerocks::string_utils::stoi(wpa_str);
+-                    msg->bss_uses_rsna = (wpa_bits & 0x2) != 0;
+-                    LOG(DEBUG) << "STA connection failure: VAP=" << conn_fail_vap_id << " wpa="
+-                               << wpa_str << " -> bss_uses_rsna=" << msg->bss_uses_rsna;
+-                } else {
+-                    LOG(DEBUG) << "STA connection failure: BSSID=" << bssid_str
+-                               << " not found in hostapd config; assuming non-RSNA";
+-                }
+-            } else {
+-                LOG(DEBUG) << "STA connection failure: failed to load hostapd config for "
+-                           << m_radio_info.iface_name << "; assuming non-RSNA";
+-            }
+-        }
++        // Determine RSNA from the per-BSS cache (warmed at AP_ENABLED). The hostapd "wpa"
++        // bitfield does not change at runtime, so this avoids a synchronous hostapd config
++        // read on every CONNECTION-FAIL — critical under an authentication-failure storm.
++        // A cache miss triggers a one-time lazy load inside get_bss_uses_rsna_cached().
++        msg->bss_uses_rsna = get_bss_uses_rsna_cached(tlvf::mac_to_string(msg->bssid));
+ 
+         LOG(DEBUG) << "CTRL-EVENT-CONNECTION-FAIL:"
+                    << " sta_mac=" << msg->sta_mac
+@@ -7651,6 +7707,10 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+             // Ignore AP-ENABLED on radio
+             return true;
+         }
++        // Warm the per-BSS RSNA cache at bring-up so the CTRL-EVENT-CONNECTION-FAIL hot path
++        // never needs a synchronous hostapd config read. The wpa bitfield is fixed for the
++        // life of the BSS, so this single read per enable is sufficient.
++        cache_bss_rsna_status(msg->vap_id);
+ 
+         event_queue_push(Event::AP_Enabled, msg_buff);
+     } break;
+@@ -8641,6 +8701,9 @@ bool ap_wlan_hal_nl80211::create_new_hostapd_conf_file(std::string &ifname, son:
+         }
+     }
+ 
++    //Enable hostapd reporting of connection failures
++    conf.set_create_vap_value(vap_id, "report_connection_failures", "1");
++
+     std::string multi_ap;
+     if (bss_conf.fronthaul) {
+         if (bss_conf.backhaul) {
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+index 8dc10f0..7f124d7 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+@@ -238,6 +238,38 @@ private:
+     // embedded in the hostapd conf by create_new_hostapd_conf_file().
+     uint16_t m_primary_vlan_id = 0;
+ 
++    // Per-BSS RSNA (dot11RSNAEnabled) cache, keyed by lower-cased BSSID string.
++    //
++    // The hostapd "wpa" bitfield for a VAP is fixed at BSS bring-up and does not change
++    // at runtime, but it is needed on every CTRL-EVENT-CONNECTION-FAIL to decide whether
++    // to emit the RSN Diagnostic Report TLV (EasyMesh R6.1 §8, RSNA BSSes only).
++    //
++    // Reading /var/run/hostapd*.conf synchronously on that hot path is expensive under an
++    // authentication-failure storm (brute force / misconfigured-client). Instead we cache
++    // the RSNA bit once when the BSS is enabled (AP_ENABLED) and simply look it up here.
++    // A missing entry falls back to a single lazy load (see get_bss_uses_rsna_cached()).
++    std::unordered_map<std::string, bool> m_bss_rsna_cache = {};
++
++    /**
++     * @brief Resolve (and cache) whether a BSS is an RSNA BSS from its hostapd "wpa" bits.
++     *
++     * @param bssid_str Lower-cased BSSID string of the BSS.
++     * @return true if wpa bit1 (0x2, dot11RSNAEnabled = WPA2/WPA3/SAE) is set.
++     *
++     * On a cache miss this performs ONE hostapd config read and memoises the result, so
++     * the expensive disk read happens at most once per BSS instead of once per failure.
++     */
++    bool get_bss_uses_rsna_cached(const std::string &bssid_str);
++
++    /**
++     * @brief Read the RSNA bit for a BSS directly from hostapd config and store it in the cache.
++     *
++     * Called at BSS bring-up (AP_ENABLED) so the value is warm before any failure event.
++     *
++     * @param vap_id    VAP index whose BSSID is used as the cache key.
++     */
++    void cache_bss_rsna_status(int vap_id);
++
+     /**
+      * @brief Detect MLO capability for a connected STA and populate the MLO fields
+      *        of the associated-notification message.
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index 7a2f9f4..6cb86eb 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -524,62 +524,6 @@ bool ap_wlan_hal_whm::update_bss_hidden_ssid(const sMacAddr &bssid, bool ssid_ad
+     return true;
+ }
+ 
+-namespace {
+-// Map a 4-byte 00-0F-AC:xx AKM suite selector to a hostapd/pWHM key_mgmt token.
+-std::string rsn_akm_selector_to_token(const uint8_t *sel)
+-{
+-    if (sel[0] != 0x00 || sel[1] != 0x0F || sel[2] != 0xAC) {
+-        return {};
+-    }
+-    switch (sel[3]) {
+-    case 0x02: return "WPA-PSK";
+-    case 0x08: return "SAE";
+-    case 0x18: return "SAE-EXT-KEY";
+-    default:   return {};
+-    }
+-}
+-
+-// Map a 4-byte 00-0F-AC:xx cipher suite selector to a hostapd/pWHM pairwise token.
+-std::string rsn_pairwise_selector_to_token(const uint8_t *sel)
+-{
+-    if (sel[0] != 0x00 || sel[1] != 0x0F || sel[2] != 0xAC) {
+-        return {};
+-    }
+-    switch (sel[3]) {
+-    case 0x04: return "CCMP";
+-    case 0x09: return "GCMP-256";
+-    case 0x08: return "GCMP";
+-    case 0x0A: return "CCMP-256";
+-    default:   return {};
+-    }
+-}
+-
+-// Extract the AKM and pairwise tokens from one RSN Override vendor element body
+-// (the bytes AFTER the WFA OUI + OUI type). Layout mirrors append_rsn_override_element():
+-//   Version(2) GroupData(4) PWCount(2) PW(4) AKMCount(2) AKM(4) RSNCaps(2) ...
+-bool parse_rsn_override_body(const uint8_t *body, size_t len, std::string &akm_token,
+-                             std::string &pairwise_token, std::string &mfp_token)
+-{
+-    // Need at least up to the RSN Capabilities low byte (offset 24).
+-    if (len < 26) {
+-        return false;
+-    }
+-    // Pairwise Cipher Suite selector at offset 6..9, AKM Suite selector at offset 14..17.
+-    pairwise_token = rsn_pairwise_selector_to_token(body + 6);
+-    akm_token      = rsn_akm_selector_to_token(body + 14);
+-    // RSN Capabilities low byte at offset 20 carries MFPC (bit7=0x80) / MFPR (bit6=0x40).
+-    const uint8_t caps_low = body[20];
+-    if (caps_low & 0x40) {
+-        mfp_token = "2"; // MFP required
+-    } else if (caps_low & 0x80) {
+-        mfp_token = "1"; // MFP capable/optional
+-    } else {
+-        mfp_token = "0"; // MFP disabled
+-    }
+-    return !akm_token.empty() && !pairwise_token.empty();
+-}
+-} // namespace
+-
+ bool ap_wlan_hal_whm::update_bss_rsn_override(const sMacAddr &bssid,
+                                               const std::vector<uint8_t> &security_ies)
+ {
+@@ -599,41 +543,24 @@ bool ap_wlan_hal_whm::update_bss_rsn_override(const sMacAddr &bssid,
+         return false;
+     }
+ 
+-    // Decode the RSNOE(0x29) -> override-1 and RSNO2E(0x2A) -> override-2 tokens from the blob.
+-    std::string o1_km, o1_pw, o1_mfp, o2_km, o2_pw, o2_mfp;
+-    bool have_o1 = false, have_o2 = false;
+-    size_t i = 0;
+-    while (i + 2 <= security_ies.size()) {
+-        const uint8_t eid = security_ies[i];
+-        const uint8_t len = security_ies[i + 1];
+-        if (i + 2 + static_cast<size_t>(len) > security_ies.size()) {
+-            break; // malformed / truncated
+-        }
+-        const uint8_t *body = &security_ies[i + 2];
+-        if (eid == 0xDD && len >= 4 && body[0] == 0x50 && body[1] == 0x6F && body[2] == 0x9A) {
+-            const uint8_t oui_type = body[3];
+-            const uint8_t *ov      = body + 4;
+-            const size_t ov_len    = static_cast<size_t>(len) - 4;
+-            if (oui_type == 0x29) { // RSNOE -> override 1
+-                have_o1 = parse_rsn_override_body(ov, ov_len, o1_km, o1_pw, o1_mfp);
+-            } else if (oui_type == 0x2A) { // RSNO2E -> override 2
+-                have_o2 = parse_rsn_override_body(ov, ov_len, o2_km, o2_pw, o2_mfp);
+-            }
+-        }
+-        i += 2 + static_cast<size_t>(len);
+-    }
++    // Decode the RSNOE(0x29) -> override-1 and RSNO2E(0x2A) -> override-2 tokens from the blob,
++    // using the shared parser in son::rsn_ie_utils (<bcl/son/son_wireless_utils.h>) so the byte
++    // layout stays in sync with the builders (Controller NBAPI, UCI/DM platform BPL).
++    son::rsn_ie_utils::sRsnOverride override1, override2;
++    son::rsn_ie_utils::parse_security_ies_overrides(security_ies, override1, override2);
+ 
+     // Write the six RSN-override parameters into the pWHM Security object. Empty strings
+     // clear the corresponding override (matches nl80211 clear_rsn_override_parameters()).
+     std::string wifi_ap_sec_path = vap_it->second.path + "Security.";
+     AmbiorixVariant new_obj(AMXC_VAR_ID_HTABLE);
+     new_obj.set_type(AMXC_VAR_ID_HTABLE);
+-    new_obj.add_child("RSNOverrideKeyMgmt", have_o1 ? o1_km : std::string());
+-    new_obj.add_child("RSNOverridePairwise", have_o1 ? o1_pw : std::string());
+-    new_obj.add_child("RSNOverrideMFP", have_o1 ? o1_mfp : std::string());
+-    new_obj.add_child("RSNOverrideKeyMgmt2", have_o2 ? o2_km : std::string());
+-    new_obj.add_child("RSNOverridePairwise2", have_o2 ? o2_pw : std::string());
+-    new_obj.add_child("RSNOverrideMFP2", have_o2 ? o2_mfp : std::string());
++    new_obj.add_child("RSNOverrideKeyMgmt", override1.present ? override1.key_mgmt : std::string());
++    new_obj.add_child("RSNOverridePairwise", override1.present ? override1.pairwise : std::string());
++    new_obj.add_child("RSNOverrideMFP", override1.present ? override1.mfp : std::string());
++    new_obj.add_child("RSNOverrideKeyMgmt2", override2.present ? override2.key_mgmt : std::string());
++    new_obj.add_child("RSNOverridePairwise2",
++                      override2.present ? override2.pairwise : std::string());
++    new_obj.add_child("RSNOverrideMFP2", override2.present ? override2.mfp : std::string());
+ 
+     if (!m_ambiorix_cl.update_object(wifi_ap_sec_path, new_obj)) {
+         LOG(ERROR) << "update_bss_rsn_override: failed to set RSN Override params for "
+@@ -642,8 +569,9 @@ bool ap_wlan_hal_whm::update_bss_rsn_override(const sMacAddr &bssid,
+     }
+ 
+     LOG(INFO) << "update_bss_rsn_override: bssid=" << bssid << " vap=" << vap_info.bss
+-              << " override1{km=" << o1_km << " pw=" << o1_pw << " mfp=" << o1_mfp
+-              << "} override2{km=" << o2_km << " pw=" << o2_pw << " mfp=" << o2_mfp << "}";
++              << " override1{km=" << override1.key_mgmt << " pw=" << override1.pairwise
++              << " mfp=" << override1.mfp << "} override2{km=" << override2.key_mgmt
++              << " pw=" << override2.pairwise << " mfp=" << override2.mfp << "}";
+     return true;
+ }
+ 
+@@ -936,25 +864,8 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+         if (security_mode == "WPA3-Personal-Compatibility" &&
+             !bss_info_conf.security_ies.empty()) {
+             bool has_akm8 = false, has_akm24 = false;
+-            const auto &ies = bss_info_conf.security_ies;
+-            size_t i        = 0;
+-            while (i + 2 <= ies.size()) {
+-                const uint8_t eid = ies[i];
+-                const uint8_t len = ies[i + 1];
+-                if (i + 2 + static_cast<size_t>(len) > ies.size()) {
+-                    break;
+-                }
+-                if (eid == 0xDD && len >= 4 && ies[i + 2] == 0x50 && ies[i + 3] == 0x6F &&
+-                    ies[i + 4] == 0x9A) {
+-                    const uint8_t oui_type = ies[i + 5];
+-                    if (oui_type == 0x29) {
+-                        has_akm8 = true;
+-                    } else if (oui_type == 0x2A) {
+-                        has_akm24 = true;
+-                    }
+-                }
+-                i += 2 + static_cast<size_t>(len);
+-            }
++            son::rsn_ie_utils::security_ies_akm_presence(bss_info_conf.security_ies, has_akm8,
++                                                         has_akm24);
+             if (has_akm8 && !has_akm24) {
+                 security_mode = "WPA3-Personal-Compatibility-8";
+             } else if (!has_akm8 && has_akm24) {
+diff --git a/controller/nbapi/on_action.cpp b/controller/nbapi/on_action.cpp
+index 675de30..b42b3c6 100644
+--- a/controller/nbapi/on_action.cpp
++++ b/controller/nbapi/on_action.cpp
+@@ -13,6 +13,7 @@
+ #include <bcl/beerocks_qos_utils.h>
+ #include <bcl/beerocks_string_utils.h>
+ #include <beerocks/tlvf/beerocks_message_bml.h>
++#include <bcl/son/son_wireless_utils.h>
+ #include <cctype>
+ #include <chrono>
+ #include <iomanip>
+@@ -36,117 +37,16 @@ namespace actions {
+ 
+ son::db *g_database = nullptr;
+ 
+-// Controller-side RSN SecurityIEs synthesizer for WPA3 Personal Compatibility Mode
++// Controller-side RSN SecurityIEs synthesis for WPA3 Personal Compatibility Mode
+ // (MRSNO, R6.1 §17.2.105). The three WPA3-Personal-Compatibility DM variants map to:
+ //   "...-8"    -> RSNE(SAE) + RSNOE(AKM8)               + RSNXOE
+ //   "...-24"   -> RSNE(SAE) + RSNO2E(AKM24)              + RSNXOE
+ //   "..." (no suffix) -> RSNE(SAE) + RSNOE(AKM8) + RSNO2E(AKM24) + RSNXOE  (union)
+ // additional_auth stays a single WPA3_PERSONAL_COMPATIBILITY flag; the AKM choice lives
+-// only in the wire IEs. Mirrors the UCI-side builder in bpl_cfg_wifi.cpp byte-for-byte.
+-
+-// RSN Capabilities low byte for MFPC + MFPR (WPA3-PCM baseline).
+-static constexpr uint8_t kRsnCapsMfpRequired = 0xC0;
+-
+-// Append one RSN Override vendor-specific element (RSNOE 0x29 / RSNO2E 0x2A)
+-// carrying a single-AKM, single-pairwise RSN body with MFPC+MFPR.
+-static void append_rsn_override_element(std::vector<uint8_t> &out, uint8_t oui_type,
+-                                        uint8_t akm, uint8_t pairwise)
+-{
+-    // Vendor payload = WFA OUI(3) + OUI type(1) + RSN body(26) = 30 (0x1E).
+-    out.push_back(0xDD);        // Element ID: Vendor-Specific
+-    out.push_back(0x1E);        // Length = 30
+-    out.push_back(0x50);        // WFA OUI
+-    out.push_back(0x6F);
+-    out.push_back(0x9A);
+-    out.push_back(oui_type);    // 0x29 (RSNOE) or 0x2A (RSNO2E)
+-    out.push_back(0x01);        // Version
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // Group Data Cipher Suite = 00-0F-AC-04 (CCMP)
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(0x04);
+-    out.push_back(0x01);        // Pairwise Cipher Suite Count = 1
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // Pairwise Cipher Suite = 00-0F-AC-<pairwise>
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(pairwise);
+-    out.push_back(0x01);        // AKM Suite Count = 1
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // AKM Suite = 00-0F-AC-<akm>
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(akm);
+-    out.push_back(kRsnCapsMfpRequired); // RSN Capabilities (low byte carries MFPC/MFPR)
+-    out.push_back(0x00);        // RSN Capabilities (high byte)
+-    out.push_back(0x00);        // PMKID Count = 0
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // Group Management Cipher Suite = 00-0F-AC-06 (BIP-CMAC-128)
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(0x06);
+-}
+-
+-// Builds the WPA3-PCM SecurityIEs blob: primary RSNE, then RSNOE/RSNO2E per include_akm8/24,
+-// then trailing RSNXOE. Returns empty if neither flag is set.
+-static std::vector<uint8_t>
+-build_wpa3_pcm_security_ies(bool include_akm8, bool include_akm24)
+-{
+-    std::vector<uint8_t> out;
+-    if (!include_akm8 && !include_akm24) {
+-        return out;
+-    }
+-
+-    // Primary RSNE: WPA3-PCM baseline (SAE / CCMP / MFP required).
+-    out.push_back(0x30);        // Element ID: RSNE
+-    out.push_back(0x1A);        // Length = 26
+-    out.push_back(0x01);        // Version
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // Group Data Cipher Suite = 00-0F-AC-04 (CCMP)
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(0x04);
+-    out.push_back(0x01);        // Pairwise Cipher Suite Count = 1
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // Pairwise Cipher Suite = 00-0F-AC-04 (CCMP)
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(0x04);
+-    out.push_back(0x01);        // AKM Suite Count = 1
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // AKM Suite = 00-0F-AC-08 (SAE)
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(0x08);
+-    out.push_back(kRsnCapsMfpRequired); // RSN Capabilities low byte = MFPC+MFPR
+-    out.push_back(0x00);        // RSN Capabilities high byte
+-    out.push_back(0x00);        // PMKID Count = 0
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // Group Management Cipher Suite = 00-0F-AC-06
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(0x06);
+-
+-    if (include_akm8) {
+-        // RSNOE (0x29): AKM = SAE (0x08), pairwise = CCMP (0x04).
+-        append_rsn_override_element(out, 0x29, /*akm=*/0x08, /*pairwise=*/0x04);
+-    }
+-    if (include_akm24) {
+-        // RSNO2E (0x2A): AKM = SAE-EXT-KEY (0x18), pairwise = GCMP-256 (0x09).
+-        append_rsn_override_element(out, 0x2A, /*akm=*/0x18, /*pairwise=*/0x09);
+-    }
+-
+-    // Trailing RSNXOE (0x2B): SAE-H2E capability (Extended RSN Capabilities byte 0x20).
+-    out.push_back(0xDD);
+-    out.push_back(0x05);        // Length = 5
+-    out.push_back(0x50);
+-    out.push_back(0x6F);
+-    out.push_back(0x9A);
+-    out.push_back(0x2B);        // OUI type: RSNXOE
+-    out.push_back(0x20);        // Extended RSN Capabilities: SAE-H2E
+-
+-    return out;
+-}
++// only in the wire IEs. The byte format is produced by the single shared builder in the
++// son::rsn_ie_utils namespace in <bcl/son/son_wireless_utils.h>
++// (son::rsn_ie_utils::build_wpa3_pcm_security_ies), which is used identically by the UCI/DM
++// platform BPL backends and parsed by the bwl HAL.
+ 
+ /*
+ ** Set the number of seconds since this Associated Device was last attempted to be steered.
+@@ -529,7 +429,8 @@ amxd_status_t access_point_commit(amxd_object_t *object, amxd_function_t *func,
+                     (mode_enabled == "WPA3-Personal-Compatibility" ||
+                      mode_enabled == "WPA3-Personal-Compatibility-24");
+ 
+-                bss_info.security_ies = build_wpa3_pcm_security_ies(include_akm8, include_akm24);
++                bss_info.security_ies =
++                    son::rsn_ie_utils::build_wpa3_pcm_security_ies(include_akm8, include_akm24);
+                 LOG(DEBUG) << "WPA3-PCM mode '" << mode_enabled << "' -> AKM8=" << include_akm8
+                            << " AKM24=" << include_akm24
+                            << " security_ies=" << bss_info.security_ies.size() << " bytes";
+diff --git a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+index 22e6b06..24d4671 100644
+--- a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+@@ -22,6 +22,8 @@
+ 
+ #include <tlvf/common/eVapType.h>
+ 
++#include <bcl/son/son_wireless_utils.h>
++
+ #include "wbapi_utils.h"
+ 
+ #include "bpl_cfg_pwhm.h"
+@@ -44,113 +46,15 @@ eFreqType string_to_freq_type(const std::string &freq_str)
+ 
+ // WPA3-PCM (MRSNO, R6.1 §17.2.105) SecurityIEs synthesizer for the pWHM/DM backend.
+ // Maps the three ModeEnabled variants to eAdditionalAuth::WPA3_PERSONAL_COMPATIBILITY plus
+-// the AKM-specific SecurityIEs blob (RSNE + RSNOE/RSNO2E + RSNXOE), mirroring the UCI
+-// backend's build_rsn_security_ies_from_uci() byte-for-byte:
++// the AKM-specific SecurityIEs blob (RSNE + RSNOE/RSNO2E + RSNXOE):
+ //   "...-8"  -> RSNE(SAE) + RSNOE(AKM8)                + RSNXOE
+ //   "...-24" -> RSNE(SAE) + RSNO2E(AKM24)               + RSNXOE
+ //   "..."    -> RSNE(SAE) + RSNOE(AKM8) + RSNO2E(AKM24) + RSNXOE
+-
+-// RSN Capabilities low byte for MFPC + MFPR (WPA3-PCM baseline).
+-constexpr uint8_t kRsnCapsMfpRequired = 0xC0;
+-
+-// Append one RSN Override vendor-specific element (RSNOE 0x29 / RSNO2E 0x2A)
+-// carrying a single-AKM, single-pairwise RSN body with MFPC+MFPR.
+-void append_rsn_override_element(std::vector<uint8_t> &out, uint8_t oui_type, uint8_t akm,
+-                                 uint8_t pairwise)
+-{
+-    // Vendor payload = WFA OUI(3) + OUI type(1) + RSN body(26) = 30 (0x1E).
+-    out.push_back(0xDD);        // Element ID: Vendor-Specific
+-    out.push_back(0x1E);        // Length = 30
+-    out.push_back(0x50);        // WFA OUI
+-    out.push_back(0x6F);
+-    out.push_back(0x9A);
+-    out.push_back(oui_type);    // 0x29 (RSNOE) or 0x2A (RSNO2E)
+-    out.push_back(0x01);        // Version
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // Group Data Cipher Suite = 00-0F-AC-04 (CCMP)
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(0x04);
+-    out.push_back(0x01);        // Pairwise Cipher Suite Count = 1
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // Pairwise Cipher Suite = 00-0F-AC-<pairwise>
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(pairwise);
+-    out.push_back(0x01);        // AKM Suite Count = 1
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // AKM Suite = 00-0F-AC-<akm>
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(akm);
+-    out.push_back(kRsnCapsMfpRequired); // RSN Capabilities (low byte carries MFPC/MFPR)
+-    out.push_back(0x00);        // RSN Capabilities (high byte)
+-    out.push_back(0x00);        // PMKID Count = 0
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // Group Management Cipher Suite = 00-0F-AC-06 (BIP-CMAC-128)
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(0x06);
+-}
+-
+-// Build the spec-compliant WPA3-PCM SecurityIEs blob for a given AKM combination.
+-std::vector<uint8_t> build_wpa3_pcm_security_ies(bool include_akm8, bool include_akm24)
+-{
+-    std::vector<uint8_t> out;
+-    if (!include_akm8 && !include_akm24) {
+-        return out;
+-    }
+-
+-    // Primary RSNE: WPA3-PCM baseline (SAE / CCMP / MFP required).
+-    out.push_back(0x30);        // Element ID: RSNE
+-    out.push_back(0x1A);        // Length = 26
+-    out.push_back(0x01);        // Version
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // Group Data Cipher Suite = 00-0F-AC-04 (CCMP)
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(0x04);
+-    out.push_back(0x01);        // Pairwise Cipher Suite Count = 1
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // Pairwise Cipher Suite = 00-0F-AC-04 (CCMP)
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(0x04);
+-    out.push_back(0x01);        // AKM Suite Count = 1
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // AKM Suite = 00-0F-AC-08 (SAE)
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(0x08);
+-    out.push_back(kRsnCapsMfpRequired); // RSN Capabilities low byte = MFPC+MFPR
+-    out.push_back(0x00);        // RSN Capabilities high byte
+-    out.push_back(0x00);        // PMKID Count = 0
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // Group Management Cipher Suite = 00-0F-AC-06
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(0x06);
+-
+-    if (include_akm8) {
+-        // RSNOE (0x29): AKM = SAE (0x08), pairwise = CCMP (0x04).
+-        append_rsn_override_element(out, 0x29, /*akm=*/0x08, /*pairwise=*/0x04);
+-    }
+-    if (include_akm24) {
+-        // RSNO2E (0x2A): AKM = SAE-EXT-KEY (0x18), pairwise = GCMP-256 (0x09).
+-        append_rsn_override_element(out, 0x2A, /*akm=*/0x18, /*pairwise=*/0x09);
+-    }
+-
+-    // Trailing RSNXOE (0x2B): SAE-H2E capability (Extended RSN Capabilities byte 0x20).
+-    out.push_back(0xDD);
+-    out.push_back(0x05);        // Length = 5
+-    out.push_back(0x50);
+-    out.push_back(0x6F);
+-    out.push_back(0x9A);
+-    out.push_back(0x2B);        // OUI type: RSNXOE
+-    out.push_back(0x20);        // Extended RSN Capabilities: SAE-H2E
+-
+-    return out;
+-}
++//
++// The builder itself lives in the shared son::rsn_ie_utils namespace in
++// <bcl/son/son_wireless_utils.h> (next to sBssInfoConf, which owns security_ies) so the
++// Controller (NBAPI), both platform BPL backends (UCI + DM) and the bwl HAL all emit/parse
++// the exact same bytes. Use it via son::rsn_ie_utils::build_wpa3_pcm_security_ies().
+ } // namespace
+ 
+ namespace beerocks {
+@@ -504,7 +408,8 @@ bool bpl_cfg_get_wifi_credentials(const std::string &iface,
+                 (mode_enabled == "WPA3-Personal-Compatibility" ||
+                  mode_enabled == "WPA3-Personal-Compatibility-24");
+ 
+-            configuration.security_ies = build_wpa3_pcm_security_ies(include_akm8, include_akm24);
++            configuration.security_ies =
++                son::rsn_ie_utils::build_wpa3_pcm_security_ies(include_akm8, include_akm24);
+             LOG(DEBUG) << "WPA3-PCM ModeEnabled='" << mode_enabled << "' on iface " << iface
+                        << " -> AKM8=" << include_akm8 << " AKM24=" << include_akm24
+                        << " security_ies=" << configuration.security_ies.size() << " bytes";
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index 38c05d2..a3afc35 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -77,60 +77,6 @@ static bool rsn_pairwise_to_cipher(const std::string &pw, uint8_t &cipher)
+     return true;
+ }
+ 
+-// Map a UCI rsn_override_mfp value ("0"/"1"/"2") to the RSN Capabilities low byte.
+-// Bit 6 (0x40) = MFPR (required), Bit 7 (0x80) = MFPC (capable).
+-static uint8_t rsn_mfp_to_caps_low_byte(const std::string &mfp)
+-{
+-    if (mfp == "2") {
+-        return 0xC0; // MFPC + MFPR (required)
+-    } else if (mfp == "1") {
+-        return 0x80; // MFPC only (capable/optional)
+-    }
+-    return 0x00; // disabled
+-}
+-
+-// Append one RSN Override vendor-specific element (RSNOE 0x29 / RSNO2E 0x2A)
+-// carrying a single-AKM, single-pairwise RSN body with the given MFP caps.
+-static void append_rsn_override_element(std::vector<uint8_t> &out, uint8_t oui_type,
+-                                        uint8_t akm, uint8_t pairwise, uint8_t caps_low)
+-{
+-    // RSN body: Version(2) GroupData(4) PWCount(2) PW(4) AKMCount(2) AKM(4)
+-    //           RSNCaps(2) PMKIDCount(2) GroupMgmt(4) = 26 bytes.
+-    // Vendor element payload = WFA OUI(3) + OUI type(1) + RSN body(26) = 30 (0x1E).
+-    out.push_back(0xDD);        // Element ID: Vendor-Specific
+-    out.push_back(0x1E);        // Length = 30
+-    out.push_back(0x50);        // WFA OUI
+-    out.push_back(0x6F);
+-    out.push_back(0x9A);
+-    out.push_back(oui_type);    // 0x29 (RSNOE) or 0x2A (RSNO2E)
+-    out.push_back(0x01);        // Version
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // Group Data Cipher Suite = 00-0F-AC-04 (CCMP)
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(0x04);
+-    out.push_back(0x01);        // Pairwise Cipher Suite Count = 1
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // Pairwise Cipher Suite = 00-0F-AC-<pairwise>
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(pairwise);
+-    out.push_back(0x01);        // AKM Suite Count = 1
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // AKM Suite = 00-0F-AC-<akm>
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(akm);
+-    out.push_back(caps_low);    // RSN Capabilities (low byte carries MFPC/MFPR)
+-    out.push_back(0x00);        // RSN Capabilities (high byte)
+-    out.push_back(0x00);        // PMKID Count = 0
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // Group Management Cipher Suite = 00-0F-AC-06 (BIP-CMAC-128)
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(0x06);
+-}
+-
+ /**
+  * @brief Build the RSN SecurityIEs blob for a BSS from its six UCI rsn_override_* values.
+  *
+@@ -160,53 +106,24 @@ static bool build_rsn_security_ies_from_uci(const std::string &o1_km, const std:
+     }
+ 
+     // Primary RSNE: WPA3-PCM baseline (SAE / CCMP / MFP required), matching the canned blobs.
+-    // AKM = SAE (0x08), pairwise = CCMP (0x04), RSN caps = MFPC+MFPR (0xC0).
+-    out.push_back(0x30);        // Element ID: RSNE
+-    out.push_back(0x1A);        // Length = 26
+-    out.push_back(0x01);        // Version
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // Group Data Cipher Suite = 00-0F-AC-04 (CCMP)
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(0x04);
+-    out.push_back(0x01);        // Pairwise Cipher Suite Count = 1
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // Pairwise Cipher Suite = 00-0F-AC-04 (CCMP)
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(0x04);
+-    out.push_back(0x01);        // AKM Suite Count = 1
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // AKM Suite = 00-0F-AC-08 (SAE)
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(0x08);
+-    out.push_back(0xC0);        // RSN Capabilities low byte = MFPC+MFPR
+-    out.push_back(0x00);        // RSN Capabilities high byte
+-    out.push_back(0x00);        // PMKID Count = 0
+-    out.push_back(0x00);
+-    out.push_back(0x00);        // Group Management Cipher Suite = 00-0F-AC-06
+-    out.push_back(0x0F);
+-    out.push_back(0xAC);
+-    out.push_back(0x06);
++    // Emitted via the shared son::rsn_ie_utils builder in <bcl/son/son_wireless_utils.h>.
++    son::rsn_ie_utils::append_wpa3_pcm_primary_rsne(out);
+ 
++    // The RSN Capabilities MFP bits of the override elements are taken verbatim from
++    // rsn_override_mfp / rsn_override_mfp_2 so the Agent applies exactly what UCI specifies.
+     if (have_ovr1) {
+-        append_rsn_override_element(out, 0x29 /* RSNOE */, o1_akm, o1_cipher,
+-                                    rsn_mfp_to_caps_low_byte(o1_mfp));
++        son::rsn_ie_utils::append_rsn_override_element(
++            out, son::rsn_ie_utils::kOuiTypeRsnoe, o1_akm, o1_cipher,
++            son::rsn_ie_utils::rsn_mfp_token_to_caps_low_byte(o1_mfp));
+     }
+     if (have_ovr2) {
+-        append_rsn_override_element(out, 0x2A /* RSNO2E */, o2_akm, o2_cipher,
+-                                    rsn_mfp_to_caps_low_byte(o2_mfp));
++        son::rsn_ie_utils::append_rsn_override_element(
++            out, son::rsn_ie_utils::kOuiTypeRsno2e, o2_akm, o2_cipher,
++            son::rsn_ie_utils::rsn_mfp_token_to_caps_low_byte(o2_mfp));
+     }
+ 
+     // RSNXOE (0x2B): SAE-H2E capability (Extended RSN Capabilities byte 0x20).
+-    out.push_back(0xDD);
+-    out.push_back(0x05);        // Length = 5
+-    out.push_back(0x50);
+-    out.push_back(0x6F);
+-    out.push_back(0x9A);
+-    out.push_back(0x2B);        // OUI type: RSNXOE
+-    out.push_back(0x20);        // Extended RSN Capabilities
++    son::rsn_ie_utils::append_rsnxoe_sae_h2e(out);
+ 
+     return true;
+ }
+@@ -374,6 +291,113 @@ static bool decode_rsn_override_uci_from_security_ies(
+     return have_ovr1 || have_ovr2;
+ }
+ 
++// ---------------------------------------------------------------------------
++// Resolve the coarse UCI `encryption` selector for a WPA3 Personal Compatibility
++// (MRSNO) BSS.
++//
++// The runtime code path collapses all three MRSNO variants into the single
++// additional_auth enum value WPA3_PERSONAL_COMPATIBILITY; the specific AKM set
++// (AKM8 / AKM24 / AKM8+AKM24) is carried ONLY in the SecurityIEs blob
++// (RSNOE=AKM8=SAE, RSNO2E=AKM24=SAE-EXT-KEY).  Without this resolver the
++// get_encryption() lambdas fall through to the default "none", producing the
++// observed `option encryption 'none'` for MRSNO VAPs even though hostapd is
++// correctly programmed via the rsn_override_* options.
++//
++// Expected mapping (matches the WPA3 Personal Compatibility recipe):
++//   AKM8 only       2.4/5G -> psk2       6G -> sae
++//   AKM24 only      2.4/5G -> psk2       6G -> sae-ext-key
++//   AKM8 + AKM24    2.4/5G -> psk2       6G -> sae
++//
++// Returns an empty string when the blob carries neither AKM8 nor AKM24, letting
++// the caller keep its existing fallback behaviour.
++// Scan the primary RSNE (EID 48) of a SecurityIEs blob for the SAE (AKM8) and
++// SAE-EXT-KEY (AKM24) AKM suite selectors.  On 6 GHz, WPA2-PSK is not allowed so
++// AKM8 (SAE) is advertised directly in the primary RSNE rather than in an RSN
++// Override element; the RSN Override decoder therefore cannot see it.  This
++// helper closes that gap so the band resolver can distinguish 6 GHz AKM8-only /
++// AKM8+AKM24 (primary=SAE) from AKM24-only (primary=SAE-EXT-KEY).
++static void scan_primary_rsne_akms(const std::vector<uint8_t> &ies, bool &primary_has_sae,
++                                   bool &primary_has_sae_ext)
++{
++    primary_has_sae     = false;
++    primary_has_sae_ext = false;
++
++    const size_t n = ies.size();
++    size_t i       = 0;
++    while (i + 2 <= n) {
++        const uint8_t eid = ies[i];
++        const uint8_t len = ies[i + 1];
++        if (i + 2 + size_t(len) > n) {
++            break;
++        }
++        if (eid == 48 /* RSNE */) {
++            const uint8_t *b = &ies[i + 2];
++            const size_t bl  = len;
++            // Version(2) + GroupData(4) + PWCount(2) + PWList + AKMCount(2) + AKMList
++            if (bl >= 8) {
++                size_t p               = 2 + 4; // skip Version + Group Data Cipher
++                const uint16_t pw_cnt  = static_cast<uint16_t>(b[p] | (b[p + 1] << 8));
++                p += 2;
++                p += size_t(pw_cnt) * 4;
++                if (p + 2 <= bl) {
++                    const uint16_t akm_cnt = static_cast<uint16_t>(b[p] | (b[p + 1] << 8));
++                    p += 2;
++                    for (uint16_t a = 0; a < akm_cnt && p + 4 <= bl; ++a, p += 4) {
++                        if (b[p] == 0x00 && b[p + 1] == 0x0F && b[p + 2] == 0xAC) {
++                            if (b[p + 3] == 8) {
++                                primary_has_sae = true;
++                            } else if (b[p + 3] == 24) {
++                                primary_has_sae_ext = true;
++                            }
++                        }
++                    }
++                }
++            }
++            return; // primary RSNE processed
++        }
++        i += 2 + size_t(len);
++    }
++}
++
++static std::string mrsno_encryption_for_band(const std::vector<uint8_t> &security_ies,
++                                             beerocks::eFreqType freq_band)
++{
++    std::string o1_km, o1_pw, o1_mfp, o2_km, o2_pw, o2_mfp;
++    decode_rsn_override_uci_from_security_ies(security_ies, o1_km, o1_pw, o1_mfp, o2_km, o2_pw,
++                                              o2_mfp);
++
++    // AKM8 (SAE) may be advertised either in RSNOE (2.4/5 GHz) or in the primary
++    // RSNE (6 GHz).  AKM24 (SAE-EXT-KEY) may be advertised in RSNO2E (2.4/5 GHz)
++    // or in the primary RSNE (6 GHz AKM24-only).  Scan both sources so all three
++    // MRSNO variants resolve correctly on every band.
++    bool primary_sae = false, primary_sae_ext = false;
++    scan_primary_rsne_akms(security_ies, primary_sae, primary_sae_ext);
++
++    const bool akm8  = (o1_km == "SAE") || primary_sae;              // AKM8
++    const bool akm24 = (o2_km == "SAE-EXT-KEY") || primary_sae_ext;  // AKM24
++
++    if (!akm8 && !akm24) {
++        return {};
++    }
++
++    const bool is_6g = (freq_band == beerocks::eFreqType::FREQ_6G);
++
++    // 2.4/5 GHz: the primary RSNE is always WPA2-PSK, with the SAE/SAE-EXT-KEY
++    // AKMs advertised through the RSN Override elements. So the coarse selector
++    // is always "psk2" regardless of the exact AKM combination.
++    if (!is_6g) {
++        return "psk2";
++    }
++
++    // 6 GHz: WPA2-PSK is not allowed, so the primary RSNE carries the AKM
++    // directly. Anything including AKM8 -> sae (AKM8-only, AKM8+AKM24);
++    // AKM24-only -> sae-ext-key.
++    if (akm8) {
++        return "sae"; // AKM8 or AKM8+AKM24
++    }
++    return "sae-ext-key"; // AKM24 only
++}
++
+ } // anonymous namespace
+ 
+ static bool bpl_cfg_get_bss_configuration(const std::string &section_name,
+@@ -1139,6 +1163,22 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+ 	    options["encryption"] = get_encryption(configuration.authentication_type, configuration.encryption_type,
+ 	                                            configuration.additional_auth, configuration.freq_band);
+ 
++        // The runtime MRSNO path uses the single WPA3_PERSONAL_COMPATIBILITY enum and
++        // carries the AKM set only in security_ies, so the get_encryption() lambda above
++        // cannot distinguish AKM8/AKM24/AKM8+AKM24 and returns "none".  Derive the correct
++        // coarse selector (psk2 on 2.4/5G, sae/sae-ext-key on 6G) from the decoded overrides.
++        if (configuration.additional_auth ==
++                son::wireless_utils::eAdditionalAuth::WPA3_PERSONAL_COMPATIBILITY &&
++            (options["encryption"].empty() || options["encryption"] == "none")) {
++            std::string mrsno_enc = mrsno_encryption_for_band(configuration.security_ies,
++                                                              configuration.freq_band);
++            if (!mrsno_enc.empty()) {
++                options["encryption"] = mrsno_enc;
++                MAPF_DBG("bpl_cfg_set_wifi_credentials: iface=" << iface
++                         << " WPA3_PERSONAL_COMPATIBILITY -> encryption='" << mrsno_enc << "'");
++            }
++        }
++
+         if (options["encryption"] == "sae") {
+                 options["sae_pwe"] = "2";
+                 options["sae"] = "1";
+@@ -1199,6 +1239,9 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+             options["interworking"] = "1";  // MUST: prerequisite for MBO IE
+             options["mbo"]          = "1";  // MUST: enables MBO IE in beacons/probe responses
+ 
++            // Enable hostapd reporting of connection failures.
++            options["report_connection_failures"] = "1";
++
+ 
+             // Set hidden option based on hidden_ssid from BSS Advanced Configuration TLV
+             // hidden_ssid ENABLED  → option hidden 1 (SSID not broadcast in beacons)
+@@ -1460,7 +1503,23 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+ 
+             options["ssid"] = config.ssid;
+             options["encryption"] = get_encryption(config.authentication_type, config.encryption_type, config.additional_auth, config.freq_band);
+-            
++
++            // The runtime MRSNO path uses the single WPA3_PERSONAL_COMPATIBILITY enum and
++            // carries the AKM set only in security_ies, so the get_encryption() lambda above
++            // cannot distinguish AKM8/AKM24/AKM8+AKM24 and returns "none".  Derive the correct
++            // coarse selector (psk2 on 2.4/5G, sae/sae-ext-key on 6G) from the decoded overrides.
++            if (config.additional_auth ==
++                    son::wireless_utils::eAdditionalAuth::WPA3_PERSONAL_COMPATIBILITY &&
++                (options["encryption"].empty() || options["encryption"] == "none")) {
++                std::string mrsno_enc = mrsno_encryption_for_band(config.security_ies,
++                                                                  config.freq_band);
++                if (!mrsno_enc.empty()) {
++                    options["encryption"] = mrsno_enc;
++                    MAPF_DBG("build_map_options: iface=" << iface
++                             << " WPA3_PERSONAL_COMPATIBILITY -> encryption='" << mrsno_enc << "'");
++                }
++            }
++
+             if (options["encryption"] == "sae") {
+                 options["sae_pwe"] = "2";
+                 options["sae"] = "1";
+@@ -1512,6 +1571,9 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+             options["interworking"] = "1";  // MUST: prerequisite for MBO IE
+             options["mbo"]          = "1";  // MUST: enables MBO IE in beacons/probe responses
+ 
++            // Enable hostapd reporting of connection failures (MLD path).
++            options["report_connection_failures"] = "1";
++
+             // Persist SSID advertisement state in UCI.
+             // hidden_ssid ENABLED  -> option hidden 1 (SSID not advertised)
+             // hidden_ssid DISABLED -> option hidden 0 (SSID advertised)
+-- 
+2.34.1
+
