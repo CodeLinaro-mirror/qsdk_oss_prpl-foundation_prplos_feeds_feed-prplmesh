@@ -1,0 +1,2346 @@
+From 7a0dc95a72cca7a3915f2c2c89765dc2bd5671b8 Mon Sep 17 00:00:00 2001
+From: Muthuchamy Kumar <muthucha@qti.qualcomm.com>
+Date: Wed, 12 Aug 2026 18:03:29 +0530
+Subject: [PATCH] patch: bSTA DPP automatic chirp and 1905-layer connector
+ store
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Split the single AgentDB::dpp_credentials struct into two distinct
+credential objects and wire up automatic DPP chirping (Presence
+Announcement) for the wireless bSTA path:
+
+- agent_db.h: dpp_credentials now documented as the bSTA's own
+  WLAN/BSS-association connector (netRole=mapBackhaulSta) — informational
+  only, populated by wpa_supplicant's plain DPP-CONNECTOR/DPP-NET-ACCESS-KEY/
+  DPP-C-SIGN-KEY ctrl events. New sDpp1905Credentials dpp_1905_credentials
+  is the separate 1905/EasyMesh-layer connector (netRole=mapAgent) that
+  actually drives the 1905 4-way handshake, populated by the new
+  DPP-1905-CONNECTOR/DPP-1905-NET-ACCESS-KEY/DPP-1905-C-SIGN-KEY events.
+  sDppBootstrapKey gains chirp_start_delay_sec/chirp_retry_interval_sec
+  (hardcoded defaults, no UCI knob, matching existing DPP fields);
+  chirp_start_delay_sec defaults to 120s.
+
+- backhaul_manager.h/.cpp: automatic chirp lifecycle — maybe_start_dpp_chirp()
+  arms a per-radio timer (EState::WAIT_WPS primary trigger, EState::OPERATIONAL
+  as cheap insurance for reconnect paths); handle_dpp_chirp_timeout() sends
+  the DPP_CHIRP via the bSTA HAL (see sta_wlan_hal below) while the bSTA is
+  not yet associated and re-arms, or stops once is_bsta_connected(); re-armed
+  on DPP-AUTH-SUCCESS (fresh retry window), on DPP-FAIL (short fixed retry
+  delay instead of waiting out the rest of the current retry window), and on
+  Event::Disconnected (immediate restart). process_dpp_bridge_events() gains
+  a second credential-bridge (m_dpp_1905_cred_bridge) that assembles the
+  three DPP-1905-* events and, once complete, copies them into
+  dpp_1905_credentials and notifies son_slave_thread. Also fixes the plain
+  DPP-CONNECTOR netRole filter, which incorrectly expected "mapAgent" instead
+  of the "mapBackhaulSta" that event actually carries, so dpp_credentials was
+  never populated. Bootstrap-key injection is now also gated on
+  is_dpp_bootstrap_injected_on_any_radio(), since the bootstrap key/
+  wpa_bootstrap_id is a single device-global identity, not one per radio —
+  without this, a device with more than one STA-capable radio would
+  inject/chirp independently per radio and stomp on shared state.
+  process_dpp_bridge_events() no longer opens and owns its own
+  wpa_supplicant ctrl_iface event socket (start_dpp_credential_bridge()
+  and m_dpp_bridge_socket/m_dpp_bridge_event_fds are removed): DPP-*
+  event lines now arrive as an Event::Dpp_Event through the STA HAL's
+  existing event queue (see sta_wlan_hal_nl80211.cpp/base_wlan_hal_types.h
+  below) via hal_event_handler(), which passes the raw line straight
+  into process_dpp_bridge_events(sta_iface, event_line). This avoids a
+  second, independent ctrl_iface connection racing/duplicating the STA
+  HAL's own socket on the same interface.
+
+  Both credential-finalize blocks in process_dpp_bridge_events() (WLAN
+  and 1905-layer) are factored out into finalize_dpp_credentials()/
+  finalize_dpp_1905_credentials(), shared with the new reboot-restore
+  path below. On WAIT_WPS entry, backhaul_fsm_wireless() now also calls
+  the new restore_dpp_credentials_on_boot() once per radio (gated on
+  !dpp_credentials_restored). wpa_supplicant never re-emits
+  DPP-CONNECTOR/DPP-1905-CONNECTOR (or their NAK/C-sign-key/DFCounter
+  counterparts) on restart — those events fire once, live, during an
+  active DPP exchange — so on reboot this is the only way to recover an
+  already-provisioned device's connectors: it pulls the persisted WLAN
+  connector, the persisted 1905 connector, and the shared per-network
+  NAK/C-sign-key back out of wpa_supplicant via the bSTA HAL (see
+  sta_wlan_hal below). Each half restores independently and is a no-op if
+  nothing is persisted yet or if a live DPP exchange already populated it
+  this run (fresh/unprovisioned device, or mid-onboarding).
+
+- ap_wlan_hal.h/sta_wlan_hal.h/base_wlan_hal_types.h/key_value_parser.h/
+  base_wlan_hal_nl80211.cpp/sta_wlan_hal_nl80211.cpp: plumbing for the
+  Dpp_Event above. base_wlan_hal_nl80211::process_ext_events() stashes
+  the full raw ctrl_iface line into the parsed-event map under the new
+  EVENT_KEYLESS_PARAM_RAW key; sta_wlan_hal_nl80211 maps any "DPP-"
+  prefixed opcode to the new sta_wlan_hal::Event::Dpp_Event and forwards
+  that raw line verbatim in the new sACTION_BACKHAUL_DPP_EVENT_NOTIFICATION
+  (fixed 4096-byte buffer), copied in with strlcpy() so a raw_line at or
+  past the buffer size is truncated instead of leaving event_line
+  unterminated (strncpy() doesn't null-terminate when the source is >=
+  size). The now-unused ap_wlan_hal::Event::
+  DPP_CREDENTIALS_READY and sACTION_APMANAGER_DPP_CREDENTIALS_READY are
+  removed along with it (superseded by the son_slave_thread ->
+  backhaul_manager credential-bridge path above; they were never
+  connected to anything downstream).
+
+- sta_wlan_hal.h/sta_wlan_hal_types.h/sta_wlan_hal_nl80211.h/.cpp/
+  sta_wlan_hal_onewifi.h/sta_wlan_hal_whm.h: all raw wpa_supplicant
+  ctrl_iface command handling for DPP moves out of BackhaulManager and
+  into the sta_wlan_hal abstraction, behind four new pure-virtual methods —
+  dpp_bootstrap_gen_and_get_uri(), dpp_set_extra_conf_req_bsta_list(),
+  get_persisted_dpp_credentials(), and dpp_chirp(). sta_wlan_hal_nl80211
+  implements all four using the base class's existing wpa_ctrl_send_msg()
+  helper on the HAL's own already-connected ctrl_iface socket, rather than
+  BackhaulManager opening a second, independent one on the same interface;
+  sta_wlan_hal_onewifi/sta_wlan_hal_whm stub them to return false.
+  get_persisted_dpp_credentials() returns the new bwl::sPersistedDppCredentials
+  (persisted WLAN/1905 connector strings plus the shared NAK/C-sign-key DER
+  bytes) and folds in the LIST_NETWORKS/GET_NETWORK walk that
+  restore_dpp_credentials_on_boot() used to do directly. BackhaulManager's
+  own wpa_ctrl_send() helper (and its wpa_ctrl_client.h/wpa_ctrl_socket_cmd
+  dependency) is removed entirely now that nothing calls it directly;
+  restore_dpp_credentials_on_boot() and inject_dpp_bootstrap_key_and_conf_req()
+  change signature from a bare sta_iface string to the radio's
+  shared_ptr<sRadioInfo>, so they can reach radio_info->sta_wlan_hal.
+  get_persisted_dpp_credentials() also now passes its own iface_name
+  explicitly as wpa_ctrl_send_msg()'s ifname argument on every ctrl_iface
+  command (LIST_NETWORKS/GET_NETWORK/GET), instead of relying on that
+  argument's default — on a device with more than one STA-capable radio,
+  the default could resolve to the wrong interface's ctrl_iface socket.
+  Each command's raw reply is also now logged at DEBUG for field triage of
+  what wpa_supplicant actually persisted.
+
+- ap_manager.cpp/son_slave_thread.cpp: remove the obsolete TASK-27
+  tmpfs-based credential relay (ap_manager writing
+  /tmp/prplmesh_dpp_connector, _dpp_nak, _dpp_csign,
+  _dpp_creds_ready; son_slave_thread polling for the marker file and
+  reading them back). That relay predates and duplicates the
+  credential-bridge path already wired up above and was never the
+  active path for dpp_credentials.
+
+- dpp_agent_task.cpp/.h: the shared 1905 handshake logic (Peer Discovery,
+  connector verification, PMK/PTK derivation, EAPOL, BSS Config trigger) —
+  used by both the wired DPP Extender and wireless bSTA paths — now reads
+  and writes dpp_1905_credentials instead of dpp_credentials throughout.
+  initiate_peer_discovery() is promoted to a public entry point so
+  son_slave_thread can call it directly. DppAgentTask::work() also gains a
+  new branch: when dpp_1905_credentials.initialized is already true on
+  entry (restored on reboot, or converted earlier this run) it no longer
+  falls through to the wired-Extender Auth Request timeout logic below —
+  instead it drives Peer Discovery directly over 1905 Direct Encap against
+  the Controller, retrying every DPP_PEER_DISCOVERY_RETRY_SECONDS (new
+  m_peer_discovery_sent_time tracks the retry window) until
+  peer_1905_security records a completed exchange. Without this, a
+  restored-on-reboot bSTA extender would never (re-)initiate Peer Discovery
+  on its own, since that path previously only ran as a reaction to a fresh
+  wireless Auth Request/GAS exchange.
+
+  work()'s restore branch also now handles the no-1905-security case
+  (controller_requires_1905_security == false): once controller_info.bridge_mac
+  is confirmed known (non-zero), it starts the TCP relay server and calls
+  trigger_bss_config_request() directly, gated by a new one-shot
+  m_bss_config_request_sent flag — there is no response/ack to key a retry
+  off of here, unlike the Peer Discovery branch above, so this fires once.
+  Mirrors the analogous live-exchange shortcut at the bottom of
+  handle_dpp_wired_gas_response(). See son_slave_thread.cpp below for why
+  bridge_mac must be checked here rather than left to the credential-bridge
+  notification.
+
+- ap_autoconfiguration_task.cpp: the Chirp TLV gate and the
+  dpp_netaccesskey reconfiguration export both switch from
+  dpp_credentials to dpp_1905_credentials, matching the handshake rename.
+  The Chirp TLV gate is also now restricted to wired extenders
+  (db->backhaul.connection_type == eConnectionType::Wired): a wireless
+  extender's Autoconfig Search is sent over the same radio it is trying to
+  onboard, before it has backhaul connectivity to the controller, so
+  chirping in that message would never actually reach the controller.
+
+- son_slave_thread.cpp: ACTION_BACKHAUL_DPP_CREDENTIALS_NOTIFICATION is
+  now informational-log-only (own WLAN connector received). New
+  ACTION_BACKHAUL_DPP_1905_CREDENTIALS_NOTIFICATION carries the
+  DER-to-JWK C-sign-key conversion that used to live on the old case, but
+  no longer also dispatches trigger_bss_config_request()/
+  initiate_peer_discovery() itself on completion — DppAgentTask::work()
+  (see dpp_agent_task.cpp/.h above) now owns that decision entirely. This
+  notification fires as soon as the credential-bridge (live exchange or
+  boot-restore) finishes assembling the 1905 connector/NAK/C-sign-key, with
+  no guard on whether controller_info.bridge_mac is known yet; on a fresh
+  restore it fires before Topology Discovery has ever learned the
+  Controller's AL-MAC, so the old immediate dispatch called
+  trigger_bss_config_request()/initiate_peer_discovery() with a still-zero
+  bridge_mac — the resulting CMDU gets flooded across every bridge port
+  (including fronthaul radios) instead of reaching only the
+  controller-facing port. work() already retries on a timer and now also
+  gates on bridge_mac being known before acting, so it is the correct
+  place to own this dispatch.
+
+  der_pubkey_to_jwk() only accepted a 65-byte uncompressed EC point
+  (0x04 prefix); wpa_supplicant actually persists/emits the C-sign-key as
+  a 33-byte compressed point (0x02/0x03 prefix), so every DER->JWK
+  conversion failed ("unexpected C-sign-key public key encoding
+  (len=33)") and dpp_1905_credentials.initialized never got set — on both
+  the live event-bridge path and the reboot-restore path above, since
+  both feed the same wpa_supplicant byte layout into this function. It
+  now re-exports the parsed EVP_PKEY with its point-conversion-form
+  switched to uncompressed (OSSL_PKEY_PARAM_EC_POINT_CONVERSION_FORMAT)
+  before reading out x/y whenever the initial read comes back compressed,
+  mirroring the compressed-form export already done the other way in
+  slave_thread::load_dpp_provisioned_keys().
+
+- beerocks_message_action.yaml/beerocks_message_backhaul.yaml: new
+  field-less ACTION_BACKHAUL_DPP_1905_CREDENTIALS_NOTIFICATION message
+  (enum 94, ACTION_BACKHAUL_ENUM_END bumped to 95 — rebased past the
+  ACTION_BACKHAUL_HOSTAP_SET_ACS_BLOCK_LIST: 92 entry already present on
+  this base).
+
+- CMakeLists.txt (agent/src/beerocks/slave): the private include of
+  common/beerocks/bwl/nl80211 (added earlier in this same series for
+  wpa_ctrl_client.h) is dropped again now that backhaul_manager.cpp no
+  longer talks to wpa_supplicant's ctrl_iface directly.
+
+- beerocks_timer_manager_impl.cpp: TimerManagerImpl::remove_timer() resets
+  the caller's fd handle to invalid_descriptor even when the timer isn't
+  found, so callers checking it for "already armed" (e.g.
+  cancel_dpp_chirp_timer()) don't get stuck.
+
+- beerocks_event_loop_impl.cpp: EventLoopImpl::register_handlers()
+  downgrades the "fd already tracked" check from a hard failure to a
+  warning, trusting epoll_ctl()'s EEXIST as the actual source of truth —
+  recovers from stale bookkeeping left behind when a previous fd owner was
+  closed directly.
+---
+ .../ap_manager/ap_manager.cpp                 |  32 -
+ agent/src/beerocks/slave/agent_db.h           |  72 ++-
+ .../backhaul_manager/backhaul_manager.cpp     | 555 ++++++++++++++++++
+ .../slave/backhaul_manager/backhaul_manager.h | 197 +++++++
+ agent/src/beerocks/slave/son_slave_thread.cpp | 189 ++++--
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  18 +-
+ .../beerocks/slave/tasks/dpp_agent_task.cpp   | 102 +++-
+ .../src/beerocks/slave/tasks/dpp_agent_task.h |  24 +-
+ .../bcl/source/beerocks_event_loop_impl.cpp   |  12 +-
+ .../source/beerocks_timer_manager_impl.cpp    |   5 +
+ common/beerocks/bwl/include/bwl/ap_wlan_hal.h |   2 -
+ .../bwl/include/bwl/base_wlan_hal_types.h     |  19 +-
+ .../bwl/include/bwl/key_value_parser.h        |   1 +
+ .../beerocks/bwl/include/bwl/sta_wlan_hal.h   |  42 +-
+ .../bwl/include/bwl/sta_wlan_hal_types.h      |  16 +
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     |   4 +
+ .../bwl/nl80211/sta_wlan_hal_nl80211.cpp      | 152 +++++
+ .../bwl/nl80211/sta_wlan_hal_nl80211.h        |   7 +
+ .../bwl/onewifi/sta_wlan_hal_onewifi.h        |  18 +
+ common/beerocks/bwl/whm/sta_wlan_hal_whm.h    |  19 +
+ .../tlvf/beerocks_message_action.yaml         |   4 +-
+ .../tlvf/beerocks_message_backhaul.yaml       |  19 +
+ 22 files changed, 1353 insertions(+), 156 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 776e5146d..75ed4c0af 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -4837,38 +4837,6 @@ bool ApManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+         encap_1905_dpp_tlv->set_dest_sta_mac(dpp_configuration_request->enrollee_mac);
+         send_cmdu(cmdu_tx);
+     } break;
+-    case Event::DPP_CREDENTIALS_READY: {
+-        // TASK-27: Wireless extender — wpa_supplicant finished DPP config exchange.
+-        // Write credentials to tmpfs so son_slave_thread (separate process) can read them.
+-        LOG(INFO) << "DPP: DPP_CREDENTIALS_READY — writing wireless credentials to tmpfs";
+-        auto creds = static_cast<bwl::sACTION_APMANAGER_DPP_CREDENTIALS_READY *>(data);
+-
+-        // Write connector
+-        {
+-            FILE *f = fopen("/tmp/prplmesh_dpp_connector", "w");
+-            if (f) { fputs(creds->connector_1905, f); fclose(f); }
+-            else { LOG(ERROR) << "DPP: failed to write /tmp/prplmesh_dpp_connector"; }
+-        }
+-        // Write NAK private key (binary DER)
+-        {
+-            FILE *f = fopen("/tmp/prplmesh_dpp_nak", "wb");
+-            if (f) { fwrite(creds->nak_private_der, 1, creds->nak_private_der_len, f); fclose(f); }
+-            else { LOG(ERROR) << "DPP: failed to write /tmp/prplmesh_dpp_nak"; }
+-        }
+-        // Write c-sign-key JWK
+-        {
+-            FILE *f = fopen("/tmp/prplmesh_dpp_csign", "w");
+-            if (f) { fputs(creds->c_sign_key_jwk, f); fclose(f); }
+-            else { LOG(ERROR) << "DPP: failed to write /tmp/prplmesh_dpp_csign"; }
+-        }
+-        // Write marker file last — son_slave_thread polls for this
+-        {
+-            FILE *f = fopen("/tmp/prplmesh_dpp_creds_ready", "w");
+-            if (f) { fputs("1", f); fclose(f); }
+-            else { LOG(ERROR) << "DPP: failed to write /tmp/prplmesh_dpp_creds_ready"; }
+-        }
+-        LOG(INFO) << "DPP: wireless credentials written to /tmp/prplmesh_dpp_creds_ready";
+-    } break;
+     // Unhandled events
+     default:
+         LOG(ERROR) << "Unhandled event: " << int(event);
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 7d025e2cd..c51ccf7d0 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -327,6 +327,10 @@ public:
+         std::array<uint8_t, 32> pubkey_hash{};  // SHA256(key_der) — used for hostapd pkhash in dpp_controller
+         std::string dpp_uri;                // DPP:V:3;K:<base64url(key_der)>;;
+         bool valid              = false;    // true when key loaded and validated
++        int wpa_bootstrap_id    = -1;       // id returned by wpa_supplicant's DPP_BOOTSTRAP_GEN,
++                                             // used for DPP_BOOTSTRAP_GET_URI / DPP_CHIRP (bSTA)
++        int chirp_start_delay_sec    = 120; // delay before first DPP_CHIRP after bootstrap injection
++        int chirp_retry_interval_sec = 120; // interval between subsequent DPP_CHIRP retries
+ 
+         ~sDppBootstrapKey() {
+             if (private_key) {
+@@ -1181,15 +1185,17 @@ public:
+     std::unordered_map<sMacAddr, s1905PeerSecurity> peer_1905_security;
+ 
+     /**
+-     * @brief Agent's own DPP credentials.
++     * @brief Agent's own WLAN/BSS-association DPP connector (netRole="mapBackhaulSta").
+      *
+-     * Populated when the Agent receives the BSS Configuration Response
+-     * containing the 1905-layer DPP Configuration Object
+-     * (wi-fi_tech="map", cred.akm="dpp").
++     * This is the credential wpa_supplicant itself uses to associate to the
++     * backhaul BSS — populated informationally when the Agent observes the
++     * plain (non-1905) DPP-CONNECTOR/DPP-NET-ACCESS-KEY/DPP-C-SIGN-KEY
++     * wpa_supplicant ctrl events. Distinct from dpp_1905_credentials below,
++     * which holds the 1905/EasyMesh-layer connector (netRole="mapAgent") used
++     * for the 1905 4-way handshake.
+      */
+     struct sDppCredentials {
+-        // Agent's own Connector (JWS, netRole="mapAgent")
+-        // Received in DPP Configuration Object (1905-layer config)
++        // Agent's own Connector (JWS, netRole="mapBackhaulSta")
+         std::string connector;
+ 
+         // Agent's netAccessKey private key (EC P-256)
+@@ -1199,6 +1205,10 @@ public:
+         EVP_PKEY *nak_pkey = nullptr;
+         std::vector<uint8_t> nak_private_der;
+ 
++        // Configurator's C-sign-key, staged as raw DER (SPKI) until son_slave_thread converts
++        // it to JWK on ACTION_BACKHAUL_DPP_CREDENTIALS_NOTIFICATION; cleared once converted.
++        std::vector<uint8_t> c_sign_key_der;
++
+         // Configurator's C-sign-key (JWK JSON string, for Connector verification)
+         std::string c_sign_key_jwk;
+ 
+@@ -1219,6 +1229,56 @@ public:
+         sDppCredentials &operator=(const sDppCredentials &) = delete;
+     } dpp_credentials;
+ 
++    /**
++     * @brief 1905/EasyMesh-layer DPP credentials (netRole="mapAgent").
++     *
++     * Populated when the Agent receives the 1905-layer DPP Configuration
++     * Object — for wired DPP Extenders, via the GAS Config Response
++     * (handle_dpp_wired_gas_response()); for wireless bSTAs, via the
++     * DPP-1905-CONNECTOR/DPP-1905-NET-ACCESS-KEY/DPP-1905-C-SIGN-KEY
++     * wpa_supplicant ctrl events bridged through
++     * ACTION_BACKHAUL_DPP_1905_CREDENTIALS_NOTIFICATION. Transport-agnostic:
++     * this is what DppAgentTask's shared 1905 4-way handshake logic
++     * (initiate_peer_discovery(), derive_1905_pmk(), etc.) reads and writes,
++     * for both wired and wireless bSTAs. Distinct from dpp_credentials above,
++     * which holds the bSTA's own backhaul-BSS association credential
++     * (netRole="mapBackhaulSta", used only by wpa_supplicant itself).
++     */
++    struct sDpp1905Credentials {
++        // Agent's own Connector (JWS, netRole="mapAgent")
++        std::string connector;
++
++        // Agent's netAccessKey private key (EC P-256)
++        // This is the Enrollee's protocol key (pR) from DPP Authentication.
++        // nak_pkey: in-memory EVP_PKEY* (correct ECDH, primary path for Peer Discovery)
++        // nak_private_der: DER-encoded fallback (for compatibility with wireless path)
++        EVP_PKEY *nak_pkey = nullptr;
++        std::vector<uint8_t> nak_private_der;
++
++        // Configurator's C-sign-key, staged as raw DER (SPKI) until son_slave_thread converts
++        // it to JWK on ACTION_BACKHAUL_DPP_1905_CREDENTIALS_NOTIFICATION; cleared once converted.
++        std::vector<uint8_t> c_sign_key_der;
++
++        // Configurator's C-sign-key (JWK JSON string, for Connector verification)
++        std::string c_sign_key_jwk;
++
++        // Configurator's Privacy-protection-key (JWK JSON string, for reconfiguration)
++        std::string pp_key_jwk;
++
++        // Decryption Failure Counter threshold (from DPP Config Object dfCounterThreshold)
++        uint16_t df_counter_threshold = 5;
++
++        bool initialized = false;
++
++        ~sDpp1905Credentials() {
++            if (nak_pkey) { EVP_PKEY_free(nak_pkey); nak_pkey = nullptr; }
++        }
++        // Non-copyable — EVP_PKEY* ownership
++        sDpp1905Credentials() = default;
++        sDpp1905Credentials(const sDpp1905Credentials &) = delete;
++        sDpp1905Credentials &operator=(const sDpp1905Credentials &) = delete;
++    } dpp_1905_credentials;
++
+     /**
+      * @brief 1905 GTK (Group Temporal Key).
+      *
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 75af50ba9..cec71ea8c 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -46,8 +46,13 @@
+ #include <bpl/bpl_cfg.h>
+ #include <bpl/bpl_err.h>
+ 
++#include <bcl/beerocks_string_utils.h>
++
++#include <openssl/evp.h>
++
+ #include <cstdlib>
+ #include <net/if.h> // if_nametoindex
++#include <sstream>
+ 
+ namespace beerocks {
+ 
+@@ -74,6 +79,14 @@ constexpr auto backhaul_steering_timeout = std::chrono::milliseconds(10000);
+  */
+ constexpr auto dev_reset_default_timeout = std::chrono::seconds(UCC_REPLY_COMPLETE_TIMEOUT_SEC);
+ 
++/**
++ * Delay before retrying DPP chirp after a DPP-FAIL or DPP-CONF-FAILED event. Kept past the DPP
++ * Controller's connection staleness window, so a retry chirp's Presence Announcement doesn't
++ * arrive while the Controller still treats the failed attempt's session as live and silently
++ * ignores it instead of starting a fresh exchange.
++ */
++constexpr auto dpp_chirp_fail_retry_delay = std::chrono::seconds(25);
++
+ const std::string dev_set_config_backhaul_param = "backhaul";
+ const std::string dev_set_config_bss_info_param = "bss_info";
+ const std::string dev_set_config_mscs_param     = "mscs";
+@@ -1045,6 +1058,10 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+         auto db = AgentDB::get();
+         if (db->device_conf.local_gw) break;
+ 
++        // Cheap insurance: the primary chirp trigger is EState::WAIT_WPS below, but this covers
++        // reconnect paths that skip WAIT_WPS (e.g. HAL re-init while already OPERATIONAL).
++        maybe_start_dpp_chirp();
++
+         if (is_collocated_veth_wired_onboarding() &&
+             db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wired) {
+             break;
+@@ -1282,6 +1299,7 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+             // Clear the flags when restarting
+             radio_info->sta_hal_initialized = false;
+             radio_info->sta_hal_disconnected_for_eth = false;
++            cancel_dpp_chirp_timer(radio_info);
+         }
+ 
+         handle_backhaul_disconnect(); //send disconnect to all connected slaves
+@@ -1478,6 +1496,38 @@ bool BackhaulManager::backhaul_fsm_wireless(bool &skip_select)
+                 radio_info->sta_hal_initialized = true;
+                 LOG(DEBUG) << "WiFi HAL initialized for " << radio_info->sta_iface;
+ 
++                // Inject the DPP bootstrap key into wpa_supplicant and set the EasyMesh
++                // bSTAList config-request fields now that this interface's wpa_supplicant ctrl
++                // socket actually exists — doing this any earlier (e.g. right after
++                // ACTION_BACKHAUL_ENABLE) would fail every time since the HAL/ctrl socket isn't
++                // created yet. dpp_bootstrap_injected guards against re-registering a fresh
++                // DPP_BOOTSTRAP_GEN id with wpa_supplicant on every HAL re-init (e.g. reconnect
++                // after a backhaul disconnect).
++                //
++                // db->dpp_bootstrap.wpa_bootstrap_id (and the bootstrap key itself) are a single
++                // device-global identity, not one per radio — so also check that no OTHER radio
++                // has already injected before doing it here. Without this, a device with more
++                // than one STA-capable radio (band-separate bSTA, not MLO) would inject/chirp
++                // independently per radio and stomp on that shared global state.
++                if (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP &&
++                    db->dpp_bootstrap.valid && !radio_info->dpp_bootstrap_injected &&
++                    !is_dpp_bootstrap_injected_on_any_radio()) {
++                    radio_info->dpp_bootstrap_injected =
++                        inject_dpp_bootstrap_key_and_conf_req(radio_info);
++                }
++
++                // On a fresh onboarding, both the WLAN/backhaul and 1905-layer connectors arrive
++                // via live DPP-CONNECTOR/DPP-1905-CONNECTOR ctrl_iface events (handled in
++                // process_dpp_bridge_events()). Those events are never re-emitted on restart
++                // though, so on reboot this is the only chance to pick the already-provisioned
++                // connectors back up from wpa_supplicant's persisted config. Idempotent/no-op if
++                // there's nothing persisted yet or it's already been restored on this radio.
++                if (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP &&
++                    !radio_info->dpp_credentials_restored) {
++                    restore_dpp_credentials_on_boot(radio_info);
++                    radio_info->dpp_credentials_restored = true;
++                }
++
+                 /**
+                  * This code was disabled as part of the effort to pass certification flow
+                  * (PR #1469), and broke wireless backhaul flow.
+@@ -1542,6 +1592,10 @@ bool BackhaulManager::backhaul_fsm_wireless(bool &skip_select)
+     case EState::WAIT_WPS: {
+         auto db = AgentDB::get();
+ 
++        // Primary chirp trigger: the bSTA isn't associated yet in this state, which is exactly
++        // when Presence Announcement chirping is needed to get discovered by a Configurator.
++        maybe_start_dpp_chirp();
++
+         // Check for ethernet link availability during WAIT_WPS timeout period
+         if (!db->device_conf.local_gw) {
+             auto now = std::chrono::steady_clock::now();
+@@ -3107,6 +3161,18 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+         }
+         if (iface == db->backhaul.selected_iface_name) {
+ 
++            // Restart the DPP chirp cycle immediately on disconnect (rather than waiting for the
++            // next WAIT_WPS tick) if this radio was bootstrap-injected but hasn't yet completed
++            // DPP provisioning.
++            auto radio_it =
++                std::find_if(m_radios_info.begin(), m_radios_info.end(),
++                             [&](const auto &r) { return r->sta_iface == iface; });
++            if (radio_it != m_radios_info.end() && !(*radio_it)->dpp_provisioning_done &&
++                (*radio_it)->dpp_bootstrap_injected) {
++                arm_dpp_chirp_timer(*radio_it,
++                                    std::chrono::seconds(db->dpp_bootstrap.chirp_start_delay_sec));
++            }
++
+             // If ethernet is available, switch to wired without sending bSTA disconnect
+             // notification or restarting — the backhaul path is still up via ethernet.
+             if ((FSM_IS_IN_STATE(OPERATIONAL) || FSM_IS_IN_STATE(CONNECTED)) &&
+@@ -3390,6 +3456,16 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+                          << " — MLD MACs cached in observed_* for later backfill";
+         }
+     } break;
++
++    case Event::Dpp_Event: {
++        auto msg = static_cast<bwl::sACTION_BACKHAUL_DPP_EVENT_NOTIFICATION *>(data);
++        if (!msg) {
++            LOG(ERROR) << "Dpp_Event: invalid data!";
++            break;
++        }
++        process_dpp_bridge_events(iface, std::string(msg->event_line));
++    } break;
++
+     // Unhandled events
+     default: {
+         LOG(ERROR) << "Unhandled event: " << int(event);
+@@ -5370,4 +5446,483 @@ bool BackhaulManager::select_gateway_reachable_eth_interface(std::string &select
+     return false;
+ }
+ 
++// ---------------------------------------------------------------------------
++// DPP Credential Bridge — consumes DPP-* ctrl_iface events forwarded from the
++// STA HAL's existing wpa_supplicant event socket and forwards collected
++// 1905-layer DPP credentials to son_slave_thread once all three are received.
++// ---------------------------------------------------------------------------
++
++void BackhaulManager::process_dpp_bridge_events(const std::string &sta_iface,
++                                                 const std::string &event_line)
++{
++    std::string event(event_line);
++    if (event.empty()) {
++        return;
++    }
++    if (event[0] == '<') {
++        auto end = event.find('>');
++        if (end != std::string::npos) {
++            event = event.substr(end + 1);
++        }
++    }
++
++    auto strip_eol = [](std::string &s) {
++        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) {
++            s.pop_back();
++        }
++    };
++
++    if (event.rfind("DPP-CONNECTOR ", 0) == 0) {
++        std::string jws = event.substr(14);
++        strip_eol(jws);
++        std::string net_role = extract_net_role_from_connector(jws);
++        if (net_role == "mapBackhaulSta") {
++            m_dpp_cred_bridge.connector               = jws;
++            m_dpp_cred_bridge.connector_1905_received = true;
++            LOG(DEBUG) << "DPP bridge: received own WLAN connector";
++        } else {
++            LOG(DEBUG) << "DPP bridge: ignoring connector with netRole=" << net_role;
++        }
++    } else if (event.rfind("DPP-NET-ACCESS-KEY ", 0) == 0) {
++        std::string hex = event.substr(19);
++        auto sp = hex.find(' ');
++        if (sp != std::string::npos) {
++            hex = hex.substr(0, sp);
++        }
++        strip_eol(hex);
++        m_dpp_cred_bridge.nak_private_der =
++            beerocks::string_utils::hex_to_bytes<std::vector<uint8_t>>(hex);
++        m_dpp_cred_bridge.nak_received = true;
++        LOG(DEBUG) << "DPP bridge: received NAK private key";
++    } else if (event.rfind("DPP-C-SIGN-KEY ", 0) == 0) {
++        std::string hex = event.substr(15);
++        strip_eol(hex);
++        m_dpp_cred_bridge.c_sign_key_der =
++            beerocks::string_utils::hex_to_bytes<std::vector<uint8_t>>(hex);
++        m_dpp_cred_bridge.csign_received = true;
++        LOG(DEBUG) << "DPP bridge: received C-sign-key";
++    } else if (event.rfind("DPP-MAP-DFCOUNTER ", 0) == 0) {
++        std::string val = event.substr(18);
++        strip_eol(val);
++        if (!val.empty()) {
++            m_dpp_cred_bridge.df_counter_threshold = static_cast<uint16_t>(std::atoi(val.c_str()));
++        }
++        LOG(DEBUG) << "DPP bridge: dfCounterThreshold=" << m_dpp_cred_bridge.df_counter_threshold;
++    } else if (event.rfind("DPP-1905-CONNECTOR ", 0) == 0) {
++        std::string jws = event.substr(19);
++        strip_eol(jws);
++        // wpa_supplicant may prefix this event with "signedConnector=" — strip it if present.
++        const std::string prefix = "signedConnector=";
++        if (jws.rfind(prefix, 0) == 0) {
++            jws = jws.substr(prefix.size());
++        }
++        std::string net_role = extract_net_role_from_connector(jws);
++        if (net_role == "mapAgent") {
++            m_dpp_1905_cred_bridge.connector          = jws;
++            m_dpp_1905_cred_bridge.connector_received = true;
++            LOG(DEBUG) << "DPP bridge: received 1905-layer connector";
++        } else {
++            LOG(DEBUG) << "DPP bridge: ignoring 1905 connector with netRole=" << net_role;
++        }
++    } else if (event.rfind("DPP-1905-NET-ACCESS-KEY ", 0) == 0) {
++        std::string hex = event.substr(24);
++        auto sp = hex.find(' ');
++        if (sp != std::string::npos) {
++            hex = hex.substr(0, sp);
++        }
++        strip_eol(hex);
++        m_dpp_1905_cred_bridge.nak_private_der =
++            beerocks::string_utils::hex_to_bytes<std::vector<uint8_t>>(hex);
++        m_dpp_1905_cred_bridge.nak_received = true;
++        LOG(DEBUG) << "DPP bridge: received 1905-layer NAK private key";
++    } else if (event.rfind("DPP-1905-C-SIGN-KEY ", 0) == 0) {
++        std::string hex = event.substr(20);
++        strip_eol(hex);
++        m_dpp_1905_cred_bridge.c_sign_key_der =
++            beerocks::string_utils::hex_to_bytes<std::vector<uint8_t>>(hex);
++        m_dpp_1905_cred_bridge.csign_received = true;
++        LOG(DEBUG) << "DPP bridge: received 1905-layer C-sign-key";
++    } else if (event.rfind("DPP-1905-DF-COUNTER-THRESHOLD ", 0) == 0) {
++        std::string val = event.substr(30);
++        strip_eol(val);
++        if (!val.empty()) {
++            m_dpp_1905_cred_bridge.df_counter_threshold =
++                static_cast<uint16_t>(std::atoi(val.c_str()));
++        }
++        LOG(DEBUG) << "DPP bridge: 1905-layer dfCounterThreshold="
++                   << m_dpp_1905_cred_bridge.df_counter_threshold;
++    } else if (event.rfind("DPP-AUTH-SUCCESS", 0) == 0) {
++        // Not final success — DPP Authentication succeeded, Configuration is still to come.
++        // Give it a fresh full window rather than firing a retry chirp mid-exchange.
++        auto db = AgentDB::get();
++        auto radio_it =
++            std::find_if(m_radios_info.begin(), m_radios_info.end(),
++                         [&](const auto &r) { return r->sta_iface == sta_iface; });
++        if (radio_it != m_radios_info.end()) {
++            arm_dpp_chirp_timer(*radio_it,
++                               std::chrono::seconds(db->dpp_bootstrap.chirp_retry_interval_sec));
++        }
++        LOG(DEBUG) << "DPP bridge: DPP-AUTH-SUCCESS on " << sta_iface << " — chirp timer reset";
++    } else if (event.rfind("DPP-FAIL", 0) == 0) {
++        // wpa_supplicant tears down the whole DPP exchange on failure (e.g. a TX status
++        // timeout for an off-channel DPP action frame) and does not resume chirping on its own.
++        retry_dpp_chirp_after_failure(sta_iface, "DPP-FAIL");
++    } else if (event.rfind("DPP-CONF-FAILED", 0) == 0) {
++        // Authentication succeeded but the Configuration exchange that followed it did not
++        // (e.g. a GAS query timeout waiting for a Configuration Response). Same story as
++        // DPP-FAIL: wpa_supplicant tears down the exchange and does not resume chirping on its
++        // own.
++        retry_dpp_chirp_after_failure(sta_iface, "DPP-CONF-FAILED");
++    }
++
++    if (m_dpp_cred_bridge.connector_1905_received && m_dpp_cred_bridge.nak_received &&
++        m_dpp_cred_bridge.csign_received) {
++        LOG(INFO) << "DPP bridge: own WLAN connector, NAK, and C-sign-key received";
++
++        finalize_dpp_credentials(m_dpp_cred_bridge.connector, m_dpp_cred_bridge.nak_private_der,
++                                 m_dpp_cred_bridge.c_sign_key_der,
++                                 m_dpp_cred_bridge.df_counter_threshold);
++
++        m_dpp_cred_bridge = sDppCredentialBridgeState{};
++    }
++
++    if (m_dpp_1905_cred_bridge.connector_received && m_dpp_1905_cred_bridge.nak_received &&
++        m_dpp_1905_cred_bridge.csign_received) {
++        LOG(INFO) << "DPP bridge: all 1905-layer credentials received — forwarding to agent";
++
++        finalize_dpp_1905_credentials(m_dpp_1905_cred_bridge.connector,
++                                       m_dpp_1905_cred_bridge.nak_private_der,
++                                       m_dpp_1905_cred_bridge.c_sign_key_der,
++                                       m_dpp_1905_cred_bridge.df_counter_threshold);
++
++        m_dpp_1905_cred_bridge = sDpp1905CredentialBridgeState{};
++    }
++}
++
++void BackhaulManager::finalize_dpp_1905_credentials(const std::string &connector,
++                                                     const std::vector<uint8_t> &nak_private_der,
++                                                     const std::vector<uint8_t> &c_sign_key_der,
++                                                     uint16_t df_counter_threshold)
++{
++    auto db                                       = AgentDB::get();
++    db->dpp_1905_credentials.connector            = connector;
++    db->dpp_1905_credentials.nak_private_der      = nak_private_der;
++    db->dpp_1905_credentials.c_sign_key_der       = c_sign_key_der;
++    db->dpp_1905_credentials.df_counter_threshold = df_counter_threshold;
++    db->dpp_1905_credentials.initialized          = false; // son_slave_thread flips this true
++                                                             // after DER->JWK conversion
++
++    auto notify = message_com::create_vs_message<
++        beerocks_message::cACTION_BACKHAUL_DPP_1905_CREDENTIALS_NOTIFICATION>(cmdu_tx);
++    if (notify && m_agent_fd != beerocks::net::FileDescriptor::invalid_descriptor) {
++        send_cmdu(m_agent_fd, cmdu_tx);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// DPP Connector reboot-restore — pulls the persisted WLAN/backhaul and
++// 1905-layer Connectors and their key material out of wpa_supplicant via
++// ctrl_iface at startup, since wpa_supplicant never re-emits DPP-CONNECTOR /
++// DPP-1905-CONNECTOR (or their NAK/C-sign-key counterparts) on restart; those
++// events only fire once, live, during an active DPP exchange.
++// ---------------------------------------------------------------------------
++
++void BackhaulManager::finalize_dpp_credentials(const std::string &connector,
++                                               const std::vector<uint8_t> &nak_private_der,
++                                               const std::vector<uint8_t> &c_sign_key_der,
++                                               uint16_t df_counter_threshold)
++{
++    auto db                                  = AgentDB::get();
++    db->dpp_credentials.connector            = connector;
++    db->dpp_credentials.nak_private_der      = nak_private_der;
++    db->dpp_credentials.c_sign_key_der       = c_sign_key_der;
++    db->dpp_credentials.df_counter_threshold = df_counter_threshold;
++    db->dpp_credentials.initialized          = false; // son_slave_thread flips this true
++                                                         // after DER->JWK conversion
++
++    auto notify = message_com::create_vs_message<
++        beerocks_message::cACTION_BACKHAUL_DPP_CREDENTIALS_NOTIFICATION>(cmdu_tx);
++    if (notify && m_agent_fd != beerocks::net::FileDescriptor::invalid_descriptor) {
++        send_cmdu(m_agent_fd, cmdu_tx);
++    }
++}
++
++void BackhaulManager::restore_dpp_credentials_on_boot(const std::shared_ptr<sRadioInfo> &radio_info)
++{
++    auto db = AgentDB::get();
++
++    bool need_backhaul =
++        !db->dpp_credentials.initialized && db->dpp_credentials.connector.empty();
++    bool need_1905 =
++        !db->dpp_1905_credentials.initialized && db->dpp_1905_credentials.connector.empty();
++    if (!need_backhaul && !need_1905) {
++        // Either already restored/converted this run, or a live DPP exchange already
++        // populated both (e.g. this is a HAL re-init after a backhaul reconnect, not a reboot).
++        return;
++    }
++
++    bwl::sPersistedDppCredentials creds;
++    if (!radio_info->sta_wlan_hal->get_persisted_dpp_credentials(creds)) {
++        LOG(WARNING) << "DPP: failed to query persisted credentials on " << radio_info->sta_iface;
++        return;
++    }
++
++    if (need_backhaul) {
++        if (!creds.has_wlan_connector) {
++            LOG(DEBUG) << "DPP: no wpa_supplicant network on " << radio_info->sta_iface
++                      << " holds a persisted connector — nothing to restore";
++        } else if (creds.nak_private_der.empty() || creds.c_sign_key_der.empty()) {
++            LOG(WARNING) << "DPP: persisted connector found on " << radio_info->sta_iface
++                         << " but NAK/C-sign-key could not be read back";
++        } else {
++            std::string net_role = extract_net_role_from_connector(creds.wlan_connector);
++            if (net_role == "mapBackhaulSta") {
++                LOG(INFO) << "DPP: restored own WLAN connector from wpa_supplicant persisted "
++                             "config on "
++                          << radio_info->sta_iface;
++                finalize_dpp_credentials(creds.wlan_connector, creds.nak_private_der,
++                                         creds.c_sign_key_der,
++                                         db->dpp_credentials.df_counter_threshold);
++            } else {
++                LOG(WARNING) << "DPP: persisted connector on " << radio_info->sta_iface
++                            << " has unexpected netRole=" << net_role
++                            << " — not restoring as WLAN/backhaul connector";
++            }
++        }
++    }
++
++    if (need_1905) {
++        if (!creds.has_1905_connector) {
++            LOG(DEBUG) << "DPP: no persisted 1905 connector on " << radio_info->sta_iface
++                      << " — nothing to restore";
++        } else if (creds.nak_private_der.empty() || creds.c_sign_key_der.empty()) {
++            LOG(WARNING) << "DPP: persisted 1905 connector found on " << radio_info->sta_iface
++                         << " but NAK/C-sign-key could not be read back";
++        } else {
++            std::string net_role = extract_net_role_from_connector(creds.dpp_1905_connector);
++            if (net_role == "mapAgent") {
++                LOG(INFO) << "DPP: restored 1905-layer connector from wpa_supplicant persisted "
++                             "config on "
++                          << radio_info->sta_iface;
++                finalize_dpp_1905_credentials(creds.dpp_1905_connector, creds.nak_private_der,
++                                              creds.c_sign_key_der,
++                                              db->dpp_1905_credentials.df_counter_threshold);
++            } else {
++                LOG(WARNING) << "DPP: persisted dpp_1905_connector has unexpected netRole="
++                             << net_role << " — ignoring";
++            }
++        }
++    }
++}
++
++void BackhaulManager::retry_dpp_chirp_after_failure(const std::string &sta_iface,
++                                                    const std::string &event_name)
++{
++    auto radio_it = std::find_if(m_radios_info.begin(), m_radios_info.end(),
++                                 [&](const std::shared_ptr<sRadioInfo> &radio_info) {
++                                     return radio_info->sta_iface == sta_iface;
++                                 });
++
++    // No chirp cycle currently running for this radio — e.g. an unrelated FSM restart (say, the
++    // WAIT_WPS overall timeout) raced with this failure and already tore the timer down.
++    // Nothing to do here; that restart's own fresh WAIT_WPS entry will arm a new cycle itself.
++    if (radio_it == m_radios_info.end() ||
++        (*radio_it)->dpp_chirp_timer_fd == beerocks::net::FileDescriptor::invalid_descriptor) {
++        LOG(INFO) << "DPP bridge: " << event_name << " on " << sta_iface
++                  << " — no active chirp cycle to retry (already progressed, or an FSM restart "
++                     "is in progress)";
++        return;
++    }
++
++    LOG(INFO) << "DPP bridge: " << event_name << " on " << sta_iface << " — retrying chirp in "
++              << dpp_chirp_fail_retry_delay.count() << "s";
++    arm_dpp_chirp_timer(*radio_it, dpp_chirp_fail_retry_delay);
++
++    // Refresh the WAIT_WPS overall timeout so it doesn't expire out from under this retry —
++    // without this, a failure landing late in the current STATE_WAIT_WPS_TIMEOUT_SECONDS window
++    // could let that window's own timeout fire a full FSM restart before the
++    // dpp_chirp_fail_retry_delay retry above even gets a chance to run, throwing the retry away
++    // and falling back to a much slower restart-and-reattach cycle instead. If nothing else
++    // happens for a further full STATE_WAIT_WPS_TIMEOUT_SECONDS after this, the normal timeout
++    // still applies as before.
++    if (FSM_IS_IN_STATE(WAIT_WPS)) {
++        state_time_stamp_timeout =
++            std::chrono::steady_clock::now() + std::chrono::seconds(STATE_WAIT_WPS_TIMEOUT_SECONDS);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// DPP bootstrap key injection — wpa_supplicant setup for a wireless bSTA
++// ---------------------------------------------------------------------------
++
++bool BackhaulManager::inject_dpp_bootstrap_key_and_conf_req(
++    const std::shared_ptr<sRadioInfo> &radio_info)
++{
++    auto db = AgentDB::get();
++    if (!db->dpp_bootstrap.valid || !db->dpp_bootstrap.private_key) {
++        LOG(WARNING) << "DPP: no valid bootstrap key — skipping wpa_supplicant injection";
++        return false;
++    }
++
++    // DPP_BOOTSTRAP_GEN key= requires the full SEC1 ECPrivateKey DER as hex (RFC 5915), not
++    // just the raw 32-byte private scalar. i2d_PrivateKey() on an EC-backed EVP_PKEY already
++    // produces this format (same call already used for the NAK export in dpp_agent_task.cpp).
++    unsigned char *der = nullptr;
++    int der_len        = i2d_PrivateKey(db->dpp_bootstrap.private_key, &der);
++    if (der_len <= 0 || !der) {
++        LOG(ERROR) << "DPP: failed to serialize bootstrap key to SEC1 DER";
++        return false;
++    }
++    std::vector<uint8_t> der_bytes(der, der + der_len);
++    OPENSSL_free(der);
++
++    int bootstrap_id = 0;
++    std::string uri;
++    if (!radio_info->sta_wlan_hal->dpp_bootstrap_gen_and_get_uri(der_bytes, bootstrap_id, uri)) {
++        LOG(ERROR) << "DPP: bootstrap key generation/URI fetch failed on "
++                   << radio_info->sta_iface;
++        return false;
++    }
++    db->dpp_bootstrap.wpa_bootstrap_id = bootstrap_id;
++    LOG(INFO) << "DPP: bootstrap key registered, wpa_bootstrap_id="
++              << db->dpp_bootstrap.wpa_bootstrap_id;
++
++    // wpa_supplicant re-derives the URI from the bootstrap key it just parsed; persist that
++    // version so wpa_supplicant is the single source of truth — this is the one genuinely new
++    // idea worth taking from the reference change; everything else about key
++    // provisioning/validation is already handled more thoroughly by the existing
++    // load_dpp_provisioned_keys() in son_slave_thread.cpp.
++    db->dpp_bootstrap.dpp_uri = uri;
++
++    // Set bSTAList for the EasyMesh config request.
++    std::string bsta_val = "[{\"netRole\":\"mapBackhaulSta\","
++                           "\"akm\":\"506F9A02+000FAC08\","
++                           "\"channelList\":\"81/1,6,11,115/36,121/100,125/149\"}]";
++    radio_info->sta_wlan_hal->dpp_set_extra_conf_req_bsta_list(bsta_val);
++
++    LOG(INFO) << "DPP: bootstrap key injected on " << radio_info->sta_iface
++              << ", URI refreshed from wpa_supplicant, bSTAList configured";
++    return true;
++}
++
++bool BackhaulManager::is_dpp_bootstrap_injected_on_any_radio() const
++{
++    return std::any_of(m_radios_info.begin(), m_radios_info.end(),
++                        [](const std::shared_ptr<sRadioInfo> &radio_info) {
++                            return radio_info->dpp_bootstrap_injected;
++                        });
++}
++
++std::string BackhaulManager::extract_net_role_from_connector(const std::string &connector_jws)
++{
++    // JWS compact: header_b64u.payload_b64u.sig_b64u — netRole lives in the payload JSON.
++    size_t dot1 = connector_jws.find('.');
++    size_t dot2 = connector_jws.find('.', dot1 + 1);
++    if (dot1 == std::string::npos || dot2 == std::string::npos) {
++        return {};
++    }
++
++    std::string payload_b64u = connector_jws.substr(dot1 + 1, dot2 - dot1 - 1);
++    // base64url decode (url-safe alphabet, missing padding tolerated)
++    std::string s = payload_b64u;
++    for (char &c : s) {
++        if (c == '-') c = '+';
++        if (c == '_') c = '/';
++    }
++    while (s.size() % 4) {
++        s += '=';
++    }
++    std::vector<uint8_t> raw(s.size());
++    int len = EVP_DecodeBlock(raw.data(), reinterpret_cast<const unsigned char *>(s.c_str()),
++                               static_cast<int>(s.size()));
++    if (len <= 0) {
++        return {};
++    }
++    std::string payload_json(reinterpret_cast<const char *>(raw.data()),
++                             static_cast<size_t>(len));
++
++    auto pos = payload_json.find("\"netRole\":\"");
++    if (pos == std::string::npos) {
++        return {};
++    }
++    pos += 11;
++    auto end = payload_json.find('"', pos);
++    if (end == std::string::npos) {
++        return {};
++    }
++    return payload_json.substr(pos, end - pos);
++}
++
++// ---------------------------------------------------------------------------
++// DPP chirp (Presence Announcement) lifecycle — wireless bSTA
++// ---------------------------------------------------------------------------
++
++bool BackhaulManager::is_bsta_connected() const
++{
++    return FSM_IS_IN_STATE(CONNECTED) || FSM_IS_IN_STATE(OPERATIONAL);
++}
++
++void BackhaulManager::maybe_start_dpp_chirp()
++{
++    auto db = AgentDB::get();
++    if (db->dpp_extender_config.onboarding_type != AgentDB::OnboardingType::DPP ||
++        !db->dpp_bootstrap.valid) {
++        return;
++    }
++
++    for (auto &radio_info : m_radios_info) {
++        if (radio_info->sta_iface.empty() || !radio_info->dpp_bootstrap_injected ||
++            radio_info->dpp_provisioning_done ||
++            radio_info->dpp_chirp_timer_fd != beerocks::net::FileDescriptor::invalid_descriptor) {
++            continue;
++        }
++        arm_dpp_chirp_timer(radio_info,
++                            std::chrono::seconds(db->dpp_bootstrap.chirp_start_delay_sec));
++    }
++}
++
++void BackhaulManager::arm_dpp_chirp_timer(const std::shared_ptr<sRadioInfo> &radio_info,
++                                          std::chrono::seconds delay)
++{
++    cancel_dpp_chirp_timer(radio_info);
++
++    radio_info->dpp_chirp_timer_fd = m_timer_manager->add_timer(
++        "DPP Chirp", std::chrono::duration_cast<std::chrono::milliseconds>(delay),
++        std::chrono::milliseconds::zero(), [this, radio_info](int fd, EventLoop &loop) {
++            radio_info->dpp_chirp_timer_fd = beerocks::net::FileDescriptor::invalid_descriptor;
++            handle_dpp_chirp_timeout(radio_info);
++            return true;
++        });
++    if (radio_info->dpp_chirp_timer_fd == beerocks::net::FileDescriptor::invalid_descriptor) {
++        LOG(ERROR) << "DPP: failed to arm chirp timer for " << radio_info->sta_iface;
++    }
++}
++
++void BackhaulManager::cancel_dpp_chirp_timer(const std::shared_ptr<sRadioInfo> &radio_info)
++{
++    if (radio_info->dpp_chirp_timer_fd != beerocks::net::FileDescriptor::invalid_descriptor) {
++        m_timer_manager->remove_timer(radio_info->dpp_chirp_timer_fd);
++    }
++}
++
++void BackhaulManager::handle_dpp_chirp_timeout(const std::shared_ptr<sRadioInfo> &radio_info)
++{
++    auto db = AgentDB::get();
++
++    if (is_bsta_connected()) {
++        radio_info->dpp_provisioning_done = true;
++        LOG(DEBUG) << "DPP: bSTA connected on " << radio_info->sta_iface
++                   << " — stopping chirp cycle";
++        return;
++    }
++
++    if (!radio_info->sta_wlan_hal->dpp_chirp(db->dpp_bootstrap.wpa_bootstrap_id, "mapAgent", 3)) {
++        LOG(WARNING) << "DPP: DPP_CHIRP failed on " << radio_info->sta_iface;
++    } else {
++        LOG(DEBUG) << "DPP: DPP_CHIRP sent on " << radio_info->sta_iface;
++    }
++
++    arm_dpp_chirp_timer(radio_info, std::chrono::seconds(db->dpp_bootstrap.chirp_retry_interval_sec));
++}
++
+ } // namespace beerocks
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+index d7edfb883..b97712894 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+@@ -412,6 +412,156 @@ private:
+     bool arping_confirm_gateway(const std::string &iface, const std::string &bridge,
+                                 const std::string &gw_ip);
+ 
++    /**
++     * @brief Processes a single DPP-* ctrl_iface event line received on the given bSTA
++     *        interface's STA HAL (DPP-CONNECTOR / DPP-NET-ACCESS-KEY / DPP-C-SIGN-KEY /
++     *        DPP-MAP-DFCOUNTER and their DPP-1905-* counterparts), and forwards the collected
++     *        credentials to son_slave_thread once the Connector, NAK, and C-sign-key have all
++     *        been received.
++     *
++     * @param sta_iface bSTA interface name the event was received on.
++     * @param event_line Raw wpa_supplicant ctrl_iface event line.
++     */
++    void process_dpp_bridge_events(const std::string &sta_iface, const std::string &event_line);
++
++    /**
++     * @brief Stages the WLAN/backhaul-layer DPP credentials (Connector, NAK, C-sign-key) into
++     *        AgentDB and notifies son_slave_thread — shared finalize step used by both the live
++     *        ctrl_iface event path (process_dpp_bridge_events) and the reboot-restore path
++     *        (restore_dpp_credentials_on_boot).
++     *
++     * @param connector WLAN/backhaul Connector (JWS, netRole="mapBackhaulSta").
++     * @param nak_private_der Agent's netAccessKey private key, DER-encoded.
++     * @param c_sign_key_der Configurator's C-sign-key, DER-encoded (SPKI).
++     * @param df_counter_threshold Decryption Failure Counter threshold.
++     */
++    void finalize_dpp_credentials(const std::string &connector,
++                                  const std::vector<uint8_t> &nak_private_der,
++                                  const std::vector<uint8_t> &c_sign_key_der,
++                                  uint16_t df_counter_threshold);
++
++    /**
++     * @brief Stages the 1905-layer DPP credentials (Connector, NAK, C-sign-key) into AgentDB
++     *        and notifies son_slave_thread — shared finalize step used by both the live
++     *        ctrl_iface event path (process_dpp_bridge_events) and the reboot-restore path
++     *        (restore_dpp_credentials_on_boot).
++     *
++     * @param connector 1905-layer Connector (JWS, netRole="mapAgent").
++     * @param nak_private_der Agent's netAccessKey private key, DER-encoded.
++     * @param c_sign_key_der Configurator's C-sign-key, DER-encoded (SPKI).
++     * @param df_counter_threshold Decryption Failure Counter threshold.
++     */
++    void finalize_dpp_1905_credentials(const std::string &connector,
++                                       const std::vector<uint8_t> &nak_private_der,
++                                       const std::vector<uint8_t> &c_sign_key_der,
++                                       uint16_t df_counter_threshold);
++
++    /**
++     * @brief Restores both the WLAN/backhaul (netRole="mapBackhaulSta") and 1905-layer
++     *        (netRole="mapAgent") DPP Connectors and their key material from wpa_supplicant's
++     *        persisted configuration on startup/reboot.
++     *
++     * wpa_supplicant never re-emits DPP-CONNECTOR/DPP-1905-CONNECTOR (or the other DPP-* /
++     * DPP-1905-* events consumed by process_dpp_bridge_events) on restart — those events only
++     * fire once, live, at the moment a DPP config/1905 exchange completes. Across a reboot:
++     *  - the WLAN connector persists per-network (ssid->dpp_connector),
++     *  - the 1905 connector persists globally (wpa_s->conf->dpp_1905_connector),
++     *  - both share the SAME per-network NAK/C-sign-key (dpp_netaccesskey/dpp_csign) —
++     *    so a single wpa_supplicant network lookup restores the key material for both.
++     * All of it must be pulled explicitly via ctrl_iface (GET / GET_NETWORK) rather than
++     * waiting for an event that will never arrive.
++     *
++     * Each half is independently no-op if wpa_supplicant has nothing persisted for it yet, or if
++     * it's already been populated by a live DPP exchange this run (fresh/unprovisioned device, or
++     * mid-onboarding — the live event path in process_dpp_bridge_events() owns that case).
++     *
++     * @param radio_info Radio whose bSTA HAL/interface to query for persisted credentials.
++     */
++    void restore_dpp_credentials_on_boot(const std::shared_ptr<sRadioInfo> &radio_info);
++
++    /**
++     * @brief Registers this Agent's pre-provisioned DPP bootstrap key with wpa_supplicant on the
++     *        given bSTA interface (DPP_BOOTSTRAP_GEN), refreshes AgentDB's dpp_bootstrap.dpp_uri
++     *        from wpa_supplicant's own DPP_BOOTSTRAP_GET_URI response, and configures the
++     *        bSTAList EasyMesh configuration request attribute.
++     *
++     * @param radio_info Radio whose bSTA HAL to inject the bootstrap key on.
++     * @return true on success, false otherwise.
++     */
++    bool inject_dpp_bootstrap_key_and_conf_req(const std::shared_ptr<sRadioInfo> &radio_info);
++
++    /**
++     * @brief Checks whether any bSTA radio has already injected the DPP bootstrap key.
++     *
++     * db->dpp_bootstrap.wpa_bootstrap_id (and the bootstrap key itself) are a single
++     * device-global identity, not one per radio, so a device with more than one STA-capable
++     * radio (band-separate bSTA, not MLO) must not inject/chirp independently per radio.
++     *
++     * @return true if dpp_bootstrap_injected is set on at least one radio in m_radios_info.
++     */
++    bool is_dpp_bootstrap_injected_on_any_radio() const;
++
++    /**
++     * @brief Extracts the "netRole" field from a DPP Connector's JWS payload.
++     *
++     * @param connector_jws Raw Connector (JWS compact serialization).
++     * @return The netRole string, or an empty string if it could not be parsed.
++     */
++    static std::string extract_net_role_from_connector(const std::string &connector_jws);
++
++    /**
++     * @brief Arms the automatic DPP_CHIRP presence-announcement cycle for any bSTA radio that
++     *        has a valid, injected DPP bootstrap key but hasn't yet completed provisioning and
++     *        doesn't already have a chirp timer armed.
++     */
++    void maybe_start_dpp_chirp();
++
++    /**
++     * @brief Whether the backhaul FSM currently considers the bSTA connected/operational.
++     *
++     * @return true if connected or operational, false otherwise.
++     */
++    bool is_bsta_connected() const;
++
++    /**
++     * @brief Arms (or re-arms) the DPP chirp timer for the given radio, cancelling any
++     *        previously-armed timer for that radio first.
++     *
++     * @param radio_info Radio to arm the chirp timer for.
++     * @param delay Delay before the timer fires.
++     */
++    void arm_dpp_chirp_timer(const std::shared_ptr<sRadioInfo> &radio_info,
++                             std::chrono::seconds delay);
++
++    /**
++     * @brief Cancels the DPP chirp timer for the given radio, if armed.
++     *
++     * @param radio_info Radio to cancel the chirp timer for.
++     */
++    void cancel_dpp_chirp_timer(const std::shared_ptr<sRadioInfo> &radio_info);
++
++    /**
++     * @brief Handles the DPP chirp timer firing for the given radio — sends a DPP_CHIRP command
++     *        to wpa_supplicant if the bSTA is not yet connected, and re-arms for the next retry;
++     *        marks provisioning done and stops chirping if the bSTA is already connected.
++     *
++     * @param radio_info Radio whose chirp timer fired.
++     */
++    void handle_dpp_chirp_timeout(const std::shared_ptr<sRadioInfo> &radio_info);
++
++    /**
++     * @brief Re-arms the chirp timer for dpp_chirp_fail_retry_delay after a DPP-FAIL or
++     *        DPP-CONF-FAILED bridge event on sta_iface, if (and only if) that radio still has a
++     *        chirp cycle actually running (dpp_chirp_timer_fd valid) — e.g. not if it raced with
++     *        an unrelated FSM restart that already tore the timer down, in which case that
++     *        restart's own fresh WAIT_WPS entry will re-arm a new cycle on its own.
++     *
++     * @param sta_iface bSTA interface name the event was received on.
++     * @param event_name Used only for the log line (e.g. "DPP-FAIL", "DPP-CONF-FAILED").
++     */
++    void retry_dpp_chirp_after_failure(const std::string &sta_iface,
++                                       const std::string &event_name);
++
+ private:
+     /**
+      * Buffer to hold CMDU to be transmitted.
+@@ -600,6 +750,20 @@ public:
+         bool added_network_status = false;
+         bool sta_hal_initialized = false;           /**< Flag: Set when sta_wlan_hal is created and attached */
+         bool sta_hal_disconnected_for_eth = false;  /**< Flag: Set when disconnected due to ethernet detection */
++        bool dpp_bootstrap_injected = false;        /**< Flag: Set once the DPP bootstrap key has
++                                                          been registered with wpa_supplicant on
++                                                          this radio's bSTA interface */
++        bool dpp_credentials_restored = false;       /**< Flag: Set once a reboot-time attempt to
++                                                          restore the persisted WLAN/backhaul and
++                                                          1905 connectors has been made on this
++                                                          radio's bSTA interface, successful or
++                                                          not — at most once per HAL attach */
++        int dpp_chirp_timer_fd = beerocks::net::FileDescriptor::invalid_descriptor;
++                                                     /**< Timer fd for the automatic DPP_CHIRP
++                                                          presence-announcement cycle, or
++                                                          invalid_descriptor if not armed */
++        bool dpp_provisioning_done = false;         /**< Flag: Set once the bSTA has associated
++                                                          to the backhaul BSS, so chirping stops */
+ 
+         /**< Flag: Set when a ACTION_BACKHAUL_RADIO_STATE_NOTIFICATION with disable=true was
+          * received for this radio - drives the reconnect watchdog timer below. */
+@@ -814,6 +978,39 @@ private:
+     std::string m_gateway_ip;
+ 
+     void create_sta_hal_for_bh_switching();
++
++    /**
++     * @brief In-progress state of the DPP credential bridge — accumulates the 1905-layer
++     *        Connector / NAK / C-sign-key / dfCounterThreshold received from wpa_supplicant
++     *        until all three credentials are present, at which point they are copied into
++     *        AgentDB::dpp_credentials and this state is reset.
++     */
++    struct sDppCredentialBridgeState {
++        std::string connector;
++        std::vector<uint8_t> nak_private_der;
++        std::vector<uint8_t> c_sign_key_der;
++        uint16_t df_counter_threshold = 5;
++        bool connector_1905_received  = false;
++        bool nak_received             = false;
++        bool csign_received           = false;
++    } m_dpp_cred_bridge;
++
++    /**
++     * @brief In-progress state of the 1905/EasyMesh-layer DPP credential bridge — accumulates
++     *        the 1905-layer (netRole=mapAgent) Connector / NAK / C-sign-key / dfCounterThreshold
++     *        received from wpa_supplicant's DPP-1905-* events until all three credentials are
++     *        present, at which point they are copied into AgentDB::dpp_1905_credentials and this
++     *        state is reset.
++     */
++    struct sDpp1905CredentialBridgeState {
++        std::string connector;
++        std::vector<uint8_t> nak_private_der;
++        std::vector<uint8_t> c_sign_key_der;
++        uint16_t df_counter_threshold = 5;
++        bool connector_received       = false;
++        bool nak_received             = false;
++        bool csign_received           = false;
++    } m_dpp_1905_cred_bridge;
+ };
+ 
+ } // namespace beerocks
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index c60013b59..9d3487aaf 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -92,6 +92,80 @@
+ #include <easylogging++.h>
+ 
+ #include <cstring>
++
++namespace {
++
++// Mirrors controller-side DppCryptoHelper::ec_key_to_jwk() (not linked into the agent build);
++// hand-adapted here since this is the only agent-side call site that needs DER->JWK for DPP.
++std::string base64url_encode(const uint8_t *data, size_t len)
++{
++    std::vector<uint8_t> out(4 * ((len + 2) / 3) + 1);
++    int out_len = EVP_EncodeBlock(out.data(), data, static_cast<int>(len));
++    std::string b64(reinterpret_cast<char *>(out.data()), static_cast<size_t>(out_len));
++    for (char &c : b64) {
++        if (c == '+') {
++            c = '-';
++        } else if (c == '/') {
++            c = '_';
++        }
++    }
++    while (!b64.empty() && b64.back() == '=') {
++        b64.pop_back();
++    }
++    return b64;
++}
++
++bool der_pubkey_to_jwk(const std::vector<uint8_t> &der, std::string &jwk_out)
++{
++    if (der.empty()) {
++        return false;
++    }
++    const uint8_t *p = der.data();
++    EVP_PKEY *key     = d2i_PUBKEY(nullptr, &p, static_cast<long>(der.size()));
++    if (!key) {
++        LOG(ERROR) << "DPP: d2i_PUBKEY failed while parsing C-sign-key DER";
++        return false;
++    }
++
++    uint8_t pub_bytes[128];
++    size_t pub_len = 0;
++    bool ok = EVP_PKEY_get_octet_string_param(key, OSSL_PKEY_PARAM_PUB_KEY, pub_bytes,
++                                               sizeof(pub_bytes), &pub_len);
++
++    if (ok && pub_len == 33 && (pub_bytes[0] == 0x02 || pub_bytes[0] == 0x03)) {
++        // wpa_supplicant persists/emits the C-sign-key as a compressed EC point.
++        // Re-export the same key with the point-conversion-form switched to
++        // uncompressed to recover the x/y coordinates the JWK needs (OpenSSL 3.x
++        // param API, mirrors the compressed-form export in
++        // slave_thread::load_dpp_provisioned_keys() below — avoids deprecated EC_KEY calls).
++        OSSL_PARAM params[] = {
++            OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_EC_POINT_CONVERSION_FORMAT,
++                                              const_cast<char *>("uncompressed"), 0),
++            OSSL_PARAM_END};
++        EVP_PKEY *dup = EVP_PKEY_dup(key);
++        ok            = dup && EVP_PKEY_set_params(dup, params) == 1 &&
++               EVP_PKEY_get_octet_string_param(dup, OSSL_PKEY_PARAM_PUB_KEY, pub_bytes,
++                                                sizeof(pub_bytes), &pub_len);
++        if (dup) {
++            EVP_PKEY_free(dup);
++        }
++    }
++
++    EVP_PKEY_free(key);
++
++    if (!ok || pub_len != 65 || pub_bytes[0] != 0x04) {
++        LOG(ERROR) << "DPP: unexpected C-sign-key public key encoding (len=" << pub_len << ")";
++        return false;
++    }
++
++    std::string x = base64url_encode(pub_bytes + 1, 32);
++    std::string y = base64url_encode(pub_bytes + 33, 32);
++    jwk_out       = "{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"" + x + "\",\"y\":\"" + y + "\"}";
++    return true;
++}
++
++} // namespace
++
+ #include <algorithm>
+ #include <fstream>
+ #include <string>
+@@ -1586,64 +1660,6 @@ bool slave_thread::handle_cmdu_ap_manager_ieee1905_1_message(const std::string &
+         }
+     }
+ 
+-    // TASK-27: Wireless DPP extender — check if ap_manager wrote credentials to tmpfs.
+-    // ap_manager (separate process) writes /tmp/prplmesh_dpp_creds_ready after receiving
+-    // DPP-1905-CONNECTOR + DPP-NET-ACCESS-KEY + DPP-C-SIGN-KEY from wpa_supplicant.
+-    {
+-        auto db = AgentDB::get();
+-        if (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP &&
+-                !db->dpp_credentials.initialized &&
+-                m_dpp_agent_task && !m_dpp_agent_task->is_relay_active()) {
+-            // Check marker file written by ap_manager
+-            FILE *marker = fopen("/tmp/prplmesh_dpp_creds_ready", "r");
+-            if (marker) {
+-                fclose(marker);
+-                // Read connector
+-                FILE *f = fopen("/tmp/prplmesh_dpp_connector", "r");
+-                if (f) {
+-                    char buf[2048] = {};
+-                    if (fgets(buf, sizeof(buf), f)) { db->dpp_credentials.connector = buf; }
+-                    fclose(f);
+-                }
+-                // Read NAK private key (binary DER)
+-                f = fopen("/tmp/prplmesh_dpp_nak", "rb");
+-                if (f) {
+-                    uint8_t nak[128];
+-                    size_t n = fread(nak, 1, sizeof(nak), f);
+-                    fclose(f);
+-                    db->dpp_credentials.nak_private_der.assign(nak, nak + n);
+-                }
+-                // Read c-sign-key JWK
+-                f = fopen("/tmp/prplmesh_dpp_csign", "r");
+-                if (f) {
+-                    char buf[512] = {};
+-                    if (fgets(buf, sizeof(buf), f)) { db->dpp_credentials.c_sign_key_jwk = buf; }
+-                    fclose(f);
+-                }
+-                if (!db->dpp_credentials.connector.empty() &&
+-                        !db->dpp_credentials.nak_private_der.empty()) {
+-                    db->dpp_credentials.initialized = true;
+-                    LOG(INFO) << "DPP: wireless credentials loaded from tmpfs — starting TCP relay";
+-                    start_dpp_tcp_relay_server();
+-                    // Remove marker so we don't re-process
+-                    remove("/tmp/prplmesh_dpp_creds_ready");
+-
+-                    // If controller did not send 0xA9 TLV, link encryption is disabled —
+-                    // skip Peer Discovery + EAPOL and trigger BSS Config Request directly.
+-                    if (!db->dpp_extender_config.controller_requires_1905_security) {
+-                        LOG(INFO) << "DPP: wireless — 0xA9 absent, skipping Peer Discovery+EAPOL";
+-                        if (m_dpp_agent_task) {
+-                            m_dpp_agent_task->trigger_bss_config_request(
+-                                db->controller_info.bridge_mac);
+-                        } else {
+-                            LOG(WARNING) << "DPP: DppAgentTask not found for BSS Config Request";
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-    }
+-
+     return true;
+ }
+ 
+@@ -3207,6 +3223,59 @@ bool slave_thread::handle_cmdu_backhaul_manager_message(
+         send_fh_vap_state_to_ap_managers(connected);
+         break;
+     }
++    case beerocks_message::ACTION_BACKHAUL_DPP_CREDENTIALS_NOTIFICATION: {
++        auto db = AgentDB::get();
++
++        if (db->dpp_credentials.connector.empty() ||
++            db->dpp_credentials.nak_private_der.empty() ||
++            db->dpp_credentials.c_sign_key_der.empty()) {
++            LOG(ERROR) << "Received ACTION_BACKHAUL_DPP_CREDENTIALS_NOTIFICATION but "
++                          "dpp_credentials is incomplete";
++            break;
++        }
++
++        std::string jwk;
++        if (!der_pubkey_to_jwk(db->dpp_credentials.c_sign_key_der, jwk)) {
++            LOG(ERROR) << "DPP: failed to convert C-sign-key DER to JWK";
++            break;
++        }
++        db->dpp_credentials.c_sign_key_jwk = jwk;
++        db->dpp_credentials.c_sign_key_der.clear();
++        db->dpp_credentials.initialized = true;
++
++        LOG(INFO) << "DPP: own WLAN connector, NAK, and C-sign-key received (bSTA)";
++        break;
++    }
++    case beerocks_message::ACTION_BACKHAUL_DPP_1905_CREDENTIALS_NOTIFICATION: {
++        auto db = AgentDB::get();
++
++        if (db->dpp_1905_credentials.connector.empty() ||
++            db->dpp_1905_credentials.nak_private_der.empty() ||
++            db->dpp_1905_credentials.c_sign_key_der.empty()) {
++            LOG(ERROR) << "Received ACTION_BACKHAUL_DPP_1905_CREDENTIALS_NOTIFICATION but "
++                          "dpp_1905_credentials is incomplete";
++            break;
++        }
++
++        std::string jwk;
++        if (!der_pubkey_to_jwk(db->dpp_1905_credentials.c_sign_key_der, jwk)) {
++            LOG(ERROR) << "DPP: failed to convert C-sign-key DER to JWK";
++            break;
++        }
++        db->dpp_1905_credentials.c_sign_key_jwk = jwk;
++        db->dpp_1905_credentials.c_sign_key_der.clear();
++        db->dpp_1905_credentials.initialized = true;
++
++        LOG(INFO) << "DPP: 1905-layer credentials ready (bSTA) — connector, NAK, and C-sign-key "
++                     "all received";
++
++        // Dispatch (BSS Config Request or Peer Discovery) is owned by DppAgentTask::work(),
++        // which waits for controller_info.bridge_mac to be known before acting.  bridge_mac is
++        // still ZERO_MAC right here on a fresh restore — Topology Discovery hasn't found the
++        // Controller yet — so firing immediately used to send the CMDU to a zero/unknown
++        // destination (flooded onto every bridge port, including fronthaul radios).
++        break;
++    }
+     default: {
+         LOG(ERROR) << "Unknown BACKHAUL_MANAGER message, action_op: "
+                    << int(beerocks_header->action_op());
+@@ -6947,8 +7016,8 @@ bool slave_thread::agent_fsm()
+ 
+         // Initialize the DPP Agent TCP server (port 8908) for DPP over TCP relay.
+         // For DPP extender agents (wired or wireless), the TCP server is deferred
+-        // until own onboarding completes (dpp_credentials.initialized = true) —
+-        // before that there is no 1905 path to the controller.
++        // until the 1905-layer onboarding completes (dpp_1905_credentials.initialized
++        // = true) — before that there is no 1905 path to the controller.
+         // For controller/WSC modes, start immediately (existing behaviour).
+         {
+             auto db = AgentDB::get();
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 604a1d590..fbc47ee5a 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -1424,7 +1424,7 @@ bool ApAutoConfigurationTask::send_ap_autoconfiguration_search_message(
+     // (pre-override) profile and the controller would never see Profile-3 on it.
+     const bool dpp_onboarding_active =
+         db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP &&
+-        db->dpp_bootstrap.valid && !db->dpp_credentials.initialized; // only before onboarding completes
++        db->dpp_bootstrap.valid && !db->dpp_1905_credentials.initialized; // only before onboarding completes
+ 
+     // Combined Controller+Agent (GW): the co-located agent always onboards itself via
+     // WSC (no bootstrap key of its own, so it must NOT add a Chirp TLV here), but its
+@@ -1457,7 +1457,11 @@ bool ApAutoConfigurationTask::send_ap_autoconfiguration_search_message(
+         tlvProfile2MultiApProfile->profile() = db->device_conf.multi_ap_profile;
+     }
+ 
+-    if (dpp_onboarding_active) {
++    // Chirp TLV is only meaningful for a wired extender: a wireless extender's Search
++    // is sent over the same radio it's trying to onboard, before it has backhaul
++    // connectivity to the controller, so chirping here would never reach it anyway.
++    if (dpp_onboarding_active &&
++        db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wired) {
+         // Add tlvDppChirpValue with bootstrap chirp hash
+         auto chirp_tlv = m_cmdu_tx.addClass<wfa_map::tlvDppChirpValue>();
+         if (chirp_tlv) {
+@@ -1983,7 +1987,7 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_response(
+         //     not DPP-capable enough; revert to WSC so the FSM proceeds via WSC M1 instead
+         //     of waiting forever for a DPP BSS Configuration that will never arrive.
+         if (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP &&
+-            !db->dpp_credentials.initialized) {
++            !db->dpp_1905_credentials.initialized) {
+             bool profile_3 =
+                 (profile == wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_3);
+             bool profile_2 =
+@@ -6246,13 +6250,13 @@ bool ApAutoConfigurationTask::send_ap_bss_configuration_message(
+     // order permanently locks out every allocator that should come before it, causing
+     // create_wifi_credentials()/create_dpp_bss_credentials()/alloc_smd_policy_list() above
+     // to fail and abort this function before the CMDU is ever sent.
+-    if (!db->dpp_credentials.nak_private_der.empty()) {
+-        if (!request->alloc_dpp_netaccesskey(db->dpp_credentials.nak_private_der.size())) {
++    if (!db->dpp_1905_credentials.nak_private_der.empty()) {
++        if (!request->alloc_dpp_netaccesskey(db->dpp_1905_credentials.nak_private_der.size())) {
+             LOG(ERROR) << "Failed to allocate dpp_netaccesskey";
+             return false;
+         }
+-        std::copy(db->dpp_credentials.nak_private_der.begin(),
+-                  db->dpp_credentials.nak_private_der.end(), request->dpp_netaccesskey());
++        std::copy(db->dpp_1905_credentials.nak_private_der.begin(),
++                  db->dpp_1905_credentials.nak_private_der.end(), request->dpp_netaccesskey());
+     }
+ 
+     LOG(INFO) << "Sending reconfiguration: " << std::endl << ss.str();
+diff --git a/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp b/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
+index b2da2fb82..c16a0222f 100644
+--- a/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
++++ b/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
+@@ -457,10 +457,48 @@ void DppAgentTask::work()
+     auto &sess = db->dpp_wired_session;
+ 
+     if (db->dpp_extender_config.onboarding_type != AgentDB::OnboardingType::DPP) return;
+-    if (db->dpp_credentials.initialized) return;
+ 
+     auto now = std::chrono::steady_clock::now();
+ 
++    // 1905 credentials already available (e.g. restored on reboot, or already
++    // converted during this run) — don't wait for a wireless Auth Request at all,
++    // drive Peer Discovery directly over 1905 Direct Encap, retrying until the
++    // Controller responds.
++    if (db->dpp_1905_credentials.initialized) {
++        if (db->controller_info.bridge_mac == beerocks::net::network_utils::ZERO_MAC) {
++            return;
++        }
++        if (!db->dpp_extender_config.controller_requires_1905_security) {
++            // Mirrors the live-exchange shortcut at the bottom of handle_dpp_wired_gas_response()
++            // below: no 0xA9 TLV means the 1905 layer doesn't need Peer Discovery+EAPOL, so go
++            // straight to BSS Config Request — just gated on the Controller's bridge_mac being
++            // known (it is still ZERO_MAC immediately after a reboot-restore, before Topology
++            // Discovery has run; firing before that sends the CMDU nowhere useful).
++            if (!m_bss_config_request_sent) {
++                LOG(INFO) << "DPP: 1905 credentials ready, no 1905 security required — sending "
++                             "BSS Config Request directly (not waiting for wireless Auth "
++                             "Request)";
++                m_btl_ctx.start_dpp_tcp_relay_server();
++                trigger_bss_config_request(db->controller_info.bridge_mac);
++                m_bss_config_request_sent = true;
++            }
++            return;
++        }
++        if (db->peer_1905_security.count(db->controller_info.bridge_mac)) {
++            return; // Peer Discovery already completed with the Controller
++        }
++        if (m_peer_discovery_sent_time != std::chrono::steady_clock::time_point{} &&
++            std::chrono::duration_cast<std::chrono::seconds>(now - m_peer_discovery_sent_time)
++                    .count() < DPP_PEER_DISCOVERY_RETRY_SECONDS) {
++            return;
++        }
++        LOG(INFO) << "DPP: 1905 credentials ready — initiating Peer Discovery over 1905 "
++                     "Direct Encap (not waiting for wireless Auth Request)";
++        initiate_peer_discovery(db->controller_info.bridge_mac);
++        m_peer_discovery_sent_time = now;
++        return;
++    }
++
+     if (!sess.active) {
+         if (db->dpp_bootstrap.valid &&
+                 db->controller_info.bridge_mac != beerocks::net::network_utils::ZERO_MAC &&
+@@ -1859,7 +1897,7 @@ bool DppAgentTask::handle_dpp_wired_gas_response(const sMacAddr &src_mac,
+                     conn_pos += 19;
+                     auto conn_end = json.find('"', conn_pos);
+                     if (conn_end != std::string::npos) {
+-                        db->dpp_credentials.connector = json.substr(conn_pos, conn_end - conn_pos);
++                        db->dpp_1905_credentials.connector = json.substr(conn_pos, conn_end - conn_pos);
+                         LOG(INFO) << "DPP: stored 1905 connector (mapAgent)";
+                         found_1905_connector = true;
+                     }
+@@ -1875,7 +1913,7 @@ bool DppAgentTask::handle_dpp_wired_gas_response(const sMacAddr &src_mac,
+                         if (json[end] == '{') ++depth;
+                         else if (json[end] == '}') { if (--depth == 0) { ++end; break; } }
+                     }
+-                    db->dpp_credentials.c_sign_key_jwk = json.substr(csign_pos, end - csign_pos);
++                    db->dpp_1905_credentials.c_sign_key_jwk = json.substr(csign_pos, end - csign_pos);
+                 }
+ 
+                 // dfCounterThreshold
+@@ -1885,26 +1923,26 @@ bool DppAgentTask::handle_dpp_wired_gas_response(const sMacAddr &src_mac,
+                     char *end_ptr = nullptr;
+                     long v = strtol(s, &end_ptr, 10);
+                     if (end_ptr != s && v >= 0 && v <= 65535) {
+-                        db->dpp_credentials.df_counter_threshold = static_cast<uint16_t>(v);
++                        db->dpp_1905_credentials.df_counter_threshold = static_cast<uint16_t>(v);
+                     }
+                 }
+             }
+         } else if (id == DPP_ATTR_NET_ACCESS_KEY /* 0x100E */ || id == 0x100E) {
+             // netAccessKey private key — store as DER
+-            db->dpp_credentials.nak_private_der.assign(val, val + len);
++            db->dpp_1905_credentials.nak_private_der.assign(val, val + len);
+             LOG(INFO) << "DPP: stored netAccessKey private key (" << len << " bytes)";
+         }
+         offset += 4 + len;
+     }
+ 
+-    if (!found_1905_connector || db->dpp_credentials.nak_private_der.empty()) {
++    if (!found_1905_connector || db->dpp_1905_credentials.nak_private_der.empty()) {
+         // The prplMesh controller embeds the NAK public key inside the signedConnector JWT
+         // (as "netAccessKey" claim) rather than as a separate DPP_ATTR_NET_ACCESS_KEY TLV.
+         // The NAK private key is sess.agent_protocol_key (pR) — the ephemeral key whose
+         // public part was sent as R-Protocol-Key in the Auth Response and used by the
+         // controller to sign the connector.
+         // Export it as traditional EC DER (SEC1 format) matching the OSSL_DECODER expectation.
+-        if (found_1905_connector && db->dpp_credentials.nak_private_der.empty()
++        if (found_1905_connector && db->dpp_1905_credentials.nak_private_der.empty()
+                 && sess.agent_protocol_key) {
+             BIO *bio = BIO_new(BIO_s_mem());
+             if (bio) {
+@@ -1914,13 +1952,13 @@ bool DppAgentTask::handle_dpp_wired_gas_response(const sMacAddr &src_mac,
+                     // Store as EVP_PKEY* loaded via traditional PEM path (correct ECDH)
+                     EVP_PKEY *reloaded = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+                     if (reloaded) {
+-                        if (db->dpp_credentials.nak_pkey) EVP_PKEY_free(db->dpp_credentials.nak_pkey);
+-                        db->dpp_credentials.nak_pkey = reloaded;
++                        if (db->dpp_1905_credentials.nak_pkey) EVP_PKEY_free(db->dpp_1905_credentials.nak_pkey);
++                        db->dpp_1905_credentials.nak_pkey = reloaded;
+                         // Also export DER for wireless/fallback path
+                         unsigned char *der = nullptr;
+                         int der_len = i2d_PrivateKey(reloaded, &der);
+                         if (der_len > 0 && der) {
+-                            db->dpp_credentials.nak_private_der.assign(der, der + der_len);
++                            db->dpp_1905_credentials.nak_private_der.assign(der, der + der_len);
+                             OPENSSL_free(der);
+                         }
+                         LOG(INFO) << "DPP: stored NAK private key from pR (pkey+der)";
+@@ -1928,20 +1966,20 @@ bool DppAgentTask::handle_dpp_wired_gas_response(const sMacAddr &src_mac,
+                 }
+                 BIO_free(bio);
+             }
+-            if (!db->dpp_credentials.nak_pkey) {
++            if (!db->dpp_1905_credentials.nak_pkey) {
+                 LOG(ERROR) << "DPP: failed to export pR as NAK private key";
+             }
+         }
+     }
+ 
+-    if (!found_1905_connector || db->dpp_credentials.nak_private_der.empty()) {
++    if (!found_1905_connector || db->dpp_1905_credentials.nak_private_der.empty()) {
+         LOG(ERROR) << "DPP: GAS Config Response missing connector or NAK key"
+                    << " connector=" << found_1905_connector
+-                   << " nak_len=" << db->dpp_credentials.nak_private_der.size();
++                   << " nak_len=" << db->dpp_1905_credentials.nak_private_der.size();
+         return false;
+     }
+ 
+-    db->dpp_credentials.initialized = true;
++    db->dpp_1905_credentials.initialized = true;
+     LOG(INFO) << "DPP: credentials initialized — sending Config Result";
+ 
+     // Send DPP Config Result (status=OK)
+@@ -1989,7 +2027,7 @@ bool DppAgentTask::handle_dpp_wired_gas_response(const sMacAddr &src_mac,
+ bool DppAgentTask::initiate_peer_discovery(const sMacAddr &controller_mac)
+ {
+     auto db = AgentDB::get();
+-    if (!db->dpp_credentials.initialized || db->dpp_credentials.connector.empty()) {
++    if (!db->dpp_1905_credentials.initialized || db->dpp_1905_credentials.connector.empty()) {
+         LOG(ERROR) << "DPP: cannot initiate Peer Discovery — credentials not ready";
+         return false;
+     }
+@@ -2006,8 +2044,8 @@ bool DppAgentTask::initiate_peer_discovery(const sMacAddr &controller_mac)
+ 
+     // Connector
+     append_attr(frame, DPP_ATTR_CONNECTOR,
+-                reinterpret_cast<const uint8_t *>(db->dpp_credentials.connector.data()),
+-                static_cast<uint16_t>(db->dpp_credentials.connector.size()));
++                reinterpret_cast<const uint8_t *>(db->dpp_1905_credentials.connector.data()),
++                static_cast<uint16_t>(db->dpp_1905_credentials.connector.size()));
+ 
+     auto cmdu_hdr = m_cmdu_tx.create(0, ieee1905_1::eMessageType::DIRECT_ENCAP_DPP_MESSAGE);
+     if (!cmdu_hdr) return false;
+@@ -2153,7 +2191,7 @@ bool DppAgentTask::handle_agent_list(const sMacAddr &src_mac,
+         }
+ 
+         // Check if we have our own DPP credentials
+-        if (!db->dpp_credentials.initialized || db->dpp_credentials.connector.empty()) {
++        if (!db->dpp_1905_credentials.initialized || db->dpp_1905_credentials.connector.empty()) {
+             LOG(WARNING) << "AGENT_LIST: DPP credentials not ready — cannot establish "
+                             "1905 security with " << e.al_mac;
+             continue;
+@@ -2207,7 +2245,7 @@ bool DppAgentTask::initiate_1905_network_introduction(const sMacAddr &peer_mac)
+ {
+     auto db = AgentDB::get();
+ 
+-    if (!db->dpp_credentials.initialized || db->dpp_credentials.connector.empty()) {
++    if (!db->dpp_1905_credentials.initialized || db->dpp_1905_credentials.connector.empty()) {
+         LOG(ERROR) << "1905 intro: DPP credentials not initialized for peer " << peer_mac;
+         return false;
+     }
+@@ -2222,7 +2260,7 @@ bool DppAgentTask::initiate_1905_network_introduction(const sMacAddr &peer_mac)
+     append_dpp_attr(frame, DPP_ATTR_TRANS_ID, &trans_id, 1);
+ 
+     // Connector attribute (ID=0x100D LE)
+-    const auto &connector = db->dpp_credentials.connector;
++    const auto &connector = db->dpp_1905_credentials.connector;
+     append_dpp_attr(frame, DPP_ATTR_CONNECTOR,
+                     reinterpret_cast<const uint8_t *>(connector.data()),
+                     static_cast<uint16_t>(connector.size()));
+@@ -2259,13 +2297,13 @@ bool DppAgentTask::handle_peer_discovery_request(const sMacAddr &src_mac,
+     std::string peer_connector(reinterpret_cast<const char *>(connector_val), connector_len);
+ 
+     // Verify Connector signature using C-sign-key
+-    if (!db->dpp_credentials.initialized || db->dpp_credentials.c_sign_key_jwk.empty()) {
++    if (!db->dpp_1905_credentials.initialized || db->dpp_1905_credentials.c_sign_key_jwk.empty()) {
+         LOG(ERROR) << "1905 intro: C-sign-key not available for Connector verification";
+         send_peer_discovery_response(src_mac, false, "");
+         return false;
+     }
+ 
+-    if (!verify_connector(peer_connector, db->dpp_credentials.c_sign_key_jwk)) {
++    if (!verify_connector(peer_connector, db->dpp_1905_credentials.c_sign_key_jwk)) {
+         LOG(ERROR) << "1905 intro: Peer Connector signature invalid from " << src_mac;
+         send_peer_discovery_response(src_mac, false, "");
+         return false;
+@@ -2292,7 +2330,7 @@ bool DppAgentTask::handle_peer_discovery_request(const sMacAddr &src_mac,
+     }
+ 
+     // Send Peer Discovery Response with our Connector
+-    if (!send_peer_discovery_response(src_mac, true, db->dpp_credentials.connector)) {
++    if (!send_peer_discovery_response(src_mac, true, db->dpp_1905_credentials.connector)) {
+         return false;
+     }
+ 
+@@ -2338,12 +2376,12 @@ bool DppAgentTask::handle_peer_discovery_response(const sMacAddr &src_mac,
+     std::string peer_connector(reinterpret_cast<const char *>(connector_val), connector_len);
+ 
+     // Verify Connector signature
+-    if (!db->dpp_credentials.initialized || db->dpp_credentials.c_sign_key_jwk.empty()) {
++    if (!db->dpp_1905_credentials.initialized || db->dpp_1905_credentials.c_sign_key_jwk.empty()) {
+         LOG(ERROR) << "1905 intro: C-sign-key not available for Connector verification";
+         return false;
+     }
+ 
+-    if (!verify_connector(peer_connector, db->dpp_credentials.c_sign_key_jwk)) {
++    if (!verify_connector(peer_connector, db->dpp_1905_credentials.c_sign_key_jwk)) {
+         LOG(ERROR) << "1905 intro: Peer Connector signature invalid from " << src_mac;
+         db->peer_1905_security.erase(src_mac);
+         return false;
+@@ -2406,7 +2444,7 @@ bool DppAgentTask::derive_1905_pmk(const sMacAddr &peer_mac,
+ {
+     auto db = AgentDB::get();
+ 
+-    if (db->dpp_credentials.nak_pkey == nullptr && db->dpp_credentials.nak_private_der.empty()) {
++    if (db->dpp_1905_credentials.nak_pkey == nullptr && db->dpp_1905_credentials.nak_private_der.empty()) {
+         LOG(ERROR) << "PMK: agent NAK private key not available";
+         return false;
+     }
+@@ -2416,11 +2454,11 @@ bool DppAgentTask::derive_1905_pmk(const sMacAddr &peer_mac,
+     // Fall back to nak_private_der + OSSL_DECODER for wireless/legacy path.
+     EVP_PKEY *agent_pkey = nullptr;
+     bool agent_pkey_owned = false;
+-    if (db->dpp_credentials.nak_pkey) {
+-        agent_pkey = db->dpp_credentials.nak_pkey;  // borrowed reference — do not free
++    if (db->dpp_1905_credentials.nak_pkey) {
++        agent_pkey = db->dpp_1905_credentials.nak_pkey;  // borrowed reference — do not free
+     } else {
+-        const uint8_t *p   = db->dpp_credentials.nak_private_der.data();
+-        size_t p_len       = db->dpp_credentials.nak_private_der.size();
++        const uint8_t *p   = db->dpp_1905_credentials.nak_private_der.data();
++        size_t p_len       = db->dpp_1905_credentials.nak_private_der.size();
+         OSSL_DECODER_CTX *dctx = OSSL_DECODER_CTX_new_for_pkey(
+             &agent_pkey, "DER", nullptr, "EC",
+             OSSL_KEYMGMT_SELECT_PRIVATE_KEY, nullptr, nullptr);
+@@ -2739,7 +2777,7 @@ bool DppAgentTask::handle_eapol_m3(const sMacAddr &src_mac,
+     // code path but must not trigger BSS Config Request (wrong destination).
+     {
+         auto db2 = AgentDB::get();
+-        if (db2->dpp_credentials.initialized &&
++        if (db2->dpp_1905_credentials.initialized &&
+                 db2->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP
+                 && src_mac == db2->controller_info.bridge_mac) {
+             m_btl_ctx.start_dpp_tcp_relay_server();
+@@ -3478,7 +3516,7 @@ bool DppAgentTask::handle_direct_encap_dpp(const sMacAddr &src_mac,
+     bool is_dpp_wired_extender =
+         (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP &&
+          db->dpp_bootstrap.valid &&
+-         !db->dpp_credentials.initialized);
++         !db->dpp_1905_credentials.initialized);
+ 
+     auto dpp_msg_tlv = cmdu_rx.getClass<wfa_map::tlvDppMessage>();
+     if (!dpp_msg_tlv) {
+diff --git a/agent/src/beerocks/slave/tasks/dpp_agent_task.h b/agent/src/beerocks/slave/tasks/dpp_agent_task.h
+index f1872ab2e..047b24c63 100644
+--- a/agent/src/beerocks/slave/tasks/dpp_agent_task.h
++++ b/agent/src/beerocks/slave/tasks/dpp_agent_task.h
+@@ -131,6 +131,16 @@ public:
+      */
+     bool trigger_bss_config_request(const sMacAddr &controller_mac);
+ 
++    /**
++     * @brief Initiate DPP Peer Discovery, which cascades into the 1905 4-way handshake.
++     *
++     * Called from son_slave_thread once the bSTA's 1905-layer Connector, NAK, and
++     * C-sign-key have all been received (wireless bSTA DPP onboarding) when the
++     * controller requires 1905 security (0xA9 TLV present in AP-Autoconfig Response).
++     * Also used internally for the wired DPP Extender flow.
++     */
++    bool initiate_peer_discovery(const sMacAddr &controller_mac);
++
+     // -------------------------------------------------------------------------
+     // External entry points (called from son_slave_thread.cpp)
+     // -------------------------------------------------------------------------
+@@ -267,8 +277,6 @@ private:
+     // Post-config: Peer Discovery → BSS Config
+     // -------------------------------------------------------------------------
+ 
+-    bool initiate_peer_discovery(const sMacAddr &controller_mac);
+-
+     bool send_bss_configuration_request(const sMacAddr &controller_mac);
+ 
+     // -------------------------------------------------------------------------
+@@ -583,8 +591,20 @@ private:
+     // Chirp sent time — used to detect Auth Request timeout after Search+Chirp.
+     std::chrono::steady_clock::time_point m_chirp_sent_time{};
+ 
++    // 1905 Peer Discovery Request sent time — used to retry if no Peer Discovery
++    // Response arrives. Only relevant once dpp_1905_credentials are already
++    // available (e.g. restored on reboot), in which case we drive Peer Discovery
++    // directly instead of waiting on a wireless Auth Request.
++    std::chrono::steady_clock::time_point m_peer_discovery_sent_time{};
++
++    // Set once work() has fired the restored-on-reboot, no-1905-security BSS Config
++    // Request (see work()) so it isn't resent every tick — there is no response/ack
++    // to key a retry off of, unlike the Peer Discovery path above.
++    bool m_bss_config_request_sent = false;
++
+     static constexpr int DPP_AUTH_TIMEOUT_SECONDS         = 10;
+     static constexpr int DPP_AUTH_REQUEST_TIMEOUT_SECONDS = 10; // spec §5.3.5 DPP_TIMER
++    static constexpr int DPP_PEER_DISCOVERY_RETRY_SECONDS = 10;
+ 
+     // DPP frame type constants (Easy Connect §8.2.1)
+     static constexpr uint8_t DPP_PA_AUTHENTICATION_REQUEST  = 0x00;
+diff --git a/common/beerocks/bcl/source/beerocks_event_loop_impl.cpp b/common/beerocks/bcl/source/beerocks_event_loop_impl.cpp
+index b5b614aaf..a2fbd6d95 100755
+--- a/common/beerocks/bcl/source/beerocks_event_loop_impl.cpp
++++ b/common/beerocks/bcl/source/beerocks_event_loop_impl.cpp
+@@ -64,10 +64,16 @@ bool EventLoopImpl::register_handlers(int fd, const EventLoop::EventHandlers &ha
+         return false;
+     }
+ 
+-    // Make sure that the file descriptor is not already part of the poll
++    // A stale map entry is left behind if a previous owner of this fd number was closed directly
++    // (e.g. its destructor closed the underlying descriptor) without going through
++    // remove_handlers() first. Trusting this bookkeeping over the kernel would make that fd
++    // number permanently unusable for the rest of the process lifetime, since a new descriptor
++    // can be assigned the same (now free) number by the OS. So only warn here; epoll_ctl() below
++    // is the actual source of truth and will fail with EEXIST if the fd is genuinely still
++    // registered.
+     if (m_fd_to_event_handlers.find(fd) != m_fd_to_event_handlers.end()) {
+-        LOG(WARNING) << "Requested to add FD (" << fd << ") to the poll, but it's already there";
+-        return false;
++        LOG(WARNING) << "FD (" << fd << ") already tracked in the poll — recovering if the "
++                     << "kernel confirms it was actually released";
+     }
+ 
+     LOG(INFO) << "Register handlers for FD (" << fd << ")" << get_fd_name_print(handlers.name);
+diff --git a/common/beerocks/bcl/source/beerocks_timer_manager_impl.cpp b/common/beerocks/bcl/source/beerocks_timer_manager_impl.cpp
+index 0e5ca6d5f..70b274cd7 100644
+--- a/common/beerocks/bcl/source/beerocks_timer_manager_impl.cpp
++++ b/common/beerocks/bcl/source/beerocks_timer_manager_impl.cpp
+@@ -90,6 +90,11 @@ bool TimerManagerImpl::remove_timer(int &fd)
+     auto it = m_timers.find(fd);
+     if (m_timers.end() == it) {
+         LOG(ERROR) << "Timer not found!, fd = " << fd;
++        // Reset the caller's handle even on failure - otherwise it keeps pointing at a fd that
++        // TimerManagerImpl has no record of, and callers that check it for "already armed" (e.g.
++        // BackhaulManager::cancel_dpp_chirp_timer()) will get stuck thinking a timer is still
++        // running when it isn't.
++        fd = beerocks::net::FileDescriptor::invalid_descriptor;
+         return false;
+     }
+ 
+diff --git a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+index acf591700..c20036489 100644
+--- a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+@@ -81,8 +81,6 @@ public:
+         DPP_PRESENCE_ANNOUNCEMENT,
+         DPP_AUTHENTICATION_RESPONSE,
+         DPP_CONFIGURATION_REQUEST,
+-        // TASK-27: Wireless extender credential events (from wpa_supplicant ctrl events)
+-        DPP_CREDENTIALS_READY, /**< All 3 DPP credentials received from wpa_supplicant */
+ 
+         Interface_Connected_OK,
+         Interface_Reconnected_OK,
+diff --git a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+index 23a4cdf2b..578e5a4b1 100644
+--- a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
++++ b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+@@ -352,6 +352,15 @@ typedef struct {
+     sMacAddr ruid;
+ } sACTION_BACKHAUL_UPDATE_MLD_MAC_NOTIFICATION;
+ 
++/**
++ * @brief Raw wpa_supplicant ctrl_iface event line for events not otherwise given a dedicated
++ *        strongly-typed notification (currently the DPP-* events consumed by
++ *        BackhaulManager::process_dpp_bridge_events()).
++ */
++typedef struct {
++    char event_line[4096];
++} sACTION_BACKHAUL_DPP_EVENT_NOTIFICATION;
++
+ //ap_wlan_hal
+ 
+ enum eWiFiStandard : uint8_t {
+@@ -467,16 +476,6 @@ typedef struct {
+     sMacAddr enrollee_mac;
+ } sACTION_APMANAGER_DPP_CONFIGURATION_REQUEST;
+ 
+-/** TASK-27: Carries 1905-layer DPP credentials received from wpa_supplicant ctrl events.
+- *  Populated by ap_manager when DPP-1905-CONNECTOR + DPP-NET-ACCESS-KEY + DPP-C-SIGN-KEY
+- *  are all received. Sent to son_slave_thread to populate AgentDB::dpp_credentials. */
+-typedef struct {
+-    char connector_1905[2048];  ///< DPP-1905-CONNECTOR JWS (netRole=mapAgent)
+-    uint8_t nak_private_der[128]; ///< DPP-NET-ACCESS-KEY decoded from hex DER
+-    uint16_t nak_private_der_len;
+-    char c_sign_key_jwk[512]; ///< DPP-C-SIGN-KEY as JWK JSON string
+-} sACTION_APMANAGER_DPP_CREDENTIALS_READY;
+-
+ typedef struct {
+     sClientAssociationParams params;
+ } sACTION_APMANAGER_CLIENT_ASSOCIATED_NOTIFICATION;
+diff --git a/common/beerocks/bwl/include/bwl/key_value_parser.h b/common/beerocks/bwl/include/bwl/key_value_parser.h
+index 948980538..b56da589a 100644
+--- a/common/beerocks/bwl/include/bwl/key_value_parser.h
++++ b/common/beerocks/bwl/include/bwl/key_value_parser.h
+@@ -19,6 +19,7 @@ namespace bwl {
+ constexpr char EVENT_KEYLESS_PARAM_OPCODE[] = "_opcode";
+ constexpr char EVENT_KEYLESS_PARAM_MAC[]    = "_mac";
+ constexpr char EVENT_KEYLESS_PARAM_IFACE[]  = "_iface";
++constexpr char EVENT_KEYLESS_PARAM_RAW[]    = "_raw";
+ 
+ /**
+  * @brief On KeyValueParser there are two types of object that can be parsed:
+diff --git a/common/beerocks/bwl/include/bwl/sta_wlan_hal.h b/common/beerocks/bwl/include/bwl/sta_wlan_hal.h
+index de69d5b96..4a8b4cc80 100644
+--- a/common/beerocks/bwl/include/bwl/sta_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/sta_wlan_hal.h
+@@ -37,7 +37,10 @@ public:
+ 
+         Interface_Connected_OK,
+         Interface_Reconnected_OK,
+-        Interface_Disconnected
++        Interface_Disconnected,
++
++        // Raw DPP-* ctrl_iface event line, forwarded verbatim for BackhaulManager to parse.
++        Dpp_Event
+     };
+ 
+     using ChannelFreqPair = std::pair<uint8_t, beerocks::eFreqType>;
+@@ -116,6 +119,43 @@ public:
+      * non-WHM backends need not override it.
+      */
+     virtual uint16_t get_multi_ap_primary_vlan_id() { return 0; }
++
++    /*!
++     * @brief Generate a DPP bootstrap key (QR-code type) from an existing DER-encoded
++     * private key and read back its bootstrapping URI.
++     *
++     * @param[in] private_key_der DER-encoded EC private key bytes.
++     * @param[out] bootstrap_id wpa_supplicant-assigned bootstrap id, on success.
++     * @param[out] uri The DPP bootstrapping URI, on success.
++     */
++    virtual bool dpp_bootstrap_gen_and_get_uri(const std::vector<uint8_t> &private_key_der,
++                                               int &bootstrap_id, std::string &uri) = 0;
++
++    /*!
++     * @brief Configure the EasyMesh bSTAList extra DPP configuration-request attribute.
++     *
++     * @param[in] json_value bSTAList JSON value to advertise in the DPP Configuration Request.
++     */
++    virtual bool dpp_set_extra_conf_req_bsta_list(const std::string &json_value) = 0;
++
++    /*!
++     * @brief Reads back any DPP Connector(s) and key material persisted by wpa_supplicant
++     * across networks configured on this interface. Used to restore DPP credentials on
++     * boot, since wpa_supplicant only emits its DPP-*-CONNECTOR events once, live, during
++     * an active DPP exchange, and never re-emits them on restart.
++     *
++     * @param[out] creds Persisted DPP credentials found, if any.
++     */
++    virtual bool get_persisted_dpp_credentials(sPersistedDppCredentials &creds) = 0;
++
++    /*!
++     * @brief Issue a DPP chirp (DPP_CHIRP) using an existing bootstrap id.
++     *
++     * @param[in] bootstrap_id wpa_supplicant bootstrap id to chirp with.
++     * @param[in] net_role netRole to advertise in the chirp.
++     * @param[in] iterations Number of chirp iterations.
++     */
++    virtual bool dpp_chirp(int bootstrap_id, const std::string &net_role, int iterations = 3) = 0;
+ };
+ 
+ // STA HAL factory types
+diff --git a/common/beerocks/bwl/include/bwl/sta_wlan_hal_types.h b/common/beerocks/bwl/include/bwl/sta_wlan_hal_types.h
+index 621796c0e..2df7f2104 100644
+--- a/common/beerocks/bwl/include/bwl/sta_wlan_hal_types.h
++++ b/common/beerocks/bwl/include/bwl/sta_wlan_hal_types.h
+@@ -11,6 +11,9 @@
+ 
+ #include <stdint.h>
+ 
++#include <string>
++#include <vector>
++
+ #include <bcl/network/net_struct.h>
+ 
+ namespace bwl {
+@@ -30,6 +33,19 @@ struct sScanResult {
+ 
+ constexpr int invalid_network_id = -1;
+ 
++/*!
++ * Persisted DPP Connector material read back from wpa_supplicant's ctrl_iface.
++ * Raw data only — netRole interpretation and AgentDB staging are the caller's job.
++ */
++struct sPersistedDppCredentials {
++    bool has_wlan_connector = false;
++    std::string wlan_connector;
++    bool has_1905_connector = false;
++    std::string dpp_1905_connector;
++    std::vector<uint8_t> nak_private_der;
++    std::vector<uint8_t> c_sign_key_der;
++};
++
+ } // namespace bwl
+ 
+ #endif // _BWL_STA_WLAN_HAL_TYPES_H_
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index 53a50cff5..c7edddda5 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -1401,6 +1401,10 @@ bool base_wlan_hal_nl80211::process_ext_events(int fd)
+     parsed_obj_map_t event_obj;
+     map_event_obj_parser(event_str, event_obj);
+ 
++    // Preserve the full raw line (still carrying any "<N>" severity prefix) for events whose
++    // handling is easier to do via direct string parsing than key/value tokenization (e.g. DPP-*).
++    event_obj[bwl::EVENT_KEYLESS_PARAM_RAW] = event_str;
++
+     // append interface name if missing
+     event_obj.emplace(bwl::EVENT_KEYLESS_PARAM_IFACE, interface);
+ 
+diff --git a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
+index 11dda5f30..5f32de2c5 100644
+--- a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
+@@ -8,9 +8,13 @@
+ 
+ #include "sta_wlan_hal_nl80211.h"
+ 
++#include <sstream>
++
++#include <bcl/beerocks_string_utils.h>
+ #include <bcl/beerocks_utils.h>
+ #include <bcl/network/network_utils.h>
+ #include <bpl/bpl_cfg.h>
++#include <bwl/key_value_parser.h>
+ 
+ #include <easylogging++.h>
+ 
+@@ -58,6 +62,8 @@ static sta_wlan_hal::Event nl80211_to_bwl_event(const std::string &opcode)
+         return sta_wlan_hal::Event::ScanResults;
+     } else if (opcode == "CTRL-EVENT-CHANNEL-SWITCH") {
+         return sta_wlan_hal::Event::ChannelSwitch;
++    } else if (opcode.rfind("DPP-", 0) == 0) {
++        return sta_wlan_hal::Event::Dpp_Event;
+     }
+ 
+     return sta_wlan_hal::Event::Invalid;
+@@ -497,6 +503,19 @@ bool sta_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+ 
+     } break;
+ 
++    case Event::Dpp_Event: {
++        const auto &raw_line = parsed_obj[EVENT_KEYLESS_PARAM_RAW];
++
++        auto msg_buff = ALLOC_SMART_BUFFER(sizeof(sACTION_BACKHAUL_DPP_EVENT_NOTIFICATION));
++        auto msg = reinterpret_cast<sACTION_BACKHAUL_DPP_EVENT_NOTIFICATION *>(msg_buff.get());
++        LOG_IF(!msg, FATAL) << "Memory allocation failed!";
++
++        memset(msg_buff.get(), 0, sizeof(sACTION_BACKHAUL_DPP_EVENT_NOTIFICATION));
++        strlcpy(msg->event_line, raw_line.c_str(), sizeof(msg->event_line));
++
++        event_queue_push(event, msg_buff);
++    } break;
++
+     // Gracefully ignore unhandled events
+     // TODO: Should be changed to an error once we handle hostapd all expected events
+     default:
+@@ -930,6 +949,139 @@ bool sta_wlan_hal_nl80211::is_disconnected()
+     return (connection_status.wpa_state.compare("DISCONNECTED") == 0);
+ }
+ 
++bool sta_wlan_hal_nl80211::dpp_bootstrap_gen_and_get_uri(
++    const std::vector<uint8_t> &private_key_der, int &bootstrap_id, std::string &uri)
++{
++    std::string hex_key =
++        beerocks::string_utils::bytes_to_hex_string(private_key_der.data(), private_key_der.size());
++
++    char *reply         = nullptr;
++    std::string gen_cmd = "DPP_BOOTSTRAP_GEN type=qrcode key=" + hex_key;
++    if (!wpa_ctrl_send_msg(gen_cmd, &reply) || !reply) {
++        LOG(ERROR) << "DPP_BOOTSTRAP_GEN failed on " << get_iface_name();
++        return false;
++    }
++    bootstrap_id = beerocks::string_utils::stoi(reply);
++    if (bootstrap_id <= 0) {
++        LOG(ERROR) << "DPP_BOOTSTRAP_GEN returned invalid bootstrap id '" << reply << "' on "
++                   << get_iface_name();
++        return false;
++    }
++
++    std::string get_uri_cmd = "DPP_BOOTSTRAP_GET_URI " + std::to_string(bootstrap_id);
++    if (!wpa_ctrl_send_msg(get_uri_cmd, &reply) || !reply) {
++        LOG(ERROR) << "DPP_BOOTSTRAP_GET_URI failed for bootstrap id " << bootstrap_id << " on "
++                   << get_iface_name();
++        return false;
++    }
++    uri = reply;
++
++    return true;
++}
++
++bool sta_wlan_hal_nl80211::dpp_set_extra_conf_req_bsta_list(const std::string &json_value)
++{
++    if (!wpa_ctrl_send_msg("SET dpp_extra_conf_req_name bSTAList")) {
++        LOG(ERROR) << "SET dpp_extra_conf_req_name failed on " << get_iface_name();
++        return false;
++    }
++    if (!wpa_ctrl_send_msg("SET dpp_extra_conf_req_value " + json_value)) {
++        LOG(ERROR) << "SET dpp_extra_conf_req_value failed on " << get_iface_name();
++        return false;
++    }
++    return true;
++}
++
++bool sta_wlan_hal_nl80211::get_persisted_dpp_credentials(sPersistedDppCredentials &creds)
++{
++    creds = sPersistedDppCredentials{};
++
++    std::string iface_name = get_iface_name();
++
++    char *reply = nullptr;
++    if (!wpa_ctrl_send_msg("LIST_NETWORKS", &reply, iface_name) || !reply) {
++        LOG(ERROR) << "LIST_NETWORKS failed on " << iface_name;
++        return false;
++    }
++    std::string networks = reply;
++    LOG(DEBUG) << "DPP: LIST_NETWORKS reply on " << iface_name << ":\n" << networks;
++
++    int network_id = invalid_network_id;
++    std::istringstream networks_stream(networks);
++    std::string line;
++    std::getline(networks_stream, line); // header row
++    while (std::getline(networks_stream, line)) {
++        auto tab = line.find('\t');
++        if (tab == std::string::npos) {
++            continue;
++        }
++        int id = beerocks::string_utils::stoi(line.substr(0, tab));
++        std::string get_connector_cmd =
++            "GET_NETWORK " + std::to_string(id) + " dpp_connector";
++        bool ok = wpa_ctrl_send_msg(get_connector_cmd, &reply, iface_name) && reply;
++        LOG(DEBUG) << "DPP: " << get_connector_cmd << " reply on " << iface_name << ": "
++                  << (ok ? reply : "<failed>");
++        if (ok) {
++            network_id                = id;
++            creds.has_wlan_connector = true;
++            creds.wlan_connector      = reply;
++            break;
++        }
++    }
++
++    if (network_id != invalid_network_id) {
++        std::string nak_hex;
++        std::string get_nak_cmd =
++            "GET_NETWORK " + std::to_string(network_id) + " dpp_netaccesskey";
++        bool nak_ok = wpa_ctrl_send_msg(get_nak_cmd, &reply, iface_name) && reply;
++        LOG(DEBUG) << "DPP: " << get_nak_cmd << " reply on " << iface_name << ": "
++                  << (nak_ok ? reply : "<failed>");
++        if (nak_ok) {
++            nak_hex = reply;
++        }
++        std::string csign_hex;
++        std::string get_csign_cmd = "GET_NETWORK " + std::to_string(network_id) + " dpp_csign";
++        bool csign_ok              = wpa_ctrl_send_msg(get_csign_cmd, &reply, iface_name) && reply;
++        LOG(DEBUG) << "DPP: " << get_csign_cmd << " reply on " << iface_name << ": "
++                  << (csign_ok ? reply : "<failed>");
++        if (csign_ok) {
++            csign_hex = reply;
++        }
++        if (!nak_hex.empty() && !csign_hex.empty()) {
++            creds.nak_private_der = beerocks::string_utils::hex_to_bytes<std::vector<uint8_t>>(nak_hex);
++            creds.c_sign_key_der = beerocks::string_utils::hex_to_bytes<std::vector<uint8_t>>(csign_hex);
++        } else {
++            LOG(WARNING) << "DPP: persisted connector found on " << iface_name
++                         << " but NAK/C-sign-key could not be read back from network "
++                         << network_id;
++        }
++    } else {
++        LOG(DEBUG) << "DPP: no wpa_supplicant network on " << iface_name
++                  << " holds a persisted connector";
++    }
++
++    bool conn1905_ok = wpa_ctrl_send_msg("GET dpp_1905_connector", &reply, iface_name) && reply;
++    LOG(DEBUG) << "DPP: GET dpp_1905_connector reply on " << iface_name << ": "
++              << (conn1905_ok ? reply : "<failed>");
++    if (conn1905_ok) {
++        creds.has_1905_connector  = true;
++        creds.dpp_1905_connector = reply;
++    }
++
++    return true;
++}
++
++bool sta_wlan_hal_nl80211::dpp_chirp(int bootstrap_id, const std::string &net_role, int iterations)
++{
++    std::string chirp_cmd = "DPP_CHIRP own=" + std::to_string(bootstrap_id) +
++                            " iter=" + std::to_string(iterations) + " netrole=" + net_role;
++    if (!wpa_ctrl_send_msg(chirp_cmd)) {
++        LOG(WARNING) << "DPP: DPP_CHIRP failed on " << get_iface_name();
++        return false;
++    }
++    return true;
++}
++
+ } // namespace nl80211
+ 
+ std::shared_ptr<sta_wlan_hal> sta_wlan_hal_create(const std::string &iface_name,
+diff --git a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h
+index e99de47fa..5b3d45682 100644
+--- a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h
+@@ -83,6 +83,13 @@ public:
+ 
+     virtual bool add_new_network(son::wireless_utils::sBssInfoConf bSta_conf) override;
+ 
++    virtual bool dpp_bootstrap_gen_and_get_uri(const std::vector<uint8_t> &private_key_der,
++                                               int &bootstrap_id, std::string &uri) override;
++    virtual bool dpp_set_extra_conf_req_bsta_list(const std::string &json_value) override;
++    virtual bool get_persisted_dpp_credentials(sPersistedDppCredentials &creds) override;
++    virtual bool dpp_chirp(int bootstrap_id, const std::string &net_role,
++                           int iterations = 3) override;
++
+ protected:
+     virtual bool nl_event_handle(struct nl_msg *msg, void *arg = nullptr) override;
+     virtual bool process_nl80211_event(parsed_obj_map_t &parsed_obj) override;
+diff --git a/common/beerocks/bwl/onewifi/sta_wlan_hal_onewifi.h b/common/beerocks/bwl/onewifi/sta_wlan_hal_onewifi.h
+index dcf070a25..3ccc70e6a 100644
+--- a/common/beerocks/bwl/onewifi/sta_wlan_hal_onewifi.h
++++ b/common/beerocks/bwl/onewifi/sta_wlan_hal_onewifi.h
+@@ -54,6 +54,24 @@ private:
+     virtual bool update_mld_mode(uint8_t mld_mode) override { return false; }
+     virtual bool update_mld_unit(int8_t mld_unit) override { return false; }
+     virtual bool add_new_network(son::wireless_utils::sBssInfoConf bSta_conf) override { return false; }
++    virtual bool dpp_bootstrap_gen_and_get_uri(const std::vector<uint8_t> &private_key_der,
++                                               int &bootstrap_id, std::string &uri) override
++    {
++        return false;
++    }
++    virtual bool dpp_set_extra_conf_req_bsta_list(const std::string &json_value) override
++    {
++        return false;
++    }
++    virtual bool get_persisted_dpp_credentials(sPersistedDppCredentials &creds) override
++    {
++        return false;
++    }
++    virtual bool dpp_chirp(int bootstrap_id, const std::string &net_role,
++                           int iterations = 3) override
++    {
++        return false;
++    }
+ };
+ 
+ } // namespace onewifi
+diff --git a/common/beerocks/bwl/whm/sta_wlan_hal_whm.h b/common/beerocks/bwl/whm/sta_wlan_hal_whm.h
+index b38756d0b..ab11ea437 100644
+--- a/common/beerocks/bwl/whm/sta_wlan_hal_whm.h
++++ b/common/beerocks/bwl/whm/sta_wlan_hal_whm.h
+@@ -76,6 +76,25 @@ public:
+     virtual bool is_disconnected() override;
+     virtual bool add_new_network(son::wireless_utils::sBssInfoConf bSta_conf) override;
+ 
++    virtual bool dpp_bootstrap_gen_and_get_uri(const std::vector<uint8_t> &private_key_der,
++                                               int &bootstrap_id, std::string &uri) override
++    {
++        return false;
++    }
++    virtual bool dpp_set_extra_conf_req_bsta_list(const std::string &json_value) override
++    {
++        return false;
++    }
++    virtual bool get_persisted_dpp_credentials(sPersistedDppCredentials &creds) override
++    {
++        return false;
++    }
++    virtual bool dpp_chirp(int bootstrap_id, const std::string &net_role,
++                           int iterations = 3) override
++    {
++        return false;
++    }
++
+     virtual bool enable_disable_ep(bool enable) override;
+ 
+     virtual uint16_t get_multi_ap_primary_vlan_id() override;
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
+index 1da8bcd67..ab15f38ee 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
+@@ -165,8 +165,10 @@ eActionOp_BACKHAUL:
+   ACTION_BACKHAUL_HOSTAP_TRIGGER_CBS: 91
+   ACTION_BACKHAUL_HOSTAP_SET_ACS_BLOCK_LIST: 92
+   ACTION_BACKHAUL_RADIO_STATE_NOTIFICATION: 93
++  ACTION_BACKHAUL_DPP_CREDENTIALS_NOTIFICATION: 94
++  ACTION_BACKHAUL_DPP_1905_CREDENTIALS_NOTIFICATION: 95
+ 
+-  ACTION_BACKHAUL_ENUM_END: 94
++  ACTION_BACKHAUL_ENUM_END: 96
+ 
+ ####################################################
+ ####################################################
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
+index ac644ca7d..0eebd34d7 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
+@@ -286,3 +286,22 @@ cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION:
+ 
+ cACTION_BACKHAUL_SUPPLICANT_RESTART:
+   _type: class
++
++# Sent by BackhaulManager to son_slave_thread once all three of the bSTA's own WLAN-association
++# DPP credentials (Connector netRole=mapBackhaulSta, NAK private key, Configurator C-sign-key)
++# have been received from wpa_supplicant on the bSTA interface. Carries no payload — the values
++# themselves are written directly into the shared AgentDB (dpp_credentials) before this is sent,
++# exactly like cACTION_BACKHAUL_CONNECTED_NOTIFICATION/cACTION_BACKHAUL_SUPPLICANT_RESTART above.
++# Informational only — this is not the 1905-layer credential and does not trigger the 1905
++# handshake; see cACTION_BACKHAUL_DPP_1905_CREDENTIALS_NOTIFICATION below for that.
++cACTION_BACKHAUL_DPP_CREDENTIALS_NOTIFICATION:
++  _type: class
++
++# Sent by BackhaulManager to son_slave_thread once all three 1905/EasyMesh-layer DPP credentials
++# (Connector netRole=mapAgent, NAK private key, Configurator C-sign-key) have been received from
++# wpa_supplicant's DPP-1905-* events on the bSTA interface. Carries no payload — the values
++# themselves are written directly into the shared AgentDB (dpp_1905_credentials) before this is
++# sent. Triggers the 1905 4-way handshake (or direct BSS Configuration Request) — the wireless
++# bSTA analog of the wired DPP Extender's handle_dpp_wired_gas_response() trigger.
++cACTION_BACKHAUL_DPP_1905_CREDENTIALS_NOTIFICATION:
++  _type: class
