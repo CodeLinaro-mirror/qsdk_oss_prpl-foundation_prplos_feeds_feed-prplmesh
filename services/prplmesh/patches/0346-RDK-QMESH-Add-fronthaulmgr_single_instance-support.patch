@@ -1,0 +1,388 @@
+From 1c858079354715ed2cb0a55e70a44094c4454844 Mon Sep 17 00:00:00 2001
+From: Arockiasathish S <arocs@qti.qualcomm.com>
+Date: Tue, 18 Aug 2026 10:44:09 +0530
+Subject: [PATCH] [RDK][QMESH] Add fronthaulmgr_single_instance support
+
+Signed-off-by: Arockiasathish S <arocs@qti.qualcomm.com>
+---
+ .../fronthaul_manager_main.cpp                | 141 ++++++++++++++++++
+ agent/src/beerocks/slave/agent_db.h           |  11 ++
+ agent/src/beerocks/slave/son_slave_thread.cpp |  55 ++++++-
+ framework/platform/bpl/cfg/rdk/bpl_cfg.cpp    |  49 ++++++
+ framework/platform/bpl/include/bpl/bpl_cfg.h  |  16 ++
+ 5 files changed, 271 insertions(+), 1 deletion(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/fronthaul_manager_main.cpp b/agent/src/beerocks/fronthaul_manager/fronthaul_manager_main.cpp
+index d58943d90..e7fe610cb 100644
+--- a/agent/src/beerocks/fronthaul_manager/fronthaul_manager_main.cpp
++++ b/agent/src/beerocks/fronthaul_manager/fronthaul_manager_main.cpp
+@@ -29,6 +29,9 @@ BEEROCKS_INIT_BEEROCKS_VERSION
+ static bool g_running = true;
+ static int s_signal   = 0;
+ static std::string fronthaul_iface;
++#ifdef BEEROCKS_RDKB
++static std::vector<std::string> fronthaul_ifaces;
++#endif
+ 
+ // Pointer to logger instance
+ static std::shared_ptr<beerocks::logging> g_logger_ap_mananger;
+@@ -104,6 +107,9 @@ static bool parse_arguments(int argc, char *argv[])
+         switch (opt) {
+         case 'i': {
+             fronthaul_iface.assign(optarg);
++#ifdef BEEROCKS_RDKB
++            fronthaul_ifaces.push_back(optarg);
++#endif
+             break;
+         }
+         case '?': {
+@@ -203,7 +209,12 @@ int main(int argc, char *argv[])
+ 
+     //get command line options
+     if (!parse_arguments(argc, argv)) {
++#ifdef BEEROCKS_RDKB
++        std::cout << "Usage: " << argv[0] << " -i <fronthaul iface> [-i <iface2> ...]"
++                  << std::endl;
++#else
+         std::cout << "Usage: " << argv[0] << " -i <fronthaul iface>" << std::endl;
++#endif
+         return 1;
+     }
+ 
+@@ -224,6 +235,136 @@ int main(int argc, char *argv[])
+         }
+     }
+ 
++#ifdef BEEROCKS_RDKB
++    if (fronthaul_ifaces.empty()) {
++        std::cout << "Usage: " << argv[0] << " -i <fronthaul iface> [-i <iface2> ...]"
++                  << std::endl;
++        return 1;
++    }
++
++    if (fronthaul_ifaces.size() > 1) {
++        // Single-instance mode: one process managing all interfaces with a shared event loop.
++        auto event_loop = std::make_shared<beerocks::EventLoopImpl>();
++        LOG_IF(!event_loop, FATAL) << "Unable to create event loop!";
++
++        auto timer_factory = std::make_shared<beerocks::TimerFactoryImpl>();
++        LOG_IF(!timer_factory, FATAL) << "Unable to create timer factory!";
++
++        auto timer_manager =
++            std::make_shared<beerocks::TimerManagerImpl>(timer_factory, event_loop);
++        LOG_IF(!timer_manager, FATAL) << "Unable to create timer manager!";
++
++        std::string agent_uds_path =
++            beerocks_slave_conf.temp_path + std::string(BEEROCKS_AGENT_UDS);
++        std::shared_ptr<beerocks::CmduClientFactory> slave_cmdu_client_factory =
++            beerocks::create_cmdu_client_factory(agent_uds_path, event_loop);
++        LOG_IF(!slave_cmdu_client_factory, FATAL) << "Unable to create CMDU client factory!";
++
++        auto mlo_sta_registry = std::make_shared<beerocks::MloStaRegistry>();
++
++        struct FronthaulEntry {
++            std::string iface;
++            std::shared_ptr<beerocks::logging> logger_ap_manager;
++            std::shared_ptr<beerocks::logging> logger_monitor;
++            std::string pid_file_path;
++            std::unique_ptr<son::ApManager> ap_manager;
++            std::unique_ptr<son::Monitor> monitor;
++            bool monitor_is_running = false;
++        };
++
++        std::vector<FronthaulEntry> entries;
++        for (const auto &iface : fronthaul_ifaces) {
++            FronthaulEntry e;
++            e.iface = iface;
++
++            e.logger_ap_manager = init_logger(std::string(BEEROCKS_AP_MANAGER) + "_" + iface,
++                                              beerocks_slave_conf.sLog, argc, argv);
++            if (!e.logger_ap_manager) return 1;
++
++            e.logger_monitor =
++                init_logger(std::string(BEEROCKS_MONITOR) + "_" + iface,
++                            beerocks_slave_conf.sLog, argc, argv, BEEROCKS_MONITOR);
++            if (!e.logger_monitor) return 1;
++            g_logger_monitor = e.logger_monitor;
++
++            std::string base_fh = std::string(BEEROCKS_FRONTHAUL) + "_" + iface;
++            beerocks::os_utils::kill_pid(beerocks_slave_conf.temp_path + "pid/", base_fh);
++            remove_residual_fronthaul_files(beerocks_slave_conf.temp_path, base_fh);
++            beerocks::os_utils::write_pid_file(beerocks_slave_conf.temp_path, base_fh);
++            e.pid_file_path = beerocks_slave_conf.temp_path + "pid/" + base_fh;
++
++            e.ap_manager = std::make_unique<son::ApManager>(iface, *e.logger_ap_manager,
++                                                            slave_cmdu_client_factory,
++                                                            timer_manager, event_loop,
++                                                            mlo_sta_registry);
++            if (!e.ap_manager->start()) {
++                if (s_signal == SIGTERM) return 0;
++                LOG(ERROR) << "Unable to start AP manager for " << iface;
++                return 1;
++            }
++            entries.push_back(std::move(e));
++        }
++
++        // Redirect stdout/stderr to a single combined log file.
++        if (!entries.empty()) {
++            auto &log_config = beerocks_slave_conf.sLog;
++            beerocks::os_utils::redirect_console_std(log_config.files_path +
++                                                     std::string(BEEROCKS_FRONTHAUL) + "_std.log");
++        }
++
++        auto touch_time_stamp_timeout = std::chrono::steady_clock::now();
++        while (g_running) {
++            if (s_signal) { handle_signal(); continue; }
++
++            if (std::chrono::steady_clock::now() > touch_time_stamp_timeout) {
++                for (auto &e : entries) beerocks::os_utils::touch_pid_file(e.pid_file_path);
++                touch_time_stamp_timeout =
++                    std::chrono::steady_clock::now() +
++                    std::chrono::seconds(beerocks::TOUCH_PID_TIMEOUT_SECONDS);
++            }
++
++            if (event_loop->run() < 0) { LOG(ERROR) << "Event loop failure!"; break; }
++
++            for (auto &e : entries) {
++                if (!e.ap_manager->is_operational()) continue;
++                if (!e.monitor) {
++                    e.monitor = std::make_unique<son::Monitor>(e.iface, beerocks_slave_conf,
++                                                               *e.logger_monitor,
++                                                               e.ap_manager->is_radio_disabled(),
++                                                               mlo_sta_registry);
++                }
++                if (e.monitor_is_running || e.ap_manager->zwdfs_ap()) {
++                    if (!e.monitor->is_running()) {
++                        LOG(INFO) << "Restarting monitor thread for " << e.iface;
++                        e.monitor_is_running = false;
++                    }
++                } else if (e.monitor->start()) {
++                    e.monitor_is_running = true;
++                } else {
++                    CLOG(ERROR, e.logger_monitor->get_logger_id())
++                        << "Unable to start monitor for " << e.iface;
++                    g_running = false;
++                    break;
++                }
++            }
++        }
++
++        for (auto &e : entries) {
++            if (e.monitor_is_running && e.monitor) e.monitor->stop();
++            e.ap_manager->stop();
++        }
++
++        return 0;
++    }
++
++    // Single-interface mode (original path).
++    if (fronthaul_iface.empty()) {
++        std::cout << "Usage: " << argv[0] << " -i <fronthaul iface>" << std::endl;
++        return 1;
++    }
++
++#endif  /* BEEROCKS_RDKB */
++
+     // Init logger ap_manager
+     std::string base_ap_manager_name = std::string(BEEROCKS_AP_MANAGER) + "_" + fronthaul_iface;
+     g_logger_ap_mananger = init_logger(base_ap_manager_name, beerocks_slave_conf.sLog, argc, argv);
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 5ceaef36f..f62f294bb 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -261,6 +261,17 @@ public:
+          */
+         bool fh_vaps_state_control = false;
+ 
++#ifdef BEEROCKS_RDKB
++        /**
++         * @brief Fronthaul manager single-instance mode.
++         *
++         * When true, a single beerocks_fronthaul process is spawned with all fronthaul
++         * interfaces passed as '-i' arguments, sharing one event loop and timer manager.
++         * Controlled by the 'fronthaulmgr_single_instance' option in /etc/config/prplmesh.
++         */
++        bool fronthaulmgr_single_instance = false;
++#endif
++
+         /**
+          * @brief Health monitoring task configuration.
+          *
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 4b624a39e..08bc1a1f2 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -768,6 +768,14 @@ bool slave_thread::read_platform_configuration()
+                      << db->device_conf.fh_vaps_state_control;
+     }
+ 
++#ifdef BEEROCKS_RDKB
++    if (!bpl::cfg_get_fronthaulmgr_single_instance(db->device_conf.fronthaulmgr_single_instance)) {
++        LOG(WARNING)
++            << "cfg_get_fronthaulmgr_single_instance() failed! using default configuration: "
++            << db->device_conf.fronthaulmgr_single_instance;
++    }
++#endif
++
+     if (!bpl::cfg_get_best_channel_rank_threshold(db->device_conf.best_channel_rank_threshold)) {
+         LOG(WARNING) << "cfg_get_best_channel_rank_threshold() failed!"
+                      << " using default configuration ";
+@@ -1356,7 +1364,18 @@ void slave_thread::handle_client_disconnected(int fd)
+                 return true;
+             }
+             LOG(DEBUG) << "agent_reset!";
++#ifdef BEEROCKS_RDKB
++            if (AgentDB::get()->device_conf.fronthaulmgr_single_instance) {
++                m_radio_managers.do_on_each_radio_manager([&](sManagedRadio &rm, const std::string &) {
++                    rm.fronthaul_started = false;
++                    return true;
++                });
++            } else {
++                radio_manager.fronthaul_started = false;
++            }
++#else
+             radio_manager.fronthaul_started = false;
++#endif
+             agent_reset();
+             return true;
+         }
+@@ -6697,14 +6716,48 @@ bool slave_thread::agent_fsm()
+ #endif
+                         LOG(DEBUG) << "iface " << base_interface << " exists - start fronthaul process";
+                         fronthaul_stop(fronthaul_iface);
++#ifdef BEEROCKS_RDKB
++                        if (!AgentDB::get()->device_conf.fronthaulmgr_single_instance) {
++                            fronthaul_start(fronthaul_iface);
++                        }
++#else
+                         fronthaul_start(fronthaul_iface);
++#endif
+ #ifndef USE_PRPLMESH_NLHAL
+                         }
+ #endif
+                 }
+                 return true;
+             });
+-        
++
++#ifdef BEEROCKS_RDKB
++        if (AgentDB::get()->device_conf.fronthaulmgr_single_instance) {
++            std::string file_name = "./" + std::string(BEEROCKS_FRONTHAUL);
++            if (access(file_name.c_str(), F_OK) == -1) {
++                file_name = mapf::utils::get_install_path() + "bin/" + std::string(BEEROCKS_FRONTHAUL);
++            }
++            std::string cmd = file_name;
++            bool any_radio  = false;
++            m_radio_managers.do_on_each_radio_manager(
++                [&](sManagedRadio &rm, const std::string &iface) {
++                    auto db = AgentDB::get();
++                    if (!db->device_conf.front_radio.config.at(iface).band_enabled)
++                        return true;
++                    auto radio = db->radio(iface);
++                    if (radio && radio->front.zwdfs)
++                        return true;
++                    cmd += " -i " + iface;
++                    rm.fronthaul_started = true;
++                    any_radio            = true;
++                    return true;
++                });
++            if (any_radio) {
++                LOG(INFO) << "STATE_JOIN_INIT: spawning combined fronthaul: " << cmd;
++                SYSTEM_CALL(cmd, true);
++            }
++        }
++#endif
++
+         LOG(TRACE) << "goto STATE_WAIT_FOR_FRONTHAUL_THREADS_JOINED";
+         m_agent_state_timer_sec =
+             std::chrono::steady_clock::now() + WAIT_FOR_FRONTHAUL_JOINED_TIMEOUT_SEC;
+diff --git a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+index eb815afe9..337951c1f 100644
+--- a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+@@ -1692,6 +1692,55 @@ bool cfg_get_fh_vaps_state_control(bool &fh_vaps_state_control)
+     return true;
+ }
+ 
++bool cfg_get_fronthaulmgr_single_instance(bool &fronthaulmgr_single_instance)
++{
++    fronthaulmgr_single_instance = false;
++
++    if (!config_file_path) {
++        LOG(ERROR) << "config_file_path is null";
++        return false;
++    }
++
++    std::ifstream config_file(config_file_path);
++    if (!config_file.is_open()) {
++        LOG(WARNING) << "Failed to open config file: " << config_file_path;
++        return false;
++    }
++
++    std::string config_content((std::istreambuf_iterator<char>(config_file)),
++                               std::istreambuf_iterator<char>());
++    config_file.clear();
++    config_file.close();
++    if (config_file.fail()) {
++        LOG(ERROR) << "unable to close config file: " << config_file_path;
++        return false;
++    }
++
++    cJSON *root = cJSON_Parse(config_content.c_str());
++    if (!root) {
++        const char *error_ptr = cJSON_GetErrorPtr();
++        LOG(ERROR) << "Failed to parse JSON config file: " << config_file_path
++                   << " Error: " << (error_ptr ? error_ptr : "unknown");
++        return false;
++    }
++
++    cJSON *config_obj = cJSON_GetObjectItem(root, "config");
++    if (!config_obj) {
++        cJSON_Delete(root);
++        return true;
++    }
++
++    cJSON *val = cJSON_GetObjectItem(config_obj, "fronthaulmgr_single_instance");
++    if (val && cJSON_IsBool(val)) {
++        fronthaulmgr_single_instance = cJSON_IsTrue(val);
++    } else if (val && cJSON_IsNumber(val)) {
++        fronthaulmgr_single_instance = (val->valueint != 0);
++    }
++
++    cJSON_Delete(root);
++    return true;
++}
++
+ bool cfg_get_multi_chan_bcn_req_duration(uint16_t &duration)
+ {
+     duration = 10;
+diff --git a/framework/platform/bpl/include/bpl/bpl_cfg.h b/framework/platform/bpl/include/bpl/bpl_cfg.h
+index e151b359f..ba59c3fba 100644
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -1988,6 +1988,22 @@ bool cfg_get_client_password(std::string &client_password);
+  */
+ bool cfg_get_fh_vaps_state_control(bool &fh_vaps_state_control);
+ 
++#ifdef BEEROCKS_RDKB
++/**
++ * @brief Returns whether fronthaul manager should run as a single multi-interface instance.
++ *
++ * When enabled, a single beerocks_fronthaul process is spawned with all fronthaul
++ * interfaces passed as '-i' arguments, sharing one event loop and timer manager.
++ *
++ * Reads the 'fronthaulmgr_single_instance' option from /etc/config/prplmesh.
++ * Default value is false (disabled).
++ *
++ * @param [out] fronthaulmgr_single_instance true if single-instance mode is enabled.
++ * @return true on success, otherwise false.
++ */
++bool cfg_get_fronthaulmgr_single_instance(bool &fronthaulmgr_single_instance);
++#endif
++
+ } // namespace bpl
+ } // namespace beerocks
+ 
+-- 
+2.34.1
+
