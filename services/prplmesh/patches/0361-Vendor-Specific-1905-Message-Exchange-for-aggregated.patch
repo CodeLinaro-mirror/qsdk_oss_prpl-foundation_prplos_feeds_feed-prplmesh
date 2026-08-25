@@ -1,0 +1,986 @@
+From 252160721517988fc98d0c61d932b22d8e01128d Mon Sep 17 00:00:00 2001
+From: Ameya Phadke <phadke@qti.qualcomm.com>
+Date: Wed, 5 Aug 2026 11:24:52 -0700
+Subject: [PATCH] Vendor Specific 1905 Message Exchange for Aggregated neighbor
+ info tlv
+
+Signed-off-by: Ameya Phadke <phadke@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/son_slave_thread.cpp |  14 +-
+ .../slave/tasks/neighbor_db_agent_task.cpp    |  47 ++++-
+ .../slave/tasks/neighbor_db_agent_task.h      |  12 ++
+ common/beerocks/multi_vendor/multi_vendor.cpp |   2 +-
+ .../qca/include/qca_vs_msg_utils.h            |  89 +++++++++
+ .../multi_vendor/qca/include/tlvf_qca_utils.h |  89 ++++++++-
+ .../multi_vendor/qca/src/multi_vendor_qca.cpp |   7 +
+ .../multi_vendor/qca/src/tlvf_qca_utils.cpp   | 176 +++++++++++++++++-
+ controller/src/beerocks/master/controller.cpp |  46 +++--
+ .../src/beerocks/master/son_actions.cpp       |  12 +-
+ .../master/tasks/neighbor_db_ctrl_task.cpp    | 129 ++++++++-----
+ .../master/tasks/neighbor_db_ctrl_task.h      |  16 +-
+ framework/tlvf/tlvf_conf.yaml                 |   2 +
+ framework/tlvf/yaml/tlvf/qca/eQcaMsgType.yaml |  13 ++
+ framework/tlvf/yaml/tlvf/qca/eQcaTLVId.yaml   |   1 +
+ .../tlvf/yaml/tlvf/qca/tlvQcaMsgType.yaml     |  36 ++++
+ 16 files changed, 602 insertions(+), 89 deletions(-)
+ create mode 100644 common/beerocks/multi_vendor/qca/include/qca_vs_msg_utils.h
+ create mode 100644 framework/tlvf/yaml/tlvf/qca/eQcaMsgType.yaml
+ create mode 100644 framework/tlvf/yaml/tlvf/qca/tlvQcaMsgType.yaml
+
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 3a73af2f1..768cff088 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -60,6 +60,7 @@
+ #include <tlvf/wfa_map/tlvEHTOperations.h>
+ #include <tlvf/wfa_map/tlvErrorCode.h>
+ #include <tlvf/wfa_map/tlvHigherLayerData.h>
++#include <tlvf_qca_utils.h>
+ #include <tlvf/wfa_map/tlvOperatingChannelReport.h>
+ #include <tlvf/wfa_map/tlvProfile2CacCompletionReport.h>
+ #include <tlvf/wfa_map/tlvProfile2CacStatusReport.h>
+@@ -1043,8 +1044,17 @@ bool slave_thread::handle_cmdu_from_broker(uint32_t iface_index, const sMacAddr
+         auto beerocks_header = message_com::parse_intel_vs_message(cmdu_rx);
+ 
+         if (!beerocks_header) {
+-            LOG(ERROR) << "Not a vendor specific message";
+-            return false;
++            // Not an Intel/beerocks VS message.
++            // Only route to task pool if it's a recognized QCA vendor message
++            // (identified by the presence of a tlvQcaMsgType TLV).
++            if (!qca::tlvf_qca_utils::is_qca_vs_msg(cmdu_rx)) {
++                LOG(WARNING) << "Dropping unknown VENDOR_SPECIFIC_MESSAGE: "
++                             << "not Intel/beerocks and not QCA vendor message";
++                return false;
++            }
++            m_task_pool.handle_cmdu(cmdu_rx, iface_index, dst_mac, src_mac,
++                                    beerocks::net::FileDescriptor::invalid_descriptor);
++            return true;
+         }
+ 
+         if (beerocks_header->action() != beerocks_message::ACTION_CONTROL) {
+diff --git a/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.cpp b/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.cpp
+index 53e7b5830..532103fd2 100644
+--- a/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.cpp
++++ b/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.cpp
+@@ -6,6 +6,9 @@
+ 
+ #include <bcl/network/network_utils.h>
+ #include <easylogging++.h>
++#include <tlvf/qca/eQcaMsgType.h>
++#include <tlvf/qca/tlvQcaMsgType.h>
++#include <tlvf/qca/tlvQcaNeighborInformation.h>
+ 
+ using namespace beerocks;
+ 
+@@ -54,14 +57,48 @@ bool NeighborDbAgentTask::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx, uint32
+ {
+     (void)iface_index;
+     (void)dst_mac;
+-    (void)src_mac;
+     (void)fd;
+     (void)beerocks_header;
+ 
+-    // Agent-side Neighbor DB task currently does not consume any CMDUs.
+-    // Retained for future use (e.g. if controller later sends aggregated neighbor info to agent).
+-    (void)cmdu_rx;
+-    return false;
++    switch (cmdu_rx.getMessageType()) {
++    case ieee1905_1::eMessageType::VENDOR_SPECIFIC_MESSAGE:
++        return handle_vendor_specific(cmdu_rx, src_mac);
++    default:
++        return false;
++    }
++}
++
++bool NeighborDbAgentTask::handle_vendor_specific(ieee1905_1::CmduMessageRx &cmdu_rx,
++                                                  const sMacAddr &src_mac)
++{
++    // The multi_vendor framework has already parsed all QCA TLVs. Use getClass<> directly.
++    auto msg_type_tlv = cmdu_rx.getClass<qca::tlvQcaMsgType>();
++    if (!msg_type_tlv) {
++        // Not a QCA message (no tlvQcaMsgType TLV present)
++        return false;
++    }
++
++    LOG(INFO) << "AP_DEBUG: NeighborDbAgentTask: received QCA VENDOR_SPECIFIC_MESSAGE"
++              << " from " << src_mac << " message_type=0x" << std::hex
++              << msg_type_tlv->message_type();
++
++    switch (static_cast<qca::eQcaMsgType>(msg_type_tlv->message_type())) {
++    case qca::eQcaMsgType::QCA_MSG_AGGREGATED_NEIGHBOR_INFO: {
++        auto neighbor_tlv = cmdu_rx.getClass<qca::tlvQcaNeighborInformation>();
++        if (!neighbor_tlv) {
++            LOG(ERROR) << "AP_DEBUG: NeighborDbAgentTask: missing QCA Neighbor Information TLV";
++            return false;
++        }
++        LOG(INFO) << "AP_DEBUG: NeighborDbAgentTask: received aggregated neighbor info with "
++                  << static_cast<int>(neighbor_tlv->num_neighbor_reports()) << " NRE entries";
++        // TODO: Process the neighbor report entries and update hostapd neighbor tables.
++        return true;
++    }
++    default:
++        LOG(DEBUG) << "AP_DEBUG: NeighborDbAgentTask: ignoring QCA message type 0x" << std::hex
++                   << msg_type_tlv->message_type();
++        return false;
++    }
+ }
+ 
+ std::vector<uint8_t> NeighborDbAgentTask::collect_local_neighbor_report()
+diff --git a/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.h b/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.h
+index 9a090191f..f1336f005 100644
+--- a/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.h
++++ b/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.h
+@@ -94,6 +94,18 @@ private:
+     // Helpers
+     // -----------------------------------------------------------------------
+ 
++    /**
++     * @brief Handle a received VENDOR_SPECIFIC_MESSAGE.
++     *
++     * Dispatches on the QCA message type TLV to the appropriate specific handler.
++     * Called from handle_cmdu() when a VENDOR_SPECIFIC_MESSAGE is received.
++     *
++     * @param cmdu_rx  Received CMDU (TLVs already parsed by the multi_vendor framework).
++     * @param src_mac  MAC address of the message sender.
++     * @return True if the message was consumed, false otherwise.
++     */
++    bool handle_vendor_specific(ieee1905_1::CmduMessageRx &cmdu_rx, const sMacAddr &src_mac);
++
+     /**
+      * @brief [STUB] Collect local neighbor information from hostapd.
+      *
+diff --git a/common/beerocks/multi_vendor/multi_vendor.cpp b/common/beerocks/multi_vendor/multi_vendor.cpp
+index e820a0c14..9d97bfba6 100644
+--- a/common/beerocks/multi_vendor/multi_vendor.cpp
++++ b/common/beerocks/multi_vendor/multi_vendor.cpp
+@@ -209,7 +209,7 @@ std::shared_ptr<BaseClass> tlvf_handler::parse_vs_tlv(ieee1905_1::CmduMessageRx
+         }
+     }
+ 
+-    LOG(DEBUG) << "parse_vs_tlv: no parser handled TLV for message type " << msg_type;
++    LOG(TRACE) << "parse_vs_tlv: no parser handled TLV for message type " << msg_type;
+     return nullptr;
+ }
+ 
+diff --git a/common/beerocks/multi_vendor/qca/include/qca_vs_msg_utils.h b/common/beerocks/multi_vendor/qca/include/qca_vs_msg_utils.h
+new file mode 100644
+index 000000000..1a92b18a3
+--- /dev/null
++++ b/common/beerocks/multi_vendor/qca/include/qca_vs_msg_utils.h
+@@ -0,0 +1,89 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#ifndef __QCA_VS_MSG_UTILS_H__
++#define __QCA_VS_MSG_UTILS_H__
++
++/**
++ * @file qca_vs_msg_utils.h
++ * @brief C-compatible header for QCA vendor-specific message utilities.
++ *
++ * Exposes selected qca::tlvf_qca_utils methods via C linkage wrappers so they
++ * can be called from C code and reused across threads and processes without
++ * C++ name-mangling issues.
++ *
++ * C++ callers should prefer the typed API directly:
++ *   qca::tlvf_qca_utils::is_qca_vs_msg(cmdu_rx)
++ *   qca::tlvf_qca_utils::add_qca_version_info_tlv(cmdu_tx)
++ *   qca::tlvf_qca_utils::add_qca_msg_type_tlv(cmdu_tx, msg_type)
++ *
++ * C callers or callers crossing ABI boundaries should use the wrappers below.
++ */
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* -------------------------------------------------------------------------
++ * RX-side utilities
++ * ---------------------------------------------------------------------- */
++
++/**
++ * @brief Check if a received VENDOR_SPECIFIC_MESSAGE is a QCA vendor message.
++ *
++ * A QCA vendor message is identified by the presence of a tlvQcaMsgType TLV
++ * in the CMDU. This is a non-destructive check: it does not consume any TLV
++ * buffer bytes.
++ *
++ * Wraps qca::tlvf_qca_utils::is_qca_vs_msg() with C linkage.
++ *
++ * @param[in] cmdu_rx  Opaque pointer to ieee1905_1::CmduMessageRx.
++ *                     Must not be NULL. Must point to a fully parsed CMDU.
++ * @return 1 if the message is a QCA vendor message, 0 otherwise.
++ */
++int qca_is_vs_msg(void *cmdu_rx);
++
++/* -------------------------------------------------------------------------
++ * TX-side utilities
++ * ---------------------------------------------------------------------- */
++
++/**
++ * @brief C linkage wrapper for qca::tlvf_qca_utils::add_qca_version_info_tlv().
++ *
++ * Appends a QCA Version Info TLV to an outgoing CMDU.
++ *
++ * Wraps qca::tlvf_qca_utils::add_qca_version_info_tlv() with C linkage so it
++ * can be called from C code and reused across threads and processes.
++ *
++ * @param[in] cmdu_tx  Opaque pointer to ieee1905_1::CmduMessageTx.
++ *                     Must not be NULL.
++ * @return 1 on success, 0 on failure or NULL pointer.
++ */
++int qca_add_version_info_tlv(void *cmdu_tx);
++
++/**
++ * @brief C linkage wrapper for qca::tlvf_qca_utils::add_qca_msg_type_tlv().
++ *
++ * Prepends a QCA Message Type TLV to an outgoing VENDOR_SPECIFIC_MESSAGE CMDU.
++ * Must be called BEFORE adding any payload TLVs. Every QCA
++ * VENDOR_SPECIFIC_MESSAGE must start with this TLV so that the receiver can
++ * dispatch on message type without inspecting payload TLVs.
++ *
++ * Wraps qca::tlvf_qca_utils::add_qca_msg_type_tlv() with C linkage so it can
++ * be called from C code and reused across threads and processes.
++ *
++ * @param[in] cmdu_tx   Opaque pointer to ieee1905_1::CmduMessageTx.
++ *                      Must not be NULL.
++ * @param[in] msg_type  QCA message type value (eQcaMsgType cast to uint16_t).
++ * @return 1 on success, 0 on failure or NULL pointer.
++ */
++int qca_add_msg_type_tlv(void *cmdu_tx, uint16_t msg_type);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* __QCA_VS_MSG_UTILS_H__ */
+diff --git a/common/beerocks/multi_vendor/qca/include/tlvf_qca_utils.h b/common/beerocks/multi_vendor/qca/include/tlvf_qca_utils.h
+index a075de9e8..ecb3814c4 100644
+--- a/common/beerocks/multi_vendor/qca/include/tlvf_qca_utils.h
++++ b/common/beerocks/multi_vendor/qca/include/tlvf_qca_utils.h
+@@ -10,11 +10,23 @@
+ #include <string>
+ #include <tlvf/CmduMessageRx.h>
+ #include <tlvf/CmduMessageTx.h>
++#include <tlvf/common/sMacAddr.h>
+ #include <vector>
+ #include <array>
+ 
+ namespace qca {
+ 
++/**
++ * @brief One neighbor entry for building a tlvQcaNeighborInformation TLV.
++ *
++ * Mirrors sNeighborReportEntry in NeighborDbCtrlTask but lives in the
++ * common QCA module to avoid a dependency on controller headers.
++ */
++struct sQcaNeighborEntry {
++    sMacAddr agent_alid;            ///< ALID of the reporting agent
++    std::vector<uint8_t> nre_bytes; ///< Raw IEEE 802.11 Neighbor Report Element bytes
++};
++
+ /**
+  * @brief SMD capability data reported by an agent via the QCA SMD Capabilities TLV.
+  *
+@@ -128,6 +140,55 @@ public:
+      */
+     static bool add_qca_smd_policy_config_tlv(ieee1905_1::CmduMessageTx &cmdu_tx);
+ 
++    /**
++     * @brief Prepend a tlvQcaMsgType TLV to an outgoing VENDOR_SPECIFIC_MESSAGE CMDU.
++     *
++     * Must be called BEFORE adding any payload TLVs.
++     * Every QCA VENDOR_SPECIFIC_MESSAGE must start with this TLV so that the
++     * receiver can dispatch on message type without inspecting payload TLVs.
++     *
++     * @param[in,out] cmdu_tx   CMDU (must already be created as VENDOR_SPECIFIC_MESSAGE).
++     * @param[in]     msg_type  QCA message type value (eQcaMsgType cast to uint16_t).
++     * @return True on success, false otherwise.
++     */
++    static bool add_qca_msg_type_tlv(ieee1905_1::CmduMessageTx &cmdu_tx, uint16_t msg_type);
++
++    /**
++     * @brief Append a tlvQcaNeighborInformation TLV to an outgoing VENDOR_SPECIFIC_MESSAGE.
++     *
++     * The tlvQcaMsgType TLV must already have been added (via add_qca_msg_type_tlv)
++     * before calling this function.
++     *
++     * One cQcaNeighborReport entry is added per element in @p entries.
++     * If @p entries is empty the TLV is still added (num_neighbor_reports = 0)
++     * so the receiver knows the DB is empty.
++     *
++     * @param[in,out] cmdu_tx  CMDU.
++     * @param[in]     entries  Neighbor entries to encode.
++     * @return True on success, false otherwise.
++     */
++    static bool add_qca_neighbor_info_tlv(ieee1905_1::CmduMessageTx &cmdu_tx,
++                                          const std::vector<sQcaNeighborEntry> &entries);
++
++    /**
++     * @brief Check if a received VENDOR_SPECIFIC_MESSAGE is a QCA vendor message.
++     *
++     * A QCA vendor message is identified by the presence of a tlvQcaMsgType TLV
++     * in the CMDU. Uses getClass<tlvQcaMsgType>() — a non-destructive check that
++     * works after CmduMessageRx::parse() has been called.
++     *
++     * This is the canonical gate for QCA VS message dispatch. Call it from any
++     * thread or process that needs to distinguish QCA VS messages from other
++     * vendor-specific messages before routing to a task pool.
++     *
++     * A C linkage wrapper (qca_is_vs_msg) is also provided in qca_vs_msg_utils.h
++     * for use from C code or across ABI boundaries.
++     *
++     * @param[in] cmdu_rx Received CMDU message (must be VENDOR_SPECIFIC_MESSAGE).
++     * @return true if the message contains a QCA tlvQcaMsgType TLV, false otherwise.
++     */
++    static bool is_qca_vs_msg(ieee1905_1::CmduMessageRx &cmdu_rx);
++
+     /**
+      * @brief Set the SMD policy profiles to be used when building policy config TLVs.
+      *
+@@ -164,10 +225,12 @@ public:
+ 
+     /**
+      * @brief Generic parser for QCA vendor-specific TLVs (RECEIVE side).
+-     * 
+-     * This function acts as a dispatcher that peeks at the TLV ID and routes
+-     * to the appropriate specific parser. This allows handling multiple
+-     * QCA TLVs in a single message without consuming the buffer prematurely.
++     *
++     * Acts as a dispatcher: peeks at the TLV ID and routes to the appropriate
++     * specific parser without consuming the buffer prematurely.
++     *
++     * Registered with the multi_vendor framework for VENDOR_SPECIFIC_MESSAGE
++     * and for autoconfiguration messages that carry QCA TLVs.
+      *
+      * @param[in] cmdu_rx Received CMDU message.
+      * @return Parsed TLV as BaseClass shared pointer, or nullptr on failure.
+@@ -233,8 +296,22 @@ private:
+     static std::shared_ptr<BaseClass>
+     parse_qca_smd_policy_config_tlv(ieee1905_1::CmduMessageRx &cmdu_rx);
+ 
+-    // Future: Add more specific parsers here
+-    // static std::shared_ptr<BaseClass> parse_qca_device_info_tlv(ieee1905_1::CmduMessageRx &cmdu_rx);
++    /**
++     * @brief Parses QCA message type TLV (specific parser).
++     *
++     * @param[in] cmdu_rx Received CMDU message.
++     * @return Parsed TLV as BaseClass shared pointer, or nullptr on failure.
++     */
++    static std::shared_ptr<BaseClass> parse_qca_msg_type_tlv(ieee1905_1::CmduMessageRx &cmdu_rx);
++
++    /**
++     * @brief Parses QCA Neighbor Information TLV (specific parser).
++     *
++     * @param[in] cmdu_rx Received CMDU message.
++     * @return Parsed TLV as BaseClass shared pointer, or nullptr on failure.
++     */
++    static std::shared_ptr<BaseClass>
++    parse_qca_neighbor_info_tlv(ieee1905_1::CmduMessageRx &cmdu_rx);
+ };
+ 
+ } // namespace qca
+diff --git a/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp b/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp
+index 2019858d1..c6af788ac 100644
+--- a/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp
++++ b/common/beerocks/multi_vendor/qca/src/multi_vendor_qca.cpp
+@@ -68,6 +68,13 @@ public:
+         multi_vendor::tlvf_handler::register_parser(
+             eMessageType::AP_AUTOCONFIGURATION_WSC_MESSAGE, parse_qca_vs_tlv);
+ 
++        // Register RECEIVE parser for VENDOR_SPECIFIC_MESSAGE.
++        // Handles incoming QCA vendor-specific messages (e.g., Local Neighbor Information
++        // sent by an agent to the controller).  The parser peeks at the OUI and TLV ID
++        // before consuming the buffer, so non-QCA messages are silently ignored.
++        multi_vendor::tlvf_handler::register_parser(eMessageType::VENDOR_SPECIFIC_MESSAGE,
++                                                    parse_qca_vs_tlv);
++
+         // Note: SMD TLVs are registered via register_smd_tlvs() based on enable_smd config
+     }
+ 
+diff --git a/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp b/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
+index d9a1d3a4c..83463d5e1 100644
+--- a/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
++++ b/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
+@@ -6,8 +6,11 @@
+ #include "../../multi_vendor.h"
+ #include <easylogging++.h>
+ #include <tlvf/ieee_1905_1/sVendorOUI.h>
++#include <tlvf/qca/eQcaMsgType.h>
+ #include <tlvf/qca/eQcaTLVId.h>
+ #include <tlvf/qca/eQcaTlvTypeMap.h>
++#include <tlvf/qca/tlvQcaMsgType.h>
++#include <tlvf/qca/tlvQcaNeighborInformation.h>
+ #include <tlvf/qca/tlvQcaSmdCapabilities.h>
+ #include <tlvf/qca/tlvQcaSmdPolicyConfig.h>
+ #include <tlvf/qca/tlvQcaVersionInfo.h>
+@@ -108,9 +111,8 @@ void tlvf_qca_utils::set_current_agent_smd_capabilities(const sQcaSmdCapabilitie
+ // SEND side: Add version TLV to outgoing message
+ bool tlvf_qca_utils::add_qca_version_info_tlv(ieee1905_1::CmduMessageTx &cmdu_tx)
+ {
+-    LOG(INFO)
+-        << "Registered this callback but not adding it in the cmdu message"
+-           "This function is a reference for new QCA vendor TLVs";
++    LOG(INFO) << "Registered this callback but not adding it in the cmdu message"
++                 "This function is a reference for new QCA vendor TLVs";
+     return true;
+ 
+     auto tlv_qca_version = cmdu_tx.addClass<qca::tlvQcaVersionInfo>();
+@@ -244,6 +246,77 @@ bool tlvf_qca_utils::add_qca_smd_policy_config_tlv(ieee1905_1::CmduMessageTx &cm
+     return true;
+ }
+ 
++// SEND side: Add QCA message type TLV (must be first TLV in every QCA VENDOR_SPECIFIC_MESSAGE)
++bool tlvf_qca_utils::add_qca_msg_type_tlv(ieee1905_1::CmduMessageTx &cmdu_tx, uint16_t msg_type)
++{
++    auto tlv = cmdu_tx.addClass<qca::tlvQcaMsgType>();
++    if (!tlv) {
++        LOG(ERROR) << "Failed to add QCA message type TLV";
++        return false;
++    }
++
++    // Set vendor OUI
++    tlv->vendor_oui() = sVendorOUI(qca::qcaVendorOUI::OUI_QCA);
++
++    // Set TLV ID
++    tlv->tlv_id() = static_cast<uint16_t>(qca::eQcaTlVId::QCA_MSG_TYPE);
++
++    // Set message type
++    tlv->message_type() = msg_type;
++
++    LOG(DEBUG) << "Added QCA message type TLV: message_type=0x" << std::hex << msg_type;
++    return true;
++}
++
++// SEND side: Add QCA Neighbor Information TLV to outgoing VENDOR_SPECIFIC_MESSAGE
++bool tlvf_qca_utils::add_qca_neighbor_info_tlv(ieee1905_1::CmduMessageTx &cmdu_tx,
++                                               const std::vector<sQcaNeighborEntry> &entries)
++{
++    auto tlv = cmdu_tx.addClass<qca::tlvQcaNeighborInformation>();
++    if (!tlv) {
++        LOG(ERROR) << "Failed to add QCA Neighbor Information TLV";
++        return false;
++    }
++
++    // Set vendor OUI
++    tlv->vendor_oui() = sVendorOUI(qca::qcaVendorOUI::OUI_QCA);
++
++    // Set TLV ID
++    tlv->tlv_id() = static_cast<uint16_t>(qca::eQcaTlVId::QCA_NEIGHBOR_INFORMATION);
++
++    // Populate one cQcaNeighborReport per entry
++    for (const auto &entry : entries) {
++        auto report = tlv->create_neighbor_report_list();
++        if (!report) {
++            LOG(ERROR) << "Failed to create neighbor_report_list entry for agent "
++                       << tlvf::mac_to_string(entry.agent_alid);
++            return false;
++        }
++
++        report->neighbor_report_element_length() = static_cast<uint16_t>(entry.nre_bytes.size());
++
++        if (!entry.nre_bytes.empty()) {
++            if (!report->set_neighbor_report_element(entry.nre_bytes.data(),
++                                                     entry.nre_bytes.size())) {
++                LOG(ERROR) << "Failed to set neighbor_report_element for agent "
++                           << tlvf::mac_to_string(entry.agent_alid);
++                return false;
++            }
++        }
++
++        if (!tlv->add_neighbor_report_list(report)) {
++            LOG(ERROR) << "Failed to add neighbor_report_list entry for agent "
++                       << tlvf::mac_to_string(entry.agent_alid);
++            return false;
++        }
++    }
++
++    tlv->num_neighbor_reports() = static_cast<uint8_t>(entries.size());
++
++    LOG(INFO) << "Added QCA Neighbor Information TLV with " << entries.size() << " entries";
++    return true;
++}
++
+ // RECEIVE side: Generic parser that routes to specific parsers based on TLV ID
+ std::shared_ptr<BaseClass> tlvf_qca_utils::parse_qca_vs_tlv(ieee1905_1::CmduMessageRx &cmdu_rx)
+ {
+@@ -288,6 +361,12 @@ std::shared_ptr<BaseClass> tlvf_qca_utils::parse_qca_vs_tlv(ieee1905_1::CmduMess
+     case qca::eQcaTlVId::QCA_WIFI_COMPAT_MODE:
+         return parse_qca_wifi_compat_mode_tlv(cmdu_rx);
+ 
++    case qca::eQcaTlVId::QCA_NEIGHBOR_INFORMATION:
++        return parse_qca_neighbor_info_tlv(cmdu_rx);
++
++    case qca::eQcaTlVId::QCA_MSG_TYPE:
++        return parse_qca_msg_type_tlv(cmdu_rx);
++
+     default:
+         LOG(WARNING) << "Unknown QCA TLV ID: 0x" << std::hex << tlv_id;
+         return nullptr;
+@@ -364,6 +443,97 @@ tlvf_qca_utils::parse_qca_smd_policy_config_tlv(ieee1905_1::CmduMessageRx &cmdu_
+ 
+     return tlv;
+ }
++
++// RECEIVE side: Specific parser for QCA message type TLV
++std::shared_ptr<BaseClass>
++tlvf_qca_utils::parse_qca_msg_type_tlv(ieee1905_1::CmduMessageRx &cmdu_rx)
++{
++    auto tlv = cmdu_rx.addVendorClass<qca::tlvQcaMsgType>();
++    if (!tlv) {
++        LOG(ERROR) << "Failed to parse QCA message type TLV";
++        return nullptr;
++    }
++
++    LOG(DEBUG) << "Parsed QCA message type TLV: message_type=0x" << std::hex << tlv->message_type();
++    return tlv;
++}
++
++// RECEIVE side: Specific parser for QCA Neighbor Information TLV
++std::shared_ptr<BaseClass>
++tlvf_qca_utils::parse_qca_neighbor_info_tlv(ieee1905_1::CmduMessageRx &cmdu_rx)
++{
++    auto tlv = cmdu_rx.addVendorClass<qca::tlvQcaNeighborInformation>();
++    if (!tlv) {
++        LOG(ERROR) << "Failed to parse QCA Neighbor Information TLV";
++        return nullptr;
++    }
++
++    uint8_t count = tlv->num_neighbor_reports();
++    LOG(INFO) << "Parsed QCA Neighbor Information TLV: " << static_cast<int>(count)
++              << " neighbor report(s)";
++
++    for (uint8_t i = 0; i < count; i++) {
++        auto report_tuple = tlv->neighbor_report_list(i);
++        if (!std::get<0>(report_tuple)) {
++            LOG(ERROR) << "Failed to access neighbor_report_list[" << static_cast<int>(i) << "]";
++            continue;
++        }
++        auto &report = std::get<1>(report_tuple);
++        LOG(DEBUG) << "  NRE[" << static_cast<int>(i)
++                   << "]: " << report.neighbor_report_element_length() << " bytes";
++    }
++
++    return tlv;
++}
++
++// RECEIVE side: Check if a VENDOR_SPECIFIC_MESSAGE is a QCA vendor message
++bool tlvf_qca_utils::is_qca_vs_msg(ieee1905_1::CmduMessageRx &cmdu_rx)
++{
++    // A QCA VENDOR_SPECIFIC_MESSAGE always starts with a tlvQcaMsgType TLV.
++    // getClass<> is non-destructive: it looks up the already-parsed TLV list
++    // without consuming any buffer bytes.
++    return cmdu_rx.getClass<qca::tlvQcaMsgType>() != nullptr;
++}
++
++// C linkage wrappers — allow QCA utility functions to be called from C code and
++// reused across threads and processes without C++ name-mangling issues.
++extern "C" {
++
++int qca_is_vs_msg(void *cmdu_rx_ptr)
++{
++    if (!cmdu_rx_ptr) {
++        return 0;
++    }
++    return qca::tlvf_qca_utils::is_qca_vs_msg(
++               *static_cast<ieee1905_1::CmduMessageRx *>(cmdu_rx_ptr))
++               ? 1
++               : 0;
++}
++
++int qca_add_version_info_tlv(void *cmdu_tx_ptr)
++{
++    if (!cmdu_tx_ptr) {
++        return 0;
++    }
++    return qca::tlvf_qca_utils::add_qca_version_info_tlv(
++               *static_cast<ieee1905_1::CmduMessageTx *>(cmdu_tx_ptr))
++               ? 1
++               : 0;
++}
++
++int qca_add_msg_type_tlv(void *cmdu_tx_ptr, uint16_t msg_type)
++{
++    if (!cmdu_tx_ptr) {
++        return 0;
++    }
++    return qca::tlvf_qca_utils::add_qca_msg_type_tlv(
++               *static_cast<ieee1905_1::CmduMessageTx *>(cmdu_tx_ptr), msg_type)
++               ? 1
++               : 0;
++}
++
++} // extern "C"
++
+ // SEND side: Add QCA WiFi-8 capabilities TLV (per-radio UHR mode).
+ // One entry per radio registered via set_radio_wifi8_mode().
+ // No TLV is added if no radio reported UHR mode.
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index e2ad34ad8..6538f9566 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -551,23 +551,35 @@ bool Controller::handle_cmdu(int fd, uint32_t iface_index, const sMacAddr &dst_m
+ 
+     if (vendor_specific) {
+         auto beerocks_header = beerocks::message_com::parse_intel_vs_message(cmdu_rx);
+-        if (!beerocks_header) {
+-            LOG(ERROR) << "Not a vendor specific message";
+-            return false;
+-        }
+-        switch (beerocks_header->action()) {
+-        case beerocks_message::ACTION_CLI: {
+-            son_management::handle_cli_message(fd, beerocks_header, cmdu_tx, database, m_task_pool);
+-        } break;
+-        case beerocks_message::ACTION_BML: {
+-            son_management::handle_bml_message(fd, beerocks_header, cmdu_tx, database, m_task_pool);
+-        } break;
+-        case beerocks_message::ACTION_CONTROL: {
+-            handle_cmdu_control_message(src_mac, beerocks_header);
+-        } break;
+-        default: {
+-            LOG(ERROR) << "Unknown message, action: " << int(beerocks_header->action());
+-        }
++        if (beerocks_header) {
++            switch (beerocks_header->action()) {
++            case beerocks_message::ACTION_CLI: {
++                son_management::handle_cli_message(fd, beerocks_header, cmdu_tx, database,
++                                                   m_task_pool);
++            } break;
++            case beerocks_message::ACTION_BML: {
++                son_management::handle_bml_message(fd, beerocks_header, cmdu_tx, database,
++                                                   m_task_pool);
++            } break;
++            case beerocks_message::ACTION_CONTROL: {
++                handle_cmdu_control_message(src_mac, beerocks_header);
++            } break;
++            default: {
++                LOG(ERROR) << "Unknown message, action: " << int(beerocks_header->action());
++            }
++            }
++        } else {
++            // Not an Intel/beerocks VS message.
++            // Only route to task pool if it's a recognized QCA vendor message
++            // (identified by the presence of a tlvQcaMsgType TLV).
++            if (!qca::tlvf_qca_utils::is_qca_vs_msg(cmdu_rx)) {
++                LOG(WARNING) << "Dropping unknown VENDOR_SPECIFIC_MESSAGE from " << src_mac
++                             << ": not Intel/beerocks and not QCA vendor message";
++                return true;
++            }
++            LOG(DEBUG) << "Non-Intel VENDOR_SPECIFIC_MESSAGE from " << src_mac
++                       << " — routing to task pool";
++            m_task_pool.handle_ieee1905_1_msg(src_mac, cmdu_rx);
+         }
+     } else {
+         LOG(DEBUG) << "received 1905.1 cmdu message";
+diff --git a/controller/src/beerocks/master/son_actions.cpp b/controller/src/beerocks/master/son_actions.cpp
+index 115252c92..ccc6e2693 100644
+--- a/controller/src/beerocks/master/son_actions.cpp
++++ b/controller/src/beerocks/master/son_actions.cpp
+@@ -468,13 +468,13 @@ bool son_actions::send_cmdu_to_agent(const sMacAddr &dest_mac, ieee1905_1::CmduM
+             return false;
+         }
+         auto beerocks_header = message_com::get_beerocks_header(cmdu_tx);
+-        if (!beerocks_header) {
+-            LOG(ERROR) << "Failed getting beerocks_header!";
+-            return false;
++        if (beerocks_header) {
++            // Intel/beerocks VS message: set routing fields in the beerocks header.
++            beerocks_header->actionhdr()->radio_mac() = tlvf::mac_from_string(radio_mac);
++            beerocks_header->actionhdr()->direction() = beerocks::BEEROCKS_DIRECTION_AGENT;
+         }
+-
+-        beerocks_header->actionhdr()->radio_mac() = tlvf::mac_from_string(radio_mac);
+-        beerocks_header->actionhdr()->direction() = beerocks::BEEROCKS_DIRECTION_AGENT;
++        // Non-Intel VS messages (e.g. QCA vendor-specific) have no beerocks header;
++        // proceed to send as-is without header manipulation.
+     }
+ 
+     auto controller_ctx = database.get_controller_ctx();
+diff --git a/controller/src/beerocks/master/tasks/neighbor_db_ctrl_task.cpp b/controller/src/beerocks/master/tasks/neighbor_db_ctrl_task.cpp
+index 9be102fef..6ddbbd310 100644
+--- a/controller/src/beerocks/master/tasks/neighbor_db_ctrl_task.cpp
++++ b/controller/src/beerocks/master/tasks/neighbor_db_ctrl_task.cpp
+@@ -3,10 +3,16 @@
+  */
+ 
+ #include "neighbor_db_ctrl_task.h"
++#include "../son_actions.h"
+ 
++#include "tlvf_qca_utils.h"
+ #include <bcl/network/network_utils.h>
+ #include <easylogging++.h>
+ #include <memory>
++#include <tlvf/common/sMacAddr.h>
++#include <tlvf/ieee_1905_1/eMessageType.h>
++#include <tlvf/qca/eQcaMsgType.h>
++#include <tlvf/qca/tlvQcaMsgType.h>
+ 
+ using namespace beerocks;
+ using namespace net;
+@@ -97,26 +103,38 @@ void NeighborDbCtrlTask::handle_event(int event_type, void *obj)
+ bool NeighborDbCtrlTask::handle_ieee1905_1_msg(const sMacAddr &src_mac,
+                                                ieee1905_1::CmduMessageRx &cmdu_rx)
+ {
+-    // TODO: When the SMD Neighbor Information TLV and message type are defined
+-    //       (via the TLV patch), add a case here for the new message type, e.g.:
+-    //
+-    //   case ieee1905_1::eMessageType::LOCAL_NEIGHBOR_INFORMATION_MESSAGE:
+-    //       return handle_local_neighbor_info_message(src_mac, cmdu_rx);
+-
+     switch (cmdu_rx.getMessageType()) {
++    case ieee1905_1::eMessageType::VENDOR_SPECIFIC_MESSAGE:
++        return handle_vendor_specific(cmdu_rx, src_mac);
++    default:
++        return false;
++    }
++}
+ 
+-        // -----------------------------------------------------------------------
+-        // Placeholder: LOCAL_NEIGHBOR_INFORMATION_MESSAGE
+-        // Replace the numeric value below with the actual eMessageType enum value
+-        // once the SMD TLV patch is applied.
+-        // -----------------------------------------------------------------------
+-        // case ieee1905_1::eMessageType::LOCAL_NEIGHBOR_INFORMATION_MESSAGE:
+-        // {
+-        //     return handle_local_neighbor_info_message(src_mac, cmdu_rx);
+-        // }
++// ---------------------------------------------------------------------------
++// handle_vendor_specific()
++// ---------------------------------------------------------------------------
++
++bool NeighborDbCtrlTask::handle_vendor_specific(ieee1905_1::CmduMessageRx &cmdu_rx,
++                                                const sMacAddr &src_mac)
++{
++    // The multi_vendor framework (via parse_qca_vs_tlv registered in multi_vendor_qca.cpp)
++    // has already parsed all QCA TLVs when the CMDU was received. Use getClass<> to access
++    // the already-parsed tlvQcaMsgType TLV directly.
++    auto msg_type_tlv = cmdu_rx.getClass<qca::tlvQcaMsgType>();
++    if (!msg_type_tlv) {
++        // Not a QCA message (no tlvQcaMsgType TLV present)
++        return false;
++    }
++
++    switch (static_cast<qca::eQcaMsgType>(msg_type_tlv->message_type())) {
++
++    case qca::eQcaMsgType::QCA_MSG_LOCAL_NEIGHBOR_INFO:
++        return handle_local_neighbor_info_message(src_mac, cmdu_rx);
+ 
+     default:
+-        // Message not handled by this task.
++        TASK_LOG(WARNING) << "Unhandled QCA message type 0x" << std::hex
++                          << msg_type_tlv->message_type() << " from agent " << src_mac;
+         return false;
+     }
+ }
+@@ -180,39 +198,56 @@ bool NeighborDbCtrlTask::handle_local_neighbor_info_message(const sMacAddr &src_
+ 
+ void NeighborDbCtrlTask::send_aggregated_neighbor_info(const sMacAddr &agent_alid)
+ {
+-    // [STUB] In the full implementation this function will:
+-    //  1. Build a 1905 Aggregated Neighbor Information Message.
+-    //  2. Add one Neighbor Information TLV per entry in m_neighbor_db.
+-    //  3. Transmit the message to agent_alid via send_cmdu_to_broker().
+-    //  The message is fire-and-forget; no response is expected.
+-
+-    TASK_LOG(DEBUG) << "AP_DEBUG: [STUB] Sending Aggregated Neighbor Information Message to agent "
+-                    << agent_alid;
+-
+-    if (m_neighbor_db.empty()) {
+-        TASK_LOG(DEBUG)
+-            << "AP_DEBUG: [STUB]   Neighbor DB is empty – sending empty aggregated message";
+-    } else {
+-        TASK_LOG(DEBUG) << "AP_DEBUG: [STUB]   Neighbor DB contains " << m_neighbor_db.size()
+-                        << " entries:";
+-        for (const auto &entry_kv : m_neighbor_db) {
+-            TASK_LOG(DEBUG) << "AP_DEBUG: [STUB]     ALID=" << entry_kv.second.agent_alid
+-                            << "  NRE bytes=" << entry_kv.second.report_data.size()
+-                            << "  last_updated=(steady_clock)";
+-        }
++    TASK_LOG(DEBUG) << "Sending Aggregated Neighbor Information Message to agent " << agent_alid;
++
++    // -----------------------------------------------------------------------
++    // Step 1: Create a VENDOR_SPECIFIC_MESSAGE CMDU.
++    // -----------------------------------------------------------------------
++    if (!cmdu_tx.create(0, ieee1905_1::eMessageType::VENDOR_SPECIFIC_MESSAGE)) {
++        TASK_LOG(ERROR) << "Failed to create VENDOR_SPECIFIC_MESSAGE for agent " << agent_alid;
++        return;
+     }
+ 
+-    // TODO: Replace stub with actual 1905 message construction and transmission:
+-    //
+-    //   if (!cmdu_tx.create(0, ieee1905_1::eMessageType::AGGREGATED_NEIGHBOR_INFO_MESSAGE)) {
+-    //       TASK_LOG(ERROR) << "Failed to create AGGREGATED_NEIGHBOR_INFO_MESSAGE";
+-    //       return;
+-    //   }
+-    //   for (const auto &entry_kv : m_neighbor_db) {
+-    //       auto tlv = cmdu_tx.addClass<vendor_specific::tlvNeighborInformation>();
+-    //       // populate tlv from entry_kv.second.report_data ...
+-    //   }
+-    //   database.send_cmdu_to_broker(cmdu_tx, agent_alid, database.get_local_bridge_mac());
++    // -----------------------------------------------------------------------
++    // Step 2: Add the QCA message type TLV (must be first).
++    //         Identifies this as an Aggregated Neighbor Information message.
++    // -----------------------------------------------------------------------
++    if (!qca::tlvf_qca_utils::add_qca_msg_type_tlv(
++            cmdu_tx, static_cast<uint16_t>(qca::eQcaMsgType::QCA_MSG_AGGREGATED_NEIGHBOR_INFO))) {
++        TASK_LOG(ERROR) << "Failed to add QCA message type TLV for agent " << agent_alid;
++        return;
++    }
++
++    // -----------------------------------------------------------------------
++    // Step 3: Collect neighbor entries from the local DB and add the payload TLV.
++    // -----------------------------------------------------------------------
++    std::vector<qca::sQcaNeighborEntry> entries;
++    entries.reserve(m_neighbor_db.size());
++    for (const auto &kv : m_neighbor_db) {
++        qca::sQcaNeighborEntry e;
++        e.agent_alid = kv.second.agent_alid;
++        e.nre_bytes  = kv.second.report_data;
++        entries.push_back(std::move(e));
++    }
++
++    TASK_LOG(DEBUG) << "  Neighbor DB has " << entries.size() << " entries";
++
++    if (!qca::tlvf_qca_utils::add_qca_neighbor_info_tlv(cmdu_tx, entries)) {
++        TASK_LOG(ERROR) << "Failed to add QCA Neighbor Information TLV for agent " << agent_alid;
++        return;
++    }
++
++    // -----------------------------------------------------------------------
++    // Step 4: Transmit (fire-and-forget; no response expected).
++    // -----------------------------------------------------------------------
++    if (!son_actions::send_cmdu_to_agent(agent_alid, cmdu_tx, database)) {
++        TASK_LOG(ERROR) << "Failed to send Aggregated Neighbor Information Message to agent "
++                        << agent_alid;
++        return;
++    }
++
++    TASK_LOG(INFO) << "Sent Aggregated Neighbor Information Message (" << entries.size()
++                   << " NRE entries) to agent " << agent_alid;
+ }
+ 
+ void NeighborDbCtrlTask::update_local_neighbor_db(const sMacAddr &agent_alid,
+diff --git a/controller/src/beerocks/master/tasks/neighbor_db_ctrl_task.h b/controller/src/beerocks/master/tasks/neighbor_db_ctrl_task.h
+index 074f62222..f05188874 100644
+--- a/controller/src/beerocks/master/tasks/neighbor_db_ctrl_task.h
++++ b/controller/src/beerocks/master/tasks/neighbor_db_ctrl_task.h
+@@ -193,11 +193,23 @@ private:
+     // Message handlers
+     // -----------------------------------------------------------------------
+ 
++    /**
++     * @brief Handle a received VENDOR_SPECIFIC_MESSAGE.
++     *
++     * Dispatches on the QCA message type TLV to the appropriate specific handler.
++     * Called from handle_ieee1905_1_msg() when a VENDOR_SPECIFIC_MESSAGE is received.
++     *
++     * @param cmdu_rx  Received CMDU (TLVs already parsed by the multi_vendor framework).
++     * @param src_mac  MAC address of the message sender.
++     * @return True if the message was consumed, false otherwise.
++     */
++    bool handle_vendor_specific(ieee1905_1::CmduMessageRx &cmdu_rx, const sMacAddr &src_mac);
++
+     /**
+      * @brief Handle a received Local Neighbor Information Message.
+      *
+-     * Called from handle_ieee1905_1_msg() when a LOCAL_NEIGHBOR_INFORMATION_MESSAGE
+-     * is received.
++     * Called from handle_vendor_specific() when a QCA_MSG_LOCAL_NEIGHBOR_INFO
++     * message is received.
+      *
+      * Steps:
+      *  1. Update the local neighbor DB with the data from the reporting agent.
+diff --git a/framework/tlvf/tlvf_conf.yaml b/framework/tlvf/tlvf_conf.yaml
+index a6ffc0c70..d6121cd0d 100644
+--- a/framework/tlvf/tlvf_conf.yaml
++++ b/framework/tlvf/tlvf_conf.yaml
+@@ -170,10 +170,12 @@ include_yaml_path: {
+     # "Qualcomm Atheros/",
+     "tlvf/qca/eQcaTLVId.yaml",
+     "tlvf/qca/eQcaTlvTypeMap.yaml",
++    "tlvf/qca/eQcaMsgType.yaml",
+     "tlvf/qca/tlvQcaVersionInfo.yaml",
+     "tlvf/qca/tlvQcaSmdCapabilities.yaml",
+     "tlvf/qca/tlvQcaSmdPolicyConfig.yaml",
+     "tlvf/qca/tlvQcaNeighborInformation.yaml",
++    "tlvf/qca/tlvQcaMsgType.yaml",
+     "tlvf/qca/tlvQcaWifi8Capabilities.yaml",
+     "tlvf/qca/tlvQcaWifiCompatMode.yaml",
+ }
+diff --git a/framework/tlvf/yaml/tlvf/qca/eQcaMsgType.yaml b/framework/tlvf/yaml/tlvf/qca/eQcaMsgType.yaml
+new file mode 100644
+index 000000000..61625ce04
+--- /dev/null
++++ b/framework/tlvf/yaml/tlvf/qca/eQcaMsgType.yaml
+@@ -0,0 +1,13 @@
++#
++---
++_namespace: qca
++
++# QCA Vendor-Specific Message Type identifiers.
++# Carried in the tlvQcaMsgType TLV which is the first TLV in every
++# QCA VENDOR_SPECIFIC_MESSAGE.  The receiver dispatches on this value
++# to determine which payload TLVs follow.
++eQcaMsgType:
++  _type: enum_class
++  _enum_storage: uint16_t
++  QCA_MSG_AGGREGATED_NEIGHBOR_INFO: 0x0001   # Controller → Agent: aggregated neighbor DB
++  QCA_MSG_LOCAL_NEIGHBOR_INFO:      0x0002   # Agent → Controller: local neighbor report
+diff --git a/framework/tlvf/yaml/tlvf/qca/eQcaTLVId.yaml b/framework/tlvf/yaml/tlvf/qca/eQcaTLVId.yaml
+index d9e40ee09..33854b926 100644
+--- a/framework/tlvf/yaml/tlvf/qca/eQcaTLVId.yaml
++++ b/framework/tlvf/yaml/tlvf/qca/eQcaTLVId.yaml
+@@ -11,3 +11,4 @@ eQcaTlVId:
+   QCA_NEIGHBOR_INFORMATION: 0x0004
+   QCA_WIFI8_CAPABILITIES: 0x0005
+   QCA_WIFI_COMPAT_MODE: 0x0006
++  QCA_MSG_TYPE: 0x0007
+diff --git a/framework/tlvf/yaml/tlvf/qca/tlvQcaMsgType.yaml b/framework/tlvf/yaml/tlvf/qca/tlvQcaMsgType.yaml
+new file mode 100644
+index 000000000..e798c190c
+--- /dev/null
++++ b/framework/tlvf/yaml/tlvf/qca/tlvQcaMsgType.yaml
+@@ -0,0 +1,36 @@
++#
++---
++
++_namespace: qca
++_include:
++  {
++    tlvf/ieee_1905_1/sVendorOUI.h,
++    tlvf/qca/eQcaTlvTypeMap.h,
++    tlvf/qca/eQcaMsgType.h,
++  }
++
++# QCA Message Type TLV
++# The first TLV in every QCA VENDOR_SPECIFIC_MESSAGE.
++# Identifies the semantic message type so the receiver can dispatch
++# without inspecting the payload TLVs.
++#
++# Wire format (tlvValue):
++#   - vendor_oui   : 3 octets  - Qualcomm OUI (0x7f0300)
++#   - tlv_id       : 2 octets  - QCA_MSG_TYPE (0x0007)
++#   - message_type : 2 octets  - eQcaMsgType value
++
++tlvQcaMsgType:
++  _type: class
++  _is_tlv_class: True
++  type:
++    _type: eQcaTlvTypeMap
++    _value_const: TLV_VENDOR_SPECIFIC
++  length: uint16_t
++  vendor_oui:
++    _type: sVendorOUI
++  tlv_id:
++    _type: uint16_t
++    _comment: "Must be QCA_MSG_TYPE (0x0007)"
++  message_type:
++    _type: uint16_t
++    _comment: "QCA message type identifier (see eQcaMsgType)"
+-- 
+2.34.1
+
