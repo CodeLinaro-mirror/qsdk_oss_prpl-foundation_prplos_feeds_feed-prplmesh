@@ -1,0 +1,1605 @@
+From 709f33a0b54c15713802c202717d992af1d935ac Mon Sep 17 00:00:00 2001
+From: Ameya Phadke <phadke@qti.qualcomm.com>
+Date: Thu, 20 Aug 2026 10:09:37 -0700
+Subject: [PATCH] Neighbor DB MQTT Changes
+
+Signed-off-by: Ameya Phadke <phadke@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/agent_db.h           |  29 ++
+ agent/src/beerocks/slave/son_slave_thread.cpp |  23 +-
+ agent/src/beerocks/slave/son_slave_thread.h   |   7 +
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  99 ++++-
+ .../slave/tasks/neighbor_db_agent_task.cpp    | 365 +++++++++++++++--
+ .../slave/tasks/neighbor_db_agent_task.h      | 155 +++++--
+ .../bwl/dummy/slave_wlan_hal_dummy.cpp        |   5 +
+ .../beerocks/bwl/dummy/slave_wlan_hal_dummy.h |   1 +
+ .../beerocks/bwl/include/bwl/slave_wlan_hal.h |   6 +-
+ .../beerocks/bwl/include/bwl/smd_nbr_db_tlv.h | 384 ++++++++++++++++++
+ .../bwl/nl80211/slave_wlan_hal_nl80211.cpp    |  47 ++-
+ .../bwl/nl80211/slave_wlan_hal_nl80211.h      |   2 +-
+ .../bwl/onewifi/slave_wlan_hal_onewifi.cpp    |   5 +
+ .../bwl/onewifi/slave_wlan_hal_onewifi.h      |   1 +
+ .../beerocks/bwl/whm/slave_wlan_hal_whm.cpp   |   5 +
+ common/beerocks/bwl/whm/slave_wlan_hal_whm.h  |   1 +
+ common/beerocks/multi_vendor/multi_vendor.cpp |   2 +-
+ .../multi_vendor/qca/src/tlvf_qca_utils.cpp   |   4 +-
+ .../master/tasks/neighbor_db_ctrl_task.cpp    |   9 -
+ 19 files changed, 1055 insertions(+), 95 deletions(-)
+ create mode 100644 common/beerocks/bwl/include/bwl/smd_nbr_db_tlv.h
+
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 5ceaef36f..9f34ee417 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -457,6 +457,35 @@ public:
+         std::vector<sEthernetPort> lan;
+     } ethernet;
+ 
++    // SMD session identifiers received from the controller via tlvQcaSmdPolicyConfig TLVs
++    // in the M2 message. Populated by ap_autoconfiguration_task and read by NeighborDbAgentTask
++    // to issue per-SMD MQTT GET queries when collecting local neighbor info.
++    std::vector<sMacAddr> smd_identifiers;
++
++    // Persists the controller's tlvWifi8NeighborInformationReportingPolicy so that
++    // handle_vs_ap_enabled_notification() can evaluate the correct trigger scope on every
++    // VAP AP_ENABLED (prplMesh-initiated RELOAD_CONFIG or external wifi reload/netifd).
++    struct sNeighborInfoReportingPolicy {
++        bool report_fbss = false; // all fronthaul VAPs (bssid_valid=0, bit5)
++        bool report_bbss = false; // all backhaul VAPs  (bssid_valid=0, bit6)
++        // Specific BSSIDs (bssid_valid=1); empty means no per-BSSID policy active.
++        std::unordered_set<sMacAddr> specific_bssids;
++
++        bool any_enabled() const
++        {
++            return report_fbss || report_bbss || !specific_bssids.empty();
++        }
++
++        // Returns true if this VAP should trigger a neighbor DB collection on AP_ENABLED.
++        bool should_trigger(const sMacAddr &bssid, bool is_fronthaul, bool is_backhaul) const
++        {
++            if (report_fbss && is_fronthaul)                              return true;
++            if (report_bbss && is_backhaul)                               return true;
++            if (!specific_bssids.empty() && specific_bssids.count(bssid)) return true;
++            return false;
++        }
++    } neighbor_info_reporting_policy;
++
+     struct sChannelPreference;
+ 
+     struct sRadio {
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 14c9798d0..89175ebcc 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -8764,7 +8764,28 @@ bool slave_thread::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_p
+         break;
+     }
+     case Event::SMD_Roaming_Completed: {
+-        LOG(DEBUG) << "Received SMD Roaming Completed Event " << event;
++        LOG(DEBUG) << "Received SMD_Roaming_Completed (unrecognized hostapd MSG_ID)";
++        break;
++    }
++    case Event::SMD_NbrDbSetResp: {
++        LOG(DEBUG) << "Received SMD_NbrDbSetResp — routing to NeighborDbAgentTask";
++        task_pool_send_event(eTaskType::NEIGHBOR_DB,
++                             NeighborDbAgentTask::MQTT_NBR_DB_SET_RESP,
++                             event_ptr->second.get());
++        break;
++    }
++    case Event::SMD_NbrDbGetResp: {
++        LOG(DEBUG) << "Received SMD_NbrDbGetResp — routing to NeighborDbAgentTask";
++        task_pool_send_event(eTaskType::NEIGHBOR_DB,
++                             NeighborDbAgentTask::MQTT_NBR_DB_GET_RESP,
++                             event_ptr->second.get());
++        break;
++    }
++    case Event::SMD_NbrDbClearResp: {
++        LOG(DEBUG) << "Received SMD_NbrDbClearResp — routing to NeighborDbAgentTask";
++        task_pool_send_event(eTaskType::NEIGHBOR_DB,
++                             NeighborDbAgentTask::MQTT_NBR_DB_CLEAR_RESP,
++                             event_ptr->second.get());
+         break;
+     }
+     case Event::Dpp_Frame_Received: {
+diff --git a/agent/src/beerocks/slave/son_slave_thread.h b/agent/src/beerocks/slave/son_slave_thread.h
+index aa587833f..c1e1274c4 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.h
++++ b/agent/src/beerocks/slave/son_slave_thread.h
+@@ -324,6 +324,13 @@ public:
+         return m_capability_reporting_task;
+     }
+ 
++    // Forward a raw MQTT payload to the HAL for publishing to hostapd/receive/SMD.
++    // Returns 0 on success, -1 if the HAL is not available.
++    inline int hal_smd_send(const void *payload, int len)
++    {
++        return m_slave_wlan_hal ? m_slave_wlan_hal->smd_send(payload, len) : -1;
++    }
++
+     void fsm_stop();
+ 
+ private:
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 4e1f4e95f..8b0aa4093 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -2653,6 +2653,18 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_wsc(ieee1905_1::CmduMe
+         LOG(DEBUG) << "No SMD Policy TLVs found in M2";
+     }
+ 
++    // Persist SMD identifiers into AgentDB so NeighborDbAgentTask can issue
++    // per-SMD MQTT GET queries when collecting local neighbor info.
++    {
++        auto db = AgentDB::get();
++        db->smd_identifiers.clear();
++        for (const auto &policy : m_smd_policies) {
++            db->smd_identifiers.push_back(policy.smd_identifier);
++        }
++        LOG(DEBUG) << "AP_DEBUG: Updated AgentDB smd_identifiers: "
++                   << db->smd_identifiers.size() << " SMD ID(s)";
++    }
++
+     std::vector<sBssConfig> bss_infos;
+     if (!handle_wsc_m2_tlv(cmdu_rx, radio->front.iface_name, m2_list, bss_infos,
+                            misconfigured_ssids)) {
+@@ -3228,14 +3240,52 @@ void ApAutoConfigurationTask::handle_multi_ap_policy_config_request(
+                    << " bBSS_report=" << bbss_report
+                    << " num_bssid=" << int(neighbor_info_reporting_policy_tlv->num_bssid());
+ 
+-        // Trigger local neighbor info reporting when fBSS or bBSS reporting is enabled.
+-        // (Both bits are only valid when BSSID_valid=0.)
++        // Persist the full policy so handle_vs_ap_enabled_notification() can re-evaluate
++        // the correct trigger scope on every AP_ENABLED (prplMesh-initiated or external).
++        {
++            auto db  = AgentDB::get();
++            auto &pol = db->neighbor_info_reporting_policy;
++            pol.report_fbss = !bssid_valid && fbss_report;
++            pol.report_bbss = !bssid_valid && bbss_report;
++            pol.specific_bssids.clear();
++            if (bssid_valid) {
++                for (uint8_t i = 0; i < neighbor_info_reporting_policy_tlv->num_bssid(); ++i) {
++                    auto tuple = neighbor_info_reporting_policy_tlv->bssid_list(i);
++                    if (std::get<0>(tuple)) {
++                        pol.specific_bssids.insert(std::get<1>(tuple));
++                    }
++                }
++            }
++            LOG(DEBUG) << "Stored neighbor info reporting policy:"
++                       << " report_fbss=" << pol.report_fbss
++                       << " report_bbss=" << pol.report_bbss
++                       << " specific_bssids=" << pol.specific_bssids.size();
++        }
++
++        // Early trigger — fires immediately. The VAP may not have reloaded yet so hostapd
++        // will likely return NOT_FOUND; an empty report is sent as a first pass. The
++        // definitive report is sent when AP_ENABLED fires after RELOAD_CONFIG completes.
+         if (!bssid_valid && (fbss_report || bbss_report)) {
+             LOG(DEBUG) << "Triggering NeighborDbAgentTask: TRIGGER_SEND_LOCAL_NEIGHBOR_INFO"
+                        << " (fBSS=" << fbss_report << " bBSS=" << bbss_report << ")";
++            NeighborDbAgentTask::sTriggerSendLocalNeighborInfoEvent ev;
++            ev.reason_code = NeighborDbAgentTask::REASON_POLICY_CONFIG;
++            ev.reason      = "MULTI_AP_POLICY_CONFIG fbss/bbss";
+             m_btl_ctx.task_pool_send_event(
+                 eTaskType::NEIGHBOR_DB,
+-                static_cast<uint8_t>(NeighborDbAgentTask::TRIGGER_SEND_LOCAL_NEIGHBOR_INFO));
++                static_cast<uint8_t>(NeighborDbAgentTask::TRIGGER_SEND_LOCAL_NEIGHBOR_INFO),
++                &ev);
++        } else if (bssid_valid && neighbor_info_reporting_policy_tlv->num_bssid() > 0) {
++            LOG(DEBUG) << "Triggering NeighborDbAgentTask: TRIGGER_SEND_LOCAL_NEIGHBOR_INFO"
++                       << " (per-BSSID count="
++                       << int(neighbor_info_reporting_policy_tlv->num_bssid()) << ")";
++            NeighborDbAgentTask::sTriggerSendLocalNeighborInfoEvent ev;
++            ev.reason_code = NeighborDbAgentTask::REASON_POLICY_CONFIG;
++            ev.reason      = "MULTI_AP_POLICY_CONFIG per-BSSID";
++            m_btl_ctx.task_pool_send_event(
++                eTaskType::NEIGHBOR_DB,
++                static_cast<uint8_t>(NeighborDbAgentTask::TRIGGER_SEND_LOCAL_NEIGHBOR_INFO),
++                &ev);
+         }
+     }
+ 
+@@ -4941,6 +4991,23 @@ void ApAutoConfigurationTask::handle_vs_wifi_credentials_update_response(
+     const uint8_t WAIT_AP_ENABLED_TIMEOUT_SECONDS = db->device_conf.certification_mode ? 10 : 20;
+     radio_conf_params.timeout =
+         std::chrono::steady_clock::now() + std::chrono::seconds(WAIT_AP_ENABLED_TIMEOUT_SECONDS);
++
++    // Trigger neighbor DB collection after credentials have been applied to hostapd.
++    // AP-ENABLED may not always follow RELOAD_CONFIG (e.g. conf unchanged, MLO suppression),
++    // so this is the guaranteed sync point that covers all cases.
++    // The drop-if-COLLECTING guard in NeighborDbAgentTask deduplicates concurrent fires
++    // from multiple radios; only the first one actually runs.
++    if (db->neighbor_info_reporting_policy.any_enabled()) {
++        LOG(DEBUG) << "WIFI_CREDENTIALS_UPDATE_RESPONSE from " << radio->front.iface_name
++                   << " — triggering neighbor DB collection (policy active)";
++        NeighborDbAgentTask::sTriggerSendLocalNeighborInfoEvent ev;
++        ev.reason_code = NeighborDbAgentTask::REASON_CREDENTIALS_UPD;
++        ev.reason      = "WIFI_CREDENTIALS_UPDATE_RESPONSE iface=" + radio->front.iface_name;
++        m_btl_ctx.task_pool_try_send_event(
++            eTaskType::NEIGHBOR_DB,
++            static_cast<uint8_t>(NeighborDbAgentTask::TRIGGER_SEND_LOCAL_NEIGHBOR_INFO),
++            &ev);
++    }
+ }
+ 
+ void ApAutoConfigurationTask::handle_vs_ap_enabled_notification(
+@@ -5148,6 +5215,32 @@ void ApAutoConfigurationTask::handle_vs_ap_enabled_notification(
+                                            TrafficSeparationTask::eEvent::TS_NEW_FH_IFACE,
+                                            vap_info.iface_name);
+     }
++
++    // Trigger neighbor DB collection whenever a VAP comes up and the controller's
++    // neighbor info reporting policy covers it. Handles:
++    //   (a) role-based: all-fBSS or all-bBSS policy (bssid_valid=0)
++    //   (b) per-BSSID: specific BSSIDs listed by controller (bssid_valid=1)
++    //   (c) external VAP restarts (UCI wifi reload, netifd) — same AP_ENABLED path
++    //   (d) SMD ID or other VAP configuration changes that hostapd reflects via AP_ENABLED
++    // Tagged REASON_AP_ENABLED so the task can suppress echoes from our own SET's beacon
++    // update while still reacting to genuine VAP changes (which arrive outside the window).
++    {
++        const auto &pol = db->neighbor_info_reporting_policy;
++        if (pol.should_trigger(vap_info.mac,
++                               vap_info.fronthaul_vap,
++                               vap_info.backhaul_vap)) {
++            LOG(DEBUG) << "AP_ENABLED for VAP " << vap_info.mac
++                       << " matches neighbor info reporting policy"
++                       << " — triggering neighbor DB collection";
++            NeighborDbAgentTask::sTriggerSendLocalNeighborInfoEvent ev;
++            ev.reason_code = NeighborDbAgentTask::REASON_AP_ENABLED;
++            ev.reason      = "AP_ENABLED iface=" + std::string(vap_info.iface_name);
++            m_btl_ctx.task_pool_try_send_event(
++                eTaskType::NEIGHBOR_DB,
++                static_cast<uint8_t>(NeighborDbAgentTask::TRIGGER_SEND_LOCAL_NEIGHBOR_INFO),
++                &ev);
++        }
++    }
+ }
+ 
+ void ApAutoConfigurationTask::handle_vs_vaps_list_update_notification(
+diff --git a/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.cpp b/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.cpp
+index ae0686ca0..93db80d5b 100644
+--- a/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.cpp
++++ b/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.cpp
+@@ -1,4 +1,4 @@
+-/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.  
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  * SPDX-License-Identifier: ISC
+  */
+ 
+@@ -6,6 +6,7 @@
+ #include "tlvf_qca_utils.h"
+ 
+ #include <bcl/network/network_utils.h>
++#include <bwl/smd_nbr_db_tlv.h>
+ #include <easylogging++.h>
+ #include <tlvf/ieee_1905_1/eMessageType.h>
+ #include <tlvf/qca/eQcaMsgType.h>
+@@ -14,6 +15,10 @@
+ 
+ using namespace beerocks;
+ 
++// Out-of-line definitions required for ODR-use of constexpr static data members (C++11/14).
++constexpr std::chrono::seconds NeighborDbAgentTask::SET_ECHO_SUPPRESS_WINDOW;
++constexpr std::chrono::seconds NeighborDbAgentTask::STATE_TIMEOUT;
++
+ NeighborDbAgentTask::NeighborDbAgentTask(slave_thread &btl_ctx_,
+                                          ieee1905_1::CmduMessageTx &cmdu_tx_)
+     : Task(eTaskType::NEIGHBOR_DB), m_btl_ctx(btl_ctx_), m_cmdu_tx(cmdu_tx_)
+@@ -23,8 +28,17 @@ NeighborDbAgentTask::NeighborDbAgentTask(slave_thread &btl_ctx_,
+ 
+ void NeighborDbAgentTask::work()
+ {
+-    // No periodic work required. The task is event-driven:
+-    //  - TRIGGER_SEND_LOCAL_NEIGHBOR_INFO event → collect and send local neighbor info.
++    if (m_collect_state == eCollectState::IDLE)
++        return;
++    if ((std::chrono::steady_clock::now() - m_state_entered_at) > STATE_TIMEOUT) {
++        LOG(ERROR) << "AP_DEBUG: NeighborDbAgentTask: timeout in state "
++                   << static_cast<int>(m_collect_state) << " — resetting to IDLE";
++        m_collect_state = eCollectState::IDLE;
++        m_pending_smd_ids.clear();
++        m_collected_nres.clear();
++        m_pending_set_entries.clear();
++        m_pending_set_count = 0;
++    }
+ }
+ 
+ void NeighborDbAgentTask::handle_event(uint8_t event_enum_value, const void *event_obj)
+@@ -32,7 +46,6 @@ void NeighborDbAgentTask::handle_event(uint8_t event_enum_value, const void *eve
+     switch (static_cast<eEvent>(event_enum_value)) {
+     case TRIGGER_SEND_LOCAL_NEIGHBOR_INFO: {
+         const auto *ev = reinterpret_cast<const sTriggerSendLocalNeighborInfoEvent *>(event_obj);
+-
+         if (ev) {
+             LOG(INFO) << "AP_DEBUG: Event TRIGGER_SEND_LOCAL_NEIGHBOR_INFO"
+                       << " reason_code=" << int(ev->reason_code) << " reason=\"" << ev->reason
+@@ -40,10 +53,94 @@ void NeighborDbAgentTask::handle_event(uint8_t event_enum_value, const void *eve
+         } else {
+             LOG(INFO) << "AP_DEBUG: Event TRIGGER_SEND_LOCAL_NEIGHBOR_INFO (no payload)";
+         }
+-
+-        auto report_data = collect_local_neighbor_report();
+-        send_local_neighbor_info_to_controller(report_data);
+-        m_last_sent = std::chrono::steady_clock::now();
++        if (m_collect_state != eCollectState::IDLE) {
++            LOG(WARNING) << "AP_DEBUG: NbrDB collection already in progress — dropping trigger";
++            break;
++        }
++        // Suppress local re-triggers that are echoes of our own SET's beacon update.
++        // Any trigger that arrives within SET_ECHO_SUPPRESS_WINDOW of the last SET publish
++        // is treated as noise unless it carries REASON_POLICY_CONFIG (which means the
++        // controller explicitly sent new policy — that always takes precedence).
++        // Covers: REASON_AP_ENABLED, REASON_CREDENTIALS_UPD, untagged (ev==nullptr).
++        const bool is_policy_override =
++            ev && ev->reason_code == REASON_POLICY_CONFIG;
++        if (!is_policy_override && within_set_echo_window()) {
++            LOG(DEBUG) << "AP_DEBUG: Suppressing trigger — within SET echo window"
++                       << " reason_code=" << (ev ? int(ev->reason_code) : -1);
++            break;
++        }
++        start_nbr_collection();
++        break;
++    }
++    case MQTT_NBR_DB_SET_RESP: {
++        const auto *resp = reinterpret_cast<const bwl::smd_nbr_db_tlv::sNbrDbSetResp *>(event_obj);
++        if (resp) {
++            LOG(INFO) << "AP_DEBUG: NbrDB SET response status=" << int(resp->status);
++        }
++        if (m_collect_state == eCollectState::SETTING) {
++            if (m_pending_set_count > 0)
++                m_pending_set_count--;
++            if (m_pending_set_count == 0) {
++                m_collect_state = eCollectState::IDLE;
++                LOG(DEBUG) << "AP_DEBUG: Aggregated SET complete — returning to IDLE";
++            } else {
++                LOG(DEBUG) << "AP_DEBUG: SET_RESP received, " << m_pending_set_count
++                           << " SET(s) still pending";
++            }
++        }
++        break;
++    }
++    case MQTT_NBR_DB_GET_RESP: {
++        if (m_collect_state != eCollectState::COLLECTING) {
++            LOG(WARNING) << "AP_DEBUG: GET_RESP received but not in COLLECTING state — ignoring";
++            break;
++        }
++        const auto *resp =
++            reinterpret_cast<const bwl::smd_nbr_db_tlv::sNbrDbGetResp *>(event_obj);
++        if (resp) {
++            if (resp->status == static_cast<uint8_t>(bwl::smd_nbr_db_tlv::eSmdNbrDbStatus::OK)) {
++                for (const auto &nre : resp->nre_entries) {
++                    m_collected_nres.push_back(nre);
++                }
++                LOG(DEBUG) << "AP_DEBUG: GET_RESP: status=OK entries=" << resp->nre_entries.size()
++                           << " total_collected=" << m_collected_nres.size();
++            } else {
++                LOG(WARNING) << "AP_DEBUG: GET_RESP: status=" << int(resp->status)
++                             << " for SMD ID " << m_pending_smd_ids[m_pending_idx]
++                             << " — no NREs added";
++            }
++        }
++        m_pending_idx++;
++        if (m_pending_idx < m_pending_smd_ids.size()) {
++            issue_get_for_current_smd();
++        } else {
++            finish_nbr_collection();
++        }
++        break;
++    }
++    case MQTT_NBR_DB_CLEAR_RESP: {
++        const auto *resp =
++            reinterpret_cast<const bwl::smd_nbr_db_tlv::sNbrDbClearResp *>(event_obj);
++        if (resp) {
++            LOG(INFO) << "AP_DEBUG: NbrDB CLEAR response status=" << int(resp->status);
++        }
++        // If we were waiting for CLEAR_RESP before a SET, execute it now.
++        if (m_collect_state == eCollectState::CLEARING_FOR_SET) {
++            if (!m_pending_set_entries.empty()) {
++                // Transition to SETTING *before* publishing so no TRIGGER arriving between
++                // the state change and the publish can start a spurious collection.
++                enter_state(eCollectState::SETTING);
++                m_pending_set_count = push_nbr_db_set_to_hostapd(m_pending_set_entries);
++                if (m_pending_set_count == 0) {
++                    LOG(ERROR) << "AP_DEBUG: NeighborDbAgentTask: SET after CLEAR_RESP failed";
++                    m_collect_state = eCollectState::IDLE;
++                }
++                m_pending_set_entries.clear();
++            } else {
++                LOG(DEBUG) << "AP_DEBUG: NeighborDbAgentTask: CLEAR_RESP received but no SET entries — nothing to push";
++                m_collect_state = eCollectState::IDLE;
++            }
++        }
+         break;
+     }
+     default:
+@@ -73,10 +170,8 @@ bool NeighborDbAgentTask::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx, uint32
+ bool NeighborDbAgentTask::handle_vendor_specific(ieee1905_1::CmduMessageRx &cmdu_rx,
+                                                   const sMacAddr &src_mac)
+ {
+-    // The multi_vendor framework has already parsed all QCA TLVs. Use getClass<> directly.
+     auto msg_type_tlv = cmdu_rx.getClass<qca::tlvQcaMsgType>();
+     if (!msg_type_tlv) {
+-        // Not a QCA message (no tlvQcaMsgType TLV present)
+         return false;
+     }
+ 
+@@ -93,7 +188,50 @@ bool NeighborDbAgentTask::handle_vendor_specific(ieee1905_1::CmduMessageRx &cmdu
+         }
+         LOG(INFO) << "AP_DEBUG: NeighborDbAgentTask: received aggregated neighbor info with "
+                   << static_cast<int>(neighbor_tlv->num_neighbor_reports()) << " NRE entries";
+-        // TODO: Process the neighbor report entries and update hostapd neighbor tables.
++
++        // Build validated {bssid, nre} pairs first.
++        std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> set_entries;
++        uint8_t count = neighbor_tlv->num_neighbor_reports();
++        for (uint8_t i = 0; i < count; ++i) {
++            auto tuple = neighbor_tlv->neighbor_report_list(i);
++            if (!std::get<0>(tuple)) {
++                LOG(WARNING) << "AP_DEBUG: NeighborDbAgentTask: failed to access NRE[" << int(i)
++                             << "]";
++                continue;
++            }
++            auto &report = std::get<1>(tuple);
++            uint16_t nre_len   = report.neighbor_report_element_length();
++            if (nre_len < bwl::smd_nbr_db_tlv::NRE_LEN_MIN ||
++                nre_len > bwl::smd_nbr_db_tlv::NRE_LEN_MAX) {
++                LOG(WARNING) << "AP_DEBUG: NeighborDbAgentTask: NRE[" << int(i)
++                             << "] length " << nre_len << " out of valid range ["
++                             << int(bwl::smd_nbr_db_tlv::NRE_LEN_MIN) << ", "
++                             << bwl::smd_nbr_db_tlv::NRE_LEN_MAX << "] — skipping";
++                continue;
++            }
++            const uint8_t *nre_data = report.neighbor_report_element();
++            std::vector<uint8_t> bssid_vec(nre_data, nre_data + 6);
++            std::vector<uint8_t> nre_vec(nre_data, nre_data + nre_len);
++            set_entries.emplace_back(std::move(bssid_vec), std::move(nre_vec));
++        }
++
++        // Send CLEAR first; defer SET until CLEAR_RESP arrives to avoid races.
++        m_pending_set_entries = std::move(set_entries);
++        enter_state(eCollectState::CLEARING_FOR_SET);
++        if (!push_nbr_db_clear_to_hostapd()) {
++            LOG(WARNING) << "AP_DEBUG: NeighborDbAgentTask: CLEAR publish failed — issuing SET immediately";
++            if (!m_pending_set_entries.empty()) {
++                // Same ordering rule: SETTING before publish.
++                enter_state(eCollectState::SETTING);
++                m_pending_set_count = push_nbr_db_set_to_hostapd(m_pending_set_entries);
++                if (m_pending_set_count == 0) {
++                    m_collect_state = eCollectState::IDLE;
++                }
++                m_pending_set_entries.clear();
++            } else {
++                m_collect_state = eCollectState::IDLE;
++            }
++        }
+         return true;
+     }
+     default:
+@@ -103,40 +241,113 @@ bool NeighborDbAgentTask::handle_vendor_specific(ieee1905_1::CmduMessageRx &cmdu
+     }
+ }
+ 
+-std::vector<uint8_t> NeighborDbAgentTask::collect_local_neighbor_report()
++// ---------------------------------------------------------------------------
++// Collection state machine helpers
++// ---------------------------------------------------------------------------
++
++void NeighborDbAgentTask::start_nbr_collection()
++{
++    auto db            = AgentDB::get();
++    m_pending_smd_ids  = db->smd_identifiers; // snapshot
++    m_pending_idx      = 0;
++    m_collected_nres.clear();
++    enter_state(eCollectState::COLLECTING);
++
++    LOG(DEBUG) << "AP_DEBUG: NbrDB collection started: " << m_pending_smd_ids.size()
++               << " SMD ID(s)";
++
++    if (m_pending_smd_ids.empty()) {
++        LOG(WARNING) << "AP_DEBUG: No SMD IDs in AgentDB — sending empty neighbor info";
++        finish_nbr_collection();
++        return;
++    }
++    issue_get_for_current_smd();
++}
++
++void NeighborDbAgentTask::issue_get_for_current_smd()
++{
++    auto db      = AgentDB::get();
++    auto ap_alid = db->bridge.mac;
++    const auto &smd_id = m_pending_smd_ids[m_pending_idx];
++
++    static const uint8_t zero_mac[6] = {0};
++    auto packed = bwl::smd_nbr_db_tlv::pack_nbr_db_get(ap_alid.oct,
++                                                         /*has_smd_id=*/true, smd_id.oct,
++                                                         /*has_mld_addr=*/false, zero_mac,
++                                                         /*has_bssid=*/false, zero_mac);
++    if (packed.empty()) {
++        LOG(ERROR) << "AP_DEBUG: pack_nbr_db_get failed for SMD ID " << smd_id
++                   << " — skipping";
++        m_pending_idx++;
++        if (m_pending_idx < m_pending_smd_ids.size()) {
++            issue_get_for_current_smd();
++        } else {
++            finish_nbr_collection();
++        }
++        return;
++    }
++
++    int rc = m_btl_ctx.hal_smd_send(packed.data(), static_cast<int>(packed.size()));
++    if (rc != 0) {
++        LOG(ERROR) << "AP_DEBUG: MQTT GET publish failed for SMD ID " << smd_id
++                   << " rc=" << rc << " — skipping";
++        m_pending_idx++;
++        if (m_pending_idx < m_pending_smd_ids.size()) {
++            issue_get_for_current_smd();
++        } else {
++            finish_nbr_collection();
++        }
++        return;
++    }
++
++    LOG(DEBUG) << "AP_DEBUG: Issued GET for SMD ID " << smd_id << " ("
++               << (m_pending_idx + 1) << "/" << m_pending_smd_ids.size() << ")";
++}
++
++void NeighborDbAgentTask::finish_nbr_collection()
+ {
+-    // [STUB] In the full implementation this function will query hostapd (per radio/BSS)
+-    // and build the Neighbor Report Element (NRE) bytes to send to the controller.
+-    //
+-    // For now, return an empty placeholder vector.
+-    LOG(DEBUG) << "AP_DEBUG: [STUB] Collecting local neighbor report element from hostapd"
+-               << " (TBD - returning placeholder empty NRE bytes)";
+-    return {};
++    m_collect_state = eCollectState::IDLE;
++
++    LOG(INFO) << "AP_DEBUG: NbrDB collection complete: " << m_collected_nres.size()
++              << " NRE(s) collected across " << m_pending_smd_ids.size() << " SMD ID(s)";
++
++    auto db = AgentDB::get();
++    std::vector<qca::sQcaNeighborEntry> entries;
++    entries.reserve(m_collected_nres.size());
++    for (const auto &nre : m_collected_nres) {
++        qca::sQcaNeighborEntry e;
++        e.agent_alid = db->bridge.mac;
++        e.nre_bytes  = nre;
++        entries.push_back(std::move(e));
++    }
++
++    send_local_neighbor_info_to_controller(entries);
++    m_last_sent = std::chrono::steady_clock::now();
+ }
+ 
++// ---------------------------------------------------------------------------
++// 1905.1 outbound helpers
++// ---------------------------------------------------------------------------
++
+ void NeighborDbAgentTask::send_local_neighbor_info_to_controller(
+-    const std::vector<uint8_t> &report_data)
++    const std::vector<qca::sQcaNeighborEntry> &entries)
+ {
+     auto db                    = AgentDB::get();
+     const auto controller_alid = db->controller_info.bridge_mac;
+-    const auto agent_alid      = db->bridge.mac;
+ 
+     LOG(DEBUG) << "AP_DEBUG: Sending Local Neighbor Information Message to controller "
+-               << controller_alid << " (NRE bytes=" << report_data.size() << ")";
++               << controller_alid << " (" << entries.size() << " NRE entries)";
+ 
+     if (controller_alid == net::network_utils::ZERO_MAC) {
+         LOG(WARNING) << "AP_DEBUG: Controller ALID is unknown (ZERO_MAC). Dropping message.";
+         return;
+     }
+ 
+-    // Step 1: Create a VENDOR_SPECIFIC_MESSAGE CMDU.
+     if (!m_cmdu_tx.create(0, ieee1905_1::eMessageType::VENDOR_SPECIFIC_MESSAGE)) {
+         LOG(ERROR) << "AP_DEBUG: Failed to create VENDOR_SPECIFIC_MESSAGE";
+         return;
+     }
+ 
+-    // Step 2: Add the QCA message type TLV (must be first).
+-    //         Identifies this as a Local Neighbor Information message (Agent → Controller).
+     if (!qca::tlvf_qca_utils::add_qca_msg_type_tlv(
+             m_cmdu_tx,
+             static_cast<uint16_t>(qca::eQcaMsgType::QCA_MSG_LOCAL_NEIGHBOR_INFO))) {
+@@ -144,25 +355,11 @@ void NeighborDbAgentTask::send_local_neighbor_info_to_controller(
+         return;
+     }
+ 
+-    // Step 3: Build the neighbor entry from the local NRE data.
+-    //         The agent reports its own ALID as the source of the NRE.
+-    std::vector<qca::sQcaNeighborEntry> entries;
+-    if (!report_data.empty()) {
+-        qca::sQcaNeighborEntry entry;
+-        entry.agent_alid = agent_alid;
+-        entry.nre_bytes  = report_data;
+-        entries.push_back(std::move(entry));
+-    }
+-
+-    // Step 4: Add the QCA Neighbor Information TLV.
+-    //         Even if entries is empty, the TLV is added so the controller
+-    //         knows the agent's neighbor DB is empty.
+     if (!qca::tlvf_qca_utils::add_qca_neighbor_info_tlv(m_cmdu_tx, entries)) {
+         LOG(ERROR) << "AP_DEBUG: Failed to add QCA Neighbor Information TLV";
+         return;
+     }
+ 
+-    // Step 5: Transmit (fire-and-forget; no response expected).
+     if (!m_btl_ctx.send_cmdu_to_controller({}, m_cmdu_tx)) {
+         LOG(ERROR) << "AP_DEBUG: Failed to send Local Neighbor Information Message to controller "
+                    << controller_alid;
+@@ -170,5 +367,93 @@ void NeighborDbAgentTask::send_local_neighbor_info_to_controller(
+     }
+ 
+     LOG(INFO) << "AP_DEBUG: Sent Local Neighbor Information Message to controller "
+-              << controller_alid << " (NRE bytes=" << report_data.size() << ")";
++              << controller_alid << " (" << entries.size() << " NRE entries)";
++}
++
++// ---------------------------------------------------------------------------
++// MQTT helpers
++// ---------------------------------------------------------------------------
++
++int NeighborDbAgentTask::push_nbr_db_set_to_hostapd(
++    const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &entries)
++{
++    auto db      = AgentDB::get();
++    auto ap_alid = db->bridge.mac;
++
++    // Adapt entries once — same list is reused for every SMD SET.
++    static const uint8_t zero_mac[6] = {0};
++    std::vector<std::pair<const uint8_t *, std::vector<uint8_t>>> adapted;
++    adapted.reserve(entries.size());
++    for (const auto &e : entries) {
++        if (e.first.size() != 6)
++            continue;
++        adapted.emplace_back(e.first.data(), e.second);
++    }
++
++    // Issue one SET per SMD ID so every entry is stored with the correct SMD
++    // tag in hostapd. Without the tag, entries are invisible to SMD-scoped GET
++    // queries. With multiple SMD IDs each SET is an independent MQTT publish.
++    // Fall back to a single untagged SET if no SMD IDs are configured.
++    int published = 0;
++    if (db->smd_identifiers.empty()) {
++        auto packed = bwl::smd_nbr_db_tlv::pack_nbr_db_set(ap_alid.oct,
++                                                             false, zero_mac,
++                                                             zero_mac, adapted);
++        if (!packed.empty() &&
++            m_btl_ctx.hal_smd_send(packed.data(), static_cast<int>(packed.size())) == 0) {
++            published = 1;
++        } else {
++            LOG(ERROR) << "AP_DEBUG: push_nbr_db_set_to_hostapd: untagged SET failed";
++        }
++    } else {
++        for (const auto &smd_id : db->smd_identifiers) {
++            auto packed = bwl::smd_nbr_db_tlv::pack_nbr_db_set(ap_alid.oct,
++                                                                 true, smd_id.oct,
++                                                                 zero_mac, adapted);
++            if (packed.empty()) {
++                LOG(ERROR) << "AP_DEBUG: push_nbr_db_set_to_hostapd: packing failed for SMD ID "
++                           << smd_id;
++                continue;
++            }
++            if (m_btl_ctx.hal_smd_send(packed.data(), static_cast<int>(packed.size())) != 0) {
++                LOG(ERROR) << "AP_DEBUG: push_nbr_db_set_to_hostapd: MQTT publish failed for SMD ID "
++                           << smd_id;
++                continue;
++            }
++            published++;
++            LOG(DEBUG) << "AP_DEBUG: push_nbr_db_set_to_hostapd: published SET for SMD ID "
++                       << smd_id << " with " << entries.size() << " entries ("
++                       << packed.size() << " bytes)";
++        }
++    }
++
++    if (published > 0)
++        m_last_set_published_at = std::chrono::steady_clock::now();
++
++    return published;
++}
++
++bool NeighborDbAgentTask::push_nbr_db_clear_to_hostapd()
++{
++    auto db      = AgentDB::get();
++    auto ap_alid = db->bridge.mac;
++
++    static const uint8_t zero_mac[6] = {0};
++    auto packed = bwl::smd_nbr_db_tlv::pack_nbr_db_clear(ap_alid.oct, false, zero_mac,
++                                                           /*has_mld_addr=*/false, zero_mac,
++                                                           /*has_bssid=*/false, zero_mac);
++    if (packed.empty()) {
++        LOG(ERROR) << "AP_DEBUG: push_nbr_db_clear_to_hostapd: packing failed";
++        return false;
++    }
++
++    int rc = m_btl_ctx.hal_smd_send(packed.data(), static_cast<int>(packed.size()));
++    if (rc != 0) {
++        LOG(ERROR) << "AP_DEBUG: push_nbr_db_clear_to_hostapd: MQTT publish failed (rc=" << rc
++                   << ")";
++        return false;
++    }
++    LOG(DEBUG) << "AP_DEBUG: push_nbr_db_clear_to_hostapd: published CLEAR (" << packed.size()
++               << " bytes)";
++    return true;
+ }
+diff --git a/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.h b/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.h
+index 456b86d16..e82bfa4db 100644
+--- a/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.h
++++ b/agent/src/beerocks/slave/tasks/neighbor_db_agent_task.h
+@@ -8,8 +8,12 @@
+ #include "../son_slave_thread.h"
+ #include "task.h"
+ 
++#include <bwl/smd_nbr_db_tlv.h>
++#include <tlvf_qca_utils.h>
++
+ #include <chrono>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ namespace beerocks {
+@@ -19,24 +23,20 @@ namespace beerocks {
+  *
+  * Agent-side task for the SMD Neighbor DB Update process.
+  *
+- * The agent only ever sends the Local Neighbor Information Message to the controller.
+- *
+  * Triggers
+  * --------
+- * This task is event-driven and exposes an internal event which can be pushed from outside
++ * This task is event-driven and exposes internal events that can be pushed from outside
+  * whenever the agent should report updated neighbor information. For example:
+  *  - After onboarding when MULTI_AP_POLICY_CONFIG_REQUEST_MESSAGE is received.
+  *  - After any change to VAP state / BSS parameters.
+  *
+- * Current implementation status
+- * ------------------------------
+- * send_local_neighbor_info_to_controller() is fully implemented: it builds and transmits
+- * a QCA VENDOR_SPECIFIC_MESSAGE with tlvQcaMsgType + tlvQcaNeighborInformation to the
+- * controller.
+- *
+- * collect_local_neighbor_report() remains a stub that returns an empty NRE byte vector.
+- * The real implementation will query hostapd for the IEEE 802.11 Neighbor Report Element.
+- * The stub is clearly marked with "[STUB]" in the log output.
++ * Collection state machine
++ * ------------------------
++ * When TRIGGER_SEND_LOCAL_NEIGHBOR_INFO fires, the task reads all SMD session identifiers
++ * from AgentDB (populated by ap_autoconfiguration_task when M2 is processed) and issues
++ * one MQTT CMD_ID_NEIGHBOR_DB_GET per SMD ID. Responses arrive asynchronously as
++ * MQTT_NBR_DB_GET_RESP events. After all GETs have been serviced, the accumulated NREs
++ * are sent to the controller via the existing QCA VENDOR_SPECIFIC_MESSAGE path.
+  */
+ class NeighborDbAgentTask : public Task {
+ public:
+@@ -53,6 +53,12 @@ public:
+          * This is fire-and-forget: no response is expected.
+          */
+         TRIGGER_SEND_LOCAL_NEIGHBOR_INFO,
++        /** hostapd NEIGHBOR_DB_SET response received from MQTT */
++        MQTT_NBR_DB_SET_RESP,
++        /** hostapd NEIGHBOR_DB_GET response received from MQTT */
++        MQTT_NBR_DB_GET_RESP,
++        /** hostapd NEIGHBOR_DB_CLEAR response received from MQTT */
++        MQTT_NBR_DB_CLEAR_RESP,
+     };
+ 
+     // -----------------------------------------------------------------------
+@@ -60,12 +66,24 @@ public:
+     // -----------------------------------------------------------------------
+ 
+     /**
+-     * @brief Payload for TRIGGER_SEND_LOCAL_NEIGHBOR_INFO.
++     * @brief Reason codes for TRIGGER_SEND_LOCAL_NEIGHBOR_INFO.
+      *
+-     * Optional debug fields to help trace the reason for the trigger.
++     * Used to distinguish triggers that originated from an AP_ENABLED notification
++     * (which may be an echo of our own SET's beacon update) from other trigger sources
++     * that always represent a genuine VAP state change.
++     */
++    enum eReason : uint8_t {
++        REASON_UNSPECIFIED     = 0,
++        REASON_POLICY_CONFIG   = 1,  ///< MULTI_AP_POLICY_CONFIG_REQUEST_MESSAGE received
++        REASON_CREDENTIALS_UPD = 2,  ///< WIFI_CREDENTIALS_UPDATE_RESPONSE received
++        REASON_AP_ENABLED      = 3,  ///< ACTION_APMANAGER_HOSTAP_AP_ENABLED_NOTIFICATION
++    };
++
++    /**
++     * @brief Payload for TRIGGER_SEND_LOCAL_NEIGHBOR_INFO.
+      */
+     struct sTriggerSendLocalNeighborInfoEvent {
+-        uint8_t reason_code = 0;
++        uint8_t reason_code = REASON_UNSPECIFIED;
+         std::string reason; ///< Optional human-readable reason (for logs/debug).
+     };
+ 
+@@ -94,6 +112,39 @@ public:
+                      std::shared_ptr<beerocks_header> beerocks_header) override;
+ 
+ private:
++    // -----------------------------------------------------------------------
++    // Collection state machine
++    // -----------------------------------------------------------------------
++
++    enum class eCollectState : uint8_t {
++        IDLE,
++        COLLECTING,
++        CLEARING_FOR_SET,  // waiting for CLEAR_RESP before issuing SET
++        SETTING            // SET published from aggregated path; waiting for SET_RESP
++    };
++
++    eCollectState m_collect_state = eCollectState::IDLE;
++    std::vector<sMacAddr> m_pending_smd_ids; ///< Snapshot of SMD IDs to GET
++    size_t m_pending_idx = 0;                ///< Index of next SMD ID to GET
++    std::vector<std::vector<uint8_t>> m_collected_nres; ///< NREs gathered across all GETs
++    // SET entries waiting for CLEAR_RESP before being pushed to hostapd
++    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> m_pending_set_entries;
++    // Number of CMD_ID_NEIGHBOR_DB_SET publishes outstanding; IDLE when it reaches 0.
++    int m_pending_set_count = 0;
++
++    // Timestamp when the state machine last left IDLE (used for timeout).
++    std::chrono::steady_clock::time_point m_state_entered_at =
++        std::chrono::steady_clock::time_point::min();
++    // Timestamp of the last successful CMD_ID_NEIGHBOR_DB_SET publish.
++    std::chrono::steady_clock::time_point m_last_set_published_at =
++        std::chrono::steady_clock::time_point::min();
++
++    // How long after a SET publish we consider an AP_ENABLED trigger to be an
++    // echo of our own beacon update rather than a genuine VAP change.
++    static constexpr std::chrono::seconds SET_ECHO_SUPPRESS_WINDOW{3};
++    // Maximum time we wait in any non-IDLE state before force-resetting.
++    static constexpr std::chrono::seconds STATE_TIMEOUT{15};
++
+     // -----------------------------------------------------------------------
+     // Helpers
+     // -----------------------------------------------------------------------
+@@ -111,38 +162,86 @@ private:
+     bool handle_vendor_specific(ieee1905_1::CmduMessageRx &cmdu_rx, const sMacAddr &src_mac);
+ 
+     /**
+-     * @brief [STUB] Collect local neighbor information from hostapd.
+-     *
+-     * In the full implementation, this will query hostapd for the current neighbor report
+-     * element bytes (IEEE Neighbor Report Element / BSS Transition Management neighbor report).
+-     *
+-     * @return Placeholder neighbor report bytes.
++     * @brief Begin NRE collection: snapshot SMD IDs from AgentDB, issue first GET.
++     * Immediately calls finish_nbr_collection() if no SMD IDs are available.
+      */
+-    std::vector<uint8_t> collect_local_neighbor_report();
++    void start_nbr_collection();
++
++    /**
++     * @brief Publish CMD_ID_NEIGHBOR_DB_GET for m_pending_smd_ids[m_pending_idx].
++     * On publish failure, advances the index and either recurses or calls finish_nbr_collection().
++     */
++    void issue_get_for_current_smd();
++
++    /**
++     * @brief Transmission step: send accumulated NREs to the controller and reset state.
++     */
++    void finish_nbr_collection();
+ 
+     /**
+      * @brief Send Local Neighbor Information Message to the controller.
+      *
+      * Builds and transmits a QCA VENDOR_SPECIFIC_MESSAGE containing:
+      *   1. tlvQcaMsgType  (QCA_MSG_LOCAL_NEIGHBOR_INFO = 0x0002)
+-     *   2. tlvQcaNeighborInformation  (one entry with the agent's own ALID + NRE bytes)
++     *   2. tlvQcaNeighborInformation  (one entry per NRE in @p entries)
+      *
+      * The message is sent fire-and-forget; no response is expected.
+      * Silently drops the message if the controller ALID is not yet known (ZERO_MAC).
+      *
+-     * @param report_data Raw NRE bytes from collect_local_neighbor_report().
+-     *                    May be empty; the TLV is still sent with num_neighbor_reports=0
+-     *                    so the controller knows the agent's neighbor DB is empty.
++     * @param entries Neighbor entries to encode (may be empty).
+      */
+-    void send_local_neighbor_info_to_controller(const std::vector<uint8_t> &report_data);
++    void send_local_neighbor_info_to_controller(const std::vector<qca::sQcaNeighborEntry> &entries);
++
++    /**
++     * @brief Pack and publish CMD_ID_NEIGHBOR_DB_SET to hostapd via MQTT.
++     *
++     * Issues one SET per SMD ID in AgentDB, each tagging all entries with that
++     * SMD ID. Returns the number of SET messages successfully published (0 on
++     * complete failure, >1 in the multi-SMD case).
++     *
++     * @param entries Vector of {bssid_bytes[6], nre_body_bytes} pairs.
++     * @return number of SET publishes that succeeded.
++     */
++    int push_nbr_db_set_to_hostapd(
++        const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &entries);
++
++    /**
++     * @brief Pack and publish CMD_ID_NEIGHBOR_DB_CLEAR (has_smd_id=0, clears all entries).
++     *
++     * @return true on successful publish, false otherwise.
++     */
++    bool push_nbr_db_clear_to_hostapd();
+ 
+-private:
+     slave_thread &m_btl_ctx;
+     ieee1905_1::CmduMessageTx &m_cmdu_tx;
+ 
+     // Last time we sent a report (for debug / potential future throttling).
+     std::chrono::steady_clock::time_point m_last_sent =
+         std::chrono::steady_clock::time_point::min();
++
++    /**
++     * @brief Enter a non-IDLE state, recording the entry time for timeout tracking.
++     */
++    void enter_state(eCollectState s)
++    {
++        m_collect_state    = s;
++        m_state_entered_at = std::chrono::steady_clock::now();
++    }
++
++    /**
++     * @brief Return true if the most recent SET was published within SET_ECHO_SUPPRESS_WINDOW.
++     *
++     * Used to suppress AP_ENABLED triggers that are echoes of our own beacon update
++     * after a Neighbor DB SET, while still allowing triggers from genuine VAP changes
++     * (which arrive after a longer delay — e.g. UCI wifi reload, SMD ID reconfiguration).
++     */
++    bool within_set_echo_window() const
++    {
++        if (m_last_set_published_at == std::chrono::steady_clock::time_point::min())
++            return false;
++        return (std::chrono::steady_clock::now() - m_last_set_published_at) <
++               SET_ECHO_SUPPRESS_WINDOW;
++    }
+ };
+ 
+ } // namespace beerocks
+diff --git a/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.cpp b/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.cpp
+index f232df091..b56bc097b 100644
+--- a/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.cpp
++++ b/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.cpp
+@@ -25,6 +25,11 @@ slave_wlan_hal_dummy::~slave_wlan_hal_dummy()
+     detach();
+ }
+ 
++int slave_wlan_hal_dummy::smd_send(const void* payload, int payload_len)
++{
++    return 0;
++}
++
+ bool slave_wlan_hal_dummy::process_ext_events(int fd)
+ {
+     return true;
+diff --git a/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.h b/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.h
+index 59bee49bb..4584944a5 100644
+--- a/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.h
++++ b/common/beerocks/bwl/dummy/slave_wlan_hal_dummy.h
+@@ -13,6 +13,7 @@ namespace dummy {
+ 
+ class slave_wlan_hal_dummy : public virtual slave_wlan_hal {
+ public:
++    virtual int smd_send(const void* payload, int payload_len) override;
+     explicit slave_wlan_hal_dummy(const std::string& iface_name,
+                                base_wlan_hal::hal_event_cb_t callback,
+                                const hal_conf_t& hal_conf);
+diff --git a/common/beerocks/bwl/include/bwl/slave_wlan_hal.h b/common/beerocks/bwl/include/bwl/slave_wlan_hal.h
+index 4f5947444..9286d3d72 100644
+--- a/common/beerocks/bwl/include/bwl/slave_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/slave_wlan_hal.h
+@@ -6,6 +6,7 @@
+ #define _BWL_SLAVE_WLAN_HAL_H_
+ 
+ #include "base_wlan_hal.h"
++#include "smd_nbr_db_tlv.h"
+ 
+ #include <cstddef>
+ #include <cstdint>
+@@ -30,6 +31,9 @@ public:
+ 
+         // SMD Events
+         SMD_Roaming_Completed,
++        SMD_NbrDbSetResp,    // EVT_ID_NEIGHBOR_DB_SET_RESP (0x0081) received
++        SMD_NbrDbGetResp,    // EVT_ID_NEIGHBOR_DB_GET_RESP (0x0082) received
++        SMD_NbrDbClearResp,  // EVT_ID_NEIGHBOR_DB_CLEAR_RESP (0x0083) received
+ 
+         // DPP-over-TCP relay events
+         Dpp_Client_Connected,
+@@ -49,7 +53,7 @@ public:
+ 
+     virtual bool reattach() { return true; }
+     virtual void run_fsm() { return; }
+-    virtual int smd_set_neighbor(const void* payload, int payload_len) { return 0; }
++    virtual int smd_send(const void* payload, int payload_len) { return 0; }
+ 
+     /**
+      * @brief Start the DPP-over-TCP relay listener, if supported by this backend. No-op
+diff --git a/common/beerocks/bwl/include/bwl/smd_nbr_db_tlv.h b/common/beerocks/bwl/include/bwl/smd_nbr_db_tlv.h
+new file mode 100644
+index 000000000..1d7b8fecb
+--- /dev/null
++++ b/common/beerocks/bwl/include/bwl/smd_nbr_db_tlv.h
+@@ -0,0 +1,384 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#ifndef _BWL_SMD_NBR_DB_TLV_H_
++#define _BWL_SMD_NBR_DB_TLV_H_
++
++/*
++ * MQTT wire-format constants, packing, and parsing for the hostapd Neighbor DB API.
++ *
++ * Frame format:
++ *   [MSG_ID header TLV: 6 bytes][payload TLVs]
++ *
++ * MSG_ID header:
++ *   type=0x8001 (2B BE), len=0x0002 (2B BE), msg_id (2B BE)
++ *
++ * Payload TLV:
++ *   type (2B BE), len (2B BE), value (len bytes)
++ *
++ * All multi-byte integers are big-endian except the 802.11 NRE bssid_info field
++ * (4 bytes little-endian, per 802.11 standard).
++ */
++
++#include <cstdint>
++#include <cstring>
++#include <utility>
++#include <vector>
++
++namespace bwl {
++namespace smd_nbr_db_tlv {
++
++// ---------------------------------------------------------------------------
++// MQTT topics
++// ---------------------------------------------------------------------------
++
++static constexpr const char *TOPIC_RECEIVE  = "hostapd/receive/SMD";
++static constexpr const char *TOPIC_TRANSMIT = "hostapd/transmit/SMD";
++
++// ---------------------------------------------------------------------------
++// MSG_ID values
++// ---------------------------------------------------------------------------
++
++static constexpr uint16_t TLV_GLOBAL_MSG_ID_TYPE = 0x8001;
++static constexpr uint16_t TLV_GLOBAL_MSG_ID_LEN  = 2;
++static constexpr size_t   MSG_HDR_SIZE           = 6; // type(2) + len(2) + value(2)
++
++// MSG_IDs encode FEATURE nibble (bits 14:8) | OPERATION (bits 7:0).
++// MQTT_FEAT_SMD = 2 per hostapd mqtt_feature_map.h, so all SMD CMDs have high byte 0x02.
++static constexpr uint16_t CMD_ID_NEIGHBOR_DB_SET   = 0x0201;
++static constexpr uint16_t CMD_ID_NEIGHBOR_DB_GET   = 0x0202;
++static constexpr uint16_t CMD_ID_NEIGHBOR_DB_CLEAR = 0x0203;
++
++static constexpr uint16_t EVT_ID_NEIGHBOR_DB_SET_RESP   = 0x0081;
++static constexpr uint16_t EVT_ID_NEIGHBOR_DB_GET_RESP   = 0x0082;
++static constexpr uint16_t EVT_ID_NEIGHBOR_DB_CLEAR_RESP = 0x0083;
++
++// ---------------------------------------------------------------------------
++// Status codes
++// ---------------------------------------------------------------------------
++
++enum class eSmdNbrDbStatus : uint8_t {
++    OK            = 0,
++    INVALID_PARAM = 1,
++    NOT_FOUND     = 2,
++    NO_RESOURCE   = 3,
++    INTERNAL      = 4,
++};
++
++// ---------------------------------------------------------------------------
++// Response payload structs
++// ---------------------------------------------------------------------------
++
++struct sNbrDbSetResp {
++    uint8_t status = static_cast<uint8_t>(eSmdNbrDbStatus::INTERNAL);
++};
++
++struct sNbrDbClearResp {
++    uint8_t status = static_cast<uint8_t>(eSmdNbrDbStatus::INTERNAL);
++};
++
++struct sNbrDbGetResp {
++    uint8_t status = static_cast<uint8_t>(eSmdNbrDbStatus::INTERNAL);
++    std::vector<std::vector<uint8_t>> nre_entries; // each entry: raw 802.11 NRE body bytes
++};
++
++// ---------------------------------------------------------------------------
++// NRE length limits (enforced by hostapd)
++// ---------------------------------------------------------------------------
++
++static constexpr uint8_t  NRE_LEN_MIN = 13;
++static constexpr uint16_t NRE_LEN_MAX = 1024; // NRE body + subelements can exceed 255 bytes
++
++// ---------------------------------------------------------------------------
++// Internal helpers
++// ---------------------------------------------------------------------------
++
++namespace detail {
++
++static inline void put_u16_be(std::vector<uint8_t> &out, uint16_t v)
++{
++    out.push_back(static_cast<uint8_t>(v >> 8));
++    out.push_back(static_cast<uint8_t>(v & 0xff));
++}
++
++static inline uint16_t get_u16_be(const uint8_t *buf, size_t off)
++{
++    return static_cast<uint16_t>((uint16_t(buf[off]) << 8) | buf[off + 1]);
++}
++
++static inline void append_tlv(std::vector<uint8_t> &out, uint16_t type, const uint8_t *value,
++                               uint16_t value_len)
++{
++    put_u16_be(out, type);
++    put_u16_be(out, value_len);
++    out.insert(out.end(), value, value + value_len);
++}
++
++static inline void append_tlv_u8(std::vector<uint8_t> &out, uint16_t type, uint8_t v)
++{
++    append_tlv(out, type, &v, 1);
++}
++
++static inline void append_tlv_u16_be(std::vector<uint8_t> &out, uint16_t type, uint16_t v)
++{
++    uint8_t tmp[2];
++    tmp[0] = static_cast<uint8_t>(v >> 8);
++    tmp[1] = static_cast<uint8_t>(v & 0xff);
++    append_tlv(out, type, tmp, 2);
++}
++
++static inline void append_tlv_mac(std::vector<uint8_t> &out, uint16_t type, const uint8_t mac[6])
++{
++    append_tlv(out, type, mac, 6);
++}
++
++static inline void write_msg_hdr(std::vector<uint8_t> &out, uint16_t msg_id)
++{
++    put_u16_be(out, TLV_GLOBAL_MSG_ID_TYPE);
++    put_u16_be(out, TLV_GLOBAL_MSG_ID_LEN);
++    put_u16_be(out, msg_id);
++}
++
++} // namespace detail
++
++// ---------------------------------------------------------------------------
++// Parsing
++// ---------------------------------------------------------------------------
++
++// Returns the MSG_ID from bytes 4-5 of the buffer (big-endian).
++// Returns 0 if buffer is too short.
++static inline uint16_t parse_msg_id(const void *buf, int len)
++{
++    if (!buf || len < static_cast<int>(MSG_HDR_SIZE)) {
++        return 0;
++    }
++    const auto *p = static_cast<const uint8_t *>(buf);
++    return detail::get_u16_be(p, 4);
++}
++
++// Parses EVT_ID_NEIGHBOR_DB_SET_RESP. On malformed input returns status=INTERNAL.
++static inline sNbrDbSetResp parse_nbr_db_set_resp(const void *buf, int len)
++{
++    sNbrDbSetResp result;
++    if (!buf || len < static_cast<int>(MSG_HDR_SIZE)) {
++        return result;
++    }
++    const auto *p     = static_cast<const uint8_t *>(buf);
++    int off           = static_cast<int>(MSG_HDR_SIZE);
++    while (off + 4 <= len) {
++        uint16_t type    = detail::get_u16_be(p, off);
++        uint16_t tlv_len = detail::get_u16_be(p, off + 2);
++        off += 4;
++        if (off + tlv_len > len) {
++            break;
++        }
++        if (type == 0x0001 && tlv_len >= 1) { // TLV_NEIGHBOR_DB_SET_RESP_STATUS
++            result.status = p[off];
++        }
++        off += tlv_len;
++    }
++    return result;
++}
++
++// Parses EVT_ID_NEIGHBOR_DB_CLEAR_RESP. On malformed input returns status=INTERNAL.
++static inline sNbrDbClearResp parse_nbr_db_clear_resp(const void *buf, int len)
++{
++    sNbrDbClearResp result;
++    if (!buf || len < static_cast<int>(MSG_HDR_SIZE)) {
++        return result;
++    }
++    const auto *p = static_cast<const uint8_t *>(buf);
++    int off       = static_cast<int>(MSG_HDR_SIZE);
++    while (off + 4 <= len) {
++        uint16_t type    = detail::get_u16_be(p, off);
++        uint16_t tlv_len = detail::get_u16_be(p, off + 2);
++        off += 4;
++        if (off + tlv_len > len) {
++            break;
++        }
++        if (type == 0x0001 && tlv_len >= 1) { // TLV_NEIGHBOR_DB_CLEAR_RESP_STATUS
++            result.status = p[off];
++        }
++        off += tlv_len;
++    }
++    return result;
++}
++
++// Parses EVT_ID_NEIGHBOR_DB_GET_RESP.
++// Container TLVs (wire type has bit 14 set = 0x4000) contain inner TLVs
++// (wire type has bit 13 set = 0x2000) for NRE_LEN (0x2001) and NRE (0x2002).
++// NRE entries with length outside [NRE_LEN_MIN, NRE_LEN_MAX] are skipped.
++static inline sNbrDbGetResp parse_nbr_db_get_resp(const void *buf, int len)
++{
++    sNbrDbGetResp result;
++    if (!buf || len < static_cast<int>(MSG_HDR_SIZE)) {
++        return result;
++    }
++    const auto *p = static_cast<const uint8_t *>(buf);
++    int off       = static_cast<int>(MSG_HDR_SIZE);
++    while (off + 4 <= len) {
++        uint16_t type    = detail::get_u16_be(p, off);
++        uint16_t tlv_len = detail::get_u16_be(p, off + 2);
++        off += 4;
++        if (off + tlv_len > len) {
++            break;
++        }
++        if (type == 0x0001 && tlv_len >= 1) { // STATUS
++            result.status = p[off];
++        } else if ((type & 0x4000) && !(type & 0x2000)) { // container TLV (NRE_ENTRY)
++            // Parse inner TLVs of this container
++            int inner_end  = off + tlv_len;
++            int inner_off  = off;
++            uint16_t nre_len = 0;
++            bool has_nre_len = false;
++            while (inner_off + 4 <= inner_end) {
++                uint16_t inner_type = detail::get_u16_be(p, inner_off);
++                uint16_t inner_len  = detail::get_u16_be(p, inner_off + 2);
++                inner_off += 4;
++                if (inner_off + inner_len > inner_end) {
++                    break;
++                }
++                if (inner_type == 0x2001 && inner_len >= 2) { // NRE_LEN
++                    nre_len     = detail::get_u16_be(p, inner_off);
++                    has_nre_len = true;
++                } else if (inner_type == 0x2002 && has_nre_len) { // NRE
++                    if (nre_len >= NRE_LEN_MIN && nre_len <= NRE_LEN_MAX &&
++                        nre_len <= inner_len) {
++                        result.nre_entries.emplace_back(p + inner_off, p + inner_off + nre_len);
++                    }
++                }
++                inner_off += inner_len;
++            }
++        }
++        off += tlv_len;
++    }
++    return result;
++}
++
++// ---------------------------------------------------------------------------
++// Packing
++// ---------------------------------------------------------------------------
++
++// Entry type for SET: {bssid[6], nre_body_bytes}
++// NRE body: first 6 bytes MUST equal bssid. Minimum 13 bytes.
++// Entries with nre_len outside [NRE_LEN_MIN, NRE_LEN_MAX] are skipped.
++// hostapd SET policy (mqtt_tlv_map.h TLV_NEIGHBOR_DB_SET_*):
++//   type 1=AP_ALID type 2=HAS_SMD_ID type 3=SMD_ID type 4=NUM_NRE
++//   per-entry: type 5=HAS_MLD_ADDR type 6=MLD_ADDR type 7=BSSID type 8=NRE_LEN type 9=NRE
++static inline std::vector<uint8_t>
++pack_nbr_db_set(const uint8_t ap_alid[6], bool has_smd_id, const uint8_t smd_id[6],
++                const uint8_t mld_addr[6],
++                const std::vector<std::pair<const uint8_t *, std::vector<uint8_t>>> &entries)
++{
++    static const uint8_t zero_mac[6] = {0};
++    bool has_mld_addr                = (memcmp(mld_addr, zero_mac, 6) != 0);
++
++    uint16_t num_nre = 0;
++    for (const auto &e : entries)
++        if (e.second.size() >= NRE_LEN_MIN && e.second.size() <= NRE_LEN_MAX)
++            num_nre++;
++
++    std::vector<uint8_t> out;
++    out.reserve(256);
++
++    detail::write_msg_hdr(out, CMD_ID_NEIGHBOR_DB_SET);
++    detail::append_tlv_mac(out, 0x0001, ap_alid);               // AP_ALID
++    detail::append_tlv_u8(out, 0x0002, has_smd_id ? 1 : 0);    // HAS_SMD_ID
++    if (has_smd_id)
++        detail::append_tlv_mac(out, 0x0003, smd_id);            // SMD_ID
++    detail::append_tlv_u16_be(out, 0x0004, num_nre);            // NUM_NRE
++
++    for (const auto &entry : entries) {
++        const uint8_t *bssid = entry.first;
++        const auto &nre      = entry.second;
++        if (nre.size() < NRE_LEN_MIN || nre.size() > NRE_LEN_MAX)
++            continue;
++        auto nre_len = static_cast<uint16_t>(nre.size());
++        detail::append_tlv_u8(out, 0x0005, has_mld_addr ? 1 : 0);       // HAS_MLD_ADDR
++        if (has_mld_addr)
++            detail::append_tlv_mac(out, 0x0006, mld_addr);               // MLD_ADDR
++        detail::append_tlv_mac(out, 0x0007, bssid);                      // BSSID
++        detail::append_tlv_u16_be(out, 0x0008, nre_len);                 // NRE_LEN
++        detail::append_tlv(out, 0x0009, nre.data(), nre_len);            // NRE
++    }
++
++    return out;
++}
++
++// Convenience overload accepting sMacAddr-like structs (6-byte arrays embedded in struct).
++// The caller provides bssid and nre as separate vectors.
++static inline std::vector<uint8_t>
++pack_nbr_db_set_simple(const uint8_t ap_alid[6],
++                       const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &entries)
++{
++    static const uint8_t zero_mac[6] = {0};
++    std::vector<std::pair<const uint8_t *, std::vector<uint8_t>>> adapted;
++    adapted.reserve(entries.size());
++    for (const auto &e : entries) {
++        if (e.first.size() != 6) {
++            continue;
++        }
++        adapted.emplace_back(e.first.data(), e.second);
++    }
++    return pack_nbr_db_set(ap_alid, false, zero_mac, zero_mac, adapted);
++}
++
++// hostapd GET policy (mqtt_tlv_map.h TLV_NEIGHBOR_DB_GET_*):
++//   type 1=AP_ALID type 2=HAS_SMD_ID type 3=SMD_ID type 4=GLOBAL_ENTRIES(optional)
++//   type 5=HAS_MLD_ADDR type 6=MLD_ADDR type 7=HAS_BSSID type 8=BSSID
++static inline std::vector<uint8_t> pack_nbr_db_get(const uint8_t ap_alid[6], bool has_smd_id,
++                                                    const uint8_t smd_id[6],
++                                                    bool has_mld_addr, const uint8_t mld_addr[6],
++                                                    bool has_bssid, const uint8_t bssid[6])
++{
++    std::vector<uint8_t> out;
++    out.reserve(64);
++
++    detail::write_msg_hdr(out, CMD_ID_NEIGHBOR_DB_GET);
++    detail::append_tlv_mac(out, 0x0001, ap_alid);
++    detail::append_tlv_u8(out, 0x0002, has_smd_id ? 1 : 0);
++    if (has_smd_id) {
++        detail::append_tlv_mac(out, 0x0003, smd_id);
++        detail::append_tlv_u8(out, 0x0004, 0); // GLOBAL_ENTRIES=0: local (self) entries only
++    }
++    detail::append_tlv_u8(out, 0x0005, has_mld_addr ? 1 : 0);       // HAS_MLD_ADDR
++    if (has_mld_addr)
++        detail::append_tlv_mac(out, 0x0006, mld_addr);               // MLD_ADDR
++    detail::append_tlv_u8(out, 0x0007, has_bssid ? 1 : 0);          // HAS_BSSID
++    if (has_bssid)
++        detail::append_tlv_mac(out, 0x0008, bssid);                  // BSSID
++
++    return out;
++}
++
++// hostapd CLEAR policy (mqtt_tlv_map.h TLV_NEIGHBOR_DB_CLEAR_*):
++//   type 1=AP_ALID type 2=HAS_SMD_ID type 3=SMD_ID
++//   type 4=HAS_MLD_ADDR type 5=MLD_ADDR type 6=HAS_BSSID type 7=BSSID
++static inline std::vector<uint8_t> pack_nbr_db_clear(const uint8_t ap_alid[6], bool has_smd_id,
++                                                      const uint8_t smd_id[6],
++                                                      bool has_mld_addr, const uint8_t mld_addr[6],
++                                                      bool has_bssid, const uint8_t bssid[6])
++{
++    std::vector<uint8_t> out;
++    out.reserve(32);
++
++    detail::write_msg_hdr(out, CMD_ID_NEIGHBOR_DB_CLEAR);
++    detail::append_tlv_mac(out, 0x0001, ap_alid);
++    detail::append_tlv_u8(out, 0x0002, has_smd_id ? 1 : 0);
++    if (has_smd_id)
++        detail::append_tlv_mac(out, 0x0003, smd_id);
++    detail::append_tlv_u8(out, 0x0004, has_mld_addr ? 1 : 0);       // HAS_MLD_ADDR
++    if (has_mld_addr)
++        detail::append_tlv_mac(out, 0x0005, mld_addr);               // MLD_ADDR
++    detail::append_tlv_u8(out, 0x0006, has_bssid ? 1 : 0);          // HAS_BSSID
++    if (has_bssid)
++        detail::append_tlv_mac(out, 0x0007, bssid);                  // BSSID
++
++    return out;
++}
++
++} // namespace smd_nbr_db_tlv
++} // namespace bwl
++
++#endif // _BWL_SMD_NBR_DB_TLV_H_
+diff --git a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp
+index 63beeb5e0..53b62785c 100644
+--- a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <bcl/beerocks_utils.h>
+ #include <bcl/network/network_utils.h>
++#include <bwl/smd_nbr_db_tlv.h>
+ #include <easylogging++.h>
+ 
+ #define MQTT_LOOP_RUN_INTERVAL 1000 // milliseconds
+@@ -89,22 +90,52 @@ void slave_wlan_hal_nl80211::subscribe_to_smd_events()
+ 
+ void slave_wlan_hal_nl80211::process_message(const char* topic, const void* payload, int payload_len)
+ {
+-    LOG(DEBUG) << " Processing message on topic " << topic;
+-    // Process message
+-    (void)payload;
+-    (void)payload_len;
++    LOG(DEBUG) << "Processing MQTT message on topic " << topic
++               << " payload_len=" << payload_len;
+ 
+-    event_queue_push(Event::SMD_Roaming_Completed);
++    using namespace bwl::smd_nbr_db_tlv;
++
++    uint16_t msg_id = parse_msg_id(payload, payload_len);
++
++    switch (msg_id) {
++    case EVT_ID_NEIGHBOR_DB_SET_RESP: {
++        auto resp = std::make_shared<sNbrDbSetResp>(
++            parse_nbr_db_set_resp(payload, payload_len));
++        LOG(DEBUG) << "NbrDB SET_RESP status=" << int(resp->status);
++        event_queue_push(Event::SMD_NbrDbSetResp, resp);
++        break;
++    }
++    case EVT_ID_NEIGHBOR_DB_GET_RESP: {
++        auto resp = std::make_shared<sNbrDbGetResp>(
++            parse_nbr_db_get_resp(payload, payload_len));
++        LOG(DEBUG) << "NbrDB GET_RESP status=" << int(resp->status)
++                   << " entries=" << resp->nre_entries.size();
++        event_queue_push(Event::SMD_NbrDbGetResp, resp);
++        break;
++    }
++    case EVT_ID_NEIGHBOR_DB_CLEAR_RESP: {
++        auto resp = std::make_shared<sNbrDbClearResp>(
++            parse_nbr_db_clear_resp(payload, payload_len));
++        LOG(DEBUG) << "NbrDB CLEAR_RESP status=" << int(resp->status);
++        event_queue_push(Event::SMD_NbrDbClearResp, resp);
++        break;
++    }
++    default:
++        LOG(WARNING) << "MQTT: unknown MSG_ID=0x" << std::hex << msg_id
++                     << " on topic " << topic;
++        event_queue_push(Event::SMD_Roaming_Completed);
++        break;
++    }
+ }
+ 
+-int slave_wlan_hal_nl80211::smd_set_neighbor(const void* payload, int payload_len)
++int slave_wlan_hal_nl80211::smd_send(const void* payload, int payload_len)
+ {
+-    if (!mqtt_client) {
++    if (!mqtt_client || mqtt_client->get_fd() < 0) {
+         LOG(ERROR) << "MQTT client is not valid for publishing";
+         return -1;
+     }
+ 
+-    return mqtt_client->publish("hostapd/receive", payload, payload_len, 1, false);
++    return mqtt_client->publish(bwl::smd_nbr_db_tlv::TOPIC_RECEIVE, payload, payload_len, 1, false);
+ }
+ 
+ bool slave_wlan_hal_nl80211::process_ext_events(int fd)
+diff --git a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h
+index f5a40f544..8fe65423c 100644
+--- a/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/slave_wlan_hal_nl80211.h
+@@ -43,7 +43,7 @@ public:
+     // Inherited from slave_wlan_hal
+     virtual bool reattach() override;
+     virtual void run_fsm() override;
+-    virtual int smd_set_neighbor(const void* payload, int payload_len) override;
++    virtual int smd_send(const void* payload, int payload_len) override;
+ 
+     // DPP-over-TCP relay
+     bool init_dpp_relay() override;
+diff --git a/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.cpp b/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.cpp
+index 00003b4fd..bec4a3d54 100644
+--- a/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.cpp
++++ b/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.cpp
+@@ -25,6 +25,11 @@ slave_wlan_hal_onewifi::~slave_wlan_hal_onewifi()
+     detach();
+ }
+ 
++int slave_wlan_hal_onewifi::smd_send(const void* payload, int payload_len)
++{
++    return 0;
++}
++
+ bool slave_wlan_hal_onewifi::process_ext_events(int fd)
+ {
+     return true;
+diff --git a/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.h b/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.h
+index 8112928a2..9966b468a 100644
+--- a/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.h
++++ b/common/beerocks/bwl/onewifi/slave_wlan_hal_onewifi.h
+@@ -13,6 +13,7 @@ namespace onewifi {
+ 
+ class slave_wlan_hal_onewifi : public virtual slave_wlan_hal {
+ public:
++    virtual int smd_send(const void* payload, int payload_len) override;
+     explicit slave_wlan_hal_onewifi(const std::string& iface_name,
+                                base_wlan_hal::hal_event_cb_t callback,
+                                const hal_conf_t& hal_conf);
+diff --git a/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
+index 1bc96efd5..9f59844be 100644
+--- a/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
+@@ -30,6 +30,11 @@ slave_wlan_hal_whm::slave_wlan_hal_whm(const std::string &iface_name, hal_event_
+ 
+ slave_wlan_hal_whm::~slave_wlan_hal_whm() { stop_dpp_relay(); }
+ 
++int slave_wlan_hal_whm::smd_send(const void* payload, int payload_len)
++{
++    return 0;
++}
++
+ const std::string slave_wlan_hal_whm::get_iface_from_fd(int fd)
+ {
+     LOG(TRACE) << __func__ << " - NOT IMPLEMENTED";
+diff --git a/common/beerocks/bwl/whm/slave_wlan_hal_whm.h b/common/beerocks/bwl/whm/slave_wlan_hal_whm.h
+index e39ae4604..027c4339d 100644
+--- a/common/beerocks/bwl/whm/slave_wlan_hal_whm.h
++++ b/common/beerocks/bwl/whm/slave_wlan_hal_whm.h
+@@ -14,6 +14,7 @@ namespace whm {
+ 
+ class slave_wlan_hal_whm : public base_wlan_hal_whm, public virtual slave_wlan_hal {
+ public:
++    virtual int smd_send(const void* payload, int payload_len) override;
+     explicit slave_wlan_hal_whm(const std::string& iface_name,
+                                base_wlan_hal::hal_event_cb_t callback,
+                                const hal_conf_t& hal_conf);
+diff --git a/common/beerocks/multi_vendor/multi_vendor.cpp b/common/beerocks/multi_vendor/multi_vendor.cpp
+index 9d97bfba6..b3a64e745 100644
+--- a/common/beerocks/multi_vendor/multi_vendor.cpp
++++ b/common/beerocks/multi_vendor/multi_vendor.cpp
+@@ -209,7 +209,7 @@ std::shared_ptr<BaseClass> tlvf_handler::parse_vs_tlv(ieee1905_1::CmduMessageRx
+         }
+     }
+ 
+-    LOG(TRACE) << "parse_vs_tlv: no parser handled TLV for message type " << msg_type;
++    //LOG(TRACE) << "parse_vs_tlv: no parser handled TLV for message type " << msg_type;
+     return nullptr;
+ }
+ 
+diff --git a/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp b/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
+index 4c9db7244..d6cce24d7 100644
+--- a/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
++++ b/common/beerocks/multi_vendor/qca/src/tlvf_qca_utils.cpp
+@@ -297,8 +297,6 @@ bool tlvf_qca_utils::add_qca_neighbor_info_tlv(ieee1905_1::CmduMessageTx &cmdu_t
+             return false;
+         }
+ 
+-        report->neighbor_report_element_length() = static_cast<uint16_t>(entry.nre_bytes.size());
+-
+         if (!entry.nre_bytes.empty()) {
+             if (!report->set_neighbor_report_element(entry.nre_bytes.data(),
+                                                      entry.nre_bytes.size())) {
+@@ -341,7 +339,7 @@ std::shared_ptr<BaseClass> tlvf_qca_utils::parse_qca_vs_tlv(ieee1905_1::CmduMess
+ 
+     // Check if this is a QCA vendor TLV
+     if (vendor_oui != qca::qcaVendorOUI::OUI_QCA) {
+-        LOG(DEBUG) << "Not a QCA vendor TLV, OUI mismatch: 0x" << std::hex << vendor_oui;
++        //LOG(DEBUG) << "Not a QCA vendor TLV, OUI mismatch: 0x" << std::hex << vendor_oui;
+         return nullptr;
+     }
+ 
+diff --git a/controller/src/beerocks/master/tasks/neighbor_db_ctrl_task.cpp b/controller/src/beerocks/master/tasks/neighbor_db_ctrl_task.cpp
+index c4c41104f..46e155aa3 100644
+--- a/controller/src/beerocks/master/tasks/neighbor_db_ctrl_task.cpp
++++ b/controller/src/beerocks/master/tasks/neighbor_db_ctrl_task.cpp
+@@ -287,15 +287,6 @@ void NeighborDbCtrlTask::update_local_neighbor_db(const sMacAddr &agent_alid,
+ 
+     TASK_LOG(INFO) << "AP_DEBUG: Local neighbor DB updated for agent " << agent_alid
+                    << " (NRE bytes=" << report_data.size() << ")";
+-
+-    // [STUB] In the full implementation, after updating the local DB we would
+-    // call the hostapd API to set the neighbor report element so that hostapd
+-    // can use it for 802.11 neighbor reports to clients.
+-    //
+-    // Example (API TBD):
+-    //   hostapd_iface.set_neighbor_report_element(agent_alid, report_data);
+-    TASK_LOG(DEBUG) << "AP_DEBUG: [STUB] Calling hostapd API: set_neighbor_report_element("
+-                    << "alid=" << agent_alid << ", nre_bytes=" << report_data.size() << ")";
+ }
+ 
+ void NeighborDbCtrlTask::propagate_neighbor_info_to_all_agents(const sMacAddr &reporting_agent_alid)
+-- 
+2.34.1
+
