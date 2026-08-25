@@ -1,0 +1,119 @@
+From b12ef6f5a328af83603a50ad7c296bebd46a7a9e Mon Sep 17 00:00:00 2001
+From: Aryan Khare <aryakhar@qti.qualcomm.com>
+Date: Fri, 14 Aug 2026 14:51:57 +0530
+Subject: [PATCH] Deduplicate BSS-TM-RESP on MLO per-link socket and remove BTM
+ flag override
+
+- Drop duplicate BSS_TM_Response event on MLO per-link socket to prevent
+  multiple BTM reports per steering attempt
+- Remove debug override that was replacing controller TLV abridged/disassoc_imminent
+  with agent config values; honor controller values directly
+- Move BTM query log to the correct send path
+
+Signed-off-by: Aryan Khare <aryakhar@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 | 34 +++++--------------
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 21 +++++++++++-
+ 2 files changed, 28 insertions(+), 27 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index a1b2c0066..ddfeedcec 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -2209,30 +2209,6 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+         btm_params.abridged           = request->params().abridged;
+         btm_params.disassoc_imminent  = request->params().disassoc_imminent;
+ 
+-        // DEBUG: override controller TLV abridged/disassoc_imminent with agent config values.
+-        // The controller sent abridged=false/disassoc_imminent=false in its TLV; override here
+-        // so the same btm_abridged/btm_disassoc_imminent knobs in beerocks_agent.conf apply to
+-        // both the controller-driven path and the agent-initiated path.
+-        // Remove this block once the controller is updated to send the correct flags.
+-        {
+-            auto db = beerocks::AgentDB::get();
+-            LOG(DEBUG) << "DEBUG BTM flag override: controller sent abridged="
+-                       << btm_params.abridged << " disassoc_imminent=" << btm_params.disassoc_imminent
+-                       << " -> overriding with agent config: btm_abridged=" << db->device_conf.btm_abridged
+-                       << " btm_disassoc_imminent=" << db->device_conf.btm_disassoc_imminent;
+-            btm_params.abridged          = db->device_conf.btm_abridged;
+-            btm_params.disassoc_imminent = db->device_conf.btm_disassoc_imminent;
+-            // Recompute disassoc_timer_btt now that disassoc_imminent may have changed.
+-            // The original calculation used the controller's disassoc_imminent (false),
+-            // which set disassoc_timer_btt=0. With disassoc_imminent=true we must provide
+-            // a non-zero timer so the STA has time to roam before being disassociated.
+-            if (btm_params.disassoc_imminent) {
+-                float timer_btt = static_cast<float>(request->params().disassoc_timer_ms)
+-                                  / static_cast<float>(BEACON_TRANSMIT_TIME_MS);
+-                btm_params.disassoc_timer_btt = (timer_btt > 0.0f) ? timer_btt : 10.0f;
+-            }
+-        }
+-
+         LOG(DEBUG) << "BTM Params: "
+         << "vap_id=" << btm_params.vap_id
+         << ", mac=" << tlvf::mac_to_string(btm_params.mac)
+@@ -4351,8 +4327,14 @@ bool ApManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+             btm_params.valid_int_btt      = 2;
+             btm_params.reason             = 0;
+             btm_params.pref_list_included = true; // since a valid target BSSID is always assumed
+-            btm_params.abridged           = true;
+-            btm_params.disassoc_imminent  = false;
++            // Use configurable BTM flags from beerocks_agent.conf for agent-initiated steering.
++            // These knobs (btm_abridged / btm_disassoc_imminent) apply only to this path;
++            // controller-driven steering uses the values from the controller TLV directly.
++            {
++                auto db = beerocks::AgentDB::get();
++                btm_params.abridged          = db->device_conf.btm_abridged;
++                btm_params.disassoc_imminent = db->device_conf.btm_disassoc_imminent;
++            }
+ 
+             LOG(DEBUG) << "CLIENT_BSS_STEER (802.11v) for sta_mac = "
+                        << tlvf::mac_to_string(btm_params.mac)
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index baa26a2ac..734555e4c 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -2774,7 +2774,7 @@ bool ap_wlan_hal_nl80211::sta_disassoc(int8_t vap_id, const std::string &mac, ui
+         return false;
+     }
+ 
+-    LOG(DEBUG) << "BTM query sent to NL: " << cmd;
++    LOG(DEBUG) << "Disassociate sent to NL: " << cmd;
+ 
+     return true;
+ }
+@@ -2906,6 +2906,8 @@ bool ap_wlan_hal_nl80211::sta_bss_steer(const sBtmRequestParams &params)
+         return false;
+     }
+ 
++    LOG(DEBUG) << "BTM query sent to NL: " << cmd;
++
+     return true;
+ }
+ 
+@@ -6763,6 +6765,23 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+     // BSS Transition (802.11v)
+     case Event::BSS_TM_Response: {
+ 
++        // On MLO hardware, BSS-TM-RESP is delivered on BOTH the global hostapd socket
++        // and the per-link socket (e.g. wlan0.1_link0), causing the event to be
++        // processed twice and two CLIENT_STEERING_BTM_REPORT_MESSAGE messages to be
++        // sent to the controller.
++        // On SLO hardware, BSS-TM-RESP is ONLY delivered on the per-VAP socket — the
++        // global socket does not carry it. Dropping all per-VAP-socket deliveries would
++        // break SLO steering entirely.
++        //
++        // Fix: drop the duplicate only when the event arrives on a per-link socket
++        // (interface name contains "_link"), which is the MLO-specific delivery path.
++        // SLO VAP interfaces (e.g. "wlan0.1") do not have "_link" in their name and
++        // are therefore unaffected.
++        if (!from_global_sock && interface.find("_link") != std::string::npos) {
++            LOG(DEBUG) << "Ignoring duplicate BSS-TM-RESP on per-link socket for " << interface;
++            break;
++        }
++
+         // TODO: Change to HAL objects
+         auto msg_buff = ALLOC_SMART_BUFFER(sizeof(sACTION_APMANAGER_CLIENT_BSS_STEER_RESPONSE));
+         auto msg = reinterpret_cast<sACTION_APMANAGER_CLIENT_BSS_STEER_RESPONSE *>(msg_buff.get());
+-- 
+2.34.1
+
