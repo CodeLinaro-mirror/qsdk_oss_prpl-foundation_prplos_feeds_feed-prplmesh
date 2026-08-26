@@ -1,0 +1,116 @@
+From 24a0a32e338b66c2ecfed491d08d6dbd40183042 Mon Sep 17 00:00:00 2001
+From: Muthuchamy Kumar <muthucha@qti.qualcomm.com>
+Date: Mon, 24 Aug 2026 22:44:43 +0530
+Subject: [PATCH] Handle ENOBUFS and raise Netlink socket SO_RCVBUF in
+ NetlinkEventListenerImpl
+
+Check the return value of the Netlink socket receive() call in the
+NetlinkEventListenerImpl event loop read handler. When it fails with
+ENOBUFS, the kernel has overflowed the socket receive buffer and
+dropped Netlink messages; log the error instead of silently ignoring
+it.
+
+Also add a setsockopt_rcvbuf() helper to SocketAbstractImpl and use it
+in create_netlink_event_listener() (ieee1905_transport main.cpp) to
+raise the Netlink socket's receive buffer to 512KB. When Traffic
+Separation is enabled and a VLAN interface is created and added to the
+bridge, the kernel emits a burst of Netlink link events that can
+overflow the default receive buffer, causing events to be dropped
+(ENOBUFS). Raising SO_RCVBUF gives the event loop more headroom to
+drain the socket before that happens.
+
+Signed-off-by: Muthuchamy Kumar <muthucha@qti.qualcomm.com>
+---
+ .../bcl/include/bcl/network/sockets_impl.h    | 25 +++++++++++++++++++
+ .../network/netlink_event_listener_impl.cpp   | 13 +++++++++-
+ .../transport/ieee1905_transport/main.cpp     |  6 +++++
+ 3 files changed, 43 insertions(+), 1 deletion(-)
+
+diff --git a/common/beerocks/bcl/include/bcl/network/sockets_impl.h b/common/beerocks/bcl/include/bcl/network/sockets_impl.h
+index 52486e120..d22d33d4e 100644
+--- a/common/beerocks/bcl/include/bcl/network/sockets_impl.h
++++ b/common/beerocks/bcl/include/bcl/network/sockets_impl.h
+@@ -79,6 +79,31 @@ public:
+         return true;
+     }
+ 
++    /**
++     * @brief Sets the SO_RCVBUF socket option.
++     *
++     * Sets the size of the socket receive buffer, in bytes. The kernel doubles this value when
++     * it is set with setsockopt(), and this doubled value is what is returned by getsockopt().
++     *
++     * Increasing this value is useful for sockets that may receive bursts of data faster than the
++     * application can read them (e.g. a Netlink socket subscribed to link events while a large
++     * number of VLAN interfaces are being created and added to a bridge). If the receive buffer
++     * overflows, the kernel drops incoming data and the next read fails with ENOBUFS.
++     *
++     * @param size Requested socket receive buffer size, in bytes.
++     * @return true on success and false otherwise.
++     */
++    bool setsockopt_rcvbuf(int size)
++    {
++        if (0 != ::setsockopt(fd(), SOL_SOCKET, SO_RCVBUF, &size, sizeof(size))) {
++            LOG(ERROR) << "Unable to set the SO_RCVBUF socket option for fd: " << fd()
++                       << ", error: " << strerror(errno);
++            return false;
++        }
++
++        return true;
++    }
++
+ protected:
+     /**
+      * @brief Class constructor.
+diff --git a/common/beerocks/bcl/source/network/netlink_event_listener_impl.cpp b/common/beerocks/bcl/source/network/netlink_event_listener_impl.cpp
+index 582c6cdfe..da5a510ba 100644
+--- a/common/beerocks/bcl/source/network/netlink_event_listener_impl.cpp
++++ b/common/beerocks/bcl/source/network/netlink_event_listener_impl.cpp
+@@ -10,6 +10,11 @@
+ #include <bcl/network/buffer_impl.h>
+ #include <bcl/network/netlink_event_listener_impl.h>
+ 
++#include <easylogging++.h>
++
++#include <cerrno>
++#include <cstring>
++
+ using namespace beerocks;
+ 
+ namespace beerocks {
+@@ -25,8 +30,14 @@ NetlinkEventListenerImpl::NetlinkEventListenerImpl(std::shared_ptr<Socket::Conne
+     handlers.name    = "Netlink Event Listener";
+     handlers.on_read = [&](int fd, EventLoop &loop) -> bool {
+         BufferImpl<netlink_buffer_size> buffer;
+-        if (m_connection->receive(buffer) > 0) {
++        int bytes_received = m_connection->receive(buffer);
++        if (bytes_received > 0) {
+             parse(buffer);
++        } else if (errno == ENOBUFS) {
++            // The Netlink socket receive buffer overflowed and some messages have been
++            // dropped by the kernel. This is not a fatal error, but it means that some
++            // Netlink events might have been missed.
++            LOG(ERROR) << "Netlink socket receive buffer overflowed: " << strerror(errno);
+         }
+ 
+         return true;
+diff --git a/framework/transport/ieee1905_transport/main.cpp b/framework/transport/ieee1905_transport/main.cpp
+index ba0d0763a..67cc82408 100755
+--- a/framework/transport/ieee1905_transport/main.cpp
++++ b/framework/transport/ieee1905_transport/main.cpp
+@@ -103,6 +103,12 @@ create_netlink_event_listener(std::shared_ptr<EventLoop> event_loop)
+     // Create NETLINK_ROUTE netlink socket for kernel/user-space communication
+     auto socket = std::make_shared<NetlinkRouteSocket>();
+ 
++    // Raise the socket receive buffer size so bursts of Netlink events (e.g. when Traffic
++    // Separation is enabled and a VLAN interface is created and added to the bridge) do not
++    // overflow the kernel receive buffer and get dropped (which shows up as ENOBUFS on read).
++    constexpr int netlink_rcvbuf_size = 512 * 1024;
++    socket->setsockopt_rcvbuf(netlink_rcvbuf_size);
++
+     // Create client socket
+     ClientSocketImpl<NetlinkRouteSocket> client(socket);
+ 
+-- 
+2.34.1
+
