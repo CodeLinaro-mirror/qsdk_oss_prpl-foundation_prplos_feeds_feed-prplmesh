@@ -1,0 +1,119 @@
+From 6eb1eec6cf82693089b0a4962b69a8efda79e234 Mon Sep 17 00:00:00 2001
+From: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+Date: Fri, 21 Aug 2026 16:41:00 +0530
+Subject: [PATCH] nl80211: retry incomplete hostapd STATUS snapshot in
+ refresh_vaps_info()
+
+refresh_vaps_info() took hostapd's "STATUS" reply as final on the first
+read. While multiple newly-added BSS/MLO-link interfaces are still
+coming up, this can return a transiently incomplete snapshot (bss_count
+== 0, or a bss[N] entry with no matching bssid[N]) that gets committed
+into available_vaps as-is, latching a radio_disable or a set of
+ZERO_MAC BSSIDs. Downstream, affected radios never reach CONFIGURED,
+so ap_autoconfiguration_task never dispatches TS_ENABLE and Traffic
+Separation is silently never applied.
+
+Retry up to 6 times with a 100ms delay before accepting the snapshot,
+reusing the same budget register_wpa_ctrl_interface() already uses for
+this class of hostapd bring-up race. If the snapshot is still
+incomplete after retries, leave available_vaps untouched and return
+false, matching the existing contract for the hard-failure path.
+---
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     | 77 ++++++++++++++-----
+ 1 file changed, 59 insertions(+), 18 deletions(-)
+
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index 53a50cff5..adb31e8e2 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -1163,28 +1163,69 @@ bool base_wlan_hal_nl80211::refresh_vaps_info(int id)
+     std::unordered_set<std::string> parsed_BSSs;
+     parsed_obj_map_t reply;
+     int vap_id = 0;
+-    // Read the radio status
+-    if (!wpa_ctrl_send_msg("STATUS", reply)) {
+-        // The cmd socket may have hit a transport-level error (e.g. because it went stale
+-        // across a hostapd reconfiguration) and will keep failing identically on the same
+-        // fd - reconnect it once and retry before giving up, the same recovery
+-        // reconnect_wpa_ctrl_cmd_socket() already provides for other retry paths (e.g.
+-        // MLD_ADD_LINK). This is a no-op if the interface isn't registered at all.
+-        LOG(DEBUG) << __func__ << " STATUS failed for " << get_iface_name()
+-                   << ", reconnecting cmd socket and retrying";
+-        if (!reconnect_wpa_ctrl_cmd_socket(get_iface_name()) || !wpa_ctrl_send_msg("STATUS", reply)) {
+-            LOG(ERROR) << __func__ << " failed";
+-            return false;
++    int bss_count = 0;
++
++    // hostapd may still be bringing up multiple newly-added BSS/MLO-link interfaces when
++    // STATUS is queried here, which can return a transiently incomplete snapshot (bss_count
++    // == 0, or a bss[N] entry with no matching bssid[N] yet). Retry a bounded number of times
++    // before accepting the snapshot, using the same retry budget register_wpa_ctrl_interface()
++    // already uses for this class of hostapd-bring-up race.
++    int retry_count = 6; //count intialized to retry for 500 milliseconds max
++    bool snapshot_complete = false;
++    do {
++        reply.clear();
++        // Read the radio status
++        if (!wpa_ctrl_send_msg("STATUS", reply)) {
++            // The cmd socket may have hit a transport-level error (e.g. because it went stale
++            // across a hostapd reconfiguration) and will keep failing identically on the same
++            // fd - reconnect it once and retry before giving up, the same recovery
++            // reconnect_wpa_ctrl_cmd_socket() already provides for other retry paths (e.g.
++            // MLD_ADD_LINK). This is a no-op if the interface isn't registered at all.
++            LOG(DEBUG) << __func__ << " STATUS failed for " << get_iface_name()
++                       << ", reconnecting cmd socket and retrying";
++            if (!reconnect_wpa_ctrl_cmd_socket(get_iface_name()) || !wpa_ctrl_send_msg("STATUS", reply)) {
++                LOG(ERROR) << __func__ << " failed";
++                return false;
++            }
+         }
+-    }
+ 
+-    int bss_count = 0;
+-    for (const auto& pair : reply) {
+-        if (pair.first.find("bss[") == 0) { // key starts with "bss["
+-            ++bss_count;
++        bss_count = 0;
++        for (const auto& pair : reply) {
++            if (pair.first.find("bss[") == 0) { // key starts with "bss["
++                ++bss_count;
++            }
+         }
++        LOG(DEBUG) << " active bss count present in STATUS for iface " << m_radio_info.iface_name << " : " << bss_count;
++
++        // A radio that is legitimately disabled, or has no local hostapd interface at all
++        // (No-VAP mode), is expected to report bss_count == 0 - accept that immediately,
++        // matching the same distinction refresh_radio_info() makes.
++        if (m_hal_conf.radio_disable || get_iface_name().empty()) {
++            snapshot_complete = true;
++            break;
++        }
++
++        snapshot_complete = (bss_count > 0);
++        for (int check_idx = 0; snapshot_complete && check_idx < bss_count; check_idx++) {
++            if (reply["bssid[" + std::to_string(check_idx) + "]"].empty()) {
++                snapshot_complete = false;
++            }
++        }
++
++        if (!snapshot_complete) {
++            retry_count--;
++            LOG(DEBUG) << __func__ << " incomplete STATUS snapshot for iface "
++                       << m_radio_info.iface_name << " (bss_count=" << bss_count
++                       << "), retrying in 100ms, retries left: " << retry_count;
++            std::this_thread::sleep_for(std::chrono::milliseconds(100));
++        }
++    } while (!snapshot_complete && retry_count > 0);
++
++    if (!snapshot_complete) {
++        LOG(ERROR) << __func__ << " STATUS snapshot still incomplete for iface "
++                   << m_radio_info.iface_name << " after retries, leaving available_vaps unchanged";
++        return false;
+     }
+-    LOG(DEBUG) << " active bss count present in STATUS for iface " << m_radio_info.iface_name << " : " << bss_count;
+ 
+     // clear the available vaps
+     m_radio_info.available_vaps.clear();
+-- 
+2.34.1
+
