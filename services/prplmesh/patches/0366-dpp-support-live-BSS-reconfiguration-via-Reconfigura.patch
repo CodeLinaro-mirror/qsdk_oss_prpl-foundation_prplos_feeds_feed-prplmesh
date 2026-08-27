@@ -1,0 +1,533 @@
+From d7b5cc6a6c54745e980663bba95dd031d4bbbd0f Mon Sep 17 00:00:00 2001
+From: Parimalarengan Gururajan <gururaja@qti.qualcomm.com>
+Date: Fri, 21 Aug 2026 19:49:02 +0530
+Subject: [PATCH] dpp: support live BSS reconfiguration via Reconfiguration
+ Trigger
+
+Add end-to-end support for the EasyMesh DPP Reconfiguration Trigger flow,
+so a controller can push updated SSID/credentials to an already-onboarded
+DPP agent, not just during initial onboarding.
+
+Agent: handle RECONFIGURATION_TRIGGER_MESSAGE and apply the resulting BSS
+Configuration Response to already-CONFIGURED radios; fix the FSM re-arming
+and reset-suppression bugs that made this only work on the first attempt.
+
+Controller: send the trigger to DPP-onboarded agents on config changes,
+scope BSS Configuration Response entries per-radio, and handle re-chirp/
+re-search from already-onboarded agents as a clean restart.
+
+Signed-off-by: Parimalarengan Gururajan <gururaja@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/agent_db.h           |   9 ++
+ agent/src/beerocks/slave/son_slave_thread.cpp |  13 ++-
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  62 ++++++++++-
+ .../beerocks/slave/tasks/dpp_agent_task.cpp   |  37 +++++++
+ .../src/beerocks/slave/tasks/dpp_agent_task.h |   8 ++
+ controller/src/beerocks/master/controller.cpp |   3 +-
+ .../src/beerocks/master/son_actions.cpp       |  45 +++++++-
+ controller/src/beerocks/master/son_actions.h  |   2 +
+ .../src/beerocks/master/son_management.cpp    |  13 +++
+ .../master/tasks/dpp_configurator_task.cpp    | 100 ++++++++++++++----
+ 10 files changed, 256 insertions(+), 36 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index c51ccf7d0..d67e7cfe5 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -301,6 +301,15 @@ public:
+         /// (where dpp_credentials.initialized is never set via the wireless path).
+         bool bss_config_sent = false;
+ 
++        /// Count of radios with a queued/in-flight BSS config push (incremented when a
++        /// radio's credentials are queued in ApAutoConfigurationTask, decremented once that
++        /// radio reaches eState::CONFIGURED again). Unlike bss_config_sent (sticky forever)
++        /// combined with ap_autoconfiguration_completed (permanently false only before the
++        /// very first onboarding finishes), this reflects an in-progress push for *any* DPP
++        /// BSS Configuration Response — including one received long after initial onboarding,
++        /// e.g. a live SSID/credential change via Reconfiguration Trigger.
++        int pending_bss_config_count = 0;
++
+         /** Returns true when all conditions for 1905 link encryption are met.
+          *  Mirrors mapService_is1905SecurityEnabled() in qca-ezmesh. */
+         bool is_1905_security_enabled(uint8_t mgmt_mode) const
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 5eb841302..bdc81a01f 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -400,6 +400,7 @@ bool slave_thread::thread_init()
+             ieee1905_1::eMessageType::IEEE1905_ENCAP_EAPOL_MESSAGE,
+             // BSS Config Response triggers BSS Config Result (EasyMesh Figure 17)
+             ieee1905_1::eMessageType::BSS_CONFIGURATION_RESPONSE_MESSAGE,
++            ieee1905_1::eMessageType::RECONFIGURATION_TRIGGER_MESSAGE,
+         })) {
+         LOG(FATAL) << "Failed subscribing to the Bus";
+     }
+@@ -1415,12 +1416,14 @@ void slave_thread::handle_client_disconnected(int fd)
+             // During DPP BSS credential application, hostapd reloads which causes
+             // the ap_manager to disconnect and reconnect. Suppressing agent_reset()
+             // in this window prevents a restart loop on DPP extenders.
+-            // bss_config_sent covers both wired (no dpp_credentials.initialized) and
+-            // wireless extenders; ap_autoconfiguration_completed stays false until
+-            // all radios reach CONFIGURED.
++            // pending_bss_config_count > 0 covers both the initial onboarding push AND
++            // any later live reconfiguration (e.g. a controller-initiated SSID/credential
++            // rename received via Reconfiguration Trigger after the agent is already
++            // CONFIGURED) — unlike checking !ap_autoconfiguration_completed, which is only
++            // false before the very first onboarding finishes and would otherwise let this
++            // guard trip a full agent_reset() on every subsequent DPP reconfiguration.
+             if (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP &&
+-                db->dpp_extender_config.bss_config_sent &&
+-                !db->statuses.ap_autoconfiguration_completed) {
++                db->dpp_extender_config.pending_bss_config_count > 0) {
+                 LOG(INFO) << "DPP BSS config in progress — ap_manager disconnect on "
+                           << fronthaul_iface << " is expected, skipping agent_reset";
+                 radio_manager.fronthaul_started = false;
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 0ae5c3606..9477841d8 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -1052,6 +1052,10 @@ void ApAutoConfigurationTask::drain_pending_bss_config_send()
+     if (!sent) {
+         LOG(ERROR) << "DPP: failed to send BSS config to ap_manager for " << radio_iface << " — "
+                    << bss_infos.size() << " VAP(s) NOT configured";
++        auto db = AgentDB::get();
++        if (db->dpp_extender_config.pending_bss_config_count > 0) {
++            --db->dpp_extender_config.pending_bss_config_count;
++        }
+         return;
+     }
+ 
+@@ -1197,6 +1201,16 @@ void ApAutoConfigurationTask::configuration_complete_wait_action(const std::stri
+     debug by reading the datamodel */
+ #endif
+ 
++    // Clear the in-flight marker (see pending_bss_config_count) now that this radio's
++    // DPP BSS config push — whether from initial onboarding or a later live
++    // reconfiguration — has fully landed and ap_manager reconnects are no longer expected.
++    {
++        auto db = AgentDB::get();
++        if (db->dpp_extender_config.pending_bss_config_count > 0) {
++            --db->dpp_extender_config.pending_bss_config_count;
++        }
++    }
++
+     FSM_MOVE_STATE(radio_iface, eState::CONFIGURED);
+ 
+     LOG(TRACE) << "Finished configuration on " << radio_iface;
+@@ -2057,6 +2071,18 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_response(
+             db->em_ap_controller_found = true;
+         }
+     }
++
++    // An EM_AP_CONTROLLER entry in the Supported Service list means the controller isn't
++    // DPP-capable - revert to WSC so the FSM proceeds via WSC M1 instead of waiting forever
++    // for a DPP BSS Configuration that will never arrive.
++    if (db->em_ap_controller_found &&
++        db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP &&
++        !db->dpp_credentials.initialized) {
++        LOG(WARNING) << "DPP: controller supports EM_AP_CONTROLLER service — controller is not "
++                        "DPP-capable, falling back to WSC onboarding";
++        db->dpp_extender_config.onboarding_type = AgentDB::OnboardingType::WSC;
++    }
++
+     if (db->em_handle_third_party == HANDLE_THIRD_PARTY_ENABLE) {
+ 
+         if (multi_ap_controller_found && (db->em_ap_controller_found)) {
+@@ -2317,7 +2343,12 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+         const auto &radio_iface = radios_conf_param_kv.first;
+         auto &conf_params       = radios_conf_param_kv.second;
+ 
+-        if (conf_params.state != eState::WAIT_AP_CONFIGURATION_COMPLETE) continue;
++        if (conf_params.state != eState::WAIT_AP_CONFIGURATION_COMPLETE &&
++            conf_params.state != eState::CONFIGURED) {
++            LOG(INFO) << "DPP: skipping " << radio_iface << " — state is "
++                      << fsm_state_to_string(conf_params.state) << ", not WAIT_AP_CONFIGURATION_COMPLETE/CONFIGURED";
++            continue;
++        }
+ 
+         auto radio = db->radio(radio_iface);
+         if (!radio) continue;
+@@ -2510,17 +2541,34 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+             rcp.sent_vaps_list_update     = false;
+             rcp.received_vaps_list_update = false;
+ 
++            // A radio that was already CONFIGURED (i.e. this is a live reconfiguration
++            // after initial onboarding, not the initial M2-driven flow) must be moved
++            // back into WAIT_AP_CONFIGURATION_COMPLETE explicitly — otherwise
++            // handle_vs_wifi_credentials_update_response() ignores ap_manager's reply
++            // and configuration_complete_wait_action() never runs for this radio again.
++            FSM_MOVE_STATE(radio_iface, eState::WAIT_AP_CONFIGURATION_COMPLETE);
++
++            // work() early-returns without calling drain_pending_bss_config_send() (or
++            // running the FSM switch below) once m_task_is_active is latched false after
++            // the first onboarding cycle completes. Re-arm it so the queued credentials
++            // below actually get drained/sent for this later, live reconfiguration.
++            m_task_is_active = true;
++
+             // Queue the credentials for a staggered send instead of sending immediately.
+             // All radios' DPP config objects arrive in this single response; sending
+             // every radio's credentials back-to-back causes simultaneous hostapd
+             // interface create/teardown across radios, which can exhaust the system's
+             // open file descriptor limit. drain_pending_bss_config_send() (called from
+             // work()) sends one radio's queued credentials at a time, staggered in time.
+-            // Radio stays in WAIT_AP_CONFIGURATION_COMPLETE (already set by the loop's
+-            // entry guard) except in NOT_MULTIAP mode, where the move to CONFIGURED is
+-            // deferred into drain_pending_bss_config_send() until the send actually happens.
++            // Radio is now in WAIT_AP_CONFIGURATION_COMPLETE (set above) except in
++            // NOT_MULTIAP mode, where the move to CONFIGURED is deferred into
++            // drain_pending_bss_config_send() until the send actually happens.
+             if (m_pending_bss_config_sends.find(radio_iface) == m_pending_bss_config_sends.end()) {
+                 m_pending_bss_config_send_order.push_back(radio_iface);
++                // Mark this radio's push as in-flight so son_slave_thread can tell an
++                // upcoming ap_manager disconnect (from the hostapd reload this triggers)
++                // is expected, even on a live post-onboarding reconfiguration.
++                ++db->dpp_extender_config.pending_bss_config_count;
+             }
+             m_pending_bss_config_sends[radio_iface] = bss_infos;
+ 
+@@ -3108,6 +3156,12 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_wsc_renew(
+         return;
+     }
+ 
++    if (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP) {
++        LOG(INFO) << "DPP: ignoring legacy AP-Autoconfiguration Renew — DPP onboarding uses "
++                     "Reconfiguration Trigger instead";
++        return;
++    }
++
+     db->statuses.controller_discovery_completed = false;
+ 
+     for (const auto radio : db->get_radios_list()) {
+diff --git a/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp b/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
+index 3a9c9202f..971968627 100644
+--- a/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
++++ b/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
+@@ -650,6 +650,8 @@ bool DppAgentTask::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx, uint32_t /*if
+         return handle_1905_encap_eapol(src_mac, cmdu_rx);
+     case ieee1905_1::eMessageType::DIRECT_ENCAP_DPP_MESSAGE:
+         return handle_direct_encap_dpp(src_mac, cmdu_rx);
++    case ieee1905_1::eMessageType::RECONFIGURATION_TRIGGER_MESSAGE:
++        return handle_reconfiguration_trigger(src_mac, cmdu_rx);
+     default:
+         return false;
+     }
+@@ -687,6 +689,41 @@ bool DppAgentTask::trigger_bss_config_request(const sMacAddr &controller_mac)
+     return send_bss_configuration_request(controller_mac);
+ }
+ 
++// ---------------------------------------------------------------------------
++// Public: handle_reconfiguration_trigger — Ack + (DPP-only) BSS Configuration Request
++// ---------------------------------------------------------------------------
++
++bool DppAgentTask::handle_reconfiguration_trigger(const sMacAddr &src_mac,
++                                                  ieee1905_1::CmduMessageRx &cmdu_rx)
++{
++    auto mid = cmdu_rx.getMessageId();
++    LOG(INFO) << "Received RECONFIGURATION_TRIGGER_MESSAGE, mid=" << std::hex << mid << std::dec;
++
++    // Spec section 5.3.10.1: respond within 1s with a 1905 Ack regardless of onboarding
++    // method — the Ack is a transport-layer receipt, not an action commitment. A failure
++    // to send it is a separate concern from the reconfiguration action itself, so it's
++    // only logged here, not treated as a reason to skip the BSS Configuration Request below.
++    if (!m_cmdu_tx.create(mid, ieee1905_1::eMessageType::ACK_MESSAGE)) {
++        LOG(ERROR) << "cmdu creation of type ACK_MESSAGE has failed";
++    } else if (!m_btl_ctx.send_cmdu_to_controller({}, m_cmdu_tx)) {
++        LOG(ERROR) << "Failed sending ACK message to controller, mid=" << std::hex << mid
++                   << std::dec;
++    }
++
++    // Safety guard: only a DPP-onboarded agent should act on a Reconfiguration Trigger.
++    // The Controller only sends this to DPP-onboarded agents, but don't rely solely on
++    // the sender's judgement — a WSC-onboarded agent has no useful BSS Configuration
++    // Request path to send here.
++    auto db = AgentDB::get();
++    if (db->dpp_extender_config.onboarding_type != AgentDB::OnboardingType::DPP) {
++        LOG(WARNING) << "Received RECONFIGURATION_TRIGGER_MESSAGE but this agent is not "
++                        "DPP-onboarded — Acked, ignoring the reconfiguration action";
++        return true;
++    }
++
++    return trigger_bss_config_request(src_mac);
++}
++
+ void DppAgentTask::on_hostapd_connected()
+ {
+     // If there is a buffered GAS Config Response (from the race where the GAS Initial Request
+diff --git a/agent/src/beerocks/slave/tasks/dpp_agent_task.h b/agent/src/beerocks/slave/tasks/dpp_agent_task.h
+index 047b24c63..89eecb139 100644
+--- a/agent/src/beerocks/slave/tasks/dpp_agent_task.h
++++ b/agent/src/beerocks/slave/tasks/dpp_agent_task.h
+@@ -167,6 +167,14 @@ public:
+      */
+     bool handle_1905_encap_eapol(const sMacAddr &src_mac, ieee1905_1::CmduMessageRx &cmdu_rx);
+ 
++    /**
++     * @brief Handle RECONFIGURATION_TRIGGER_MESSAGE from Controller.
++     *
++     * Acks unconditionally (spec section 5.3.10.1), then triggers a BSS Configuration
++     * Request only if this agent is DPP-onboarded.
++     */
++    bool handle_reconfiguration_trigger(const sMacAddr &src_mac, ieee1905_1::CmduMessageRx &cmdu_rx);
++
+     /**
+      * @brief Convert a JWK EC public key (JSON string) to DER SubjectPublicKeyInfo.
+      *
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index c7507875c..271df2310 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -1103,7 +1103,8 @@ bool Controller::handle_cmdu_1905_autoconfiguration_search(const sMacAddr &src_m
+     // silently dropped by the 1905 security manager and by send_cmdu_to_agent().
+     if (!chirp_tlv_rx) {
+         auto stale_agent = database.m_agents.get(al_mac);
+-        if (stale_agent && stale_agent->dpp_security_required) {
++        if (stale_agent && (stale_agent->dpp_security_required || stale_agent->tk_1905_installed ||
++                            stale_agent->pmk_1905_valid)) {
+             LOG(INFO) << "DPP: agent " << al_mac
+                       << " re-Searched without Chirp TLV — clearing stale DPP/1905 "
+                          "security state (dpp_security_required=false)";
+diff --git a/controller/src/beerocks/master/son_actions.cpp b/controller/src/beerocks/master/son_actions.cpp
+index 64088bae3..e031714c7 100644
+--- a/controller/src/beerocks/master/son_actions.cpp
++++ b/controller/src/beerocks/master/son_actions.cpp
+@@ -563,6 +563,11 @@ bool son_actions::send_ap_config_renew_msg(ieee1905_1::CmduMessageTx &cmdu_tx, d
+             if (agent_alid == database.get_local_bridge_mac()) {
+                 continue;
+             }
++            // DPP-onboarded agents are reconfigured via RECONFIGURATION_TRIGGER_MESSAGE
++            // instead of the legacy WSC Renew.
++            if (agent.second && agent.second->dpp_wired_onboarding_complete) {
++                continue;
++            }
+             LOG(INFO) << "Send unicast AP_AUTOCONFIGURATION_RENEW_MESSAGE to agent " << agent_alid;
+             if (!son_actions::send_cmdu_to_agent(agent_alid, cmdu_tx, database)) {
+                 LOG(ERROR) << "Failed to send unicast AP_AUTOCONFIGURATION_RENEW_MESSAGE to agent " << agent_alid;
+@@ -573,6 +578,19 @@ bool son_actions::send_ap_config_renew_msg(ieee1905_1::CmduMessageTx &cmdu_tx, d
+     return ret;
+ }
+ 
++bool son_actions::send_reconfiguration_trigger_msg(const sMacAddr &agent_mac,
++                                                    ieee1905_1::CmduMessageTx &cmdu_tx, db &database)
++{
++    // Per EasyMesh spec section 17.1.57, no TLVs are required in this message.
++    if (!cmdu_tx.create(0, ieee1905_1::eMessageType::RECONFIGURATION_TRIGGER_MESSAGE)) {
++        LOG(ERROR) << "Failed building RECONFIGURATION_TRIGGER_MESSAGE";
++        return false;
++    }
++
++    LOG(INFO) << "Send RECONFIGURATION_TRIGGER_MESSAGE to agent " << agent_mac;
++    return son_actions::send_cmdu_to_agent(agent_mac, cmdu_tx, database);
++}
++
+ bool son_actions::send_topology_query_msg(const sMacAddr &dest_mac,
+                                           ieee1905_1::CmduMessageTx &cmdu_tx, db &database)
+ {
+@@ -674,8 +692,25 @@ bool son_actions::send_agent_list_to_all_agents(db &database, ieee1905_1::CmduMe
+         return true;
+     }
+ 
++    // The Controller's own co-located agent isn't a remote 1905 peer — it never goes
++    // through Peer Discovery/EAPOL with anyone, so it has no meaningful security state
++    // to report. Exclude it here rather than letting every receiving agent special-case
++    // (or misinterpret) a self-referential entry for the Controller's al_mac.
++    std::vector<std::shared_ptr<Agent>> remote_agents;
++    for (const auto &agent : all_agents) {
++        if (agent->al_mac == database.get_local_bridge_mac()) {
++            continue;
++        }
++        remote_agents.push_back(agent);
++    }
++
++    if (remote_agents.empty()) {
++        LOG(DEBUG) << "No remote connected agents, skipping Agent List message";
++        return true;
++    }
++
+     LOG(INFO) << "Sending AGENT_LIST_MESSAGE to all agents after new agent " << new_agent_mac
+-              << " onboarded/disconnected. Total agents: " << all_agents.size();
++              << " onboarded/disconnected. Total agents: " << remote_agents.size();
+ 
+     // Build AGENT_LIST_MESSAGE (type 0x8035) with Agent List TLV (type 0xD5)
+     if (!cmdu_tx.create(0, ieee1905_1::eMessageType::AGENT_LIST_MESSAGE)) {
+@@ -689,14 +724,14 @@ bool son_actions::send_agent_list_to_all_agents(db &database, ieee1905_1::CmduMe
+         return false;
+     }
+ 
+-    // Allocate one entry per connected agent
+-    if (!agent_list_tlv->alloc_agents(all_agents.size())) {
+-        LOG(ERROR) << "Failed to alloc_agents(" << all_agents.size() << ") in tlvAgentList";
++    // Allocate one entry per remote connected agent
++    if (!agent_list_tlv->alloc_agents(remote_agents.size())) {
++        LOG(ERROR) << "Failed to alloc_agents(" << remote_agents.size() << ") in tlvAgentList";
+         return false;
+     }
+ 
+     size_t idx = 0;
+-    for (const auto &agent : all_agents) {
++    for (const auto &agent : remote_agents) {
+         auto agent_tuple = agent_list_tlv->agents(idx);
+         if (!std::get<0>(agent_tuple)) {
+             LOG(ERROR) << "Failed to access agent entry at index " << idx;
+diff --git a/controller/src/beerocks/master/son_actions.h b/controller/src/beerocks/master/son_actions.h
+index c359a9ccc..427e7db10 100644
+--- a/controller/src/beerocks/master/son_actions.h
++++ b/controller/src/beerocks/master/son_actions.h
+@@ -58,6 +58,8 @@ public:
+     static bool send_cmdu_to_agent(const sMacAddr &dest_mac, ieee1905_1::CmduMessageTx &cmdu_tx,
+                                    db &database, const std::string &radio_mac = std::string());
+     static bool send_ap_config_renew_msg(ieee1905_1::CmduMessageTx &cmdu_tx, db &database);
++    static bool send_reconfiguration_trigger_msg(const sMacAddr &agent_mac,
++                                                 ieee1905_1::CmduMessageTx &cmdu_tx, db &database);
+     static bool send_topology_query_msg(const sMacAddr &dest_mac,
+                                         ieee1905_1::CmduMessageTx &cmdu_tx, db &database);
+ 
+diff --git a/controller/src/beerocks/master/son_management.cpp b/controller/src/beerocks/master/son_management.cpp
+index 07f20ef38..eb35ecb80 100644
+--- a/controller/src/beerocks/master/son_management.cpp
++++ b/controller/src/beerocks/master/son_management.cpp
+@@ -1749,6 +1749,19 @@ void son_management::handle_bml_message(int sd, std::shared_ptr<beerocks_header>
+             LOG(ERROR) << "Failed son_actions::send_ap_config_renew_msg ! ";
+         }
+ 
++        // DPP-onboarded agents are reconfigured via RECONFIGURATION_TRIGGER_MESSAGE, which
++        // makes them fetch fresh BSS configuration via BSS Configuration Request (spec
++        // section 5.3.10.1), instead of the legacy WSC Renew handled above.
++        for (const auto &agent : database.get_all_connected_agents()) {
++            if (!agent->dpp_wired_onboarding_complete) {
++                continue;
++            }
++            if (!son_actions::send_reconfiguration_trigger_msg(agent->al_mac, cmdu_tx, database)) {
++                LOG(ERROR) << "Failed son_actions::send_reconfiguration_trigger_msg for agent "
++                           << agent->al_mac;
++            }
++        }
++
+         auto response = message_com::create_vs_message<
+             beerocks_message::cACTION_BML_WIFI_CREDENTIALS_UPDATE_RESPONSE>(cmdu_tx,
+                                                                             beerocks_header->id());
+diff --git a/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp b/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp
+index 41ef71848..6b381aad2 100644
+--- a/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp
++++ b/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp
+@@ -417,9 +417,15 @@ bool DppConfiguratorTask::handle_wired_dpp_chirp(const sMacAddr &agent_mac,
+ 
+     auto agent = m_database.m_agents.get(agent_mac);
+     if (agent && agent->dpp_wired_onboarding_complete) {
+-        LOG(DEBUG) << "DPP: wired chirp from already-onboarded agent " << agent_mac
+-                   << " — ignoring (no Auth Request restart)";
+-        return true;
++        LOG(INFO) << "DPP: wired chirp from already-onboarded agent " << agent_mac
++                  << " — treating as restart, clearing stale DPP/1905 security state";
++        agent->dpp_wired_onboarding_complete = false;
++        agent->dpp_security_required         = false;
++        agent->pmk_1905_valid                = false;
++        agent->tk_1905_installed             = false;
++        if (m_broker_client) {
++            m_broker_client->install_security_key(agent_mac, {}, {}, 0, false);
++        }
+     }
+ 
+     auto *existing = get_session_by_hash(hash);
+@@ -1039,29 +1045,81 @@ bool DppConfiguratorTask::add_bss_config_response_tlvs(const sMacAddr &agent_mac
+             return auth;
+         };
+ 
++        // Mirrors son_actions::has_matching_operating_class(), used by the WSC M1/M2 path
++        // to scope each bss_info entry to the radio it's meant for, but against the cached
++        // DB capabilities (ap_basic_caps_operating_classes) instead of a live TLV, since a
++        // DPP BSS Config Request doesn't carry one. Without this, entries with no usable
++        // operating-class info (or a mismatched one) were applied to every radio instead
++        // of just the intended one.
++        auto matches_radio = [&agent_entry, &radio_uids, ri,
++                              &ruid](const wireless_utils::sBssInfoConf &bss) -> bool {
++            if (ri >= radio_uids.size()) {
++                return true;
++            }
++            if (bss.operating_class.empty()) {
++                LOG(WARNING) << "DPP: matches_radio: ssid=" << bss.ssid
++                             << " has no operating_class — including for radio ruid=" << ruid;
++                return true;
++            }
++            if (!agent_entry) {
++                LOG(WARNING) << "DPP: matches_radio: no agent DB entry — including ssid=" << bss.ssid
++                             << " for radio ruid=" << ruid;
++                return true;
++            }
++            auto radio_ptr = agent_entry->radios.get(radio_uids[ri]);
++            if (!radio_ptr || radio_ptr->ap_basic_caps_operating_classes.empty()) {
++                LOG(WARNING) << "DPP: matches_radio: radio ruid=" << ruid
++                             << " has no cached operating-class capabilities — including ssid="
++                             << bss.ssid << " by default";
++                return true;
++            }
++            for (auto oc : bss.operating_class) {
++                if (radio_ptr->ap_basic_caps_operating_classes.count(oc)) {
++                    LOG(DEBUG) << "DPP: matches_radio: ssid=" << bss.ssid << " op_class="
++                               << int(oc) << " matches radio ruid=" << ruid;
++                    return true;
++                }
++            }
++            LOG(DEBUG) << "DPP: matches_radio: skipping ssid=" << bss.ssid << " for radio ruid="
++                       << ruid << " — no operating-class overlap (radio has "
++                       << radio_ptr->ap_basic_caps_operating_classes.size() << " classes, bss has "
++                       << bss.operating_class.size() << ")";
++            return false;
++        };
++
+         for (const auto &bss : bss_info) {
+-            if (bss.backhaul && seen_bh.insert(ruid + bss.ssid).second) {
+-                std::string akm = wsc_auth_to_bh_akm(adjust_auth(bss.authentication_type));
+-                std::string custom_alias = son::wireless_utils::vap_type_to_string(bss.vap_type);
+-                std::string cfg = generate_backhaul_bss_config(*session, ruid, bss.ssid,
+-                                                                bss.network_key, akm, custom_alias);
+-                if (!cfg.empty()) configs.push_back(cfg);
++            if (!bss.backhaul) continue;
++            if (!matches_radio(bss)) continue;
++            if (!seen_bh.insert(ruid + bss.ssid).second) {
++                LOG(WARNING) << "DPP: skip duplicate backhaul config ssid=" << bss.ssid
++                             << " for radio ruid=" << ruid;
++                continue;
+             }
++            std::string akm = wsc_auth_to_bh_akm(adjust_auth(bss.authentication_type));
++            std::string custom_alias = son::wireless_utils::vap_type_to_string(bss.vap_type);
++            std::string cfg = generate_backhaul_bss_config(*session, ruid, bss.ssid,
++                                                            bss.network_key, akm, custom_alias);
++            if (!cfg.empty()) configs.push_back(cfg);
+         }
+         for (const auto &bss : bss_info) {
+-            if (!bss.backhaul && seen_fh.insert(ruid + bss.ssid).second) {
+-                std::string akm = wsc_auth_to_fh_akm(adjust_auth(bss.authentication_type));
+-                // Only prepend the DPP AKM for fronthaul BSSes explicitly flagged DPP
+-                // (option dpp '1' on the gateway, or akm=dpp parsed by an extender) —
+-                // unlike backhaul, which always uses a DPP connector by design.
+-                if (bss.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP) {
+-                    akm = "506F9A02+" + akm;
+-                }
+-                std::string custom_alias = son::wireless_utils::vap_type_to_string(bss.vap_type);
+-                std::string cfg = generate_fronthaul_bss_config(*session, ruid, bss.ssid,
+-                                                                  bss.network_key, akm, custom_alias);
+-                if (!cfg.empty()) configs.push_back(cfg);
++            if (bss.backhaul) continue;
++            if (!matches_radio(bss)) continue;
++            if (!seen_fh.insert(ruid + bss.ssid).second) {
++                LOG(WARNING) << "DPP: skip duplicate fronthaul config ssid=" << bss.ssid
++                             << " for radio ruid=" << ruid;
++                continue;
++            }
++            std::string akm = wsc_auth_to_fh_akm(adjust_auth(bss.authentication_type));
++            // Only prepend the DPP AKM for fronthaul BSSes explicitly flagged DPP
++            // (option dpp '1' on the gateway, or akm=dpp parsed by an extender) —
++            // unlike backhaul, which always uses a DPP connector by design.
++            if (bss.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP) {
++                akm = "506F9A02+" + akm;
+             }
++            std::string custom_alias = son::wireless_utils::vap_type_to_string(bss.vap_type);
++            std::string cfg = generate_fronthaul_bss_config(*session, ruid, bss.ssid,
++                                                              bss.network_key, akm, custom_alias);
++            if (!cfg.empty()) configs.push_back(cfg);
+         }
+     }
+ 
+-- 
+2.34.1
+
