@@ -1,0 +1,402 @@
+From 0102e95b24a69c1cf351913ae722445369f8076d Mon Sep 17 00:00:00 2001
+From: Sonali Naresh <sonanare@qti.qualcomm.com>
+Date: Thu, 20 Aug 2026 09:35:17 +0530
+Subject: [PATCH] WPS PBS fixes for CERT WFA
+
+For Independent Repeater mode, it is expected for the AP
+vaps to be in UP state. Hence invoking the script during
+dev_reset_default to clear the wireless file and bring up
+1 AP and 1 STA vap per radio.
+
+Initial implementation of dev_reset_default would teardown
+all the vaps leading to WPS PBC failure.
+
+Signed-off-by: Sonali Naresh <sonanare@qti.qualcomm.com>
+---
+ agent/config/scripts/reset_vaps.sh            | 271 ++++++++++++------
+ .../backhaul_manager/backhaul_manager.cpp     |  40 ++-
+ 2 files changed, 217 insertions(+), 94 deletions(-)
+
+diff --git a/agent/config/scripts/reset_vaps.sh b/agent/config/scripts/reset_vaps.sh
+index 8c1aed6..2a690e4 100644
+--- a/agent/config/scripts/reset_vaps.sh
++++ b/agent/config/scripts/reset_vaps.sh
+@@ -2,9 +2,32 @@
+ #Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ #SPDX-License-Identifier: ISC
+ #
+-# This script resets the VAP (Virtual Access Point) UCI configuration
+-# for the wireless interface. It is invoked during the DEV_RESET_DEFAULT
+-# flow from the prplmesh application.
++# This script resets the VAP (Virtual Access Point) UCI configuration for the
++# wireless interface. It is invoked during the DEV_RESET_DEFAULT flow from the
++# prplmesh application.
++#
++# The whole wireless config is (re)built ONLY through UCI commands (no direct
++# file writes). Per radio it writes exactly one AP VAP (SSID "OpenWrt") and one
++# STA (backhaul) VAP, with the SAME options the application would write:
++#
++#   AP VAP (wlan<band>.1):
++#     device, network=lan, mode=ap, ssid=OpenWrt
++#     2.4/5 GHz -> encryption=none
++#     6 GHz     -> encryption=sae, sae_pwe=1, key=0123456789 (open BSS not allowed on 6 GHz)
++#     5 GHz     -> additionally wps_pushbutton=1, multi_ap=2 (fronthaul+backhaul combined AP)
++#
++#   STA VAP (wlan<band>):
++#     device, network=lan, mode=sta, wps_pushbutton=1, multi_ap=1, wds=1
++#
++# htmode handling (per band, mirroring bpl_cfg_reset_ap_vaps_to_default):
++#   - If the radio's CURRENT htmode is EHT* (Wi-Fi 7 / 11be) -> keep it EHT<width> (11be).
++#   - Otherwise (HE/VHT/HT/empty)                            -> bring it up as HE<width> (11ax).
++#   The channel-width suffix is preserved from the existing htmode. HE has no
++#   320 MHz, so a 320 width is clamped to 160 for the HE family; when the width
++#   cannot be determined it defaults to 80.
++#
++# After committing the UCI, it invokes the bare "wifi" (full reconfigure) so
++# netifd regenerates hostapd/wpa_supplicant configs and brings the radios up.
+ 
+ # Detect the OS type from uname -a output
+ UNAME_OUTPUT=$(uname -a)
+@@ -19,112 +42,182 @@ fi
+ 
+ echo "reset_vaps.sh: Detected OS type: $OS_TYPE" > /dev/console
+ 
+-# If running on OpenWrt, perform UCI operations and reload wireless
++# reset_default_htmode <current_htmode>
++# Echoes the target htmode:
++#   EHT<width> if current starts with "EHT" (11be), else HE<width> (11ax).
++# Width is taken from the leading digits of the current htmode (default 80);
++# HE is clamped to a max width of 160.
++reset_default_htmode() {
++    cur="$1"
++
++    # Extract leading numeric width (e.g. "EHT160" -> 160, "HT20" -> 20).
++    width=$(echo "$cur" | sed -n 's/^[A-Za-z]*\([0-9][0-9]*\).*/\1/p')
++    [ -z "$width" ] && width=80
++
++    case "$cur" in
++    EHT*)
++        echo "EHT${width}"
++        ;;
++    *)
++        # HE (11ax) has no 320 MHz; clamp.
++        if [ "$width" -gt 160 ] 2>/dev/null; then
++            width=160
++        fi
++        echo "HE${width}"
++        ;;
++    esac
++}
++
++# If running on OpenWrt, rebuild the wireless config via UCI and reload.
+ if [ "$OS_TYPE" = "OpenWrt" ]; then
+-    # Read machine ID from fw_printenv and set radio band names accordingly
+-    MACHID=$(fw_printenv machid 2>/dev/null | cut -d'=' -f2)
+-    echo "reset_vaps.sh: machid=$MACHID" > /dev/console
+-
+-    if [ "$MACHID" = "8071100" ] || [ "$MACHID" = "8050501" ] || [ "$MACHID" = "8050301" ] || [ "$MACHID" = "8070100" ]; then
+-        radio2G="radio0_band0"
+-        radio5G="radio0_band1"
+-        radio6G="radio0_band2"
+-        echo "reset_vaps.sh: machid=$MACHID - radio2G=$radio2G radio5G=$radio5G radio6G=$radio6G" > /dev/console
+-    else
+-        radio2G="default_radio0_band0"
+-        radio5G="default_radio0_band1"
+-        radio6G="default_radio0_band2"
+-        echo "reset_vaps.sh: machid=$MACHID (default) - radio2G=$radio2G radio5G=$radio5G radio6G=$radio6G" > /dev/console
+-    fi
+ 
+-    # Step 1: Generate base config
++    # Read the CURRENT per-band htmode BEFORE regenerating, so we can preserve
++    # the 11be(EHT)/11ax(HE) family and width per radio. Try the named band
++    # sections first (radio0_band{0,1,2}); fall back to the "wifi config"
++    # default names (default_radio0_band{0,1,2}) if those are what exist.
++    get_cur_htmode() {
++        band_named="$1"
++        band_default="$2"
++        ht=$(uci -q get wireless."${band_named}".htmode 2>/dev/null)
++        [ -z "$ht" ] && ht=$(uci -q get wireless."${band_default}".htmode 2>/dev/null)
++        echo "$ht"
++    }
++
++    CUR_HT_2G=$(get_cur_htmode "radio0_band0" "default_radio0_band0")
++    CUR_HT_5G=$(get_cur_htmode "radio0_band1" "default_radio0_band1")
++    CUR_HT_6G=$(get_cur_htmode "radio0_band2" "default_radio0_band2")
++
++    # Step 1: Generate the base config (creates the wifi-device sections).
+     wifi config > /etc/config/wireless
+ 
+-    # Step 2: Enable radios
++    # Compute target htmode (EHT -> 11be, else HE -> 11ax) per band.
++    # 2.4 GHz keeps HT20 baseline when the current htmode cannot be read.
++    if [ -z "$CUR_HT_2G" ]; then
++        HTMODE_2G="HT20"
++    else
++        HTMODE_2G=$(reset_default_htmode "$CUR_HT_2G")
++    fi
++    HTMODE_5G=$(reset_default_htmode "${CUR_HT_5G:-HE80}")
++    HTMODE_6G=$(reset_default_htmode "${CUR_HT_6G:-HE80}")
++
++    echo "reset_vaps.sh: htmode 2G=$HTMODE_2G 5G=$HTMODE_5G 6G=$HTMODE_6G" > /dev/console
++
++    # Radio band section names. "wifi config" names the wifi-device sections
++    # radio0_band{0,1,2}; keep those as the device references.
++    radio2G="radio0_band0"
++    radio5G="radio0_band1"
++    radio6G="radio0_band2"
++
++    # Step 2: Configure the smp_affinity section.
++    #         "wifi config" may or may not create it; find or add it, then set options.
++    smp_section=$(uci show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.]*\)=smp_affinity$/\1/p" | head -n1)
++    if [ -z "$smp_section" ]; then
++        smp_section=$(uci add wireless smp_affinity)
++    fi
++    uci set wireless."${smp_section}".enable_smp_affinity='1'
++    uci set wireless."${smp_section}".enable_color='1'
++    uci set wireless."${smp_section}".athnewind='1'
++
++    # Step 3: Configure the per-band wifi-device sections (channel/channels/htmode/etc).
++    uci set wireless.${radio2G}.band='2g'
++    uci set wireless.${radio2G}.channel='6'
++    uci set wireless.${radio2G}.channels='1-11'
++    uci set wireless.${radio2G}.htmode="${HTMODE_2G}"
+     uci set wireless.${radio2G}.disabled='0'
++    uci set wireless.${radio2G}.he_bss_color='7'
++
++    uci set wireless.${radio5G}.band='5g'
++    uci set wireless.${radio5G}.channel='36'
++    uci set wireless.${radio5G}.channels='36-165'
++    uci set wireless.${radio5G}.htmode="${HTMODE_5G}"
+     uci set wireless.${radio5G}.disabled='0'
++    uci set wireless.${radio5G}.he_bss_color='24'
++
++    uci set wireless.${radio6G}.band='6g'
++    uci set wireless.${radio6G}.channel='49'
++    uci set wireless.${radio6G}.channels='1-233'
++    uci set wireless.${radio6G}.htmode="${HTMODE_6G}"
+     uci set wireless.${radio6G}.disabled='0'
++    uci set wireless.${radio6G}.he_bss_color='19'
+ 
+-    # Step 3: Delete existing named wifi-iface sections
+-    # (wifi config always names these default_radio0_band{0,1,2} regardless of machid)
++    # Step 4: Delete existing named wifi-iface sections that "wifi config" creates
++    #         (default_radio0_band{0,1,2}), plus any leftover anonymous ones.
+     uci delete wireless.default_radio0_band0 2>/dev/null
+     uci delete wireless.default_radio0_band1 2>/dev/null
+     uci delete wireless.default_radio0_band2 2>/dev/null
++    while uci -q delete wireless.@wifi-iface[0] 2>/dev/null; do :; done
+ 
+-    # Step 4: Add new anonymous wifi-iface sections
++    # Step 5: Add fresh AP + STA wifi-iface sections per radio, mirroring the
++    #         application reset (bpl_cfg_reset_ap_vaps_to_default).
+ 
+-    # wlan0 STA (2.4GHz, disabled)
++    # --- 2.4 GHz radio ---
++    # AP VAP (wlan0.1): open, no WPS/multi_ap on 2.4 GHz
+     uci add wireless wifi-iface
+-    uci set wireless.@wifi-iface[0].device="${radio2G}"
+-    uci set wireless.@wifi-iface[0].network='lan'
+-    uci set wireless.@wifi-iface[0].ifname='wlan0'
+-    uci set wireless.@wifi-iface[0].mode='sta'
+-    uci set wireless.@wifi-iface[0].wps_pushbutton='1'
+-    uci set wireless.@wifi-iface[0].multi_ap='1'
+-    uci set wireless.@wifi-iface[0].wds='1'
+-    uci set wireless.@wifi-iface[0].disabled='0'
+-
+-    # wlan0.1 AP (2.4GHz)
++    uci set wireless.@wifi-iface[-1].device="${radio2G}"
++    uci set wireless.@wifi-iface[-1].network='lan'
++    uci set wireless.@wifi-iface[-1].mode='ap'
++    uci set wireless.@wifi-iface[-1].ssid='OpenWrt'
++    uci set wireless.@wifi-iface[-1].encryption='none'
++    uci set wireless.@wifi-iface[-1].ifname='wlan0.1'
++
++    # STA VAP (wlan0): backhaul STA
+     uci add wireless wifi-iface
+-    uci set wireless.@wifi-iface[1].device="${radio2G}"
+-    uci set wireless.@wifi-iface[1].network='lan'
+-    uci set wireless.@wifi-iface[1].mode='ap'
+-    uci set wireless.@wifi-iface[1].ssid='OpenWrt'
+-    uci set wireless.@wifi-iface[1].ifname='wlan0.1'
+-    uci set wireless.@wifi-iface[1].encryption='none'
+-    uci set wireless.@wifi-iface[1].athnewind='1'
+-
+-    # wlan1 STA (5GHz)
++    uci set wireless.@wifi-iface[-1].device="${radio2G}"
++    uci set wireless.@wifi-iface[-1].network='lan'
++    uci set wireless.@wifi-iface[-1].ifname='wlan0'
++    uci set wireless.@wifi-iface[-1].mode='sta'
++    uci set wireless.@wifi-iface[-1].wps_pushbutton='1'
++    uci set wireless.@wifi-iface[-1].multi_ap='1'
++    uci set wireless.@wifi-iface[-1].wds='1'
++
++    # --- 5 GHz radio ---
++    # STA VAP (wlan1): backhaul STA
+     uci add wireless wifi-iface
+-    uci set wireless.@wifi-iface[2].device="${radio5G}"
+-    uci set wireless.@wifi-iface[2].network='lan'
+-    uci set wireless.@wifi-iface[2].ifname='wlan1'
+-    uci set wireless.@wifi-iface[2].mode='sta'
+-    uci set wireless.@wifi-iface[2].wps_pushbutton='1'
+-    uci set wireless.@wifi-iface[2].multi_ap='1'
+-    uci set wireless.@wifi-iface[2].wds='1'
+-    uci set wireless.@wifi-iface[2].disabled='0'
+-
+-    # wlan1.1 AP (5GHz)
++    uci set wireless.@wifi-iface[-1].device="${radio5G}"
++    uci set wireless.@wifi-iface[-1].network='lan'
++    uci set wireless.@wifi-iface[-1].ifname='wlan1'
++    uci set wireless.@wifi-iface[-1].mode='sta'
++    uci set wireless.@wifi-iface[-1].wps_pushbutton='1'
++    uci set wireless.@wifi-iface[-1].multi_ap='1'
++    uci set wireless.@wifi-iface[-1].wds='1'
++
++    # AP VAP (wlan1.1): open + fronthaul/backhaul (multi_ap=2) + WPS
+     uci add wireless wifi-iface
+-    uci set wireless.@wifi-iface[3].device="${radio5G}"
+-    uci set wireless.@wifi-iface[3].ifname='wlan1.1'
+-    uci set wireless.@wifi-iface[3].network='lan'
+-    uci set wireless.@wifi-iface[3].mode='ap'
+-    uci set wireless.@wifi-iface[3].ssid='OpenWrt'
+-    uci set wireless.@wifi-iface[3].encryption='sae'
+-    uci set wireless.@wifi-iface[3].sae_pwe='1'
+-    uci set wireless.@wifi-iface[3].key='0123456789'
+-    uci set wireless.@wifi-iface[3].athnewind='1'
+-
+-    # wlan2.1 AP (6GHz)
++    uci set wireless.@wifi-iface[-1].device="${radio5G}"
++    uci set wireless.@wifi-iface[-1].network='lan'
++    uci set wireless.@wifi-iface[-1].mode='ap'
++    uci set wireless.@wifi-iface[-1].ssid='OpenWrt'
++    uci set wireless.@wifi-iface[-1].encryption='none'
++    uci set wireless.@wifi-iface[-1].ifname='wlan1.1'
++    uci set wireless.@wifi-iface[-1].wps_pushbutton='1'
++    uci set wireless.@wifi-iface[-1].multi_ap='2'
++
++    # --- 6 GHz radio ---
++    # STA VAP (wlan2): backhaul STA
+     uci add wireless wifi-iface
+-    uci set wireless.@wifi-iface[4].device="${radio6G}"
+-    uci set wireless.@wifi-iface[4].ifname='wlan2.1'
+-    uci set wireless.@wifi-iface[4].network='lan'
+-    uci set wireless.@wifi-iface[4].mode='ap'
+-    uci set wireless.@wifi-iface[4].ssid='OpenWrt'
+-    uci set wireless.@wifi-iface[4].encryption='sae'
+-    uci set wireless.@wifi-iface[4].sae_pwe='1'
+-    uci set wireless.@wifi-iface[4].key='0123456789'
+-    uci set wireless.@wifi-iface[4].athnewind='1'
+-
+-    # wlan2 STA (6GHz, disabled)
++    uci set wireless.@wifi-iface[-1].device="${radio6G}"
++    uci set wireless.@wifi-iface[-1].network='lan'
++    uci set wireless.@wifi-iface[-1].ifname='wlan2'
++    uci set wireless.@wifi-iface[-1].mode='sta'
++    uci set wireless.@wifi-iface[-1].wps_pushbutton='1'
++    uci set wireless.@wifi-iface[-1].multi_ap='1'
++    uci set wireless.@wifi-iface[-1].wds='1'
++
++    # AP VAP (wlan2.1): 6 GHz mandates WPA3-SAE (open BSS not allowed on 6 GHz)
+     uci add wireless wifi-iface
+-    uci set wireless.@wifi-iface[5].device="${radio6G}"
+-    uci set wireless.@wifi-iface[5].network='lan'
+-    uci set wireless.@wifi-iface[5].ifname='wlan2'
+-    uci set wireless.@wifi-iface[5].mode='sta'
+-    uci set wireless.@wifi-iface[5].wps_pushbutton='1'
+-    uci set wireless.@wifi-iface[5].multi_ap='1'
+-    uci set wireless.@wifi-iface[5].disabled='0'
+-    uci set wireless.@wifi-iface[5].wds='1'
+-
+-    # Step 5: Commit
++    uci set wireless.@wifi-iface[-1].device="${radio6G}"
++    uci set wireless.@wifi-iface[-1].network='lan'
++    uci set wireless.@wifi-iface[-1].mode='ap'
++    uci set wireless.@wifi-iface[-1].ssid='OpenWrt'
++    uci set wireless.@wifi-iface[-1].encryption='sae'
++    uci set wireless.@wifi-iface[-1].sae_pwe='1'
++    uci set wireless.@wifi-iface[-1].key='0123456789'
++    uci set wireless.@wifi-iface[-1].ifname='wlan2.1'
++
++    # Step 6: Commit
+     uci commit wireless
+ 
+-
+-    echo "reset_vaps.sh: UCI wireless VAP entries deleted and committed" > /dev/console
++    echo "reset_vaps.sh: wireless config rebuilt via UCI (1 AP + 1 STA per radio) and committed" > /dev/console
+ 
+     echo "reset_vaps.sh: OpenWrt detected, invoking wifi..." > /dev/console
+     wifi
+@@ -132,4 +225,4 @@ if [ "$OS_TYPE" = "OpenWrt" ]; then
+     echo "reset_vaps.sh: wifi invoked and sleep completed" > /dev/console
+ fi
+ 
+-echo "reset_vaps.sh: Done" > /dev/console
++echo "reset_vaps.sh: Done" > /dev/console
+\ No newline at end of file
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 08a4c13..915e958 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -731,12 +731,36 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+                 // The "dev_reset_default" asynchronous command processing is complete.
+                 m_dev_reset_default_completed = true;
+ 
+-                // Tear down all VAPs in all radios to make sure no station can connect until APs
+-                // are given a fresh configuration.
+-                LOG(INFO) << "backhaul_fsm_main: FSM=ENABLED, dev_reset_default_completed=false"
+-                          << " -> calling send_slaves_tear_down() to tear down all VAPs";
++                // Tear down all VAPs so no station can connect until the APs are
++                // reconfigured.
++                LOG(INFO) << "backhaul_fsm_main: dev_reset_default -"
++                          << " calling send_slaves_tear_down() to tear down all VAPs";
+                 send_slaves_tear_down();
+ 
++                // Invoke reset_vaps.sh AFTER teardown, but only in certification mode
++                // and only via the dev_reset_default path (m_is_in_reset_state +
++                // !m_dev_reset_default_completed). This script rebuilds the wireless UCI
++                // (1 AP + 1 STA VAP per radio, SSID "OpenWrt", 11ax/11be per htmode) and
++                // reloads wireless via "wifi". It must not be called in any other context.
++                {
++                    auto db = AgentDB::get();
++                    if (db->device_conf.certification_mode) {
++                        const std::string reset_vaps_script =
++                            "/opt/prplmesh/scripts/reset_vaps.sh";
++                        LOG(INFO) << "backhaul_fsm_main: certification mode - invoking "
++                                  << reset_vaps_script << " after send_slaves_tear_down()";
++                        int ret = std::system(reset_vaps_script.c_str());
++                        if (ret != 0) {
++                            LOG(ERROR) << "reset_vaps.sh returned non-zero exit code: " << ret;
++                        } else {
++                            LOG(INFO) << "backhaul_fsm_main: reset_vaps.sh completed successfully";
++                        }
++                    } else {
++                        LOG(DEBUG) << "backhaul_fsm_main: non-certification mode"
++                                   << " - skipping reset_vaps.sh";
++                    }
++                }
++
+                 if (m_dev_reset_default_timer !=
+                     beerocks::net::FileDescriptor::invalid_descriptor) {
+                     // Send back second reply to UCC client.
+@@ -4524,12 +4548,18 @@ void BackhaulManager::handle_dev_reset_default(
+     m_is_in_reset_state           = true;
+     m_dev_reset_default_completed = false;
+ 
++    // NOTE: The AP/STA VAP default reset (1 AP + 1 STA per radio via
++    // reset_vaps.sh) is NOT performed here. It is triggered from
++    // backhaul_fsm_main()'s dev_reset_default path (m_is_in_reset_state +
++    // !m_dev_reset_default_completed) right after send_slaves_tear_down(), and
++    // only in certification mode.
++
+     LOG(INFO) << "handle_dev_reset_default: completed"
+               << " | m_is_in_reset_state=" << m_is_in_reset_state
+               << " | m_selected_backhaul=" << (m_selected_backhaul.empty() ? "<empty>" : m_selected_backhaul)
+               << " | m_dev_reset_default_completed=" << m_dev_reset_default_completed;
+     LOG(INFO) << "handle_dev_reset_default: device reset sequence finished"
+-              << " - VAPs will be torn down by send_slaves_tear_down() in backhaul_fsm_main()";
++              << " - AP/STA VAPs reset to default (certification mode)";
+ }
+ 
+ bool BackhaulManager::handle_dev_set_config(
+-- 
+2.34.1
+
