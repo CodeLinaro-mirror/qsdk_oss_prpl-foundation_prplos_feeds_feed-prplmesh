@@ -1,0 +1,146 @@
+From 0fd6fc4dab68731f49fde4b3755c6ad003628089 Mon Sep 17 00:00:00 2001
+From: Sonali Naresh <sonanare@qti.qualcomm.com>
+Date: Fri, 28 Aug 2026 08:45:35 +0530
+Subject: [PATCH] Failed Connection Message for R6.1 in PrplOS
+
+Signed-off-by: Sonali Naresh <sonanare@qti.qualcomm.com>
+---
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp | 84 ++++++++++++++-------
+ 1 file changed, 57 insertions(+), 27 deletions(-)
+
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index a78bd71..4636bfe 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -65,6 +65,11 @@ static ap_wlan_hal::Event wpaCtrl_to_bwl_event(const std::string &opcode)
+         return ap_wlan_hal::Event::AP_Sta_Possible_Psk_Mismatch;
+     } else if (opcode == "ACL-DENY") {
+         return ap_wlan_hal::Event::ACL_DENY;
++    } else if (opcode == "CTRL-EVENT-CONNECTION-FAIL") {
++        // EasyMesh R6.1: STA (re)association/authentication failure reported by hostapd
++        // (requires report_connection_failures=1). Forwarded by pWHM with addr/bssid/
++        // status_code/reason_code/frame_type/frame_body fields.
++        return ap_wlan_hal::Event::STA_Connection_Fail;
+     } else if (opcode == "INTERFERENCE-DETECTED") {
+         return ap_wlan_hal::Event::AWGN_Detected;
+     }
+@@ -2608,6 +2613,13 @@ bool ap_wlan_hal_whm::process_wpa_ctrl_event(const beerocks::wbapi::AmbiorixVari
+             object = "WiFi.AccessPoint.vap5g0priv.",
+             path = "WiFi.AccessPoint.1."
+         */
++    case Event::STA_Connection_Fail:
++        /* EasyMesh R6.1 CTRL-EVENT-CONNECTION-FAIL (forwarded by pWHM):
++            eventData = "<3>CTRL-EVENT-CONNECTION-FAIL addr=<sta> bssid=<ap>
++                         status_code=<n> reason_code=<n>
++                         frame_type=<Authentication_frame|Association_frame>
++                         frame_body=<hex>"
++        */
+     case Event::ACL_DENY: {
+         // eventData = "<3>ACL-DENY AA:BB:CC:DD:EE:FF"
+         auto vap_id    = get_vap_id_with_bss(interface);
+@@ -2624,12 +2636,23 @@ bool ap_wlan_hal_whm::process_wpa_ctrl_event(const beerocks::wbapi::AmbiorixVari
+         // Initialize the message
+         memset(msg_buff.get(), 0, sizeof(sStaConnectionFail));
+ 
+-        // STA Mac Address
+-        msg->sta_mac = tlvf::mac_from_string(parsed_obj[bwl::EVENT_KEYLESS_PARAM_MAC]);
++        // STA Mac Address (prefer the event-provided 'addr', else fall back to keyless MAC)
++        const auto addr_it = parsed_obj.find("addr");
++        if (addr_it != parsed_obj.end() && !addr_it->second.empty()) {
++            msg->sta_mac = tlvf::mac_from_string(addr_it->second);
++        } else {
++            msg->sta_mac = tlvf::mac_from_string(parsed_obj[bwl::EVENT_KEYLESS_PARAM_MAC]);
++        }
+         LOG(DEBUG) << "STA connection failure: offending Sta MAC: " << msg->sta_mac;
+ 
+-        // BSSID
+-        msg->bssid = tlvf::mac_from_string(m_radio_info.available_vaps[vap_id].mac);
++        // BSSID: prefer the AP link MAC carried in the CTRL-EVENT-CONNECTION-FAIL event
++        // ('bssid'); fall back to the VAP MAC when the event does not provide it.
++        const auto bssid_it = parsed_obj.find("bssid");
++        if (bssid_it != parsed_obj.end() && !bssid_it->second.empty()) {
++            msg->bssid = tlvf::mac_from_string(bssid_it->second);
++        } else {
++            msg->bssid = tlvf::mac_from_string(m_radio_info.available_vaps[vap_id].mac);
++        }
+         LOG(DEBUG) << "STA connection failure: interface BSSID: " << msg->bssid;
+ 
+         std::string status_str;
+@@ -2641,8 +2664,10 @@ bool ap_wlan_hal_whm::process_wpa_ctrl_event(const beerocks::wbapi::AmbiorixVari
+             status_str = CODE_INSUFFICIENT_BANDWIDTH;
+             reason_str = CODE_OK;
+         } else {
+-            status_str = parsed_obj["status"];
+-            reason_str = parsed_obj["reason"];
++            // pWHM forwards the raw CTRL-EVENT-CONNECTION-FAIL line, so the keys are
++            // hostapd's 'status_code' / 'reason_code' (not 'status' / 'reason').
++            status_str = parsed_obj["status_code"];
++            reason_str = parsed_obj["reason_code"];
+             if (status_str.empty()) {
+                 status_str = reason_str.empty() ? CODE_UNSPECIFIED : CODE_OK;
+             }
+@@ -2655,6 +2680,16 @@ bool ap_wlan_hal_whm::process_wpa_ctrl_event(const beerocks::wbapi::AmbiorixVari
+         msg->reason = beerocks::string_utils::stoi(reason_str);
+         LOG(DEBUG) << "STA connection failure: status=" << msg->status << " reason=" << msg->reason;
+ 
++        // Derive the RSN error phase (Table 129) from the event's frame_type field:
++        // frame_type=Authentication_frame -> AUTH_FAILURE, (Re)Association -> ASSOC_FAILURE.
++        // ACL_DENY has no frame_type and is treated as an association-stage failure.
++        const std::string frame_type = parsed_obj["frame_type"];
++        if (!frame_type.empty() && frame_type.find("Authentication") != std::string::npos) {
++            msg->rsn_error = bwl::eRsnError::AUTH_FAILURE;
++        } else {
++            msg->rsn_error = bwl::eRsnError::ASSOC_FAILURE;
++        }
++
+         // EasyMesh R6.1 §8: the RSN Diagnostic Report TLV is only sent for RSNA BSSes.
+         // Determine RSNA from the VAP's pWHM Security ModeEnabled.
+         msg->bss_uses_rsna = false;
+@@ -2684,28 +2719,23 @@ bool ap_wlan_hal_whm::process_wpa_ctrl_event(const beerocks::wbapi::AmbiorixVari
+             }
+         }
+ 
+-        // FrameBody must carry the last 802.11 frame from the STA (R6.1 §8). pWHM exposes the
+-        // last (Re)Assoc Request via getLastAssocReq; EAP/4-way-handshake failures may not have
+-        // one, in which case frame_body stays empty (spec-permissible).
+-        if (msg->bss_uses_rsna && !conn_fail_vap_ifname.empty() &&
+-            msg->sta_mac != net::network_utils::ZERO_MAC) {
+-            const std::string sta_mac_str = tlvf::mac_to_string(msg->sta_mac);
+-            auto answer                   = get_last_assoc_frame(conn_fail_vap_ifname, sta_mac_str);
+-            std::string frame_body_str;
+-            if (answer && answer->read_child(frame_body_str, "frame") && !frame_body_str.empty()) {
+-                auto management_frame = create_mgmt_frame_notification(frame_body_str.c_str());
+-                if (management_frame && !management_frame->data.empty()) {
+-                    msg->frame_body.assign(management_frame->data.begin(),
+-                                           management_frame->data.end());
+-                    LOG(DEBUG) << "STA connection failure: captured " << msg->frame_body.size()
+-                               << " frame_body byte(s) for RSN Diagnostic Report (sta="
+-                               << sta_mac_str << " vap=" << conn_fail_vap_ifname << ")";
+-                } else {
+-                    LOG(DEBUG) << "STA connection failure: could not decode last frame for "
+-                               << sta_mac_str << "; frame_body left empty";
+-                }
++        // FrameBody must carry the failing 802.11 frame from the STA (R6.1 §8). pWHM now
++        // forwards it directly in the CTRL-EVENT-CONNECTION-FAIL event as the 'frame_body'
++        // hex field (paired with 'frame_type'), so parse it straight from parsed_obj rather
++        // than issuing a separate getLastAssocReq call. EAP/4-way-handshake failures may not
++        // carry a frame_body, in which case it stays empty (spec-permissible). ACL_DENY has
++        // no frame_body either.
++        if (msg->bss_uses_rsna) {
++            const std::string frame_body_hex = parsed_obj["frame_body"];
++            if (!frame_body_hex.empty()) {
++                msg->frame_body =
++                    beerocks::string_utils::hex_to_bytes<std::vector<uint8_t>>(frame_body_hex);
++                LOG(DEBUG) << "STA connection failure: captured " << msg->frame_body.size()
++                           << " frame_body byte(s) for RSN Diagnostic Report (sta="
++                           << msg->sta_mac << " vap=" << conn_fail_vap_ifname
++                           << " frame_type=" << (frame_type.empty() ? "N/A" : frame_type) << ")";
+             } else {
+-                LOG(DEBUG) << "STA connection failure: no last frame available for " << sta_mac_str
++                LOG(DEBUG) << "STA connection failure: no frame_body in event for " << msg->sta_mac
+                            << " on " << conn_fail_vap_ifname << "; frame_body left empty";
+             }
+         }
+-- 
+2.34.1
+
