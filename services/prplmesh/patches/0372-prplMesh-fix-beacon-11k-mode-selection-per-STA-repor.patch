@@ -1,0 +1,1071 @@
+From cb1551fb1fa6f6759f14134d5b4f9d08eb1ef48b Mon Sep 17 00:00:00 2001
+From: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+Date: Fri, 28 Aug 2026 17:14:09 +0530
+Subject: [PATCH] prplMesh: fix MLO beacon 11k mode selection, link resolution,
+ DM-lifecycle, and BTM flag forwarding
+
+RRM capability is now derived from the STA's own association frame
+(active/passive vs table mode) instead of a dead ctrl-iface field,
+with an MLD-MAC fallback for MLO clients and a fix for reassociation
+frames being misdetected as association requests (which desynced the
+IE parse and hid the RM Enabled Capabilities element). Skip the check
+entirely for backhaul VAPs. Also fix beacon-report duplication across
+overlapping STA reports, an orphaned DM instance when BSSID resolution
+fails on disconnect, and link-probe ordering for non-MLD clients.
+Default regular-STA beacon measurement to Active with 200 TU duration.
+
+Forward disassoc_imminent and abridged BTM flags from NBAPI
+ClientSteering through to the outgoing steering TLV.
+
+sta_beacon_11k_request() picked the preferred link for REQ_BEACON by
+probing hostapd's "STA <mac>" ctrl command and stopping at the first
+link that reported the STA as associated. For MLO clients, hostapd
+reports the STA as associated on every negotiated (setup) link, even
+ones that are currently idle and carry no traffic, so this could
+resolve to a dormant link before ever reaching the link the STA
+actually uses, sending REQ_BEACON where the client isn't listening
+(TX status ack=0, no report).
+
+REQ_BEACON is itself a downlink (AP->STA) unicast frame, so the
+correct signal is whether the AP has actually delivered traffic to
+the STA on a given link (tx_bytes), not RX/SIGNAL, which only
+reflects frames received FROM the STA. NL80211 TX_BYTES is also a
+cumulative, monotonically-increasing counter, so a bare snapshot
+comparison would degrade back to "first link the STA has EVER used"
+over time; a per-(link, STA) baseline cache turns that into a delta
+since the last check.
+
+The per-link probe used update_stations_stats(), which parses the
+flat NL80211_ATTR_STA_INFO attribute directly. The kernel always
+fills that attribute from the STA's primary/deflink only
+(net/mac80211/sta_info.c sta_set_sinfo()) regardless of which
+link_iface is queried, so every probe in the loop returned the same
+primary-link snapshot -- confirmed in the field, where three
+different links' first-ever probes all reported an identical byte
+count within the same few seconds, and the AP's own "iw station
+dump" showed one link's per-link stats fully zeroed out while the
+top-level aggregate matched the other (real) link's numbers exactly.
+Switch the per-link probe to get_sta_info(), which already resolves
+the true per-link breakdown from the nested NL80211_ATTR_MLO_LINKS
+attribute, keyed by the link ID encoded in link_iface, instead of the
+primary-link-only flat attribute. Fix a follow-on SMacAddr-to-sMacAddr
+conversion bug in this same link-resolution path.
+
+Don't delete the DM STA instance on a stale TOPOLOGY_RESPONSE received
+from a former agent.
+
+beerocks_agent_main.cpp reads beacon_11k_{active,passive,table}_measurement_duration
+from beerocks_agent.conf and calls bwl::nl80211::set_beacon_11k_*_measurement_duration(),
+but those setters only update a process-local static in the bwl library. The 11k
+Beacon Request that actually uses those statics is built by mon_wlan_hal_nl80211
+running inside the separate fronthaul_manager process, which never received the
+configured value and silently fell back to the compiled-in default of 50 TU for
+Active requests regardless of what beacon_11k_active_measurement_duration was set
+to. Read and apply the same config in Monitor::thread_init(), alongside the
+existing beacon_11k_measurement_mode initialization, which already runs in this
+same process.
+
+Signed-off-by: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+---
+ agent/config/beerocks_agent.conf.in           |  17 +-
+ .../ap_manager/ap_manager.cpp                 |  17 +-
+ .../fronthaul_manager/monitor/monitor.cpp     |  35 +++
+ agent/src/beerocks/slave/agent_db.h           |   6 +-
+ .../beerocks/slave/beerocks_agent_main.cpp    |   4 +-
+ .../beerocks/bwl/include/bwl/assoc_frame_db.h | 147 ++++++++++-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  75 +-----
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 230 +++++++++++++-----
+ .../bwl/nl80211/mon_wlan_hal_nl80211.h        |  14 ++
+ controller/nbapi/on_action.cpp                |  24 +-
+ controller/src/beerocks/master/controller.cpp |  10 +-
+ controller/src/beerocks/master/controller.h   |   8 +-
+ controller/src/beerocks/master/db/db.cpp      |  20 +-
+ .../master/tasks/client_steering_task.cpp     |   5 +-
+ .../master/tasks/client_steering_task.h       |   2 +
+ .../beerocks/master/tasks/topology_task.cpp   |  25 +-
+ .../AssociationRequestFrame/AssocReqFrame.cpp |  14 +-
+ 17 files changed, 477 insertions(+), 176 deletions(-)
+
+diff --git a/agent/config/beerocks_agent.conf.in b/agent/config/beerocks_agent.conf.in
+index 7a92c6583..9cc8d8b61 100644
+--- a/agent/config/beerocks_agent.conf.in
++++ b/agent/config/beerocks_agent.conf.in
+@@ -130,9 +130,12 @@ send_btm_to_non_11v_sta=1
+ rsn_overriding_supported=0
+ 
+ # beacon_11k_default_measurement_mode = BEACON_MEASUREMENT_MODE_PASSIVE (0) -> Passive measurement mode
+-# beacon_11k_default_measurement_mode = BEACON_MEASUREMENT_MODE_ACTIVE (1) -> Active measurement mode
+-# beacon_11k_default_measurement_mode = BEACON_MEASUREMENT_MODE_TABLE (2) -> Beacon Table measurement mode (default for regular STAs)
+-beacon_11k_default_measurement_mode=2
++# beacon_11k_default_measurement_mode = BEACON_MEASUREMENT_MODE_ACTIVE (1) -> Active measurement mode (default for regular STAs)
++# beacon_11k_default_measurement_mode = BEACON_MEASUREMENT_MODE_TABLE (2) -> Beacon Table measurement mode
++# Some STAs advertise Beacon Table support but return an empty report for it; Active mode is
++# requested by default and downgraded to Table per-STA only on positive proof of incapability
++# from the STA's own association frame (see the RRM-capability check in mon_wlan_hal_nl80211.cpp).
++beacon_11k_default_measurement_mode=1
+ 
+ # beacon_11k_bsta_measurement_mode: Beacon measurement mode used for backhaul STAs (bSTAs).
+ # bSTAs typically cannot respond to Beacon Table requests (they have no cached beacon table),
+@@ -144,13 +147,13 @@ beacon_11k_bsta_measurement_mode=1
+ 
+ # beacon_11k_active_measurement_duration: Measurement duration for Active beacon requests (TUs, 1 TU = 1024 usec)
+ # Equivalent to Prop: ezlbd.Estimator_Adv.BcnrptActiveDuration
+-# Default: 50 TU
+-beacon_11k_active_measurement_duration=50
++# Default: 200 TU
++beacon_11k_active_measurement_duration=200
+ 
+ # beacon_11k_passive_measurement_duration: Measurement duration for Passive beacon requests (TUs)
+ # Equivalent to Prop: ezlbd.Estimator_Adv.BcnrptPassiveDuration
+-# Default: 110 TU
+-beacon_11k_passive_measurement_duration=110
++# Default: 200 TU
++beacon_11k_passive_measurement_duration=200
+ 
+ # beacon_11k_table_measurement_duration: Measurement duration for Beacon Table requests (TUs)
+ # Equivalent to Prop: ezlbd.Estimator_Adv.BcnrptBcnTableDuration
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 69a2eadd1..d0ef78fcc 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -4268,7 +4268,22 @@ bool ApManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+ 
+                 params.struct_swap();
+ 
+-                response.beacon_report.push_back(beacon_report);
++                /* Overlapping/retransmitted RADIO_MEASUREMENT_REPORT frames from the STA
++                 * can carry a report for a BSSID this ap_manager already collected within
++                 * the same measurement window. Overwrite the existing entry with the latest
++                 * values instead of appending a duplicate, so the eventual response reports
++                 * each measured BSS once. This is per-radio only and does not affect the
++                 * cross-radio is_primary logic used for MLO. */
++                auto existing = std::find_if(
++                    response.beacon_report.begin(), response.beacon_report.end(),
++                    [&beacon_report](const sBeaconMetricsResponse::sBeaconReport &stored) {
++                        return stored.params.bssid == beacon_report.params.bssid;
++                    });
++                if (existing != response.beacon_report.end()) {
++                    *existing = beacon_report;
++                } else {
++                    response.beacon_report.push_back(beacon_report);
++                }
+ 
+                 /* Jump to the next beacon */
+                 idx = idx + element_length - min_measurement_length;
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+index f8e26d116..8ce184bfd 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+@@ -359,6 +359,41 @@ bool Monitor::thread_init()
+     LOG(DEBUG) << "Setting beacon_11k_measurement_mode to: " << int(beacon_mode);
+     bwl::nl80211::set_beacon_11k_measurement_mode(beacon_mode);
+ 
++    // Initialize beacon 11k measurement durations from configuration.
++    //
++    // bwl::nl80211::set_beacon_11k_{active,passive,table}_measurement_duration() only update
++    // a process-local static in the bwl library. beerocks_agent_main.cpp already calls them
++    // after reading this same config file, but that only affects the beerocks_agent process's
++    // own copy of the bwl statics -- the monitor code that actually builds and sends the 11k
++    // Beacon Request runs here, in the separate fronthaul_manager process, which never
++    // otherwise receives the configured value and silently falls back to the compiled-in
++    // default. Apply it here too so the request that's actually sent matches configuration.
++    auto set_beacon_duration = [](const std::string &conf_str, const char *name,
++                                  uint16_t default_val,
++                                  void (*setter)(uint16_t)) {
++        uint16_t duration = default_val;
++        if (!conf_str.empty()) {
++            auto val = string_utils::stoi(conf_str);
++            if (val <= 0) {
++                LOG(WARNING) << "Invalid " << name << " value: " << val << ", using default "
++                             << default_val << " TU";
++            } else {
++                duration = static_cast<uint16_t>(val);
++            }
++        }
++        LOG(DEBUG) << "Setting " << name << " to: " << duration << " TU";
++        setter(duration);
++    };
++    set_beacon_duration(beerocks_slave_conf.beacon_11k_active_measurement_duration,
++                       "beacon_11k_active_measurement_duration", 200,
++                       bwl::nl80211::set_beacon_11k_active_measurement_duration);
++    set_beacon_duration(beerocks_slave_conf.beacon_11k_passive_measurement_duration,
++                       "beacon_11k_passive_measurement_duration", 200,
++                       bwl::nl80211::set_beacon_11k_passive_measurement_duration);
++    set_beacon_duration(beerocks_slave_conf.beacon_11k_table_measurement_duration,
++                       "beacon_11k_table_measurement_duration", 200,
++                       bwl::nl80211::set_beacon_11k_table_measurement_duration);
++
+ #ifdef USE_PRPLMESH_NLHAL
+     bwl::HALState state = mon_wlan_hal->get_state();
+     std::string interface_mld_mac;
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index f292be0ba..bddddfeb3 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -232,10 +232,10 @@ public:
+         bool unsolicited_preference_report_only_on_cache_update = true;
+         bool enable_smd                             = false;
+         int8_t num_of_bands = 0;
+-        uint8_t beacon_11k_default_measurement_mode = 2; ///< Beacon measurement mode for regular (fronthaul) STAs. Default: TABLE (2).
++        uint8_t beacon_11k_default_measurement_mode = 1; ///< Beacon measurement mode for regular (fronthaul) STAs. Default: ACTIVE (1); downgraded to TABLE per-STA on proof of incapability (see mon_wlan_hal_nl80211.cpp RRM-capability check).
+         uint8_t beacon_11k_bsta_measurement_mode    = 1; ///< Beacon measurement mode for backhaul STAs (bSTAs). Default: ACTIVE (1).
+-        uint16_t beacon_11k_active_measurement_duration  = 50;  ///< Measurement duration for Active beacon requests (TU). Prop: BcnrptActiveDuration.
+-        uint16_t beacon_11k_passive_measurement_duration = 110; ///< Measurement duration for Passive beacon requests (TU). Prop: BcnrptPassiveDuration.
++        uint16_t beacon_11k_active_measurement_duration  = 200; ///< Measurement duration for Active beacon requests (TU). Prop: BcnrptActiveDuration.
++        uint16_t beacon_11k_passive_measurement_duration = 200; ///< Measurement duration for Passive beacon requests (TU). Prop: BcnrptPassiveDuration.
+         uint16_t beacon_11k_table_measurement_duration   = 200; ///< Measurement duration for Beacon Table requests (TU). Prop: BcnrptBcnTableDuration.
+ 
+         /**
+diff --git a/agent/src/beerocks/slave/beerocks_agent_main.cpp b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+index 4699f161f..8a9cbd991 100644
+--- a/agent/src/beerocks/slave/beerocks_agent_main.cpp
++++ b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+@@ -566,10 +566,10 @@ static int run_beerocks_slave(beerocks::config_file::sConfigSlave &beerocks_slav
+         };
+         read_beacon_duration(beerocks_slave_conf.beacon_11k_active_measurement_duration,
+                              db->device_conf.beacon_11k_active_measurement_duration,
+-                             "beacon_11k_active_measurement_duration", 50);
++                             "beacon_11k_active_measurement_duration", 200);
+         read_beacon_duration(beerocks_slave_conf.beacon_11k_passive_measurement_duration,
+                              db->device_conf.beacon_11k_passive_measurement_duration,
+-                             "beacon_11k_passive_measurement_duration", 110);
++                             "beacon_11k_passive_measurement_duration", 200);
+         read_beacon_duration(beerocks_slave_conf.beacon_11k_table_measurement_duration,
+                              db->device_conf.beacon_11k_table_measurement_duration,
+                              "beacon_11k_table_measurement_duration", 200);
+diff --git a/common/beerocks/bwl/include/bwl/assoc_frame_db.h b/common/beerocks/bwl/include/bwl/assoc_frame_db.h
+index 9a4b28e82..f226a53dc 100644
+--- a/common/beerocks/bwl/include/bwl/assoc_frame_db.h
++++ b/common/beerocks/bwl/include/bwl/assoc_frame_db.h
+@@ -25,6 +25,7 @@
+  */
+ 
+ #include <cstdint>
++#include <cstdio>
+ #include <fstream>
+ #include <sstream>
+ #include <string>
+@@ -36,6 +37,98 @@ namespace bwl {
+ /// process boundaries (AP manager → agent) and agent restarts.
+ static constexpr const char *ASSOC_FRAMES_DB_PATH = "/tmp/beerocks/sta_assoc_frames.txt";
+ 
++namespace assoc_frame_db_internal {
++inline std::vector<uint8_t> decode_hex_frame(const std::string &hex_str)
++{
++    std::vector<uint8_t> frame;
++    frame.reserve(hex_str.size() / 2);
++    for (size_t i = 0; i + 1 < hex_str.size(); i += 2) {
++        frame.push_back(static_cast<uint8_t>(std::stoi(hex_str.substr(i, 2), nullptr, 16)));
++    }
++    return frame;
++}
++} // namespace assoc_frame_db_internal
++
++/**
++ * @brief Extract the MLD MAC address from an association/reassociation request
++ * frame's Multi-Link Element (IEEE 802.11be, Extension IE 255/107), if present.
++ *
++ * The frame's 802.11 header is always addressed by the transmitting link STA
++ * (there is no MLD address in a MAC header) — the MLD MAC only appears inside
++ * the Multi-Link Element payload carried by the frame body. This helper digs
++ * it out so a link-MAC-keyed frame (as persisted by persist_assoc_frame() /
++ * restore_assoc_frame_from_db()) can still be matched against an MLD MAC.
++ *
++ * @param frame        Raw association/reassociation request frame bytes.
++ * @param mld_mac_out  Receives the MLD MAC as a colon-separated string on success.
++ * @return true if a Basic-variant MLE with a valid MLD MAC field was found,
++ *         false otherwise (frame too short, no MLE, or non-Basic variant).
++ */
++inline bool extract_mld_mac_from_assoc_frame(const std::vector<uint8_t> &frame,
++                                              std::string &mld_mac_out)
++{
++    static constexpr uint8_t IE_ID_EXTENSION      = 255;
++    static constexpr uint8_t IE_EXT_MULTI_LINK    = 107;
++    static constexpr size_t  MLE_MLCTRL_OFFSET    = 1;
++    static constexpr size_t  MLE_CINFO_LEN_OFFSET = 3;
++    static constexpr size_t  MLE_CINFO_MAC_OFFSET = 4;
++    static constexpr size_t  MLE_CINFO_MIN_LEN    = 7;
++
++    static constexpr uint16_t candidate_offsets[] = {4, 10};
++    size_t best_offset = 4;
++    int best_count      = -1;
++    for (uint16_t off : candidate_offsets) {
++        if (frame.size() <= (size_t)off + 2) { continue; }
++        size_t pos = off;
++        int count  = 0;
++        while (pos + 2 <= frame.size()) {
++            uint8_t elen = frame[pos + 1];
++            if (pos + 2 + elen > frame.size()) { break; }
++            count++;
++            pos += 2 + elen;
++        }
++        if (count > best_count) {
++            best_count  = count;
++            best_offset = off;
++        }
++    }
++
++    size_t pos = best_offset;
++    const uint8_t *mle    = nullptr;
++    size_t mle_elen        = 0;
++    while (pos + 2 <= frame.size()) {
++        uint8_t id   = frame[pos];
++        uint8_t elen = frame[pos + 1];
++        if (pos + 2 + elen > frame.size()) { break; }
++        if (id == IE_ID_EXTENSION && elen >= 1 && frame[pos + 2] == IE_EXT_MULTI_LINK) {
++            mle      = frame.data() + pos + 2;
++            mle_elen = elen;
++            break;
++        }
++        pos += 2 + elen;
++    }
++    if (!mle || mle_elen < MLE_CINFO_MAC_OFFSET + 6) {
++        return false;
++    }
++
++    if ((mle[MLE_MLCTRL_OFFSET] & 0x07) != 0) {
++        return false;
++    }
++
++    uint8_t cinfo_len = mle[MLE_CINFO_LEN_OFFSET];
++    if (cinfo_len < MLE_CINFO_MIN_LEN) {
++        return false;
++    }
++
++    char mac_buf[18];
++    snprintf(mac_buf, sizeof(mac_buf), "%02x:%02x:%02x:%02x:%02x:%02x",
++             mle[MLE_CINFO_MAC_OFFSET], mle[MLE_CINFO_MAC_OFFSET + 1],
++             mle[MLE_CINFO_MAC_OFFSET + 2], mle[MLE_CINFO_MAC_OFFSET + 3],
++             mle[MLE_CINFO_MAC_OFFSET + 4], mle[MLE_CINFO_MAC_OFFSET + 5]);
++    mld_mac_out = mac_buf;
++    return true;
++}
++
+ /**
+  * @brief Restore the association frame for one STA from the shared DB file.
+  *
+@@ -44,7 +137,9 @@ static constexpr const char *ASSOC_FRAMES_DB_PATH = "/tmp/beerocks/sta_assoc_fra
+  * For SLO clients @p sta_mac is the STA MAC address.
+  * For MLO clients @p sta_mac must be the **link MAC** (affiliated STA MAC),
+  * because AP-MGMT-FRAME-RECEIVED uses the link MAC as the key when writing
+- * the file — not the MLD MAC that AP-STA-CONNECTED carries.
++ * the file — not the MLD MAC that AP-STA-CONNECTED carries. Callers that
++ * only have the MLD MAC should fall back to
++ * restore_assoc_frame_from_db_by_mld_mac() on a miss here.
+  *
+  * @param sta_mac  MAC address string to look up (e.g. "bc:cd:99:9f:94:77").
+  * @return         Raw frame bytes, or empty vector if not found.
+@@ -67,14 +162,50 @@ inline std::vector<uint8_t> restore_assoc_frame_from_db(const std::string &sta_m
+         if (mac != sta_mac) {
+             continue;
+         }
+-        // Decode hex string back to raw bytes
+-        std::vector<uint8_t> frame;
+-        frame.reserve(hex_str.size() / 2);
+-        for (size_t i = 0; i + 1 < hex_str.size(); i += 2) {
+-            frame.push_back(
+-                static_cast<uint8_t>(std::stoi(hex_str.substr(i, 2), nullptr, 16)));
++        return assoc_frame_db_internal::decode_hex_frame(hex_str);
++    }
++    return {};
++}
++
++/**
++ * @brief Restore the association frame for an MLO STA by its MLD MAC.
++ *
++ * The DB file is keyed by link MAC (see restore_assoc_frame_from_db()), so a
++ * direct lookup by MLD MAC always misses. This scans every entry, decodes it,
++ * and returns the first frame whose embedded Multi-Link Element MLD MAC
++ * (extract_mld_mac_from_assoc_frame()) matches @p mld_mac.
++ *
++ * Intended as a fallback after restore_assoc_frame_from_db(mld_mac) misses —
++ * cheap direct lookups still cover SLO clients without paying this scan.
++ *
++ * @param mld_mac  MLD MAC address string to look up (e.g. "02:14:5f:b8:ae:9f").
++ * @return         Raw frame bytes of the matching entry, or empty vector if
++ *                  no entry's embedded MLD MAC matches.
++ */
++inline std::vector<uint8_t> restore_assoc_frame_from_db_by_mld_mac(const std::string &mld_mac)
++{
++    std::ifstream ifs(ASSOC_FRAMES_DB_PATH);
++    if (!ifs) {
++        return {};
++    }
++
++    std::string line;
++    while (std::getline(ifs, line)) {
++        if (line.empty()) {
++            continue;
++        }
++        std::istringstream ss(line);
++        std::string mac, hex_str;
++        ss >> mac >> hex_str;
++        if (mac.empty() || hex_str.empty()) {
++            continue;
++        }
++        auto frame = assoc_frame_db_internal::decode_hex_frame(hex_str);
++        std::string candidate_mld_mac;
++        if (extract_mld_mac_from_assoc_frame(frame, candidate_mld_mac) &&
++            candidate_mld_mac == mld_mac) {
++            return frame;
+         }
+-        return frame;
+     }
+     return {};
+ }
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 7fca9daae..5e7256144 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -483,76 +483,6 @@ static int remove_mld_entry_by_ifname(const std::string &ifname)
+     return removed ? 0 : -1;
+ }
+ 
+-// Extract the MLD MAC address from an association/reassociation request
+-// frame's Multi-Link Element (IEEE 802.11be, Extension IE 255/107), if present.
+-//
+-// Returns true and fills mld_mac if a Basic-variant MLE with a valid MLD MAC
+-// field was found; false otherwise (frame too short, no MLE, or non-Basic variant).
+-static bool extract_mld_mac_from_assoc_frame(const std::vector<uint8_t> &frame,
+-                                             std::string &mld_mac_out)
+-{
+-    static constexpr uint8_t IE_ID_EXTENSION    = 255;
+-    static constexpr uint8_t IE_EXT_MULTI_LINK  = 107;
+-    static constexpr size_t  MLE_MLCTRL_OFFSET    = 1;
+-    static constexpr size_t  MLE_CINFO_LEN_OFFSET = 3;
+-    static constexpr size_t  MLE_CINFO_MAC_OFFSET = 4;
+-    static constexpr size_t  MLE_CINFO_MIN_LEN    = 7;
+-
+-    static constexpr uint16_t candidate_offsets[] = {4, 10};
+-    size_t best_offset = 4;
+-    int best_count      = -1;
+-    for (uint16_t off : candidate_offsets) {
+-        if (frame.size() <= (size_t)off + 2) { continue; }
+-        size_t pos = off;
+-        int count  = 0;
+-        while (pos + 2 <= frame.size()) {
+-            uint8_t elen = frame[pos + 1];
+-            if (pos + 2 + elen > frame.size()) { break; }
+-            count++;
+-            pos += 2 + elen;
+-        }
+-        if (count > best_count) {
+-            best_count  = count;
+-            best_offset = off;
+-        }
+-    }
+-
+-    size_t pos = best_offset;
+-    const uint8_t *mle    = nullptr;
+-    size_t mle_elen        = 0;
+-    while (pos + 2 <= frame.size()) {
+-        uint8_t id   = frame[pos];
+-        uint8_t elen = frame[pos + 1];
+-        if (pos + 2 + elen > frame.size()) { break; }
+-        if (id == IE_ID_EXTENSION && elen >= 1 && frame[pos + 2] == IE_EXT_MULTI_LINK) {
+-            mle      = frame.data() + pos + 2;
+-            mle_elen = elen;
+-            break;
+-        }
+-        pos += 2 + elen;
+-    }
+-    if (!mle || mle_elen < MLE_CINFO_MAC_OFFSET + 6) {
+-        return false;
+-    }
+-
+-    if ((mle[MLE_MLCTRL_OFFSET] & 0x07) != 0) {
+-        return false;
+-    }
+-
+-    uint8_t cinfo_len = mle[MLE_CINFO_LEN_OFFSET];
+-    if (cinfo_len < MLE_CINFO_MIN_LEN) {
+-        return false;
+-    }
+-
+-    char mac_buf[18];
+-    snprintf(mac_buf, sizeof(mac_buf), "%02x:%02x:%02x:%02x:%02x:%02x",
+-             mle[MLE_CINFO_MAC_OFFSET], mle[MLE_CINFO_MAC_OFFSET + 1],
+-             mle[MLE_CINFO_MAC_OFFSET + 2], mle[MLE_CINFO_MAC_OFFSET + 3],
+-             mle[MLE_CINFO_MAC_OFFSET + 4], mle[MLE_CINFO_MAC_OFFSET + 5]);
+-    mld_mac_out = mac_buf;
+-    return true;
+-}
+-
+ static std::string bytes_to_hex(const std::vector<uint8_t> &bytes)
+ {
+     std::ostringstream hex;
+@@ -7094,7 +7024,12 @@ bool ap_wlan_hal_nl80211::generate_connected_clients_events(
+             if (it == m_latest_assoc_frame.end()) {
+                 // Agent restarted while STA was associated — no over-the-air frame in cache.
+                 // Try to restore from the shared assoc frame DB persisted at first association.
++                // client_mac may be the MLD MAC (MLO) while the file is keyed by link MAC —
++                // fall back to the MLD-MAC scan on a direct-key miss.
+                 auto frame_bytes = bwl::restore_assoc_frame_from_db(client_mac);
++                if (frame_bytes.empty()) {
++                    frame_bytes = bwl::restore_assoc_frame_from_db_by_mld_mac(client_mac);
++                }
+                 if (!frame_bytes.empty() &&
+                     frame_bytes.size() <= sizeof(msg->params.association_frame)) {
+                     std::copy(frame_bytes.begin(), frame_bytes.end(),
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 79e90f6a9..00fefd4cf 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -14,7 +14,9 @@
+ #include <bcl/beerocks_utils.h>
+ #include <bcl/network/network_utils.h>
+ #include <bcl/son/son_wireless_utils.h>
++#include <bwl/assoc_frame_db.h>
+ #include <bwl/key_value_parser.h>
++#include <tlvf/AssociationRequestFrame/AssocReqFrame.h>
+ 
+ #include <easylogging++.h>
+ 
+@@ -639,6 +641,26 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+     // not set req.measurement_mode explicitly, but the task layer always sets it now.
+     uint8_t measurement_mode = req.measurement_mode;
+ 
++    // Detect if the target VAP is a backhaul BSS by checking m_radio_info.available_vaps.
++    // Backhaul STAs (bSTAs) have no association frame in the AP-side assoc-frame DB to
++    // derive real RRM Enabled Capabilities from (they are queried from the fronthaul AP's
++    // perspective as a client, not tracked the same way regular STAs are), so the per-STA
++    // RRM-capability check below is skipped for backhaul BSS and the configured
++    // measurement_mode (beacon_11k_bsta_measurement_mode) is trusted as-is.
++    bool is_backhaul_vap = false;
++    {
++        std::string base_target_iface;
++        extractBase1Interface(vap_iface_name, base_target_iface);
++        for (const auto &vap : m_radio_info.available_vaps) {
++            std::string base_vap_iface_check;
++            extractBase1Interface(vap.second.bss, base_vap_iface_check);
++            if (base_vap_iface_check == base_target_iface && vap.second.backhaul) {
++                is_backhaul_vap = true;
++                break;
++            }
++        }
++    }
++
+     // Select measurement duration based on mode (from agent config, overrides req.duration).
+     // Matches Prop: BcnrptActiveDuration / BcnrptPassiveDuration / BcnrptBcnTableDuration.
+     uint16_t measurement_duration;
+@@ -654,76 +676,150 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+             break;
+     }
+ 
+-    // Per-STA measurement mode validation:
+-    // If Active or Passive mode is requested, verify the STA actually supports it via
+-    // hostapd's "STA <mac>" command (rrm_capability field).
+-    // iPhones and some clients only support Beacon Table (mode=2) — sending Active/Passive
+-    // to them causes hostapd to log "does not support active beacon report" and drop the request.
++    // Resolve which registered link interface the STA is actually using, by
++    // probing each one with get_sta_info() (nl80211 GET_STATION, the same
++    // query "iw dev <iface> station dump" uses). Non-MLD clients associate on
++    // exactly one link, so probing link0, link1, ... in a fixed order for
++    // REQ_BEACON below wastes N-1 guaranteed-fail attempts. Resolving the real
++    // link first lets us try it before the others.
+     //
+-    // This check is intentionally at the BWL layer so it does NOT impact higher-level callers
+-    // (e.g., the steering app) that already set the correct mode per STA. If the steering app
+-    // sets TABLE for iPhones, the check passes unchanged. If it sets Active/Passive for capable
+-    // STAs, the check also passes unchanged. Only the global/default path is protected here.
++    // update_stations_stats() must NOT be used here: it parses the flat
++    // NL80211_ATTR_STA_INFO directly, which the kernel always fills from the
++    // STA's primary/deflink only (net/mac80211/sta_info.c sta_set_sinfo()) —
++    // every link_iface probe would read the same primary-link snapshot
++    // regardless of which link was actually queried (observed in the field:
++    // three different links' first-ever probes all reporting the identical
++    // byte count). get_sta_info() (nl80211_client_impl.cpp) already resolves
++    // the real per-link breakdown from the nested NL80211_ATTR_MLO_LINKS,
++    // keyed by the link ID encoded in link_iface.
+     //
+-    // RRM Enabled Capabilities (IEEE 802.11-2020, Section 9.4.2.45), byte 0:
+-    //   Bit 4 (0x10) = Beacon Passive Measurement Capability
+-    //   Bit 5 (0x20) = Beacon Active Measurement Capability
+-    //   Bit 6 (0x40) = Beacon Table Measurement Capability
+-    // Detect if the target VAP is a backhaul BSS by checking m_radio_info.available_vaps.
+-    bool is_backhaul_vap = false;
++    // For MLO clients, hostapd/nl80211 report the STA as associated on every
++    // negotiated (setup) link, including links that are currently idle and
++    // carry no traffic — a plain "is this link associated" probe (e.g.
++    // hostapd's "STA <mac>" ctrl command) can succeed on a dormant link before
++    // ever reaching the link the STA actually uses, sending REQ_BEACON where
++    // the client isn't listening (TX status ack=0, no report). REQ_BEACON is
++    // itself a downlink (AP->STA) unicast frame, so the relevant signal is
++    // whether the AP has actually delivered traffic to the STA on this link
++    // (tx_bytes), not RX/SIGNAL, which only reflects frames the AP received
++    // FROM the STA -- an MLO STA can RX on one link and TX on another, so
++    // uplink signal quality on a link says nothing about whether the STA is
++    // listening on that link for AP->STA frames.
++    //
++    // NL80211 TX_BYTES is a cumulative, monotonically-increasing counter, so a
++    // bare "tx_bytes > 0" snapshot stays true forever once a link has ever
++    // carried any traffic -- it can't tell "currently active" from "was used
++    // once, ages ago." m_beacon_11k_link_tx_baseline stores the last-seen
++    // cumulative total per (link, STA); comparing against that baseline here
++    // yields the delta since our last check (i.e. recent activity) instead of
++    // the full cumulative counter. Prefer the first link with recent downlink
++    // tx activity over one that merely proves association.
++    int preferred_link_idx = -1;
++    int associated_fallback_idx = -1;
+     {
+-        std::string base_target_iface;
+-        extractBase1Interface(vap_iface_name, base_target_iface);
+-        for (const auto &vap : m_radio_info.available_vaps) {
+-            std::string base_vap_iface_check;
+-            extractBase1Interface(vap.second.bss, base_vap_iface_check);
+-            if (base_vap_iface_check == base_target_iface && vap.second.backhaul) {
+-                is_backhaul_vap = true;
++        std::string sta_mac_str = tlvf::mac_to_string(req.sta_mac.oct);
++        sMacAddr sta_mac_tlvf   = tlvf::mac_from_array(req.sta_mac.oct);
++        auto now                        = std::chrono::steady_clock::now();
++        constexpr auto baseline_max_age = std::chrono::minutes(10);
++        std::lock_guard<std::mutex> lock(m_beacon_11k_link_tx_baseline_mutex);
++        // Evict baselines we haven't refreshed recently, so links/STAs that
++        // disappear (disconnect, link teardown) don't leak entries forever.
++        for (auto it = m_beacon_11k_link_tx_baseline.begin();
++             it != m_beacon_11k_link_tx_baseline.end();) {
++            it = (now - it->second.last_seen > baseline_max_age)
++                     ? m_beacon_11k_link_tx_baseline.erase(it)
++                     : std::next(it);
++        }
++        for (int link_idx = 0; link_idx < 8; link_idx++) {
++            std::string link_iface = base_vap_iface + "_link" + std::to_string(link_idx);
++            if (!is_wpa_ctrl_interface_registered(link_iface)) {
++                continue;
++            }
++            std::string baseline_key = link_iface + "|" + sta_mac_str;
++            nl80211_client::sta_info link_sta_info;
++            if (!m_nl80211_client->get_sta_info(link_iface, sta_mac_tlvf, link_sta_info)) {
++                m_beacon_11k_link_tx_baseline.erase(baseline_key);
++                continue; // STA not associated on this link at all
++            }
++            auto &baseline       = m_beacon_11k_link_tx_baseline[baseline_key];
++            uint32_t prev_total  = baseline.total_tx_bytes;
++            uint32_t curr_total  = link_sta_info.tx_bytes;
++            // NL80211_STA_INFO_TX_BYTES is a 32-bit counter and can wrap or
++            // reset (e.g. link teardown/re-setup); treat a decrease as a
++            // reset rather than underflowing the delta.
++            uint32_t delta       = (curr_total >= prev_total) ? (curr_total - prev_total)
++                                                               : curr_total;
++            baseline.total_tx_bytes = curr_total;
++            baseline.last_seen      = now;
++            if (associated_fallback_idx < 0) {
++                associated_fallback_idx = link_idx;
++            }
++            if (delta > 0) {
++                preferred_link_idx = link_idx;
++                LOG(DEBUG) << __func__ << " - STA " << sta_mac_str
++                           << " resolved to active link interface " << link_iface
++                           << " (" << delta
++                           << " bytes of downlink tx since last check)";
+                 break;
+             }
+         }
++        if (preferred_link_idx < 0) {
++            preferred_link_idx = associated_fallback_idx;
++            LOG(DEBUG) << __func__ << " - could not find a link with recent downlink tx activity for STA "
++                       << sta_mac_str << ", falling back to "
++                       << (preferred_link_idx >= 0
++                               ? ("first associated link_idx=" + std::to_string(preferred_link_idx))
++                               : std::string("default link0..link7 probe order"));
++        }
+     }
+ 
++    // Per-STA RRM-capability check, sourced from the STA's own association frame
++    // (ground truth) instead of hostapd's ctrl_iface "STA <mac>" dump.
++    //
++    // hostapd_ctrl_iface_sta_mib() (src/ap/ctrl_iface_ap.c) never serializes an
++    // "rrm_capability=" field over the wpa_ctrl socket — hostapd parses and stores
++    // the RRM Enabled Capabilities element into sta->rrm_enabled_capa[], but only
++    // exposes it via ubus, not wpa_ctrl. A prior version of this check queried that
++    // nonexistent field and unconditionally forced Table mode for every STA.
++    //
++    // The association frame is persisted by the AP manager on AP-MGMT-FRAME-RECEIVED
++    // (bwl::restore_assoc_frame_from_db(), keyed the same way the per-link "STA <mac>"
++    // probe above already succeeds with req.sta_mac) and contains the real RRM Enabled
++    // Capabilities element. Fail open on any lookup/parse miss (STA not yet in the DB,
++    // driver without 11k support, etc.) — only downgrade on positive proof of
++    // incapability for the specific mode requested, never on absence of data.
++    //
++    // req.sta_mac is the MLD MAC for MLO clients (qmesh-steering-app sends the MLD MAC
++    // in the 11k Beacon Metrics Query), but the DB file is keyed by link MAC — the frame's
++    // own 802.11 header addressing, which has no concept of an MLD identity. A direct-key
++    // lookup therefore only ever hits for SLO clients; fall back to a scan matching the
++    // frame's embedded Multi-Link Element MLD MAC for MLO clients.
+     if (is_backhaul_vap && measurement_mode != BEACON_MEASUREMENT_MODE_TABLE) {
+         LOG(DEBUG) << "Beacon 11k: STA " << tlvf::mac_to_string(req.sta_mac.oct)
+                    << " is on backhaul BSS " << vap_iface_name
+                    << " — skipping RRM capability check, trusting measurement_mode="
+                    << int(measurement_mode);
+-    } else if (measurement_mode != BEACON_MEASUREMENT_MODE_TABLE) {
+-        // Find the first registered link interface to query STA capabilities
+-        std::string query_iface;
+-        for (int link_idx = 0; link_idx < 8; link_idx++) {
+-            std::string link_iface = base_vap_iface + "_link" + std::to_string(link_idx);
+-            if (is_wpa_ctrl_interface_registered(link_iface)) {
+-                query_iface = link_iface;
+-                break;
+-            }
++    } else if (measurement_mode == BEACON_MEASUREMENT_MODE_ACTIVE ||
++        measurement_mode == BEACON_MEASUREMENT_MODE_PASSIVE) {
++        std::string sta_mac_str = tlvf::mac_to_string(req.sta_mac.oct);
++        auto frame_bytes = bwl::restore_assoc_frame_from_db(sta_mac_str);
++        if (frame_bytes.empty()) {
++            frame_bytes = bwl::restore_assoc_frame_from_db_by_mld_mac(sta_mac_str);
+         }
+-        if (!query_iface.empty()) {
+-            std::string sta_cmd = "STA " + tlvf::mac_to_string(req.sta_mac.oct);
+-            char *sta_reply     = nullptr;
+-            if (wpa_ctrl_send_msg(sta_cmd, &sta_reply, query_iface) && sta_reply) {
+-                std::string reply_str(sta_reply);
+-                auto rrm_pos = reply_str.find("rrm_capability=");
+-                if (rrm_pos != std::string::npos) {
+-                    // Parse first byte of rrm_capability (10 hex chars = 5 bytes)
+-                    std::string rrm_hex  = reply_str.substr(rrm_pos + 15, 2);
+-                    uint8_t rrm_byte0    = static_cast<uint8_t>(std::strtoul(rrm_hex.c_str(), nullptr, 16));
+-                    bool supports_passive = (rrm_byte0 & 0x10) != 0;
+-                    bool supports_active  = (rrm_byte0 & 0x20) != 0;
+-                    if ((measurement_mode == BEACON_MEASUREMENT_MODE_PASSIVE && !supports_passive) ||
+-                        (measurement_mode == BEACON_MEASUREMENT_MODE_ACTIVE  && !supports_active)) {
+-                        LOG(DEBUG) << "Beacon 11k: STA " << tlvf::mac_to_string(req.sta_mac.oct)
+-                                   << " does not support measurement_mode=" << int(measurement_mode)
+-                                   << " (rrm_byte0=0x" << std::hex << int(rrm_byte0) << std::dec
+-                                   << "), falling back to Beacon Table mode";
+-                        measurement_mode = BEACON_MEASUREMENT_MODE_TABLE;
+-                    }
+-                } else {
+-                    // No rrm_capability field → STA has no RRM support at all
+-                    // Fall back to Beacon Table mode to avoid hostapd rejection
+-                    LOG(DEBUG) << "Beacon 11k: STA " << tlvf::mac_to_string(req.sta_mac.oct)
+-                               << " has no rrm_capability field, falling back to Beacon Table mode";
++        if (!frame_bytes.empty()) {
++            auto assoc_req_frame =
++                assoc_frame::AssocReqFrame::parse(frame_bytes.data(), frame_bytes.size());
++            auto rm_caps = assoc_req_frame ? assoc_req_frame->rm_enabled_caps() : nullptr;
++            if (rm_caps) {
++                auto data1 = rm_caps->data1();
++                bool capable = (measurement_mode == BEACON_MEASUREMENT_MODE_ACTIVE)
++                                   ? data1.beacon_active_measure
++                                   : data1.beacon_passive_measure;
++                if (!capable) {
++                    LOG(DEBUG) << __func__ << " - STA " << sta_mac_str
++                               << " association frame reports no support for requested"
++                               << " measurement mode " << int(measurement_mode)
++                               << ", downgrading to Table mode";
+                     measurement_mode = BEACON_MEASUREMENT_MODE_TABLE;
+                 }
+             }
+@@ -839,15 +935,31 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+                 << ", link_id=" << int(link_id)
+                 << ", cmd=[" << cmd << "]";
+ 
+-    // Send REQ_BEACON to link interfaces in order: _link0, _link1, _link2, ...
+-    // Only try registered link interfaces (those with an active wpa_ctrl socket).
++    // Send REQ_BEACON to link interfaces, trying the STA's resolved associated
++    // link first (preferred_link_idx, computed above) and only falling back to
++    // the remaining registered links in _link0, _link1, ... order if that
++    // attempt fails. For a non-MLD client (single associated link), this sends
++    // the request directly on that link instead of absorbing guaranteed
++    // "not connected" failures on the other links first.
+     // Stop immediately on the first success — no duplicate queries are sent.
+     // Responses (BEACON-REQ-TX-STATUS, BEACON-RESP-RX, RADIO_MEASUREMENT_REPORT)
+     // will arrive on any link interface socket and are handled by the event processing
+     // path (process_nl80211_event for the monitor, MGMT_Frame for the ap_manager).
+     parsed_obj_map_t reply;
+     bool succeeded = false;
+-    for (int link_idx = 0; link_idx < 8 && !succeeded; link_idx++) {
++    std::vector<int> link_try_order;
++    if (preferred_link_idx >= 0) {
++        link_try_order.push_back(preferred_link_idx);
++    }
++    for (int link_idx = 0; link_idx < 8; link_idx++) {
++        if (link_idx != preferred_link_idx) {
++            link_try_order.push_back(link_idx);
++        }
++    }
++    for (int link_idx : link_try_order) {
++        if (succeeded) {
++            break;
++        }
+         std::string link_iface = base_vap_iface + "_link" + std::to_string(link_idx);
+         if (!is_wpa_ctrl_interface_registered(link_iface)) {
+             continue; // skip unregistered interfaces — registered ones may not start at _link0
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
+index aafa89a5b..6e8d77c16 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
+@@ -14,6 +14,7 @@
+ #include <hostapd/configuration.h>
+ 
+ #include <mutex>
++#include <unordered_map>
+ 
+ namespace bwl {
+ namespace nl80211 {
+@@ -135,6 +136,19 @@ protected:
+      std::mutex m_pending_unassoc_mutex;
+      int m_roc_timeout_timer_fd = -1;
+ 
++     /* Per-(link_iface, STA) baseline for sta_beacon_11k_request()'s link
++      * resolution: NL80211 TX_BYTES is a cumulative counter, so without a
++      * stored baseline "tx_bytes > 0" would stay true forever once a link
++      * has ever carried traffic, defeating detection of which link is
++      * *currently* active. Guarded by its own mutex since sta_beacon_11k_request()
++      * may run on a different thread than other users of this map. */
++     struct LinkTxBaseline {
++         uint32_t total_tx_bytes = 0;
++         std::chrono::steady_clock::time_point last_seen;
++     };
++     std::unordered_map<std::string, LinkTxBaseline> m_beacon_11k_link_tx_baseline;
++     std::mutex m_beacon_11k_link_tx_baseline_mutex;
++
+      // Helper functions for unassociated STA measurements
+      bool write_debugfs_file(const std::string &path, const std::string &data);
+      bool read_debugfs_file(const std::string &path, std::string &output);
+diff --git a/controller/nbapi/on_action.cpp b/controller/nbapi/on_action.cpp
+index b42b3c67a..41da3e485 100644
+--- a/controller/nbapi/on_action.cpp
++++ b/controller/nbapi/on_action.cpp
+@@ -501,14 +501,21 @@ amxd_status_t client_steering(amxd_object_t *object, amxd_function_t *func, amxc
+ 
+     /*
+      * Read optional parameters added by the qmesh-steering-app:
+-     *   acl_allowed      — false = BTM-only (skip ACL BLOCK messages)
+-     *   is_btm_supported — true  = STA supports 802.11v BTM (from assoc frame parse)
+-     *                      false = use legacy disassociation
+-     * Both default to true for backward compatibility with callers that do not
+-     * set these fields (e.g. NBAPI CLI, certification tests).
++     *   acl_allowed          — false = BTM-only (skip ACL BLOCK messages)
++     *   is_btm_supported     — true  = STA supports 802.11v BTM (from assoc frame parse)
++     *                          false = use legacy disassociation
++     *   DisassociationImminent, Abridged — BTM Request Mode flag bits (802.11-2020
++     *                          9.4.2.9); forwarded verbatim into the outgoing
++     *                          CLIENT_STEERING_REQUEST TLV's request_flags().
++     * acl_allowed/is_btm_supported default to true for backward compatibility with
++     * callers that do not set these fields (e.g. NBAPI CLI, certification tests).
++     * DisassociationImminent/Abridged default to false, matching the TLV's prior
++     * hardcoded behavior for those same callers.
+      */
+-    bool acl_allowed      = GET_BOOL(args, "acl_allowed");
+-    bool is_btm_supported = GET_BOOL(args, "is_btm_supported");
++    bool acl_allowed          = GET_BOOL(args, "acl_allowed");
++    bool is_btm_supported     = GET_BOOL(args, "is_btm_supported");
++    bool disassoc_imminent    = GET_BOOL(args, "DisassociationImminent");
++    bool abridged             = GET_BOOL(args, "Abridged");
+ 
+     /* GET_BOOL returns false when the key is absent; default both to true */
+     {
+@@ -523,7 +530,8 @@ amxd_status_t client_steering(amxd_object_t *object, amxd_function_t *func, amxc
+                      << " with attempt connecting to an AP with BSSID: " << target_bssid;
+     } else {
+         controller_ctx->start_client_steering(sta_mac, target_bssid,
+-                                              acl_allowed, is_btm_supported);
++                                              acl_allowed, is_btm_supported,
++                                              disassoc_imminent, abridged);
+     }
+     return amxd_status_ok;
+ }
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 58849936c..7120f78d4 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -6053,14 +6053,16 @@ bool Controller::handle_cmdu_control_message(
+ }
+ 
+ bool Controller::start_client_steering(const std::string &sta_mac, const std::string &target_bssid,
+-                                        bool acl_allowed, bool is_btm_supported)
++                                        bool acl_allowed, bool is_btm_supported,
++                                        bool disassoc_imminent, bool abridged)
+ {
+     std::string triggered_by{"NBAPI"};
+-    bool disassoc_imminent = false;
+ 
+     LOG(DEBUG) << "NBAPI client steer request for " << sta_mac << " to hostap: " << target_bssid
+                << " acl_allowed=" << acl_allowed
+-               << " is_btm_supported=" << is_btm_supported;
++               << " is_btm_supported=" << is_btm_supported
++               << " disassoc_imminent=" << disassoc_imminent
++               << " abridged=" << abridged;
+ 
+     /* Create client_steering_task directly so we can pass acl_allowed and is_btm_supported.
+      * son_actions::steer_sta() does not have these parameters and is used by many other
+@@ -6072,7 +6074,7 @@ bool Controller::start_client_steering(const std::string &sta_mac, const std::st
+         database, cmdu_tx, m_task_pool, sta_mac, target_bssid, triggered_by,
+         std::string() /* steering_type */, disassoc_imminent,
+         static_cast<int>(database.config.steering_disassoc_timer_msec.count()),
+-        false /* steer_restricted */, acl_allowed, is_btm_supported);
++        false /* steer_restricted */, acl_allowed, is_btm_supported, abridged);
+     m_task_pool.add_task(new_task);
+     return true;
+ }
+diff --git a/controller/src/beerocks/master/controller.h b/controller/src/beerocks/master/controller.h
+index 412f5932f..3649e11d2 100644
+--- a/controller/src/beerocks/master/controller.h
++++ b/controller/src/beerocks/master/controller.h
+@@ -102,11 +102,15 @@ public:
+      *
+      * @param sta_mac Mac address of client.
+      * @param target_bssid Target BSSID.
++     * @param disassoc_imminent BTM Disassociation Imminent bit for the steering request.
++     * @param abridged BTM Abridged bit for the steering request.
+      * @return True if client steering started successfully, false otherwise.
+      */
+     bool start_client_steering(const std::string &sta_mac, const std::string &target_bssid,
+-                                bool acl_allowed      = true,
+-                                bool is_btm_supported = true);
++                                bool acl_allowed        = true,
++                                bool is_btm_supported   = true,
++                                bool disassoc_imminent  = false,
++                                bool abridged           = false);
+ 
+     /**
+      * @brief Send BTM Request on NBAPI RPC.
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 94fee3023..8361b65c8 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -9089,18 +9089,22 @@ bool db::dm_remove_sta(Station &station)
+         return true;
+     }
+ 
+-    /* Trigger vendor-specific event for station disconnection before removing DM instance */
+-    // Extract context parameters for the trigger
++    /* Trigger vendor-specific event for station disconnection before removing DM instance.
++     * The radio for this BSS may no longer be resolvable (e.g. AP MLD link BSSIDs were
++     * reshuffled by a concurrent MLO reconfiguration) - that must not block removal of the
++     * DM instance below, otherwise the STA object is leaked and a duplicate gets created
++     * on the next reconnect. */
+     auto bss_mac = tlvf::mac_from_string(station.parent_mac);
+     auto radio   = get_radio_by_bssid(bss_mac);
+     if (!radio) {
+-        LOG(ERROR) << "Failed to get radio for BSS MAC: " << bss_mac;
+-        return false;
++        LOG(ERROR) << "Failed to get radio for BSS MAC: " << bss_mac
++                   << ", skipping StationDisconnected event but still removing DM instance "
++                   << station.dm_path;
++    } else {
++        auto agent_al_mac = get_bss_parent_agent(bss_mac);
++        dm_trigger_station_disconnected_event(station.mac, station.dm_path, bss_mac,
++                                              radio->radio_uid, agent_al_mac);
+     }
+-    auto agent_al_mac = get_bss_parent_agent(bss_mac);
+-
+-    dm_trigger_station_disconnected_event(station.mac, station.dm_path, bss_mac, radio->radio_uid,
+-                                          agent_al_mac);
+ 
+     auto instance = get_dm_index_from_path(station.dm_path);
+     station.dm_path.clear();
+diff --git a/controller/src/beerocks/master/tasks/client_steering_task.cpp b/controller/src/beerocks/master/tasks/client_steering_task.cpp
+index d7d51f702..1fdb88553 100644
+--- a/controller/src/beerocks/master/tasks/client_steering_task.cpp
++++ b/controller/src/beerocks/master/tasks/client_steering_task.cpp
+@@ -30,14 +30,14 @@ client_steering_task::client_steering_task(db &database, ieee1905_1::CmduMessage
+                                            const std::string &triggered_by,
+                                            const std::string &steering_type, bool disassoc_imminent,
+                                            int disassoc_timer_ms, bool steer_restricted,
+-                                           bool acl_allowed, bool is_btm_supported,
++                                           bool acl_allowed, bool is_btm_supported, bool abridged,
+                                            const std::string &task_name)
+     : task(task_name), m_database(database), m_cmdu_tx(cmdu_tx), m_tasks(tasks), m_sta_mac(sta_mac),
+       m_target_bssid(target_bssid), //Chosen VAP BSSID to steer the client to
+       m_triggered_by(triggered_by), m_steering_type(steering_type),
+       m_disassoc_imminent(disassoc_imminent), m_disassoc_timer_ms(disassoc_timer_ms),
+       m_steer_restricted(steer_restricted), m_acl_allowed(acl_allowed),
+-      m_is_btm_supported(is_btm_supported)
++      m_is_btm_supported(is_btm_supported), m_abridged(abridged)
+ {
+ }
+ 
+@@ -442,6 +442,7 @@ bool client_steering_task::steer_sta()
+     steering_request_tlv->request_flags().request_mode =
+         wfa_map::tlvSteeringRequest::REQUEST_IS_A_STEERING_MANDATE_TO_TRIGGER_STEERING;
+     steering_request_tlv->request_flags().btm_disassociation_imminent_bit = m_disassoc_imminent;
++    steering_request_tlv->request_flags().btm_abridged_bit                = m_abridged;
+ 
+     steering_request_tlv->btm_disassociation_timer_ms() = m_disassoc_timer_ms;
+     steering_request_tlv->bssid()                       = tlvf::mac_from_string(m_original_bssid);
+diff --git a/controller/src/beerocks/master/tasks/client_steering_task.h b/controller/src/beerocks/master/tasks/client_steering_task.h
+index 3cea6337f..c35d6082d 100644
+--- a/controller/src/beerocks/master/tasks/client_steering_task.h
++++ b/controller/src/beerocks/master/tasks/client_steering_task.h
+@@ -32,6 +32,7 @@ public:
+                          bool steer_restricted        = false,
+                          bool acl_allowed             = true,
+                          bool is_btm_supported        = true,
++                         bool abridged                = false,
+                          const std::string &task_name = std::string("client_steering_task"));
+     virtual ~client_steering_task() {}
+     bool handle_ieee1905_1_msg(const sMacAddr &src_mac,
+@@ -106,6 +107,7 @@ private:
+      *  Default: true (normal prplMesh flow). */
+     bool m_acl_allowed         = true;
+     bool m_is_btm_supported    = true; /**< true = send 802.11v BTM Request; false = legacy disassoc */
++    bool m_abridged            = false; /**< BTM Request Mode Abridged bit */
+ 
+     /**
+      * @brief The timestamp of steering event in data model of steering events.
+diff --git a/controller/src/beerocks/master/tasks/topology_task.cpp b/controller/src/beerocks/master/tasks/topology_task.cpp
+index 48fde404e..cf5412311 100644
+--- a/controller/src/beerocks/master/tasks/topology_task.cpp
++++ b/controller/src/beerocks/master/tasks/topology_task.cpp
+@@ -959,8 +959,31 @@ bool topology_task::handle_associated_clients_tlv(ieee1905_1::CmduMessageRx &cmd
+     for (std::pair<sMacAddr, sMacAddr> prev_connection : previous_connected) {
+         sMacAddr sta_mac = prev_connection.first;
+         if (current_connected.find(sta_mac) == current_connected.end()) {
++            // Guard against a stale TOPOLOGY_RESPONSE from a PREVIOUS parent agent.
++            //
++            // previous_connected/current_connected above are scoped to THIS agent's own
++            // radios/BSSes only. If the STA has already moved to a DIFFERENT agent (e.g.
++            // via a TOPOLOGY_NOTIFICATION steer completed after this agent's stale
++            // TOPOLOGY_RESPONSE was generated but before it was processed here), it is
++            // correctly absent from this agent's fresh association list -- but that just
++            // means it left THIS agent, not that it disconnected. Without this guard the
++            // STA's DM entry is deleted out from under its new, correct agent/BSS.
++            auto sta = database.get_station(sta_mac);
++            if (sta) {
++                auto bss       = sta->get_bss();
++                auto bss_agent = bss ? database.get_agent_by_bssid(bss->bssid) : nullptr;
++                if (bss_agent && bss_agent->al_mac != agent.al_mac) {
++                    LOG(WARNING) << "Stale TOPOLOGY_RESPONSE 'station disconnected' report"
++                                 << " suppressed: sta_mac=" << sta_mac
++                                 << " DB already has it on agent=" << bss_agent->al_mac
++                                 << " bssid=" << bss->bssid
++                                 << " but stale TOPOLOGY_RESPONSE from agent=" << agent.al_mac
++                                 << " no longer lists it";
++                    continue;
++                }
++            }
++
+             son_actions::handle_dead_station(tlvf::mac_to_string(sta_mac), true, database, tasks);
+-            std::shared_ptr<Station> sta = database.get_station(sta_mac);
+             if (sta) {
+                 database.dm_remove_sta(*sta);
+                 database.remove_sta(sta_mac);
+diff --git a/framework/tlvf/src/src/AssociationRequestFrame/AssocReqFrame.cpp b/framework/tlvf/src/src/AssociationRequestFrame/AssocReqFrame.cpp
+index bc855cfe8..f9834a04b 100644
+--- a/framework/tlvf/src/src/AssociationRequestFrame/AssocReqFrame.cpp
++++ b/framework/tlvf/src/src/AssociationRequestFrame/AssocReqFrame.cpp
+@@ -47,7 +47,19 @@ std::shared_ptr<AssocReqFrame> AssocReqFrame::parse(uint8_t *assoc_frame_buff,
+     default:
+         // The (Re)Association Request frame which comes with Capability Report
+         // contains only frame body, so we don't know it's type.
+-        if (fields->init_assoc_frame()) {
++        //
++        // init_assoc_frame() alone is not a reliable type test: a Reassociation
++        // Request's 6-byte Current AP Address can coincidentally look like a
++        // valid (id=ID_SSID, len<32) SSID element to add_ssid_field(), causing
++        // init_assoc_frame() to "succeed" on a reassociation frame and lock in
++        // the wrong 4-byte (instead of 10-byte) fixed-field length. That
++        // desyncs every subsequent optional element in init()'s loop (e.g. the
++        // real RM Enabled Capabilities element ends up missed even though it's
++        // present in the frame). Since Supported Rates always immediately
++        // follows SSID in both frame types, use it as a cheap sanity check on
++        // the assoc-frame guess before trusting it.
++        if (fields->init_assoc_frame() && fields->getRemainingBytes() > 0 &&
++            fields->getNextAttrType() == ID_SUPPORT_RATES) {
+             fields->type = ASSOCIATION_REQUEST;
+         } else if (fields->init_reassoc_frame()) {
+             fields->type = REASSOCIATION_REQUEST;
+-- 
+2.34.1
+
