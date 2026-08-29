@@ -1,0 +1,412 @@
+From 5c3596fa52b497225a561f31c999413f3eab8589 Mon Sep 17 00:00:00 2001
+From: Sandeep Tomer <stomer@qti.qualcomm.com>
+Date: Thu, 20 Aug 2026 14:30:19 +0530
+Subject: [PATCH] agent: backhaul: fallback to previous BSSID after failed 
+ steering
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When a controller-triggered BACKHAUL_STEERING_REQUEST causes the bSTA
+to disconnect (rather than cleanly roam to the target BSSID), the
+current behavior waits 30 seconds in WIRELESS_WAIT_FOR_RECONNECT and
+then reconnects to whichever BSSID has the best RSSI — with no memory
+of the previous BSSID. Additionally, the previous/good BSSID can be
+incorrectly blacklisted as a side effect of the 30s timeout.
+
+This commit implements the backhaul steering fallback design:
+
+1. Snapshot the pre-steering BSSID in handle_backhaul_steering_request()
+   so that if the steer causes a disconnect, we know what to fall back to.
+
+2. On a steering-caused disconnect (OPERATIONAL/CONNECTED state):
+   - Queue the BACKHAUL_STEERING_RESPONSE FAILURE to be sent when the
+     backhaul is restored (wireless link is down at disconnect time, so
+     the message cannot be delivered immediately).
+   - Cancel the 10s steering timer (avoids duplicate response).
+   - Clear selected_bssid defensively to prevent the previous/good BSSID
+     from being blacklisted by the WIRELESS_WAIT_FOR_RECONNECT timeout.
+   - If a previous BSSID is known: arm m_fallback_bssid and go straight
+     to INITIATE_SCAN (skipping the 30s passive wait).
+   - If no previous BSSID is known: fall back to existing passive-reconnect
+     behavior (WIRELESS_WAIT_FOR_RECONNECT), but with selected_bssid cleared.
+
+3. In select_bssid(): when m_fallback_bssid is set, short-circuit
+   selection to that BSSID (bypassing the blacklist), then one-shot clear
+   m_fallback_bssid.
+
+4. In EState::CONNECTED: send the deferred BACKHAUL_STEERING_RESPONSE
+   FAILURE now that the backhaul is restored and the message can reach
+   the controller.
+
+5. In EState::RESTART and INITIATE_SCAN give-up branch: clear all
+   fallback/pending state so stale values do not persist.
+
+6. In sta_wlan_hal_nl80211::process_nl80211_event(): drop events delivered
+   on the global wpa_supplicant ctrl socket when a dedicated per-interface
+   socket is in use. Both sockets are connected simultaneously (the global
+   one is kept only as a best-effort backup for AP-ENABLED/AP-DISABLED
+   discovery on the AP/Monitor side), so every event - including
+   CTRL-EVENT-SCAN-RESULTS - was being delivered and processed twice. The
+   resulting duplicate Event::ScanResults caused active_hal->roam() to be
+   called a second time for the same steering attempt; that second call
+   observed the station transiently not "COMPLETED" (mid-roam) and failed
+   with "Not connected, can't roam", which was misread as the steering
+   attempt failing and cancelled the still-fresh steering timer within
+   milliseconds of arming it. Since the fallback logic above only runs from
+   Event::Disconnected or the steering timer's own 10s expiry, that
+   premature cancellation prevented the fallback from ever being reached.
+   Mirrors the existing AP-ENABLED/AP-DISABLED/CSA_Started de-duplication
+   in ap_wlan_hal_nl80211::process_nl80211_event().
+
+7. Fix a dangling reference in the steering-timeout timer's callback: it
+   was capturing its enclosing scope by reference ([&]), including the
+   local `bssid` (destroyed once handle_backhaul_steering_request()
+   returns, well before the timer fires up to 10s later). The callback
+   now captures `bssid` explicitly by value ([bssid, this]).
+
+8. Fix m_steering_caused_disconnect/m_backhaul_steering_previous_bssid
+   leaking into a later, unrelated steering operation: the Event::Connected
+   success path (bSTA reconnects to the target) used to clear only
+   m_backhaul_steering_bssid and the timer directly, leaving the two new
+   members stale if a disconnect had happened earlier in the same steering
+   attempt. It now calls cancel_backhaul_steering_operation() instead,
+   which resets both members alongside the bssid/timer/channel, so no
+   steering operation can end (success, superseded, or synchronous roam
+   failure) without clearing this bookkeeping.
+
+New members added to BackhaulManager:
+  - m_backhaul_steering_previous_bssid: pre-steer BSSID snapshot
+  - m_fallback_bssid: one-shot fallback target for select_bssid()
+  - m_pending_steering_failure_bssid: queued FAILURE response
+
+Files changed:
+  agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+  agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+  common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
+
+Signed-off-by: Sandeep Tomer <stomer@qti.qualcomm.com>
+---
+ .../backhaul_manager/backhaul_manager.cpp     | 163 +++++++++++++++---
+ .../slave/backhaul_manager/backhaul_manager.h |  36 ++++
+ .../bwl/nl80211/sta_wlan_hal_nl80211.cpp      |  17 ++
+ 3 files changed, 193 insertions(+), 23 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index c3e901848..09f7538e8 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -997,6 +997,31 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+             }
+         }
+ 
++        // Send any queued backhaul steering FAILURE response now that the backhaul is restored.
++        // The response was queued (rather than sent immediately) when the steering-caused
++        // disconnect was detected, because the wireless link was down at that point and the
++        // message could not be delivered to the controller.
++        if (m_pending_steering_failure_bssid != beerocks::net::network_utils::ZERO_MAC) {
++            // create_backhaul_steering_response() needs an active wireless HAL (to read the
++            // bSTA MAC), which is not available right after restoring over a wired backhaul —
++            // in that case there is nothing useful to send, so just drop the deferred response
++            // rather than forwarding a stale/unrelated cmdu_tx to the controller.
++            if (create_backhaul_steering_response(
++                    wfa_map::tlvErrorCode::eReasonCode::
++                        BACKHAUL_STEERING_REQUEST_REJECTED_TARGET_BSS_SIGNAL_NOT_SUITABLE,
++                    m_pending_steering_failure_bssid)) {
++                LOG(DEBUG) << "Sending deferred BACKHAUL_STA_STEERING_RESPONSE_MESSAGE "
++                              "(backhaul restored), target_bssid="
++                           << m_pending_steering_failure_bssid;
++                send_cmdu_to_broker(cmdu_tx, db->controller_info.bridge_mac, db->bridge.mac);
++            } else {
++                LOG(ERROR) << "Failed to build deferred BACKHAUL_STA_STEERING_RESPONSE_MESSAGE "
++                              "for target_bssid="
++                           << m_pending_steering_failure_bssid << ", dropping it";
++            }
++            m_pending_steering_failure_bssid = beerocks::net::network_utils::ZERO_MAC;
++        }
++
+         handle_backhaul_connect();
+         stop_on_failure_attempts = configuration_stop_on_failure_attempts;
+ 
+@@ -1258,6 +1283,13 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+ 
+         LOG(DEBUG) << "Restarting ...";
+ 
++        // Clear steering fallback state on restart — any pending FAILURE response is stale
++        // by the time the agent reconnects after a full restart cycle.
++        m_steering_caused_disconnect       = false;
++        m_backhaul_steering_previous_bssid = beerocks::net::network_utils::ZERO_MAC;
++        m_fallback_bssid                   = beerocks::net::network_utils::ZERO_MAC;
++        m_pending_steering_failure_bssid   = beerocks::net::network_utils::ZERO_MAC;
++
+         if (m_remove_platform_manager_client) {
+             m_platform_manager_client.reset();
+             m_remove_platform_manager_client = false;
+@@ -1718,6 +1750,10 @@ bool BackhaulManager::backhaul_fsm_wireless(bool &skip_select)
+             hidden_ssid              = true;
+             pending_slave_sta_ifaces = slave_sta_ifaces;
+ 
++            // Give up on the steering-fallback candidate too, so it doesn't linger and bias
++            // an unrelated future connection attempt.
++            m_fallback_bssid = beerocks::net::network_utils::ZERO_MAC;
++
+             FSM_MOVE_STATE(WIRELESS_CONFIG_4ADDR_MODE);
+             break;
+         }
+@@ -2818,8 +2854,9 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+         if ((m_backhaul_steering_bssid != beerocks::net::network_utils::ZERO_MAC) &&
+             (m_backhaul_steering_bssid == bssid)) {
+ 
+-            m_backhaul_steering_bssid = beerocks::net::network_utils::ZERO_MAC;
+-            m_timer_manager->remove_timer(m_backhaul_steering_timer);
++            // Also resets m_steering_caused_disconnect/m_backhaul_steering_previous_bssid, so
++            // they cannot leak into a later, unrelated steering operation.
++            cancel_backhaul_steering_operation();
+ 
+             create_backhaul_steering_response(wfa_map::tlvErrorCode::eReasonCode::RESERVED, bssid);
+ 
+@@ -3110,12 +3147,33 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+                     platform_notify_error(bpl::eErrorCode::BH_DISCONNECTED,
+                                           "Backhaul disconnected on operational state");
+                     stop_on_failure_attempts--;
+-                }
+ 
+-                state_time_stamp_timeout =
+-                    std::chrono::steady_clock::now() +
+-                    std::chrono::seconds(WIRELESS_WAIT_FOR_RECONNECT_TIMEOUT);
+-                FSM_MOVE_STATE(WIRELESS_WAIT_FOR_RECONNECT);
++                    state_time_stamp_timeout =
++                        std::chrono::steady_clock::now() +
++                        std::chrono::seconds(WIRELESS_WAIT_FOR_RECONNECT_TIMEOUT);
++                    FSM_MOVE_STATE(WIRELESS_WAIT_FOR_RECONNECT);
++                } else {
++                    // The steer caused a disconnect. Do NOT cancel the steering timer yet —
++                    // give the bSTA the full remaining steering window (up to the 10s timeout)
++                    // to connect to the target BSSID. Record that a disconnect happened so the
++                    // timer callback can trigger the fallback if the bSTA never connects.
++                    m_steering_caused_disconnect = true;
++                    LOG(DEBUG) << "Steering-triggered disconnect. Keeping steering timer running "
++                                  "to give bSTA a chance to connect to target="
++                               << m_backhaul_steering_bssid;
++
++                    // Clear selected_bssid defensively so that if the 30s
++                    // WIRELESS_WAIT_FOR_RECONNECT timer fires (it won't, since the 10s steering
++                    // timer fires first), it does not blacklist the previous/good BSSID.
++                    selected_bssid.clear();
++
++                    // Move to WIRELESS_WAIT_FOR_RECONNECT so that if the bSTA connects to the
++                    // target within the remaining steering window, Event::Connected can handle it.
++                    state_time_stamp_timeout =
++                        std::chrono::steady_clock::now() +
++                        std::chrono::seconds(WIRELESS_WAIT_FOR_RECONNECT_TIMEOUT);
++                    FSM_MOVE_STATE(WIRELESS_WAIT_FOR_RECONNECT);
++                }
+             } else if (FSM_IS_IN_STATE(WIRELESS_ASSOCIATE_4ADDR_WAIT)) {
+                 if (!data) {
+                     LOG(ERROR) << "Disconnected event without data!";
+@@ -3373,6 +3431,12 @@ bool BackhaulManager::select_bssid()
+                        << ", channel = " << int(scan_result.channel) << " iface = " << iface
+                        << ", rssi=" << int(scan_result.rssi);
+ 
++            // Check if this BSSID is the one-shot steering-fallback candidate.
++            // If so, bypass the blacklist check and short-circuit selection immediately.
++            bool is_fallback_bssid_candidate =
++                (m_fallback_bssid != beerocks::net::network_utils::ZERO_MAC) &&
++                (tlvf::mac_from_string(bssid) == m_fallback_bssid);
++
+             auto ap_blacklist_it = ap_blacklist.find(bssid);
+             if (ap_blacklist_it != ap_blacklist.end()) {
+                 ap_blacklist_entry &entry = ap_blacklist_it->second;
+@@ -3381,11 +3445,24 @@ bool BackhaulManager::select_bssid()
+                     LOG(DEBUG) << " bssid = " << bssid
+                                << " aged and removed from backhaul blacklist";
+                     ap_blacklist.erase(bssid);
+-                } else if (entry.attempts >= AP_BLACK_LIST_FAILED_ATTEMPTS_THRESHOLD) {
++                } else if (entry.attempts >= AP_BLACK_LIST_FAILED_ATTEMPTS_THRESHOLD &&
++                           !is_fallback_bssid_candidate) {
+                     LOG(DEBUG) << " bssid = " << bssid << " is blacklisted, skipping";
+                     continue;
+                 }
+             }
++            if (is_fallback_bssid_candidate) {
++                LOG(DEBUG) << "steering-fallback bssid - found bssid match = " << bssid;
++                selected_bssid_channel           = {scan_result.channel, scan_result.freq_type};
++                selected_bssid                   = bssid;
++                db->backhaul.selected_iface_name = iface;
++                auto radio = db->radio(iface);
++                if (radio) {
++                    db->backhaul.selected_iface_radio_mac = radio->front.iface_mac;
++                }
++                m_fallback_bssid = beerocks::net::network_utils::ZERO_MAC; // one-shot clear
++                return true;
++            }
+             if (roam_flag) {
+                 if ((bssid == roam_selected_bssid) &&
+                     (scan_result.channel == roam_selected_bssid_channel.first &&
+@@ -4086,26 +4163,58 @@ bool BackhaulManager::handle_backhaul_steering_request(ieee1905_1::CmduMessageRx
+     m_backhaul_steering_bssid   = bssid;
+     m_backhaul_steering_channel = {channel, freq_type};
+ 
++    // Snapshot the BSSID we were on before this steer, so that if it results in a disconnect
++    // (rather than a clean roam), we can fall back to it instead of doing generic best-RSSI
++    // reselection or waiting out WIRELESS_WAIT_FOR_RECONNECT. Empty active_hal->get_bssid()
++    // (e.g. no prior association) yields ZERO_MAC, which the disconnect handler treats as
++    // "nothing to fall back to".
++    m_backhaul_steering_previous_bssid = tlvf::mac_from_string(active_hal->get_bssid());
++
+     // Create a timer to check if this Backhaul Steering Request times out.
+     m_backhaul_steering_timer = m_timer_manager->add_timer(
+         "Backhaul Steering Timeout", backhaul_steering_timeout, std::chrono::milliseconds::zero(),
+-        [&](int fd, beerocks::EventLoop &loop) {
+-            cancel_backhaul_steering_operation();
++        [bssid, this](int fd, beerocks::EventLoop &loop) {
++            // Snapshot state before cancel_backhaul_steering_operation() clears it.
++            bool caused_disconnect  = m_steering_caused_disconnect;
++            sMacAddr previous_bssid = m_backhaul_steering_previous_bssid;
+ 
+-            // We'll end up in this situation only if an attempt to scan and associate was made, but
+-            // we didn't manage to actually connect within 10 seconds, so that's probably indicative
+-            // of bad reception.
+-            // There is no suitable reason code for "timeout" so "target BSS signal not suitable" is
+-            // used as it seems to be the more appropriate of all the reason codes available.
+-            create_backhaul_steering_response(
+-                wfa_map::tlvErrorCode::eReasonCode::
+-                    BACKHAUL_STEERING_REQUEST_REJECTED_TARGET_BSS_SIGNAL_NOT_SUITABLE,
+-                bssid);
++            // Also resets m_steering_caused_disconnect/m_backhaul_steering_previous_bssid.
++            cancel_backhaul_steering_operation();
+ 
+-            LOG(DEBUG)
+-                << "Steering request timed out. Sending BACKHAUL_STA_STEERING_RESPONSE_MESSAGE";
+-            auto db = AgentDB::get();
+-            send_cmdu_to_broker(cmdu_tx, db->controller_info.bridge_mac, db->bridge.mac);
++            if (caused_disconnect) {
++                // The bSTA disconnected during the steering window and did not connect to
++                // the target BSSID within the 10s timeout. Queue the FAILURE response (the
++                // wireless link is still down) and trigger fallback to the previous BSSID.
++                m_pending_steering_failure_bssid = bssid;
++                LOG(DEBUG) << "Steering timeout after disconnect. Queuing "
++                              "BACKHAUL_STA_STEERING_RESPONSE_MESSAGE (target="
++                           << bssid << ") for delivery when backhaul is restored.";
++
++                if (previous_bssid != beerocks::net::network_utils::ZERO_MAC) {
++                    LOG(DEBUG) << "Falling back to previous bssid=" << previous_bssid
++                               << " after failed steer to " << bssid;
++                    m_fallback_bssid = previous_bssid;
++                    selected_bssid.clear();
++                    state_attempts = 0;
++                    FSM_MOVE_STATE(INITIATE_SCAN);
++                }
++                // else: no previous BSSID known — stay in WIRELESS_WAIT_FOR_RECONNECT,
++                // existing passive-reconnect behavior applies.
++            } else {
++                // The bSTA did not disconnect — it is still connected to the original BSSID
++                // but simply did not roam to the target within the timeout. The wireless link
++                // is up, so send the FAILURE response immediately.
++                // There is no suitable reason code for "timeout" so "target BSS signal not
++                // suitable" is used as it seems to be the most appropriate available.
++                create_backhaul_steering_response(
++                    wfa_map::tlvErrorCode::eReasonCode::
++                        BACKHAUL_STEERING_REQUEST_REJECTED_TARGET_BSS_SIGNAL_NOT_SUITABLE,
++                    bssid);
++                LOG(DEBUG) << "Steering request timed out (no disconnect). "
++                              "Sending BACKHAUL_STA_STEERING_RESPONSE_MESSAGE";
++                auto db = AgentDB::get();
++                send_cmdu_to_broker(cmdu_tx, db->controller_info.bridge_mac, db->bridge.mac);
++            }
+             return true;
+         });
+     if (m_backhaul_steering_timer == beerocks::net::FileDescriptor::invalid_descriptor) {
+@@ -4181,6 +4290,14 @@ void BackhaulManager::cancel_backhaul_steering_operation()
+     m_backhaul_steering_channel = {0, eFreqType::FREQ_UNKNOWN};
+ 
+     m_timer_manager->remove_timer(m_backhaul_steering_timer);
++
++    // Reset steering-fallback bookkeeping too, whenever a steering operation ends via any
++    // path (clean success, superseded by a new request, or synchronous roam failure) - not
++    // just via the timer's own expiry. Otherwise a stale m_steering_caused_disconnect/
++    // m_backhaul_steering_previous_bssid from this operation could be misread by a later,
++    // unrelated steering operation's timer callback.
++    m_steering_caused_disconnect       = false;
++    m_backhaul_steering_previous_bssid = beerocks::net::network_utils::ZERO_MAC;
+ }
+ 
+ std::string BackhaulManager::freq_to_radio_mac(eFreqType freq) const
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+index 8808a772d..337216659 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+@@ -725,6 +725,42 @@ private:
+      */
+     int m_backhaul_steering_timer = beerocks::net::FileDescriptor::invalid_descriptor;
+ 
++    /**
++     * Set to true when a disconnect event is received while a backhaul steering operation is
++     * in progress (m_backhaul_steering_bssid != ZERO_MAC). The steering timer is kept running
++     * so the bSTA has the full 10-second window to connect to the target BSSID. When the timer
++     * fires, if this flag is still true (bSTA never connected to the target), the fallback to
++     * the previous BSSID is triggered. Cleared by the timer callback, by EState::RESTART, and
++     * when the bSTA successfully connects to the target (Event::Connected steering branch).
++     */
++    bool m_steering_caused_disconnect = false;
++
++    /**
++     * The BSSID the bSTA was associated to right before an ongoing backhaul steering
++     * operation was triggered. Snapshotted in handle_backhaul_steering_request() before the
++     * scan/roam is attempted, so that if the steer results in a disconnect, we know what to
++     * fall back to. ZERO_MAC if no steering operation is in progress, or none was known.
++     */
++    sMacAddr m_backhaul_steering_previous_bssid = beerocks::net::network_utils::ZERO_MAC;
++
++    /**
++     * One-shot fallback target for select_bssid(): when set, select_bssid() preferentially
++     * matches this BSSID (bypassing the blacklist for it) and clears it once matched.
++     * Set by the steering timeout timer's callback (handle_backhaul_steering_request()) when
++     * it fires with m_steering_caused_disconnect still true and a previous BSSID is known, to
++     * recover the previous BSSID via the normal scan->select->connect flow (roam() cannot be
++     * used here since it requires an already-associated station).
++     */
++    sMacAddr m_fallback_bssid = beerocks::net::network_utils::ZERO_MAC;
++
++    /**
++     * The target BSSID of a steering operation that caused a disconnect on a wireless-only
++     * backhaul. The BACKHAUL_STEERING_RESPONSE FAILURE cannot be sent immediately (the
++     * wireless link is down), so it is queued here and sent once the backhaul is restored
++     * (i.e. when the FSM enters EState::CONNECTED). ZERO_MAC if no response is pending.
++     */
++    sMacAddr m_pending_steering_failure_bssid = beerocks::net::network_utils::ZERO_MAC;
++
+     /*
+  * State Machines
+  */
+diff --git a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
+index 11dda5f30..41289dd51 100644
+--- a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
+@@ -388,6 +388,23 @@ bool sta_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+     auto opcode = parsed_obj["_opcode"];
+     LOG(TRACE) << __func__ << " " << get_iface_name() << " - opcode: |" << opcode << "|";
+ 
++    // The per-interface event socket is always the complete, authoritative source of
++    // every STA event; the global wpa_supplicant socket is kept connected only as a
++    // best-effort backup for AP-ENABLED/AP-DISABLED discovery on the AP/Monitor side
++    // (base_wlan_hal_nl80211's Attach state). When both are connected, every event is
++    // delivered twice - drop the global-socket copy here so state-driving events
++    // (ScanResults, Connected, Disconnected, ...) are only processed once.
++    // get_iface_name() != global_iface guards the (STA-atypical) case where no
++    // dedicated per-interface socket exists at all, i.e. this instance's own events
++    // legitimately arrive tagged as "global".
++    if (get_iface_name() != global_iface) {
++        auto from_global_it = parsed_obj.find(EVENT_PARAM_FROM_GLOBAL_SOCK);
++        if (from_global_it != parsed_obj.end() && from_global_it->second == "1") {
++            LOG(DEBUG) << "Ignoring duplicate event on global socket: " << opcode;
++            return true;
++        }
++    }
++
+     auto event = nl80211_to_bwl_event(opcode);
+ 
+     switch (event) {
+-- 
+2.34.1
+
