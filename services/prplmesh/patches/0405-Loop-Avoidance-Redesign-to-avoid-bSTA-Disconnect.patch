@@ -1,0 +1,657 @@
+From 62c4da0b79ccdbf226cfe01afd9f5b15a1872199 Mon Sep 17 00:00:00 2001
+From: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+Date: Sun, 30 Aug 2026 23:10:01 +0530
+Subject: [PATCH] Loop Avoidance Redesign to avoid bSTA Disconnect
+
+Signed-off-by: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 | 48 +---------
+ .../fronthaul_manager/ap_manager/ap_manager.h |  9 --
+ .../backhaul_manager/backhaul_manager.cpp     | 49 ++++++++--
+ .../beerocks/bwl/dummy/sta_wlan_hal_dummy.cpp | 15 +++
+ .../beerocks/bwl/dummy/sta_wlan_hal_dummy.h   |  8 ++
+ .../beerocks/bwl/dwpal/sta_wlan_hal_dwpal.cpp | 91 +++++++++++++++++++
+ .../beerocks/bwl/dwpal/sta_wlan_hal_dwpal.h   |  8 ++
+ .../bwl/dwpald/sta_wlan_hal_dwpald.cpp        | 91 +++++++++++++++++++
+ .../beerocks/bwl/dwpald/sta_wlan_hal_dwpald.h |  8 ++
+ .../beerocks/bwl/include/bwl/sta_wlan_hal.h   | 13 ++-
+ .../bwl/nl80211/sta_wlan_hal_nl80211.cpp      | 20 ++++
+ .../bwl/nl80211/sta_wlan_hal_nl80211.h        |  3 +
+ .../bwl/onewifi/sta_wlan_hal_onewifi.cpp      | 44 +++++++++
+ .../bwl/onewifi/sta_wlan_hal_onewifi.h        |  2 +
+ common/beerocks/bwl/whm/sta_wlan_hal_whm.cpp  | 38 ++++++++
+ common/beerocks/bwl/whm/sta_wlan_hal_whm.h    |  3 +
+ 16 files changed, 389 insertions(+), 61 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index d0ef78fcc..b30ed75f7 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -1311,12 +1311,9 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+         if (!ap_wlan_hal->set_hop_count(hop_count)) {
+             LOG(ERROR) << "Setting hop count failed on backhaul BSSes of radio " << m_iface;
+         }
+-        if (!notification->connected()) {
+-            // Disconnect all bSTAs connected to this agent's backhaul BSSes
+-            // This prevents loop formation when the agent tries to reconnect
+-            LOG(INFO) << "Disconnecting all bSTAs from backhaul BSSes to prevent mesh loops";
+-            disconnect_all_backhaul_stas();
+-        }
++        // Downstream bSTAs stay connected across a backhaul disconnect/reconnect cycle
++        // (loop-avoidance now relies on BSSID pinning + WIRELESS_WAIT_FOR_RECONNECT, not
++        // on tearing down the fronthaul).
+         return;
+     }
+     case beerocks_message::ACTION_APMANAGER_UPDATE_HIDDEN_SSID_REQUEST: {
+@@ -5504,42 +5501,3 @@ void ApManager::start_csa_notification_timer(
+             return true;
+         });
+ }
+-
+-void ApManager::disconnect_all_backhaul_stas()
+-{
+-    LOG(INFO) << "Disconnecting all bSTAs from backhaul BSSes on radio " << m_iface;
+-
+-    if (!ap_wlan_hal) {
+-        LOG(WARNING) << "ap_wlan_hal not initialized, cannot disconnect bSTAs";
+-        return;
+-    }
+-
+-    const auto &vap_unordered_map = ap_wlan_hal->get_radio_info().available_vaps;
+-
+-    // Iterate through all VAPs and disconnect clients from backhaul BSSes
+-    for (const auto &vap_entry : vap_unordered_map) {
+-        const auto &vap = vap_entry.second;
+-
+-        // Only process backhaul BSSes
+-        if (!vap.backhaul) {
+-            continue;
+-        }
+-
+-        LOG(INFO) << "Disconnecting all clients from backhaul BSS: " << vap.bss
+-                  << " (BSSID: " << vap.mac << ")";
+-
+-        // Deauthenticate all stations on this backhaul BSS
+-        // Using wildcard MAC address to disconnect all connected stations
+-        if (!ap_wlan_hal->sta_deauth(vap_entry.first,
+-                                     beerocks::net::network_utils::WILD_MAC_STRING,
+-                                     wfa_map::tlvProfile2ReasonCode::LEAVING_NETWORK_DEAUTH)) {
+-            LOG(ERROR) << "Failed to deauthenticate all stations from backhaul BSS "
+-                       << vap.bss;
+-        } else {
+-            LOG(INFO) << "Successfully deauthenticated all stations from backhaul BSS "
+-                      << vap.bss;
+-        }
+-    }
+-
+-    LOG(INFO) << "Completed disconnecting all bSTAs from backhaul BSSes";
+-}
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
+index f6a17a0e3..7d8c37dbe 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
+@@ -196,15 +196,6 @@ private:
+     void allow_expired_clients();
+     bool register_ext_events_handlers(int fd);
+ 
+-    /**
+-     * @brief Disconnect all bSTAs connected to this agent's backhaul BSSes.
+-     *
+-     * This method is called when the agent loses controller connectivity or loses
+-     * connection on its bSTA. Disconnecting all downstream bSTAs prevents loop
+-     * formation in the mesh network by forcing all agents to set hop count to 255.
+-     */
+-    void disconnect_all_backhaul_stas();
+-
+     /**
+      * @brief Create a new BSS and register handlers for it.
+      *
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 23998e662..5d3533ea8 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -1216,20 +1216,20 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+                     // Ethernet backhaul disconnected - check if we should reconnect STA or restart FSM
+                     bool should_reconnect_sta = false;
+                     for (auto &radio_info : m_radios_info) {
+-                        if (radio_info->sta_hal_initialized && radio_info->sta_hal_disconnected_for_eth) {
++                        if (radio_info->sta_hal_initialized && radio_info->sta_wlan_hal &&
++                            radio_info->sta_hal_disconnected_for_eth) {
+                             should_reconnect_sta = true;
+-                            LOG(DEBUG) << "Both flags set for " << radio_info->sta_iface
++                            LOG(DEBUG) << "STA HAL available for " << radio_info->sta_iface
+                                       << " - will reconnect STA instead of restarting FSM";
+                             break;
+                         }
+                     }
+ 
+                     if (should_reconnect_sta) {
+-                        // Reconnect STA interfaces that were disconnected due to ethernet detection
++                        // Reconnect STA interfaces that have an initialized STA HAL
+                         for (auto &radio_info : m_radios_info) {
+-                            if (radio_info->sta_hal_initialized &&
+-                                radio_info->sta_hal_disconnected_for_eth &&
+-                                radio_info->sta_wlan_hal) {
++                            if (radio_info->sta_hal_initialized && radio_info->sta_wlan_hal &&
++                                radio_info->sta_hal_disconnected_for_eth) {
+ 
+                                 LOG(INFO) << "Reconnecting STA interface " << radio_info->sta_iface
+                                          << " after ethernet backhaul disconnection";
+@@ -2065,6 +2065,17 @@ bool BackhaulManager::backhaul_fsm_wireless(bool &skip_select)
+         if (now > state_time_stamp_timeout) {
+             LOG(DEBUG) << "reconnect wait timed out";
+ 
++            // The reconnect timeout has elapsed - clear the BSSID pin so the bSTA is free
++            // to scan and connect to other BSSes instead of continuing to retry the same one.
++            {
++                auto db        = AgentDB::get();
++                auto iface_hal = get_wireless_hal(db->backhaul.selected_iface_name);
++                if (iface_hal && !iface_hal->unpin_bssid()) {
++                    LOG(ERROR) << "Failed to unpin bssid on iface "
++                               << db->backhaul.selected_iface_name;
++                }
++            }
++
+             // Before scanning, check if ethernet is now available.
+             if (try_switch_to_wired_backhaul()) {
+                 break;
+@@ -2933,6 +2944,21 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+             break;
+         }
+ 
++        // Pin the bSTA to this BSSID so that, if it later gets disconnected, it keeps
++        // retrying the same node rather than roaming away immediately (loop-avoidance:
++        // gives the other agents' heartbeat mechanism a chance to detect loss of
++        // controller reachability before this bSTA connects elsewhere).
++        // Only pin if the BSSID is a valid unicast MAC - a zero/broadcast BSSID would
++        // otherwise pin the bSTA to an unusable address, blocking any real connection.
++        if (bssid != beerocks::net::network_utils::ZERO_MAC &&
++            bssid != beerocks::net::network_utils::WILD_MAC) {
++            if (!iface_hal->pin_bssid(bssid)) {
++                LOG(ERROR) << "Failed to pin bssid " << bssid << " on iface " << iface;
++            }
++        } else {
++            LOG(WARNING) << "Skipping pin_bssid: invalid BSSID " << bssid << " on iface " << iface;
++        }
++
+         if (db->device_conf.certification_mode) {
+             /* When the station is connected we wanted to enable
+                3addr multicast packets entering the system.
+@@ -3273,6 +3299,17 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+                 }
+ #endif
+ 
++                // Re-assert the BSSID pin (defensively, in case it was not already set or
++                // was cleared) so that the bSTA keeps retrying this same node while we wait
++                // for reconnection below, instead of roaming away immediately.
++                if (db->backhaul.backhaul_bssid != beerocks::net::network_utils::ZERO_MAC) {
++                    auto iface_hal = get_wireless_hal(iface);
++                    if (iface_hal && !iface_hal->pin_bssid(db->backhaul.backhaul_bssid)) {
++                        LOG(ERROR) << "Failed to re-pin bssid " << db->backhaul.backhaul_bssid
++                                   << " on iface " << iface;
++                    }
++                }
++
+                 if (m_backhaul_steering_bssid == beerocks::net::network_utils::ZERO_MAC) {
+                     platform_notify_error(bpl::eErrorCode::BH_DISCONNECTED,
+                                           "Backhaul disconnected on operational state");
+diff --git a/common/beerocks/bwl/dummy/sta_wlan_hal_dummy.cpp b/common/beerocks/bwl/dummy/sta_wlan_hal_dummy.cpp
+index 0f27a6a79..4cfb09c5e 100644
+--- a/common/beerocks/bwl/dummy/sta_wlan_hal_dummy.cpp
++++ b/common/beerocks/bwl/dummy/sta_wlan_hal_dummy.cpp
+@@ -93,6 +93,21 @@ std::string sta_wlan_hal_dummy::get_wireless_backhaul_mac()
+ 
+ bool sta_wlan_hal_dummy::enable_disable_ep(bool enable) { return true; }
+ 
++bool sta_wlan_hal_dummy::pin_bssid(const sMacAddr &bssid) { return true; }
++
++bool sta_wlan_hal_dummy::unpin_bssid() { return true; }
++
++bool sta_wlan_hal_dummy::disconnect_backhaul_sta() { return true; }
++
++bool sta_wlan_hal_dummy::reconnect_backhaul_sta() { return true; }
++
++bool sta_wlan_hal_dummy::is_disconnected() { return true; }
++
++bool sta_wlan_hal_dummy::add_new_network(son::wireless_utils::sBssInfoConf bSta_conf)
++{
++    return true;
++}
++
+ sMacAddr sta_wlan_hal_dummy::get_bsta_mld_mac() { return beerocks::net::network_utils::ZERO_MAC; }
+ 
+ sMacAddr sta_wlan_hal_dummy::get_ap_mld_mac() { return beerocks::net::network_utils::ZERO_MAC; }
+diff --git a/common/beerocks/bwl/dummy/sta_wlan_hal_dummy.h b/common/beerocks/bwl/dummy/sta_wlan_hal_dummy.h
+index 148aa2921..fe7f2e518 100644
+--- a/common/beerocks/bwl/dummy/sta_wlan_hal_dummy.h
++++ b/common/beerocks/bwl/dummy/sta_wlan_hal_dummy.h
+@@ -70,6 +70,14 @@ public:
+ 
+     virtual bool enable_disable_ep(bool enable) override;
+ 
++    virtual bool pin_bssid(const sMacAddr &bssid) override;
++    virtual bool unpin_bssid() override;
++
++    virtual bool disconnect_backhaul_sta() override;
++    virtual bool reconnect_backhaul_sta() override;
++    virtual bool is_disconnected() override;
++    virtual bool add_new_network(son::wireless_utils::sBssInfoConf bSta_conf) override;
++
+     virtual sMacAddr get_bsta_mld_mac() override;
+     virtual sMacAddr get_ap_mld_mac() override;
+ 
+diff --git a/common/beerocks/bwl/dwpal/sta_wlan_hal_dwpal.cpp b/common/beerocks/bwl/dwpal/sta_wlan_hal_dwpal.cpp
+index 794b6a31a..c92ca6349 100644
+--- a/common/beerocks/bwl/dwpal/sta_wlan_hal_dwpal.cpp
++++ b/common/beerocks/bwl/dwpal/sta_wlan_hal_dwpal.cpp
+@@ -478,6 +478,97 @@ std::string sta_wlan_hal_dwpal::get_wireless_backhaul_mac()
+ 
+ bool sta_wlan_hal_dwpal::enable_disable_ep(bool enable) { return true; }
+ 
++bool sta_wlan_hal_dwpal::pin_bssid(const sMacAddr &bssid)
++{
++    if (m_active_network_id < 0) {
++        LOG(ERROR) << "Failed pinning bssid on interface " << get_iface_name()
++                   << ": no active network";
++        return false;
++    }
++    return set_network(m_active_network_id, "bssid", tlvf::mac_to_string(bssid));
++}
++
++bool sta_wlan_hal_dwpal::unpin_bssid()
++{
++    if (m_active_network_id < 0) {
++        LOG(ERROR) << "Failed unpinning bssid on interface " << get_iface_name()
++                   << ": no active network";
++        return false;
++    }
++    return set_network(m_active_network_id, "bssid", "any");
++}
++
++bool sta_wlan_hal_dwpal::disconnect_backhaul_sta() { return disconnect(); }
++
++bool sta_wlan_hal_dwpal::reconnect_backhaul_sta()
++{
++    if (m_active_network_id < 0) {
++        LOG(ERROR) << "Failed reconnecting backhaul sta on interface " << get_iface_name()
++                   << ": no active network";
++        return false;
++    }
++    return enable_network(m_active_network_id);
++}
++
++bool sta_wlan_hal_dwpal::is_disconnected() { return !is_connected(); }
++
++static WiFiSec wsc_to_wifi_sec(WSC::eWscAuth auth)
++{
++    using W = WSC::eWscAuth;
++
++    // OPEN
++    if (auth == W::WSC_AUTH_OPEN) {
++        return WiFiSec::None;
++    }
++
++    // WPA3 Transition (SAE + WPA2PSK)
++    if ((auth & W::WSC_AUTH_SAE) && (auth & W::WSC_AUTH_WPA2PSK)) {
++        return WiFiSec::WPA2_WPA3_PSK;
++    }
++
++    // WPA3 only
++    if (auth & W::WSC_AUTH_SAE) {
++        return WiFiSec::WPA3_PSK;
++    }
++
++    // WPA2
++    if (auth & W::WSC_AUTH_WPA2PSK) {
++        return WiFiSec::WPA2_PSK;
++    }
++
++    // Legacy WPA
++    if (auth & W::WSC_AUTH_WPAPSK) {
++        return WiFiSec::WPA_PSK;
++    }
++
++    return WiFiSec::Invalid;
++}
++
++bool sta_wlan_hal_dwpal::add_new_network(son::wireless_utils::sBssInfoConf bSta_conf)
++{
++    if (bSta_conf.ssid.empty()) {
++        LOG(ERROR) << "add_new_network(): empty BSTA SSID";
++        return false;
++    }
++
++    WiFiSec sec = wsc_to_wifi_sec(bSta_conf.authentication_type);
++    if (sec == WiFiSec::Invalid) {
++        LOG(ERROR) << "add_new_network(): invalid authentication type";
++        return false;
++    }
++
++    bool hidden_ssid = false;
++    if (bSta_conf.hidden_ssid != WSC::eWscVendorExtHiddenSsid::UNSET) {
++        hidden_ssid = static_cast<bool>(bSta_conf.hidden_ssid);
++    }
++
++    return connect(bSta_conf.ssid, bSta_conf.network_key, sec, false /* mem_only_psk */,
++                   (bSta_conf.bssid == beerocks::net::network_utils::ZERO_MAC)
++                       ? std::string("")
++                       : tlvf::mac_to_string(bSta_conf.bssid),
++                   ChannelFreqPair{0, eFreqType::FREQ_UNKNOWN}, hidden_ssid);
++}
++
+ bool sta_wlan_hal_dwpal::process_dwpal_event(char *buffer, int bufLen, const std::string &opcode)
+ {
+     LOG(TRACE) << __func__ << " " << get_iface_name() << " - opcode: |" << opcode << "|";
+diff --git a/common/beerocks/bwl/dwpal/sta_wlan_hal_dwpal.h b/common/beerocks/bwl/dwpal/sta_wlan_hal_dwpal.h
+index 40dc99371..05c416f5e 100644
+--- a/common/beerocks/bwl/dwpal/sta_wlan_hal_dwpal.h
++++ b/common/beerocks/bwl/dwpal/sta_wlan_hal_dwpal.h
+@@ -65,6 +65,14 @@ public:
+ 
+     virtual bool enable_disable_ep(bool enable) override;
+ 
++    virtual bool pin_bssid(const sMacAddr &bssid) override;
++    virtual bool unpin_bssid() override;
++
++    virtual bool disconnect_backhaul_sta() override;
++    virtual bool reconnect_backhaul_sta() override;
++    virtual bool is_disconnected() override;
++    virtual bool add_new_network(son::wireless_utils::sBssInfoConf bSta_conf) override;
++
+ protected:
+     virtual bool process_dwpal_event(char *buffer, int bufLen, const std::string &opcode) override;
+     virtual bool process_dwpal_nl_event(struct nl_msg *msg, void *arg = nullptr) override;
+diff --git a/common/beerocks/bwl/dwpald/sta_wlan_hal_dwpald.cpp b/common/beerocks/bwl/dwpald/sta_wlan_hal_dwpald.cpp
+index fdac07226..5ceb49a3f 100644
+--- a/common/beerocks/bwl/dwpald/sta_wlan_hal_dwpald.cpp
++++ b/common/beerocks/bwl/dwpald/sta_wlan_hal_dwpald.cpp
+@@ -504,6 +504,97 @@ std::string sta_wlan_hal_dwpal::get_wireless_backhaul_mac()
+ 
+ bool sta_wlan_hal_dwpal::enable_disable_ep(bool enable) { return true; }
+ 
++bool sta_wlan_hal_dwpal::pin_bssid(const sMacAddr &bssid)
++{
++    if (m_active_network_id < 0) {
++        LOG(ERROR) << "Failed pinning bssid on interface " << get_iface_name()
++                   << ": no active network";
++        return false;
++    }
++    return set_network(m_active_network_id, "bssid", tlvf::mac_to_string(bssid));
++}
++
++bool sta_wlan_hal_dwpal::unpin_bssid()
++{
++    if (m_active_network_id < 0) {
++        LOG(ERROR) << "Failed unpinning bssid on interface " << get_iface_name()
++                   << ": no active network";
++        return false;
++    }
++    return set_network(m_active_network_id, "bssid", "any");
++}
++
++bool sta_wlan_hal_dwpal::disconnect_backhaul_sta() { return disconnect(); }
++
++bool sta_wlan_hal_dwpal::reconnect_backhaul_sta()
++{
++    if (m_active_network_id < 0) {
++        LOG(ERROR) << "Failed reconnecting backhaul sta on interface " << get_iface_name()
++                   << ": no active network";
++        return false;
++    }
++    return enable_network(m_active_network_id);
++}
++
++bool sta_wlan_hal_dwpal::is_disconnected() { return !is_connected(); }
++
++static WiFiSec wsc_to_wifi_sec(WSC::eWscAuth auth)
++{
++    using W = WSC::eWscAuth;
++
++    // OPEN
++    if (auth == W::WSC_AUTH_OPEN) {
++        return WiFiSec::None;
++    }
++
++    // WPA3 Transition (SAE + WPA2PSK)
++    if ((auth & W::WSC_AUTH_SAE) && (auth & W::WSC_AUTH_WPA2PSK)) {
++        return WiFiSec::WPA2_WPA3_PSK;
++    }
++
++    // WPA3 only
++    if (auth & W::WSC_AUTH_SAE) {
++        return WiFiSec::WPA3_PSK;
++    }
++
++    // WPA2
++    if (auth & W::WSC_AUTH_WPA2PSK) {
++        return WiFiSec::WPA2_PSK;
++    }
++
++    // Legacy WPA
++    if (auth & W::WSC_AUTH_WPAPSK) {
++        return WiFiSec::WPA_PSK;
++    }
++
++    return WiFiSec::Invalid;
++}
++
++bool sta_wlan_hal_dwpal::add_new_network(son::wireless_utils::sBssInfoConf bSta_conf)
++{
++    if (bSta_conf.ssid.empty()) {
++        LOG(ERROR) << "add_new_network(): empty BSTA SSID";
++        return false;
++    }
++
++    WiFiSec sec = wsc_to_wifi_sec(bSta_conf.authentication_type);
++    if (sec == WiFiSec::Invalid) {
++        LOG(ERROR) << "add_new_network(): invalid authentication type";
++        return false;
++    }
++
++    bool hidden_ssid = false;
++    if (bSta_conf.hidden_ssid != WSC::eWscVendorExtHiddenSsid::UNSET) {
++        hidden_ssid = static_cast<bool>(bSta_conf.hidden_ssid);
++    }
++
++    return connect(bSta_conf.ssid, bSta_conf.network_key, sec, false /* mem_only_psk */,
++                   (bSta_conf.bssid == beerocks::net::network_utils::ZERO_MAC)
++                       ? std::string("")
++                       : tlvf::mac_to_string(bSta_conf.bssid),
++                   ChannelFreqPair{0, eFreqType::FREQ_UNKNOWN}, hidden_ssid);
++}
++
+ bool sta_wlan_hal_dwpal::process_dwpal_event(char *ifname, char *buffer, int bufLen,
+                                              const std::string &opcode)
+ {
+diff --git a/common/beerocks/bwl/dwpald/sta_wlan_hal_dwpald.h b/common/beerocks/bwl/dwpald/sta_wlan_hal_dwpald.h
+index 5e6ba0971..b3973d84f 100644
+--- a/common/beerocks/bwl/dwpald/sta_wlan_hal_dwpald.h
++++ b/common/beerocks/bwl/dwpald/sta_wlan_hal_dwpald.h
+@@ -65,6 +65,14 @@ public:
+ 
+     virtual bool enable_disable_ep(bool enable) override;
+ 
++    virtual bool pin_bssid(const sMacAddr &bssid) override;
++    virtual bool unpin_bssid() override;
++
++    virtual bool disconnect_backhaul_sta() override;
++    virtual bool reconnect_backhaul_sta() override;
++    virtual bool is_disconnected() override;
++    virtual bool add_new_network(son::wireless_utils::sBssInfoConf bSta_conf) override;
++
+     virtual bool process_dwpal_event(char *ifname, char *buffer, int bufLen,
+                                      const std::string &opcode) override;
+     virtual bool process_dwpal_nl_event(struct nl_msg *msg, void *arg = nullptr) override;
+diff --git a/common/beerocks/bwl/include/bwl/sta_wlan_hal.h b/common/beerocks/bwl/include/bwl/sta_wlan_hal.h
+index 4a8b4cc80..c8fb59d91 100644
+--- a/common/beerocks/bwl/include/bwl/sta_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/sta_wlan_hal.h
+@@ -104,9 +104,20 @@ public:
+     virtual bool enable_disable_ep(bool enable) = 0;
+     
+     virtual bool disconnect_backhaul_sta() = 0;
+-    
++
+     virtual bool reconnect_backhaul_sta() = 0;
+ 
++    /*!
++     * @brief Pin the bSTA to a specific BSSID so wpa_supplicant does not
++     * roam/scan away from it on link loss.
++     */
++    virtual bool pin_bssid(const sMacAddr &bssid) = 0;
++
++    /*!
++     * @brief Clear a previously set BSSID pin, re-enabling normal scanning.
++     */
++    virtual bool unpin_bssid() = 0;
++
+     virtual bool is_disconnected()  = 0;
+ 
+     virtual bool add_new_network(son::wireless_utils::sBssInfoConf bSta_conf) = 0;
+diff --git a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
+index 8c1eed762..9b5f24f9e 100644
+--- a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
+@@ -959,6 +959,26 @@ bool sta_wlan_hal_nl80211::process_scan_nl_event(struct nl_msg *msg, void *arg)
+     return false;
+ }
+ 
++bool sta_wlan_hal_nl80211::pin_bssid(const sMacAddr &bssid)
++{
++    if (m_active_network_id < 0) {
++        LOG(ERROR) << "Failed pinning bssid on interface " << get_iface_name()
++                   << ": no active network";
++        return false;
++    }
++    return set_network(m_active_network_id, "bssid", tlvf::mac_to_string(bssid));
++}
++
++bool sta_wlan_hal_nl80211::unpin_bssid()
++{
++    if (m_active_network_id < 0) {
++        LOG(ERROR) << "Failed unpinning bssid on interface " << get_iface_name()
++                   << ": no active network";
++        return false;
++    }
++    return set_network(m_active_network_id, "bssid", "any");
++}
++
+ bool sta_wlan_hal_nl80211::is_disconnected()
+ {
+     ConnectionStatus connection_status;
+diff --git a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h
+index c6879d8ae..48e91da4d 100644
+--- a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h
+@@ -78,6 +78,9 @@ public:
+     virtual bool reconnect_backhaul_sta() override;
+     virtual bool is_disconnected() override;
+ 
++    virtual bool pin_bssid(const sMacAddr &bssid) override;
++    virtual bool unpin_bssid() override;
++
+     virtual sMacAddr get_bsta_mld_mac() override;
+     virtual sMacAddr get_ap_mld_mac() override;
+ 
+diff --git a/common/beerocks/bwl/onewifi/sta_wlan_hal_onewifi.cpp b/common/beerocks/bwl/onewifi/sta_wlan_hal_onewifi.cpp
+index 7843ed873..ae3797c8a 100644
+--- a/common/beerocks/bwl/onewifi/sta_wlan_hal_onewifi.cpp
++++ b/common/beerocks/bwl/onewifi/sta_wlan_hal_onewifi.cpp
+@@ -133,6 +133,16 @@ bool sta_wlan_hal_onewifi::disconnect_backhaul_sta()
+     return true;
+ }
+ 
++bool sta_wlan_hal_onewifi::pin_bssid(const sMacAddr &bssid)
++{
++    return true;
++}
++
++bool sta_wlan_hal_onewifi::unpin_bssid()
++{
++    return true;
++}
++
+ bool sta_wlan_hal_onewifi::is_disconnected()
+ {
+     return false;
+ }
+
+diff --git a/common/beerocks/bwl/onewifi/sta_wlan_hal_onewifi.h b/common/beerocks/bwl/onewifi/sta_wlan_hal_onewifi.h
+index f5ccd64fa..17bf3c1fb 100644
+--- a/common/beerocks/bwl/onewifi/sta_wlan_hal_onewifi.h
++++ b/common/beerocks/bwl/onewifi/sta_wlan_hal_onewifi.h
+@@ -44,6 +44,8 @@ public:
+     virtual bool enable_disable_ep(bool enable) override;
+     virtual bool disconnect_backhaul_sta() override;
+     virtual bool reconnect_backhaul_sta() override;
++    virtual bool pin_bssid(const sMacAddr &bssid) override;
++    virtual bool unpin_bssid() override;
+     virtual bool is_disconnected() override;
+ 
+ private:
+diff --git a/common/beerocks/bwl/whm/sta_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/sta_wlan_hal_whm.cpp
+index 19601a5e5..3ecd3b329 100644
+--- a/common/beerocks/bwl/whm/sta_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/sta_wlan_hal_whm.cpp
+@@ -869,6 +869,44 @@ bool sta_wlan_hal_whm::enable_disable_ep(bool enable)
+     return true;
+ }
+ 
++bool sta_wlan_hal_whm::pin_bssid(const sMacAddr &bssid)
++{
++    if (m_ep_path.empty() || m_active_profile_id <= 0) {
++        LOG(ERROR) << "pin_bssid(): no active profile/EP for iface " << get_iface_name();
++        return false;
++    }
++
++    std::string profile_path = m_ep_path + "Profile." + std::to_string(m_active_profile_id) + ".";
++    AmbiorixVariant params(AMXC_VAR_ID_HTABLE);
++    params.add_child("ForceBSSID", tlvf::mac_to_string(bssid));
++
++    if (!m_ambiorix_cl.update_object(profile_path, params)) {
++        LOG(ERROR) << "pin_bssid(): failed to set ForceBSSID on " << profile_path;
++        return false;
++    }
++
++    return true;
++}
++
++bool sta_wlan_hal_whm::unpin_bssid()
++{
++    if (m_ep_path.empty() || m_active_profile_id <= 0) {
++        LOG(ERROR) << "unpin_bssid(): no active profile/EP for iface " << get_iface_name();
++        return false;
++    }
++
++    std::string profile_path = m_ep_path + "Profile." + std::to_string(m_active_profile_id) + ".";
++    AmbiorixVariant params(AMXC_VAR_ID_HTABLE);
++    params.add_child("ForceBSSID", std::string());
++
++    if (!m_ambiorix_cl.update_object(profile_path, params)) {
++        LOG(ERROR) << "unpin_bssid(): failed to clear ForceBSSID on " << profile_path;
++        return false;
++    }
++
++    return true;
++}
++
+ std::string sta_wlan_hal_whm::resolve_bstamld_path(int8_t mld_unit)
+ {
+     if (mld_unit <= beerocks::DISABLED_MLDUNIT) {
+diff --git a/common/beerocks/bwl/whm/sta_wlan_hal_whm.h b/common/beerocks/bwl/whm/sta_wlan_hal_whm.h
+index ab11ea437..383247cea 100644
+--- a/common/beerocks/bwl/whm/sta_wlan_hal_whm.h
++++ b/common/beerocks/bwl/whm/sta_wlan_hal_whm.h
+@@ -97,6 +97,9 @@ public:
+ 
+     virtual bool enable_disable_ep(bool enable) override;
+ 
++    virtual bool pin_bssid(const sMacAddr &bssid) override;
++    virtual bool unpin_bssid() override;
++
+     virtual uint16_t get_multi_ap_primary_vlan_id() override;
+ 
+     virtual sMacAddr get_bsta_mld_mac() override;
+-- 
+2.34.1
+
