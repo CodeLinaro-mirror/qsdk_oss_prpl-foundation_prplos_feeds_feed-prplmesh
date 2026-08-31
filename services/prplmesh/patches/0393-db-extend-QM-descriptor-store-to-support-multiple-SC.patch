@@ -1,0 +1,533 @@
+From f933a55861690191025a63af3331672fcde4c1e8 Mon Sep 17 00:00:00 2001
+From: mpaluri <mpaluri@qti.qualcomm.com>
+Date: Fri, 14 Aug 2026 16:15:28 -0700
+Subject: [PATCH] db: extend QM descriptor store to support multiple SCS
+ streams per client
+
+Extend m_controller_qm_descriptors from a flat (bssid, client_mac) map
+to a three-level map keyed by (bssid, client_mac, descriptor_key), where
+descriptor_key is a packed uint16_t encoding (scsid << 8 | source_type).
+
+This allows CLIENT and APPLICATION sources to each hold an independent
+descriptor for the same SCS ID simultaneously, while still rejecting a
+duplicate Add from the same source type for the same SCS ID.
+
+set_controller_qm_descriptor gains source_type and descriptor_config_type
+parameters (both defaulted) so callers can declare the origin and scope of
+each descriptor without breaking existing call sites.  The northbound
+SetQMDescriptors handler now passes APPLICATION as the source type and
+deduplicates incoming entries by (client_mac, scsid) rather than client_mac
+alone.
+
+Signed-off-by: Manaswini Paluri <mpaluri@qti.qualcomm.com>
+
+diff --git a/common/beerocks/bcl/include/bcl/beerocks_qos_utils.h b/common/beerocks/bcl/include/bcl/beerocks_qos_utils.h
+index 21ef0f47b..c55aa8d17 100644
+--- a/common/beerocks/bcl/include/bcl/beerocks_qos_utils.h
++++ b/common/beerocks/bcl/include/bcl/beerocks_qos_utils.h
+@@ -31,6 +31,8 @@ struct sDescriptorElementInfo {
+     eDescriptorElementType element_type = eDescriptorElementType::Invalid;
+     eDescriptorRequestType request_type = eDescriptorRequestType::Invalid;
+     uint8_t raw_request_type            = 0;
++    /* SCS stream ID from byte[2]; always 0 for MSCS. */
++    uint8_t scsid                       = 0;
+ 
+     /**
+      * @brief Check whether the parsed descriptor metadata is usable.
+diff --git a/common/beerocks/bcl/source/beerocks_qos_utils.cpp b/common/beerocks/bcl/source/beerocks_qos_utils.cpp
+index f8b917b0f..6c1f1bca7 100644
+--- a/common/beerocks/bcl/source/beerocks_qos_utils.cpp
++++ b/common/beerocks/bcl/source/beerocks_qos_utils.cpp
+@@ -64,8 +64,11 @@ sDescriptorElementInfo parse_qos_management_descriptor_element(const uint8_t *de
+ 
+     if (is_scs_descriptor_element(descriptor, descriptor_len)) {
+         info.element_type = eDescriptorElementType::Scs;
++        /* SCS layout: [EID=185][len][SCSID][request_type][...] */
++        info.scsid = descriptor[2];
+     } else if (is_mscs_descriptor_element(descriptor, descriptor_len)) {
+         info.element_type = eDescriptorElementType::Mscs;
++        /* MSCS has no SCSID; scsid stays 0 */
+     } else {
+         return info;
+     }
+diff --git a/controller/nbapi/on_action.cpp b/controller/nbapi/on_action.cpp
+index 675de3028..0c15dad08 100644
+--- a/controller/nbapi/on_action.cpp
++++ b/controller/nbapi/on_action.cpp
+@@ -18,10 +18,10 @@
+ #include <iomanip>
+ #include <iostream>
+ #include <locale.h>
++#include <set>
+ #include <sstream>
+ #include <time.h>
+ #include <unordered_map>
+-#include <unordered_set>
+ #include <utility>
+ #include <vector>
+ 
+@@ -1317,6 +1317,7 @@ bool is_strict_hex_string(const std::string &value)
+ struct sPendingQmDescriptor {
+     sMacAddr client_mac = beerocks::net::network_utils::ZERO_MAC;
+     std::string descriptor_element;
++    uint8_t scsid = 0;
+ };
+ 
+ } // namespace
+@@ -1364,7 +1365,7 @@ amxd_status_t set_qm_descriptors(amxd_object_t *bss_instance, amxd_function_t *f
+     }
+ 
+     std::vector<sPendingQmDescriptor> pending_descriptors;
+-    std::unordered_set<std::string> client_macs;
++    std::set<std::pair<std::string, uint8_t>> descriptor_keys;
+ 
+     amxc_var_for_each(entry, descriptors)
+     {
+@@ -1385,10 +1386,6 @@ amxd_status_t set_qm_descriptors(amxd_object_t *bss_instance, amxd_function_t *f
+ 
+         const auto client_mac            = tlvf::mac_from_string(client_mac_str);
+         const auto normalized_client_mac = tlvf::mac_to_string(client_mac);
+-        if (!client_macs.insert(normalized_client_mac).second) {
+-            LOG(ERROR) << "Duplicate QMDescriptor entry for client " << normalized_client_mac;
+-            return amxd_status_invalid_value;
+-        }
+ 
+         if (read_string_value(entry, "BSSID", entry_bssid_str) && !entry_bssid_str.empty()) {
+             if (!network_utils::is_valid_mac(entry_bssid_str) ||
+@@ -1410,7 +1407,15 @@ amxd_status_t set_qm_descriptors(amxd_object_t *bss_instance, amxd_function_t *f
+             return amxd_status_invalid_value;
+         }
+ 
+-        pending_descriptors.push_back({client_mac, std::move(descriptor_element)});
++        const auto descriptor_info =
++            qos_management::parse_qos_management_descriptor_element(descriptor_bytes);
++        if (!descriptor_keys.insert({normalized_client_mac, descriptor_info.scsid}).second) {
++            LOG(ERROR) << "Duplicate QMDescriptor entry for client " << normalized_client_mac
++                       << " scsid " << static_cast<unsigned>(descriptor_info.scsid);
++            return amxd_status_invalid_value;
++        }
++
++        pending_descriptors.push_back({client_mac, std::move(descriptor_element), descriptor_info.scsid});
+     }
+ 
+     if (pending_descriptors.empty()) {
+@@ -1419,8 +1424,10 @@ amxd_status_t set_qm_descriptors(amxd_object_t *bss_instance, amxd_function_t *f
+     }
+ 
+     for (const auto &descriptor : pending_descriptors) {
+-        if (!g_database->set_controller_qm_descriptor(bssid, descriptor.client_mac,
+-                                                      descriptor.descriptor_element)) {
++        if (!g_database->set_controller_qm_descriptor(
++                bssid, descriptor.client_mac, descriptor.descriptor_element,
++                son::db::eDescriptorSource::APPLICATION,
++                son::db::eDescriptorConfigType::BSS_LEVEL)) {
+             LOG(ERROR) << "Failed to configure controller QMDescriptor for client "
+                        << descriptor.client_mac;
+             return amxd_status_unknown_error;
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 94fee3023..0a27cb2b9 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -8332,10 +8332,10 @@ bool db::remove_qm_descriptor(const sMacAddr &bssid, const sMacAddr &client_mac)
+ }
+ 
+ bool db::set_controller_qm_descriptor(const sMacAddr &bssid, const sMacAddr &client_mac,
+-                                      const std::string &descriptor_element)
++                                      const std::string &descriptor_element,
++                                      eDescriptorSource     source_type,
++                                      eDescriptorConfigType descriptor_config_type)
+ {
+-    sStoredQmDescriptor descriptor;
+-    bool allocated_new_qmid    = false;
+     const auto descriptor_info = parse_qos_management_descriptor_element(descriptor_element);
+     if (!descriptor_info.is_valid()) {
+         LOG(ERROR) << "Invalid QoS management descriptor element for BSSID " << bssid << ", client "
+@@ -8343,36 +8343,50 @@ bool db::set_controller_qm_descriptor(const sMacAddr &bssid, const sMacAddr &cli
+         return false;
+     }
+ 
+-    auto bss_entry = m_controller_qm_descriptors.find(bssid);
+-    if (bss_entry != m_controller_qm_descriptors.end()) {
+-        auto client_entry = bss_entry->second.find(client_mac);
+-        if (client_entry != bss_entry->second.end()) {
+-            descriptor = client_entry->second;
+-        }
+-    }
++    const uint8_t  scsid = descriptor_info.scsid;
++    const uint16_t key   = make_descriptor_key(scsid, source_type);
+ 
+-    if (descriptor.qmid == 0 &&
+-        descriptor_info.request_type != qos_management::eDescriptorRequestType::Add) {
+-        LOG(ERROR) << "No existing QMID for QoS management descriptor request on BSSID " << bssid
+-                   << ", client " << client_mac;
+-        return false;
+-    }
++    auto &key_map = m_controller_qm_descriptors[bssid][client_mac];
++    auto  it      = key_map.find(key);
+ 
+-    if (descriptor.qmid == 0) {
+-        descriptor.qmid    = m_next_qmid;
+-        allocated_new_qmid = true;
++    if (descriptor_info.request_type == qos_management::eDescriptorRequestType::Add) {
++        if (it != key_map.end()) {
++            LOG(ERROR) << "Descriptor already exists for scsid "
++                       << static_cast<unsigned>(scsid) << " source "
++                       << static_cast<unsigned>(source_type) << " on BSSID " << bssid
++                       << ", client " << client_mac << "; rejecting duplicate Add";
++            return false;
++        }
++    } else {
++        if (it == key_map.end()) {
++            LOG(ERROR) << "No existing descriptor for scsid "
++                       << static_cast<unsigned>(scsid) << " source "
++                       << static_cast<unsigned>(source_type) << " on BSSID " << bssid
++                       << ", client " << client_mac;
++            return false;
++        }
+     }
+ 
+-    descriptor.descriptor_element = descriptor_element;
+-    descriptor.request_type       = descriptor_info.request_type;
++    uint16_t qmid     = (it != key_map.end()) ? it->second.qmid : 0;
++    bool     new_qmid = (qmid == 0);
++    if (new_qmid) {
++        qmid = m_next_qmid;
++    }
+ 
+     if (!set_qm_descriptor(bssid, client_mac, descriptor_element)) {
+         return false;
+     }
+ 
+-    m_controller_qm_descriptors[bssid][client_mac] = std::move(descriptor);
++    sStoredQmDescriptor &entry   = key_map[key];
++    entry.qmid                   = qmid;
++    entry.scsid                  = scsid;
++    entry.descriptor_element     = descriptor_element;
++    entry.request_type           = descriptor_info.request_type;
++    entry.need_send              = true;
++    entry.source_type            = source_type;
++    entry.descriptor_config_type = descriptor_config_type;
+ 
+-    if (allocated_new_qmid) {
++    if (new_qmid) {
+         ++m_next_qmid;
+         if (m_next_qmid == 0) {
+             m_next_qmid = 1;
+@@ -8392,8 +8406,19 @@ std::vector<db::sControllerQmDescriptor> db::get_controller_qm_descriptors(const
+         }
+ 
+         for (const auto &client_entry : bss_entry.second) {
+-            descriptors.push_back({bss_entry.first, client_entry.first, client_entry.second.qmid,
+-                                   client_entry.second.descriptor_element});
++            for (const auto &key_entry : client_entry.second) {
++                const auto &stored = key_entry.second;
++                sControllerQmDescriptor desc;
++                desc.bssid                  = bss_entry.first;
++                desc.client_mac             = client_entry.first;
++                desc.qmid                   = stored.qmid;
++                desc.scsid                  = stored.scsid;
++                desc.descriptor_element     = stored.descriptor_element;
++                desc.descriptor_config_type = stored.descriptor_config_type;
++                desc.need_send              = stored.need_send;
++                desc.descriptor_key         = key_entry.first;
++                descriptors.push_back(std::move(desc));
++            }
+         }
+     }
+ 
+@@ -8413,21 +8438,31 @@ bool db::clear_transient_controller_qm_descriptors(const sMacAddr &al_mac)
+ 
+         for (auto client_entry = bss_entry->second.begin();
+              client_entry != bss_entry->second.end();) {
+-            if (client_entry->second.request_type !=
+-                qos_management::eDescriptorRequestType::Remove) {
+-                ++client_entry;
+-                continue;
++            bool any_removed = false;
++            for (auto key_entry = client_entry->second.begin();
++                 key_entry != client_entry->second.end();) {
++                if (key_entry->second.request_type !=
++                    qos_management::eDescriptorRequestType::Remove) {
++                    ++key_entry;
++                    continue;
++                }
++                key_entry = client_entry->second.erase(key_entry);
++                any_removed = true;
+             }
+ 
+-            if (!remove_qm_descriptor(bss_entry->first, client_entry->first)) {
+-                LOG(ERROR) << "Failed removing transient QMDescriptor for BSSID "
+-                           << bss_entry->first << ", client " << client_entry->first;
+-                ret_val = false;
+-                ++client_entry;
+-                continue;
++            if (any_removed) {
++                if (!remove_qm_descriptor(bss_entry->first, client_entry->first)) {
++                    LOG(ERROR) << "Failed removing transient QMDescriptor for BSSID "
++                               << bss_entry->first << ", client " << client_entry->first;
++                    ret_val = false;
++                }
+             }
+ 
+-            client_entry = bss_entry->second.erase(client_entry);
++            if (client_entry->second.empty()) {
++                client_entry = bss_entry->second.erase(client_entry);
++            } else {
++                ++client_entry;
++            }
+         }
+ 
+         if (bss_entry->second.empty()) {
+diff --git a/controller/src/beerocks/master/db/db.h b/controller/src/beerocks/master/db/db.h
+index 5cc535e61..cbb9f1cbb 100644
+--- a/controller/src/beerocks/master/db/db.h
++++ b/controller/src/beerocks/master/db/db.h
+@@ -94,6 +94,16 @@ public:
+      */
+     using ValuesMap = std::unordered_map<std::string, std::string>;
+ 
++    enum class eDescriptorSource : uint8_t {
++        CLIENT      = 0, /* descriptor pushed by an associated STA */
++        APPLICATION = 1, /* descriptor received via northbound API */
++    };
++
++    enum class eDescriptorConfigType : uint8_t {
++        BSS_LEVEL     = 0, /* scoped to a specific BSS */
++        NETWORK_LEVEL = 1, /* end-to-end, propagated along the client path */
++    };
++
+     /**
+      * @brief Controller-managed QoS management descriptor pending for an Agent.
+      */
+@@ -101,7 +111,11 @@ public:
+         sMacAddr bssid      = beerocks::net::network_utils::ZERO_MAC;
+         sMacAddr client_mac = beerocks::net::network_utils::ZERO_MAC;
+         uint16_t qmid       = 0;
++        uint8_t  scsid      = 0;
+         std::string descriptor_element;
++        eDescriptorConfigType descriptor_config_type = eDescriptorConfigType::BSS_LEVEL;
++        bool need_send      = true;
++        uint16_t descriptor_key = 0;
+     };
+ 
+     /**
+@@ -2520,17 +2534,24 @@ public:
+     /**
+      * @brief Store a controller-managed QoS management descriptor.
+      *
+-     * Add requests allocate a controller QMID. Change and Remove requests reuse an existing QMID
+-     * and fail if the controller has no descriptor state for the BSS/client pair. Remove requests
+-     * are stored temporarily so they can be sent to the Agent with the reused QMID.
++     * The descriptor is keyed by (bssid, client_mac, scsid, source_type).
++     * CLIENT and APPLICATION may each hold one descriptor for the same scsid
++     * simultaneously.  A second Add from the same source_type for the same scsid
++     * is rejected.  Change and Remove must match an existing (scsid, source_type)
++     * entry, failing otherwise.
+      *
+      * @param[in] bssid BSSID of the BSS.
+      * @param[in] client_mac MAC address of the STA for which the descriptor applies.
+      * @param[in] descriptor_element Hex-encoded descriptor element payload.
++     * @param[in] source_type Origin of the descriptor (CLIENT or APPLICATION).
++     * @param[in] descriptor_config_type Scope of the descriptor (BSS_LEVEL or NETWORK_LEVEL).
+      * @return True on success, otherwise false.
+      */
+-    bool set_controller_qm_descriptor(const sMacAddr &bssid, const sMacAddr &client_mac,
+-                                      const std::string &descriptor_element);
++    bool set_controller_qm_descriptor(
++        const sMacAddr &bssid, const sMacAddr &client_mac,
++        const std::string &descriptor_element,
++        eDescriptorSource     source_type            = eDescriptorSource::CLIENT,
++        eDescriptorConfigType descriptor_config_type = eDescriptorConfigType::BSS_LEVEL);
+ 
+     /**
+      * @brief Get controller QoS management descriptors for an Agent.
+@@ -3998,13 +4019,33 @@ private:
+      * the owning Agent, then cleared from DB/DM and memory.
+      */
+     struct sStoredQmDescriptor {
+-        uint16_t qmid = 0;
++        uint16_t qmid  = 0;
++        uint8_t  scsid = 0;
+         std::string descriptor_element;
+         beerocks::qos_management::eDescriptorRequestType request_type =
+             beerocks::qos_management::eDescriptorRequestType::Invalid;
++        bool need_send = true;
++        eDescriptorSource     source_type            = eDescriptorSource::CLIENT;
++        eDescriptorConfigType descriptor_config_type = eDescriptorConfigType::BSS_LEVEL;
+     };
+ 
+-    std::unordered_map<sMacAddr, std::unordered_map<sMacAddr, sStoredQmDescriptor>>
++    /*
++     * BSS-level descriptors keyed bssid -> client_mac -> descriptor_key -> sStoredQmDescriptor.
++     *
++     * descriptor_key is a packed uint16_t: (scsid << 8) | source_type.
++     * This allows at most one entry per (scsid, source_type) pair per client:
++     *   - CLIENT and APPLICATION can both hold a descriptor for the same scsid.
++     *   - Two entries of the same source_type for the same scsid are rejected.
++     */
++    static constexpr uint16_t make_descriptor_key(uint8_t scsid, eDescriptorSource src)
++    {
++        return static_cast<uint16_t>(
++            (static_cast<uint16_t>(scsid) << 8) | static_cast<uint8_t>(src));
++    }
++
++    std::unordered_map<sMacAddr,
++        std::unordered_map<sMacAddr,
++            std::unordered_map<uint16_t, sStoredQmDescriptor>>>
+         m_controller_qm_descriptors;
+ 
+     std::vector<sMacAddr> m_mscs_disallowed_sta_list;
+diff --git a/controller/src/beerocks/master/db/unit_tests/db_test.cpp b/controller/src/beerocks/master/db/unit_tests/db_test.cpp
+index 2368395a3..d59f4e063 100644
+--- a/controller/src/beerocks/master/db/unit_tests/db_test.cpp
++++ b/controller/src/beerocks/master/db/unit_tests/db_test.cpp
+@@ -472,9 +472,11 @@ TEST_F(DbTestRadio1Bss1, set_qm_descriptor_updates_existing_instance)
+ 
+ TEST_F(DbTestRadio1Bss1, controller_qm_descriptor_reuses_qmid_and_clears_remove)
+ {
++    /* scsid byte[2]=2 shared by all three; request byte[3]=0/2/1 */
+     static constexpr auto add_descriptor    = "b9020100";
+     static constexpr auto change_descriptor = "b9020102";
+     static constexpr auto remove_descriptor = "b9020101";
++    static constexpr uint8_t scsid          = 2;
+     const auto bssid                        = tlvf::mac_from_string(g_bssid_1);
+     const auto client_mac                   = tlvf::mac_from_string(g_client_mac);
+     const auto agent_mac                    = tlvf::mac_from_string(g_bridge_mac);
+@@ -502,6 +504,7 @@ TEST_F(DbTestRadio1Bss1, controller_qm_descriptor_reuses_qmid_and_clears_remove)
+     auto descriptors = m_db->get_controller_qm_descriptors(agent_mac);
+     ASSERT_EQ(1U, descriptors.size());
+     EXPECT_EQ(1U, descriptors.front().qmid);
++    EXPECT_EQ(scsid, descriptors.front().scsid);
+     EXPECT_EQ(add_descriptor, descriptors.front().descriptor_element);
+ 
+     EXPECT_CALL(
+@@ -567,6 +570,126 @@ TEST_F(DbTestRadio1Bss1, controller_qm_descriptor_rejects_invalid_initial_reques
+     EXPECT_FALSE(m_db->set_controller_qm_descriptor(bssid, client_mac, "b9020103"));
+ }
+ 
++TEST_F(DbTestRadio1Bss1, controller_qm_descriptor_multiple_scsids_per_client)
++{
++    /*
++     * Two Add descriptors for the same client with different SCSIDs.
++     * Each occupies its own scsid slot and gets a unique QMID.
++     * The DM is updated twice via the ClientMAC-based search.
++     */
++    static constexpr auto desc_scs1 = "b9010100"; /* scsid=1, add */
++    static constexpr auto desc_scs2 = "b9020100"; /* scsid=2, add */
++    const auto bssid                = tlvf::mac_from_string(g_bssid_1);
++    const auto client_mac           = tlvf::mac_from_string(g_client_mac);
++    const auto agent_mac            = tlvf::mac_from_string(g_bridge_mac);
++
++    InSequence sequence;
++
++    /* First Add: scsid=1 → qmid=1 */
++    EXPECT_CALL(
++        *m_ambiorix,
++        get_instance_index(g_radio_1_qm_descriptor_path + ".[ClientMAC == '%s'].", g_client_mac))
++        .WillOnce(Return(0));
++    EXPECT_CALL(*m_ambiorix, add_instance(g_radio_1_qm_descriptor_path))
++        .WillOnce(Return(g_radio_1_qm_descriptor_path + ".1"));
++    EXPECT_CALL(*m_ambiorix,
++                set(g_radio_1_qm_descriptor_path + ".1", "BSSID", Matcher<const sMacAddr &>(bssid)))
++        .WillOnce(Return(true));
++    EXPECT_CALL(*m_ambiorix, set(g_radio_1_qm_descriptor_path + ".1", "ClientMAC",
++                                 Matcher<const sMacAddr &>(client_mac)))
++        .WillOnce(Return(true));
++    EXPECT_CALL(*m_ambiorix, set(g_radio_1_qm_descriptor_path + ".1", "DescriptorElement",
++                                 Matcher<const std::string &>(desc_scs1)))
++        .WillOnce(Return(true));
++
++    EXPECT_TRUE(m_db->set_controller_qm_descriptor(bssid, client_mac, desc_scs1));
++
++    /* Second Add: scsid=2 → qmid=2 */
++    EXPECT_CALL(
++        *m_ambiorix,
++        get_instance_index(g_radio_1_qm_descriptor_path + ".[ClientMAC == '%s'].", g_client_mac))
++        .WillOnce(Return(1));
++    EXPECT_CALL(*m_ambiorix,
++                set(g_radio_1_qm_descriptor_path + ".1", "BSSID", Matcher<const sMacAddr &>(bssid)))
++        .WillOnce(Return(true));
++    EXPECT_CALL(*m_ambiorix, set(g_radio_1_qm_descriptor_path + ".1", "ClientMAC",
++                                 Matcher<const sMacAddr &>(client_mac)))
++        .WillOnce(Return(true));
++    EXPECT_CALL(*m_ambiorix, set(g_radio_1_qm_descriptor_path + ".1", "DescriptorElement",
++                                 Matcher<const std::string &>(desc_scs2)))
++        .WillOnce(Return(true));
++
++    EXPECT_TRUE(m_db->set_controller_qm_descriptor(bssid, client_mac, desc_scs2));
++
++    auto descriptors = m_db->get_controller_qm_descriptors(agent_mac);
++    ASSERT_EQ(2U, descriptors.size());
++    EXPECT_EQ(1U, descriptors.front().qmid);
++    EXPECT_EQ(2U, descriptors.back().qmid);
++}
++
++TEST_F(DbTestRadio1Bss1, controller_qm_descriptor_application_blocks_duplicate_scsid)
++{
++    /*
++     * Same scsid=2, different source types: CLIENT and APPLICATION may coexist.
++     * A second Add from the SAME source type for the same scsid must be rejected.
++     */
++    static constexpr auto app_desc  = "b9020100"; /* scsid=2, add — APPLICATION */
++    static constexpr auto cli_desc  = "b9020100"; /* scsid=2, add — CLIENT, must succeed */
++    static constexpr auto app_desc2 = "b9020100"; /* scsid=2, add — APPLICATION again, rejected */
++    const auto bssid                = tlvf::mac_from_string(g_bssid_1);
++    const auto client_mac           = tlvf::mac_from_string(g_client_mac);
++    const auto agent_mac            = tlvf::mac_from_string(g_bridge_mac);
++
++    /* APPLICATION Add for scsid=2 → qmid=1 */
++    EXPECT_CALL(
++        *m_ambiorix,
++        get_instance_index(g_radio_1_qm_descriptor_path + ".[ClientMAC == '%s'].", g_client_mac))
++        .WillOnce(Return(0));
++    EXPECT_CALL(*m_ambiorix, add_instance(g_radio_1_qm_descriptor_path))
++        .WillOnce(Return(g_radio_1_qm_descriptor_path + ".1"));
++    EXPECT_CALL(*m_ambiorix,
++                set(g_radio_1_qm_descriptor_path + ".1", "BSSID", Matcher<const sMacAddr &>(bssid)))
++        .WillOnce(Return(true));
++    EXPECT_CALL(*m_ambiorix, set(g_radio_1_qm_descriptor_path + ".1", "ClientMAC",
++                                 Matcher<const sMacAddr &>(client_mac)))
++        .WillOnce(Return(true));
++    EXPECT_CALL(*m_ambiorix, set(g_radio_1_qm_descriptor_path + ".1", "DescriptorElement",
++                                 Matcher<const std::string &>(app_desc)))
++        .WillOnce(Return(true));
++
++    EXPECT_TRUE(m_db->set_controller_qm_descriptor(bssid, client_mac, app_desc,
++                                                    son::db::eDescriptorSource::APPLICATION));
++
++    /* CLIENT Add for the same scsid=2 must SUCCEED — different source type */
++    EXPECT_CALL(
++        *m_ambiorix,
++        get_instance_index(g_radio_1_qm_descriptor_path + ".[ClientMAC == '%s'].", g_client_mac))
++        .WillOnce(Return(1));
++    EXPECT_CALL(*m_ambiorix,
++                set(g_radio_1_qm_descriptor_path + ".1", "BSSID", Matcher<const sMacAddr &>(bssid)))
++        .WillOnce(Return(true));
++    EXPECT_CALL(*m_ambiorix, set(g_radio_1_qm_descriptor_path + ".1", "ClientMAC",
++                                 Matcher<const sMacAddr &>(client_mac)))
++        .WillOnce(Return(true));
++    EXPECT_CALL(*m_ambiorix, set(g_radio_1_qm_descriptor_path + ".1", "DescriptorElement",
++                                 Matcher<const std::string &>(cli_desc)))
++        .WillOnce(Return(true));
++
++    EXPECT_TRUE(m_db->set_controller_qm_descriptor(bssid, client_mac, cli_desc,
++                                                    son::db::eDescriptorSource::CLIENT));
++
++    /* Both entries are visible */
++    auto descriptors = m_db->get_controller_qm_descriptors(agent_mac);
++    ASSERT_EQ(2U, descriptors.size());
++
++    /* A second APPLICATION Add for scsid=2 must be REJECTED — same source type */
++    EXPECT_FALSE(m_db->set_controller_qm_descriptor(bssid, client_mac, app_desc2,
++                                                     son::db::eDescriptorSource::APPLICATION));
++
++    /* Still only two entries */
++    ASSERT_EQ(2U, m_db->get_controller_qm_descriptors(agent_mac).size());
++}
++
+ TEST_F(DbTest, test_set_ap_ht_capabilities)
+ {
+     const std::string capabilities1    = g_radio_path_1 + ".Capabilities.";
+-- 
+2.34.1
+
