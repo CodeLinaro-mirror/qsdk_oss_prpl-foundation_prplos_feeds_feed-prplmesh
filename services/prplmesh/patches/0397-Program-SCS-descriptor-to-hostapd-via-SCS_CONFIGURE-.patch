@@ -1,0 +1,232 @@
+From 578e8bd29f57c787674e16107697227a543eb487 Mon Sep 17 00:00:00 2001
+From: mpaluri <mpaluri@qti.qualcomm.com>
+Date: Tue, 1 Sep 2026 13:49:53 -0700
+Subject: [PATCH] Program SCS descriptor to hostapd via SCS_CONFIGURE in NLHAL
+
+Implements the SCS/MSCS QoS-management descriptor path for the nl80211
+(OpenWrt, non-pwhm) AP HAL backend. On pwhm the descriptor is forwarded
+through an Ambiorix RPC (handleQosMgmtDesc); OpenWrt has no pwhm, so the
+descriptor is programmed directly to hostapd over the wpa_ctrl control
+interface.
+
+- ap_wlan_hal_nl80211.h: override supports_qos_management() -> true
+  (gates the ap_manager call path) and declare
+  handle_qos_management_descriptor().
+- ap_wlan_hal_nl80211.cpp: include beerocks_string_utils.h and implement
+  handle_qos_management_descriptor(): resolve BSSID -> vap_id -> per-BSS
+  ifname, validate descriptor length (1..256) and qmid (<= 0xFF),
+  hex-encode the descriptor, and send the raw wpa_ctrl command:
+    SCS_CONFIGURE <peer_mac> <scs_sta_mac> <qm_id> <scs_desc_hex>
+
+Signed-off-by: Gyanranjan Hazarika <gyanranj@qti.qualcomm.com>
+Signed-off-by: Manaswini Paluri <mpaluri@qti.qualcomm.com>
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index d0ef78fcc..c04274630 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -2961,6 +2961,8 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+             return;
+         }
+ 
++        const sMacAddr peer_mac = msg->peer_mac();
++
+         auto descriptor_tlvs = cmdu_rx.getClassList<wfa_map::tlvQoSManagementDescriptor>();
+         if (descriptor_tlvs.empty()) {
+             LOG(ERROR) << "No tlvQoSManagementDescriptor found";
+@@ -2995,7 +2997,7 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+ 
+             if (!ap_wlan_hal->handle_qos_management_descriptor(
+                     descriptor_tlv->bssid(), descriptor_tlv->qmid(), descriptor_tlv->client_mac(),
+-                    descriptor_element)) {
++                    peer_mac, descriptor_element)) {
+                 LOG(ERROR) << "handle_qos_management_descriptor failed for BSSID "
+                            << descriptor_tlv->bssid() << ", client "
+                            << descriptor_tlv->client_mac();
+diff --git a/agent/src/beerocks/slave/tasks/service_prioritization_task.cpp b/agent/src/beerocks/slave/tasks/service_prioritization_task.cpp
+index 1c1112681..e70240617 100644
+--- a/agent/src/beerocks/slave/tasks/service_prioritization_task.cpp
++++ b/agent/src/beerocks/slave/tasks/service_prioritization_task.cpp
+@@ -401,13 +401,25 @@ bool ServicePrioritizationTask::handle_qos_management_descriptors(
+             return false;
+         }
+ 
++        /*
++         * Resolve the bSTA MAC of the immediate downstream agent through which
++         * this client is reachable.  For a directly-associated client the entry
++         * is absent from remote_stations; use the client MAC itself as peer_mac
++         * (hostapd treats it as a directly-connected STA).
++         */
++        sMacAddr peer_mac = descriptor_tlv->client_mac();
++        auto rs_it = db->remote_stations.find(descriptor_tlv->client_mac());
++        if (rs_it != db->remote_stations.end()) {
++            peer_mac = rs_it->second.bsta_mac;
++        }
++
+         auto descriptor_request = message_com::create_vs_message<
+             beerocks_message::cACTION_APMANAGER_QOS_MANAGEMENT_DESCRIPTOR_REQUEST>(m_cmdu_tx);
+         if (!descriptor_request) {
+             LOG(ERROR) << "Failed building QoS management descriptor request";
+             return false;
+         }
+-        (void)descriptor_request;
++        descriptor_request->peer_mac() = peer_mac;
+ 
+         auto descriptor_out = m_cmdu_tx.addClass<wfa_map::tlvQoSManagementDescriptor>();
+         if (!descriptor_out) {
+diff --git a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+index c20036489..655b7adc1 100644
+--- a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+@@ -738,11 +738,17 @@ public:
+      * @param [in] bssid BSSID for which the descriptor applies.
+      * @param [in] qmid QoS Management ID assigned by the controller.
+      * @param [in] client_mac Client MAC address.
++     * @param [in] peer_mac bSTA MAC of the immediate downstream agent through
++     *             which the client is reachable.  For a directly-associated
++     *             client this equals the client_mac.  For a remote client
++     *             behind a downstream agent this is the bSTA MAC reported in
++     *             AgentDB::remote_stations.
+      * @param [in] descriptor_element SCS/MSCS descriptor element bytes.
+      * @return true on success or false on error.
+      */
+     virtual bool handle_qos_management_descriptor(const sMacAddr &bssid, uint16_t qmid,
+                                                   const sMacAddr &client_mac,
++                                                  const sMacAddr &peer_mac,
+                                                   const std::vector<uint8_t> &descriptor_element)
+     {
+         return false;
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 5208a8d7a..bbdd77c5f 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -10,6 +10,7 @@
+ #include "mlo_utils.h"
+ #include <bwl/assoc_frame_db.h>
+ #include <bcl/beerocks_os_utils.h>
++#include <bcl/beerocks_string_utils.h>
+ #include <bcl/beerocks_utils.h>
+ #include <bcl/network/network_utils.h>
+ #include <bcl/son/son_assoc_frame_utils.h>
+@@ -8693,6 +8694,54 @@ bool ap_wlan_hal_nl80211::configure_service_priority(const uint8_t *data)
+     return false;
+ }
+ 
++bool ap_wlan_hal_nl80211::handle_qos_management_descriptor(
++    const sMacAddr &bssid, uint16_t qmid, const sMacAddr &client_mac,
++    const sMacAddr &peer_mac,
++    const std::vector<uint8_t> &descriptor_element)
++{
++    auto vap_id = get_vap_id_with_mac(tlvf::mac_to_string(bssid));
++    if (!check_vap_id(vap_id)) {
++        LOG(ERROR) << "handle_qos_management_descriptor: invalid vap_id for bssid " << bssid;
++        return false;
++    }
++    const std::string ifname = m_radio_info.available_vaps[vap_id].bss;
++
++    if (descriptor_element.empty() || descriptor_element.size() > 256) {
++        LOG(ERROR) << "handle_qos_management_descriptor: invalid descriptor length "
++                   << descriptor_element.size() << " (must be 1..256) for bssid " << bssid;
++        return false;
++    }
++
++    if (qmid > 0xFF) {
++        LOG(ERROR) << "handle_qos_management_descriptor: qmid " << qmid
++                   << " out of range (must be <= 0xFF) for bssid " << bssid;
++        return false;
++    }
++
++    const auto descriptor_hex = beerocks::string_utils::bytes_to_hex_string(
++        descriptor_element.data(), descriptor_element.size());
++
++    // SCS_CONFIGURE <peer_mac> <scs_sta_mac> <qm_id> <scs_desc_hex>
++    // peer_mac    -> bSTA MAC of the immediate downstream agent through which
++    //               the client is reachable (resolved by the caller from
++    //               AgentDB::remote_stations).
++    // scs_sta_mac -> the end client STA MAC
++    const std::string cmd = "SCS_CONFIGURE " + tlvf::mac_to_string(peer_mac) + " " +
++                            tlvf::mac_to_string(client_mac) + " " + std::to_string(qmid) + " " +
++                            descriptor_hex;
++
++    if (!wpa_ctrl_send_msg(cmd, ifname)) {
++        LOG(ERROR) << "handle_qos_management_descriptor: SCS_CONFIGURE failed on " << ifname
++                   << " (peer=" << peer_mac << " sta=" << client_mac << " qmid=" << qmid << ")";
++        return false;
++    }
++
++    LOG(DEBUG) << "handle_qos_management_descriptor: programmed SCS descriptor on " << ifname
++               << " (peer=" << peer_mac << " sta=" << client_mac << " qmid=" << qmid
++               << " desc_len=" << descriptor_element.size() << ")";
++    return true;
++}
++
+ bool ap_wlan_hal_nl80211::set_hop_count(uint8_t hop_count)
+ {
+     LOG(DEBUG) << "Setting hop_count=" << int(hop_count) << " on radio " << get_iface_name();
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+index f7e88056a..b7f1ab72f 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+@@ -141,6 +141,23 @@ public:
+                                  bool reconfigure) override;
+     virtual bool configure_service_priority(const uint8_t *data) override;
+ 
++    /**
++     * @see ap_wlan_hal::supports_qos_management
++     */
++    virtual bool supports_qos_management() const override { return true; }
++
++    /**
++     * @see ap_wlan_hal::handle_qos_management_descriptor
++     *
++     * Programs a single SCS/MSCS descriptor into hostapd over the wpa_ctrl
++     * control interface using the "SCS_CONFIGURE" command.
++     */
++    virtual bool
++    handle_qos_management_descriptor(const sMacAddr &bssid, uint16_t qmid,
++                                     const sMacAddr &client_mac,
++                                     const sMacAddr &peer_mac,
++                                     const std::vector<uint8_t> &descriptor_element) override;
++
+     bool generate_new_bssid(sMacAddr &new_bssid);
+     void generate_bssid_pool(void);
+ 
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index d7465951e..10d65637b 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -3211,6 +3211,7 @@ bool ap_wlan_hal_whm::configure_service_priority(const uint8_t *dscp)
+ 
+ bool ap_wlan_hal_whm::handle_qos_management_descriptor(
+     const sMacAddr &bssid, uint16_t qmid, const sMacAddr &client_mac,
++    const sMacAddr & /*peer_mac*/,
+     const std::vector<uint8_t> &descriptor_element)
+ {
+     auto vap_id = get_vap_id_with_mac(tlvf::mac_to_string(bssid));
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
+index 1fb5f650b..94fd13d7a 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
+@@ -204,6 +204,7 @@ public:
+     virtual bool
+     handle_qos_management_descriptor(const sMacAddr &bssid, uint16_t qmid,
+                                      const sMacAddr &client_mac,
++                                     const sMacAddr &peer_mac,
+                                      const std::vector<uint8_t> &descriptor_element) override;
+ 
+     /**
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+index 6675da46b..630d1f42b 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+@@ -424,6 +424,7 @@ cACTION_APMANAGER_MLD_MODE_UPDATE_REQUEST:
+ 
+ cACTION_APMANAGER_QOS_MANAGEMENT_DESCRIPTOR_REQUEST:
+   _type: class
++  peer_mac: sMacAddr
+ 
+ cACTION_APMANAGER_QOS_MANAGEMENT_POLICY_REQUEST:
+   _type: class
+-- 
+2.34.1
+
