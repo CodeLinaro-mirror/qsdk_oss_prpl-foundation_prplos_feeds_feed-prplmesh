@@ -1,0 +1,387 @@
+From d191e2a8fb517ff47f009559bb716e5da5132bcd Mon Sep 17 00:00:00 2001
+From: mpaluri <mpaluri@qti.qualcomm.com>
+Date: Tue, 18 Aug 2026 17:33:56 -0700
+Subject: [PATCH] agent: track bSTA MAC and remote stations for downstream
+ clients
+
+Store remote_stations and downstream_agent_bsta in AgentDB to track
+clients connected to downstream agents along with the first-hop bSTA
+MAC on the path to each client.
+
+On new neighbor discovery, send a Topology Query to learn associated
+clients immediately.  handle_topology_response() populates
+remote_stations from the Associated Clients TLV and recursively
+discovers indirect agents via the 1905 Neighbor Device TLV, inheriting
+the same first-hop bSTA MAC.  Stale entries are purged when a neighbor
+expires from neighbor_devices.
+
+Signed-off-by: Manaswini Paluri <mpaluri@qti.qualcomm.com>
+
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 7d025e2cd..f33d2d706 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -1026,6 +1026,68 @@ public:
+      */
+     std::unordered_map<sMacAddr, std::unordered_map<sMacAddr, sNeighborDevice>> neighbor_devices;
+ 
++    /**
++     * @brief A client station connected to a downstream agent in this agent's subtree.
++     *
++     * bsta_mac is the backhaul STA MAC of the directly-connected downstream
++     * agent that lies on the L2 path from this agent toward the remote client.
++     * source_agent_mac is the AL MAC of the downstream agent that directly
++     * reported this client; it is used to purge stale entries when a topology
++     * refresh or neighbor removal occurs for that agent.
++     */
++    struct sRemoteStation {
++        /**
++         * MAC address of the first-hop backhaul STA (bSTA) on the path from
++         * this agent to the remote client.  This is the transmitting interface
++         * MAC of the directly-connected downstream agent as carried in the
++         * 1905.1 Topology Discovery MAC Address TLV.
++         */
++        sMacAddr bsta_mac;
++
++        /**
++         * AL MAC address of the downstream agent that directly serves this
++         * client (may differ from the first-hop neighbor when the client is
++         * behind a daisy-chained agent).
++         */
++        sMacAddr source_agent_mac;
++    };
++
++    /**
++     * @brief Map of all remote stations learned from downstream agents.
++     *
++     * Key:   client STA MAC address
++     * Value: sRemoteStation (first-hop bSTA MAC + owning agent AL MAC)
++     *
++     * Entries are added or refreshed when a Topology Response is received from
++     * a downstream agent and removed when that agent is no longer reachable
++     * (i.e., its entry is erased from neighbor_devices during the periodic
++     * expiry sweep in TopologyTask::work()).
++     */
++    std::unordered_map<sMacAddr, sRemoteStation> remote_stations;
++
++    /**
++     * @brief First-hop bSTA MAC for each known downstream agent.
++     *
++     * Tracks the bSTA MAC that lies on the path from this agent to a given
++     * downstream agent, whether direct or reachable only through a chain of
++     * other agents.
++     *
++     * Key:   AL MAC address of a downstream agent (direct or transitive)
++     * Value: MAC of the directly-connected downstream bSTA through which that
++     *        agent is reachable (i.e., the transmitting interface MAC from its
++     *        Topology Discovery message, or the same value inherited for
++     *        indirect agents discovered via a neighbor's Topology Response).
++     *
++     * For a direct neighbor B:  value = B's transmitting_iface_mac
++     * For an indirect neighbor C behind B: value = B's transmitting_iface_mac
++     *
++     * An entry is added in handle_topology_discovery() for direct neighbors
++     * and in handle_topology_response() for indirect agents.  It is removed
++     * together with the corresponding remote_stations entries when the owning
++     * direct neighbor expires.
++     */
++    std::unordered_map<sMacAddr, sMacAddr> downstream_agent_bsta;
++
+     /**
+      * Internal structure to keep MLO configuration configured
+      */
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 75af50ba9..83ccadc11 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -311,6 +311,7 @@ bool BackhaulManager::thread_init()
+             ieee1905_1::eMessageType::TOPOLOGY_DISCOVERY_MESSAGE,
+             ieee1905_1::eMessageType::TOPOLOGY_NOTIFICATION_MESSAGE,
+             ieee1905_1::eMessageType::TOPOLOGY_QUERY_MESSAGE,
++            ieee1905_1::eMessageType::TOPOLOGY_RESPONSE_MESSAGE,
+             ieee1905_1::eMessageType::VENDOR_SPECIFIC_MESSAGE,
+             ieee1905_1::eMessageType::UNASSOCIATED_STA_LINK_METRICS_QUERY_MESSAGE,
+             ieee1905_1::eMessageType::OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE,
+diff --git a/agent/src/beerocks/slave/tasks/topology_task.cpp b/agent/src/beerocks/slave/tasks/topology_task.cpp
+index b516d1dfa..8e3649bb4 100644
+--- a/agent/src/beerocks/slave/tasks/topology_task.cpp
++++ b/agent/src/beerocks/slave/tasks/topology_task.cpp
+@@ -100,10 +100,24 @@ void TopologyTask::work()
+             auto &last_topology_discovery = it->second.timestamp;
+             if (now - last_topology_discovery >
+                 std::chrono::seconds(DISCOVERY_NEIGHBOUR_REMOVAL_TIMEOUT_SEC)) {
+-                auto &device_al_mac = it->first;
++                const sMacAddr device_al_mac = it->first;
+                 LOG(INFO) << "Removed 1905.1 device " << device_al_mac << " from neighbors list";
+                 it                     = neighbors_on_local_iface.erase(it);
+                 neighbors_list_changed = true;
++
++                /* Remove all remote stations that were reported by this agent. */
++                for (auto rs_it = db->remote_stations.begin();
++                     rs_it != db->remote_stations.end();) {
++                    if (rs_it->second.source_agent_mac == device_al_mac) {
++                        rs_it = db->remote_stations.erase(rs_it);
++                    } else {
++                        ++rs_it;
++                    }
++                }
++
++                /* Remove the path-bSTA entry for this agent. */
++                db->downstream_agent_bsta.erase(device_al_mac);
++
+                 continue;
+             }
+             ++it;
+@@ -173,6 +187,10 @@ bool TopologyTask::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx, uint32_t ifac
+         handle_topology_notification(cmdu_rx, src_mac);
+         break;
+     }
++    case ieee1905_1::eMessageType::TOPOLOGY_RESPONSE_MESSAGE: {
++        handle_topology_response(cmdu_rx, src_mac);
++        break;
++    }
+     case ieee1905_1::eMessageType::VENDOR_SPECIFIC_MESSAGE: {
+         return handle_vendor_specific(cmdu_rx, src_mac, beerocks_header);
+     }
+@@ -256,11 +274,62 @@ void TopologyTask::handle_topology_discovery(ieee1905_1::CmduMessageRx &cmdu_rx,
+     auto &neighbor_devices_by_al_mac            = db->neighbor_devices[local_receiving_iface_mac];
+     neighbor_devices_by_al_mac[tlvAlMac->mac()] = neighbor_device;
+ 
+-    // If it is a new device, then our 1905.1 neighbors list has changed and we are required to send
+-    // Topology Notification Message.
++    /*
++     * Only store in downstream_agent_bsta when the discovery was received on
++     * a backhaul BSS (bBSS) interface — the sender is a downstream agent whose
++     * bSTA is connecting to our bBSS.  If received on any other interface
++     * (fronthaul BSS, bSTA uplink, Ethernet) the sender is an upstream device
++     * and must not be treated as a downstream agent.
++     */
++    bool is_received_on_backhaul_bss = false;
++    for (const auto radio : db->get_radios_list()) {
++        if (!radio) {
++            continue;
++        }
++        for (const auto &bssid : radio->front.bssids) {
++            if (!bssid.backhaul_bss) {
++                continue;
++            }
++
++            /* Derive the base radio interface name by stripping any _link<N>
++             * suffix (MLO per-link naming, e.g. "wlan4_link0" → "wlan4").
++             * The WDS peer interface created by the driver uses the base radio
++             * name as its prefix (e.g. "wlan4.sta1"). */
++            std::string base_iface = bssid.iface_name;
++            auto link_pos = base_iface.rfind("_link");
++            if (link_pos != std::string::npos) {
++                base_iface = base_iface.substr(0, link_pos);
++            }
++
++            /* Match exact bBSS name, exact base name, or any WDS
++             * per-peer sub-interface of the base (e.g. "wlan4.sta1"). */
++            if (bssid.iface_name == local_receiving_iface_name ||
++                base_iface == local_receiving_iface_name ||
++                local_receiving_iface_name.substr(0, base_iface.size() + 1) ==
++                    base_iface + ".") {
++                is_received_on_backhaul_bss = true;
++                break;
++            }
++        }
++        if (is_received_on_backhaul_bss) {
++            break;
++        }
++    }
++
++    if (is_received_on_backhaul_bss) {
++        db->downstream_agent_bsta[tlvAlMac->mac()] = tlvMac->mac();
++    } else {
++    }
++
++    /* If it is a new device our 1905.1 neighbor list changed; send a
++     * Topology Notification and query the new neighbor so we can learn
++     * its associated clients. */
+     if (new_device) {
+         LOG(INFO) << "Sending Topology Notification on newly discovered 1905.1 device";
+         send_topology_notification();
++        if (is_received_on_backhaul_bss) {
++            send_topology_query(tlvAlMac->mac());
++        }
+     }
+ }
+ 
+@@ -1466,3 +1535,128 @@ bool TopologyTask::add_mld_structure_tlvs()
+ 
+     return true;
+ }
++
++void TopologyTask::send_topology_query(const sMacAddr &dst_mac)
++{
++    auto cmdu_header =
++        m_cmdu_tx.create(0, ieee1905_1::eMessageType::TOPOLOGY_QUERY_MESSAGE);
++    if (!cmdu_header) {
++        LOG(ERROR) << "Failed creating TOPOLOGY_QUERY_MESSAGE for " << dst_mac;
++        return;
++    }
++    auto db = AgentDB::get();
++    LOG(DEBUG) << "Sending topology query to downstream agent " << dst_mac;
++    m_btl_ctx.send_cmdu_to_broker(m_cmdu_tx, dst_mac, db->bridge.mac);
++}
++
++void TopologyTask::handle_topology_response(ieee1905_1::CmduMessageRx &cmdu_rx,
++                                             const sMacAddr &src_mac)
++{
++    auto db = AgentDB::get();
++
++    /* Ignore responses we generated ourselves. */
++    if (src_mac == db->bridge.mac) {
++        return;
++    }
++
++    /*
++     * Look up the first-hop bSTA MAC for this agent.  If we have not
++     * registered it yet (e.g., the response arrived before the Topology
++     * Discovery) there is nothing useful we can do.
++     */
++    auto bsta_it = db->downstream_agent_bsta.find(src_mac);
++    if (bsta_it == db->downstream_agent_bsta.end()) {
++        LOG(WARNING) << "Topology response from unregistered downstream agent "
++                     << src_mac << ", ignoring";
++        return;
++    }
++    const sMacAddr path_bsta_mac = bsta_it->second;
++
++
++    /* Purge stale entries previously reported by this agent before
++     * repopulating so that departed clients are removed. */
++    for (auto it = db->remote_stations.begin();
++         it != db->remote_stations.end();) {
++        if (it->second.source_agent_mac == src_mac)
++            it = db->remote_stations.erase(it);
++        else
++            ++it;
++    }
++
++    /* Populate remote_stations from the Associated Clients TLV. */
++    for (const auto &assoc_tlv :
++         cmdu_rx.getClassList<wfa_map::tlvAssociatedClients>()) {
++        if (!assoc_tlv) {
++            continue;
++        }
++        for (size_t bss_idx = 0;
++             bss_idx < assoc_tlv->bss_list_length(); ++bss_idx) {
++            auto bss_tuple = assoc_tlv->bss_list(bss_idx);
++            if (!std::get<0>(bss_tuple)) {
++                LOG(ERROR) << "Failed to get bss_list entry " << bss_idx;
++                continue;
++            }
++            auto &bss_info = std::get<1>(bss_tuple);
++            for (size_t cli_idx = 0;
++                 cli_idx < bss_info.clients_associated_list_length();
++                 ++cli_idx) {
++                auto cli_tuple = bss_info.clients_associated_list(cli_idx);
++                if (!std::get<0>(cli_tuple)) {
++                    LOG(ERROR) << "Failed to get client entry " << cli_idx;
++                    continue;
++                }
++                const sMacAddr &client_mac = std::get<1>(cli_tuple).mac();
++                AgentDB::sRemoteStation remote_sta;
++                remote_sta.bsta_mac              = path_bsta_mac;
++                remote_sta.source_agent_mac      = src_mac;
++                db->remote_stations[client_mac]  = remote_sta;
++                LOG(DEBUG) << "Remote station " << client_mac
++                           << " agent=" << src_mac
++                           << " bSTA=" << path_bsta_mac;
++            }
++        }
++    }
++
++    /* Discover indirect agents listed in src_mac's 1905 neighbor TLVs and
++     * query them if not already known, attributing their clients to the same
++     * first-hop bSTA. */
++    for (const auto &neighbor_tlv :
++         cmdu_rx.getClassList<ieee1905_1::tlv1905NeighborDevice>()) {
++        if (!neighbor_tlv) {
++            continue;
++        }
++        const size_t device_count =
++            neighbor_tlv->mac_al_1905_device_length() /
++            sizeof(ieee1905_1::tlv1905NeighborDevice::sMacAl1905Device);
++        for (size_t i = 0; i < device_count; ++i) {
++            const auto entry_tuple = neighbor_tlv->mac_al_1905_device(i);
++            if (!std::get<0>(entry_tuple)) {
++                LOG(ERROR) << "Failed to get 1905 neighbor entry " << i;
++                continue;
++            }
++            const sMacAddr &indirect_al_mac = std::get<1>(entry_tuple).mac;
++
++            /* Skip our own AL MAC and the agent that sent this response. */
++            if (indirect_al_mac == db->bridge.mac ||
++                indirect_al_mac == src_mac) {
++                continue;
++            }
++
++            /* Only register and query agents we have not seen before to
++             * avoid redundant queries on every periodic refresh. */
++            if (db->downstream_agent_bsta.count(indirect_al_mac)) {
++                continue;
++            }
++
++            /*
++             * Attribute the indirect agent to the same first-hop bSTA so
++             * that its clients are reachable through path_bsta_mac.
++             */
++            db->downstream_agent_bsta[indirect_al_mac] = path_bsta_mac;
++            LOG(INFO) << "Discovered indirect downstream agent " << indirect_al_mac
++                      << " via " << src_mac
++                      << " path_bsta=" << path_bsta_mac;
++            send_topology_query(indirect_al_mac);
++        }
++    }
++}
+diff --git a/agent/src/beerocks/slave/tasks/topology_task.h b/agent/src/beerocks/slave/tasks/topology_task.h
+index 745301bdc..daa8b0a98 100644
+--- a/agent/src/beerocks/slave/tasks/topology_task.h
++++ b/agent/src/beerocks/slave/tasks/topology_task.h
+@@ -112,9 +112,39 @@ private:
+     void send_topology_discovery();
+     void send_topology_notification();
+ 
++    /**
++     * @brief Send a 1905.1 Topology Query to a specific downstream agent.
++     *
++     * Used to trigger a Topology Response so that the remote agent's
++     * associated clients can be learned and stored in AgentDB::remote_stations.
++     *
++     * @param[in] dst_mac AL MAC address of the agent to query.
++     */
++    void send_topology_query(const sMacAddr &dst_mac);
++
++    /**
++     * @brief Handle an incoming 1905.1 Topology Response message.
++     *
++     * Parses the Associated Clients TLV to populate AgentDB::remote_stations
++     * for every client reported by the responding agent.  Also walks the 1905
++     * Neighbor Device TLVs to discover indirect (daisy-chained) downstream
++     * agents; for each new indirect agent a Topology Query is issued and its
++     * first-hop bSTA MAC is recorded in AgentDB::downstream_agent_bsta so
++     * that its future clients are attributed to the correct path bSTA.
++     *
++     * Before repopulating, all existing remote_stations entries whose
++     * source_agent_mac matches src_mac are removed so that clients which have
++     * left are not retained.
++     *
++     * @param[in] cmdu_rx Received CMDU carrying the Topology Response.
++     * @param[in] src_mac AL MAC of the agent that sent the response.
++     */
++    void handle_topology_response(ieee1905_1::CmduMessageRx &cmdu_rx,
++                                  const sMacAddr &src_mac);
++
+     /**
+      * @brief Add and fill device information tlv.
+-     * 
++     *
+      * @return true on success, otherwise false.
+      */
+     bool add_device_information_tlv();
+-- 
+2.34.1
+
