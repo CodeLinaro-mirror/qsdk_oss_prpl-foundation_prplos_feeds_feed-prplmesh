@@ -1,14 +1,13 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=prplmesh-dm-mapper
-PKG_VERSION:=v0.4.5
+PKG_VERSION:=v0.4.6
 PKG_RELEASE:=1
 
-PKG_SOURCE:=prplmesh-dm-mapper-v0.4.5.tar.gz
-PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/prplmesh-dm-mapper/-/archive/v0.4.5
-PKG_HASH:=e7cbea64ec6445ff82f46e26a9f9b361d71de3c634ccd0e999fa8770fc18a04e
-PKG_BUILD_DIR:=$(BUILD_DIR)/prplmesh-dm-mapper-v0.4.5
-
+PKG_SOURCE:=prplmesh-dm-mapper-v0.4.6.tar.gz
+PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/prplmesh-dm-mapper/-/archive/v0.4.6
+PKG_HASH:=c87f4de33be998b19c32917d3c127fa18a72d11a9dfd83b9da40de553edd8e02
+PKG_BUILD_DIR:=$(BUILD_DIR)/prplmesh-dm-mapper-v0.4.6
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
@@ -50,3 +49,4 @@ define Package/$(PKG_NAME)/config
 endef
 
 $(eval $(call BuildPackage,$(PKG_NAME)))
+
