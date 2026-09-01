@@ -1,0 +1,2934 @@
+From d48dd61eaf9aa85df5bf7960418856301ec02448 Mon Sep 17 00:00:00 2001
+From: Vinu Bharath R <vinubhar@qti.qualcomm.com>
+Date: Tue, 14 Jul 2026 11:09:50 +0530
+Subject: [PATCH] Data Model Enablement for MQTT Client
+
+Signed-off-by: Vinu Bharath R <vinubhar@qti.qualcomm.com>
+---
+ CMakeLists.txt                                |   1 +
+ controller/src/beerocks/master/CMakeLists.txt |   8 +-
+ .../beerocks/master/beerocks_master_main.cpp  |  29 +
+ controller/src/beerocks/master/db/db.cpp      | 784 ++++++++----------
+ controller/src/beerocks/master/db/db.h        |   1 +
+ framework/platform/CMakeLists.txt             |   9 +-
+ .../platform/mqttapi/include/mqtt_client.h    |   3 +-
+ .../mqttapi/include/mqtt_client_impl.h        |   3 +
+ .../platform/mqttapi/mqtt_client_impl.cpp     |  58 +-
+ framework/platform/nbapi/CMakeLists.txt       |   9 +-
+ framework/platform/nbapi/ambiorix_dummy.cpp   |  19 +
+ framework/platform/nbapi/ambiorix_impl.cpp    | 161 +++-
+ framework/platform/nbapi/include/ambiorix.h   |  48 ++
+ .../platform/nbapi/include/ambiorix_dummy.h   |   9 +
+ .../platform/nbapi/include/ambiorix_impl.h    |  55 ++
+ .../platform/nbapi/include/ambiorix_mock.h    |  12 +
+ .../platform/nbapi/include/mqtt_nbapi_impl.h  | 193 +++++
+ framework/platform/nbapi/mqtt_nbapi_impl.cpp  | 591 +++++++++++++
+ 18 files changed, 1533 insertions(+), 460 deletions(-)
+ create mode 100644 framework/platform/nbapi/include/mqtt_nbapi_impl.h
+ create mode 100644 framework/platform/nbapi/mqtt_nbapi_impl.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b8d08df79..f62187cc6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -77,6 +77,7 @@ option (BUILD_CONTROLLER "Build EasyMesh controller" ON)
+ option(BUILD_SHARED_LIBS "Build shared libraries (.so) instead of static ones (.a)" ON)
+ option (ENABLE_NBAPI "Build the northbound (high-level) API" ON)
+ option (ENABLE_VBSS "Build with Virtual BSS support" ON)
++option (ENABLE_MQTT_DM "Enable the MQTT data model bridge (GET/SET/RESOLVE/CMD/EVENT over MQTT)" OFF)
+ 
+ ## Generic checks and defaults
+ 
+diff --git a/controller/src/beerocks/master/CMakeLists.txt b/controller/src/beerocks/master/CMakeLists.txt
+index 4dd0a464f..c12905c7a 100644
+--- a/controller/src/beerocks/master/CMakeLists.txt
++++ b/controller/src/beerocks/master/CMakeLists.txt
+@@ -50,8 +50,14 @@ if (ENABLE_NBAPI OR USE_PRPLMESH_WHM)
+     find_package(amxd REQUIRED)
+     find_package(amxo REQUIRED)
+     find_package(amxp REQUIRED)
++    find_package(amxj REQUIRED)
+     find_package(libamxrt REQUIRED)
+-    list(APPEND LINKED_LIBS amxc amxd amxo amxp libamxrt)
++    list(APPEND LINKED_LIBS amxc amxd amxo amxp amxj libamxrt)
++endif()
++
++if (ENABLE_NBAPI AND ENABLE_MQTT_DM AND NOT TARGET_PLATFORM STREQUAL "rdkb")
++    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_MQTT_DM")
++    list(APPEND LINKED_LIBS mqttapi)
+ endif()
+ 
+ if (USE_PRPLMESH_WHM)
+diff --git a/controller/src/beerocks/master/beerocks_master_main.cpp b/controller/src/beerocks/master/beerocks_master_main.cpp
+index 380d5ceac..f6b0f9a40 100644
+--- a/controller/src/beerocks/master/beerocks_master_main.cpp
++++ b/controller/src/beerocks/master/beerocks_master_main.cpp
+@@ -47,6 +47,10 @@ static std::shared_ptr<beerocks::nbapi::Amxrt> guarantee = nullptr;
+ #include "ambiorix_impl.h"
+ #include "on_action.h"
+ 
++#ifdef ENABLE_MQTT_DM
++#include <mqtt_nbapi_impl.h>
++#endif //ENABLE_MQTT_DM
++
+ #ifndef CONTROLLER_DATAMODEL_PATH
+ #define CONTROLLER_DATAMODEL_PATH "config/controller/odl/master_config.odl"
+ #endif
+@@ -839,6 +843,31 @@ int main(int argc, char *argv[])
+     LOG_IF(!amb_dm_obj, FATAL) << "Unable to create Ambiorix!";
+ 
+     LOG_IF(!amb_dm_obj->init(controller_dm_path), FATAL) << "Unable to init ambiorix object!";
++
++#ifdef ENABLE_MQTT_DM
++    // Create MQTT handler with event loop - FD registration is handled internally
++    auto mqtt_handler = std::make_shared<beerocks::nbapi::MqttNbapiImpl>(amb_dm_obj, event_loop);
++
++    // Initialize MQTT handler (creates client, connects to broker, subscribes to topics)
++    LOG_IF(!mqtt_handler->init(MQTT_DEFAULT_BROKER_ADDRESS, "beerocks_controller"), FATAL)
++        << "Failed to initialize MQTT handler!";
++
++    // Mirror every triggered data model event to MQTT subscribers as well.
++    amb_dm_obj->set_mqtt_event_publisher(
++        [mqtt_handler](const std::string &topic, const std::string &json_data) {
++            return mqtt_handler->publish_event(topic, json_data);
++        });
++
++    // Add timer to call run_loop() periodically for keepalive and reconnection
++    auto mqtt_run_loop_timer = timer_manager->add_timer(
++        "MQTT Handler", std::chrono::milliseconds(1000), std::chrono::milliseconds(1000),
++        [mqtt_handler](int fd, beerocks::EventLoop &loop) {
++            mqtt_handler->run_loop();
++            return true;
++        });
++    LOG_IF(mqtt_run_loop_timer == beerocks::net::FileDescriptor::invalid_descriptor, ERROR)
++        << "Failed to add MQTT handler run_loop timer!";
++#endif //ENABLE_MQTT_DM
+ #else
+     auto amb_dm_obj = std::make_shared<beerocks::nbapi::AmbiorixDummy>();
+ #endif //ENABLE_NBAPI
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 94fee3023..c872d22a6 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -7527,6 +7527,7 @@ void db::dm_fire_steer_summary_stats_event(const Station &station)
+     const std::string vendor_event_obj =
+         DATAELEMENTS_ROOT_DM ".Network.QCOM_Vendor.SteeringSummaryStatsUpdated";
+ 
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -7552,6 +7553,10 @@ void db::dm_fire_steer_summary_stats_event(const Station &station)
+         LOG(WARNING) << "dm_fire_steer_summary_stats_event: trigger_event_with_data failed for STA="
+                      << station.mac;
+     }
++#else // !ENABLE_NBAPI
++    (void)vendor_event_obj;
++    (void)s;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_add_failed_connection_event(const sMacAddr &bssid, const sMacAddr &sta_mac,
+@@ -11424,9 +11429,9 @@ std::shared_ptr<Agent::sEthSwitch> db::get_eth_switch(const sMacAddr &mac)
+     return eth_switch;
+ }
+ 
+-#ifdef ENABLE_NBAPI
+ bool db::dm_trigger_channel_preference_report_event(const sMacAddr &radio_mac, const std::string &radio_dm_path, const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -11451,11 +11456,18 @@ bool db::dm_trigger_channel_preference_report_event(const sMacAddr &radio_mac, c
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)radio_mac;
++    (void)radio_dm_path;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_qcom_vendor_event(const sMacAddr &mac, const std::string &dm_path,
+                                       const std::string &event_name)
+ {
++#ifdef ENABLE_NBAPI
+     if (dm_path.empty()) {
+         LOG(DEBUG) << "dm_path is empty, skipping event trigger for " << event_name;
+         return true;
+@@ -11483,12 +11495,19 @@ bool db::dm_trigger_qcom_vendor_event(const sMacAddr &mac, const std::string &dm
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)mac;
++    (void)dm_path;
++    (void)event_name;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_ap_radio_basic_capabilities_event(const sMacAddr &radio_mac,
+                                                       const std::string &radio_dm_path,
+                                                       const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -11515,6 +11534,12 @@ bool db::dm_trigger_ap_radio_basic_capabilities_event(const sMacAddr &radio_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)radio_mac;
++    (void)radio_dm_path;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_unassoc_sta_link_metrics_event(const sMacAddr &sta_mac,
+@@ -11522,6 +11547,7 @@ bool db::dm_trigger_unassoc_sta_link_metrics_event(const sMacAddr &sta_mac,
+                                                    const sMacAddr &radio_mac,
+                                                    const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -11551,12 +11577,20 @@ bool db::dm_trigger_unassoc_sta_link_metrics_event(const sMacAddr &sta_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)sta_mac;
++    (void)sta_dm_path;
++    (void)radio_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_sta_mld_added_event(const sMacAddr &sta_mld_mac,
+                                         const std::string &sta_mld_dm_path,
+                                         const sMacAddr &ap_mld_mac, const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -11585,12 +11619,20 @@ bool db::dm_trigger_sta_mld_added_event(const sMacAddr &sta_mld_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)sta_mld_mac;
++    (void)sta_mld_dm_path;
++    (void)ap_mld_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_sta_mld_removed_event(const sMacAddr &sta_mld_mac,
+                                           const std::string &sta_mld_dm_path,
+                                           const sMacAddr &ap_mld_mac, const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -11619,12 +11661,20 @@ bool db::dm_trigger_sta_mld_removed_event(const sMacAddr &sta_mld_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)sta_mld_mac;
++    (void)sta_mld_dm_path;
++    (void)ap_mld_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_ap_mld_added_event(const sMacAddr &ap_mld_mac,
+                                        const std::string &ap_mld_dm_path,
+                                        const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -11650,12 +11700,19 @@ bool db::dm_trigger_ap_mld_added_event(const sMacAddr &ap_mld_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)ap_mld_mac;
++    (void)ap_mld_dm_path;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_ap_mld_removed_event(const sMacAddr &ap_mld_mac,
+                                          const std::string &ap_mld_dm_path,
+                                          const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -11681,6 +11738,12 @@ bool db::dm_trigger_ap_mld_removed_event(const sMacAddr &ap_mld_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)ap_mld_mac;
++    (void)ap_mld_dm_path;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_affiliated_ap_added_event(const sMacAddr &bssid,
+@@ -11688,6 +11751,7 @@ bool db::dm_trigger_affiliated_ap_added_event(const sMacAddr &bssid,
+                                               const sMacAddr &ap_mld_mac,
+                                               const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -11717,6 +11781,13 @@ bool db::dm_trigger_affiliated_ap_added_event(const sMacAddr &bssid,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)bssid;
++    (void)affl_ap_dm_path;
++    (void)ap_mld_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_affiliated_ap_removed_event(const sMacAddr &bssid,
+@@ -11724,6 +11795,7 @@ bool db::dm_trigger_affiliated_ap_removed_event(const sMacAddr &bssid,
+                                                 const sMacAddr &ap_mld_mac,
+                                                 const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -11753,6 +11825,13 @@ bool db::dm_trigger_affiliated_ap_removed_event(const sMacAddr &bssid,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)bssid;
++    (void)affl_ap_dm_path;
++    (void)ap_mld_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_affiliated_sta_added_event(const sMacAddr &sta_mac,
+@@ -11761,6 +11840,7 @@ bool db::dm_trigger_affiliated_sta_added_event(const sMacAddr &sta_mac,
+                                                const sMacAddr &ap_mld_mac,
+                                                const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -11796,12 +11876,22 @@ bool db::dm_trigger_affiliated_sta_added_event(const sMacAddr &sta_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)sta_mac;
++    (void)sta_dm_path;
++    (void)sta_mld_mac;
++    (void)bss_mac;
++    (void)ap_mld_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_affiliated_sta_removed_event(
+     const sMacAddr &sta_mac, const std::string &sta_dm_path, const sMacAddr &sta_mld_mac,
+     const sMacAddr &bss_mac, const sMacAddr &ap_mld_mac, const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -11837,6 +11927,15 @@ bool db::dm_trigger_affiliated_sta_removed_event(
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)sta_mac;
++    (void)sta_dm_path;
++    (void)sta_mld_mac;
++    (void)bss_mac;
++    (void)ap_mld_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_affiliated_sta_metrics_event(const sMacAddr &sta_mac,
+@@ -11846,6 +11945,7 @@ bool db::dm_trigger_affiliated_sta_metrics_event(const sMacAddr &sta_mac,
+ {
+     LOG(DEBUG) << "[CONTROLLER][TLV 0xE4] dm_trigger_affiliated_sta_metrics_event: sta_mac="
+                << sta_mac << " dm_path=" << sta_dm_path;
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -11875,6 +11975,13 @@ bool db::dm_trigger_affiliated_sta_metrics_event(const sMacAddr &sta_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)sta_mac;
++    (void)sta_dm_path;
++    (void)sta_mld_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_assoc_sta_mld_config_report_event(const sMacAddr &sta_mld_mac,
+@@ -11882,6 +11989,7 @@ bool db::dm_trigger_assoc_sta_mld_config_report_event(const sMacAddr &sta_mld_ma
+                                                        const sMacAddr &ap_mld_mac,
+                                                        const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -11911,11 +12019,19 @@ bool db::dm_trigger_assoc_sta_mld_config_report_event(const sMacAddr &sta_mld_ma
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)sta_mld_mac;
++    (void)sta_mld_dm_path;
++    (void)ap_mld_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_radio_added_event(const sMacAddr &radio_mac, const std::string &radio_dm_path,
+                                       const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -11941,11 +12057,18 @@ bool db::dm_trigger_radio_added_event(const sMacAddr &radio_mac, const std::stri
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)radio_mac;
++    (void)radio_dm_path;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_radio_removed_event(const sMacAddr &radio_mac, const std::string &radio_dm_path,
+                                         const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -11971,11 +12094,18 @@ bool db::dm_trigger_radio_removed_event(const sMacAddr &radio_mac, const std::st
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)radio_mac;
++    (void)radio_dm_path;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_bss_added_event(const sMacAddr &bss_mac, const std::string &bss_dm_path,
+                                     const sMacAddr &radio_mac, const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12003,11 +12133,19 @@ bool db::dm_trigger_bss_added_event(const sMacAddr &bss_mac, const std::string &
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)bss_mac;
++    (void)bss_dm_path;
++    (void)radio_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_bss_removed_event(const sMacAddr &bss_mac, const std::string &bss_dm_path,
+                                       const sMacAddr &radio_mac, const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12035,12 +12173,20 @@ bool db::dm_trigger_bss_removed_event(const sMacAddr &bss_mac, const std::string
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)bss_mac;
++    (void)bss_dm_path;
++    (void)radio_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_ap_vht_capabilities_event(const sMacAddr &radio_mac,
+                                               const std::string &radio_dm_path,
+                                               const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12067,12 +12213,19 @@ bool db::dm_trigger_ap_vht_capabilities_event(const sMacAddr &radio_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)radio_mac;
++    (void)radio_dm_path;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_ap_wifi6_capabilities_event(const sMacAddr &radio_mac,
+                                                 const std::string &radio_dm_path,
+                                                 const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12099,11 +12252,18 @@ bool db::dm_trigger_ap_wifi6_capabilities_event(const sMacAddr &radio_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)radio_mac;
++    (void)radio_dm_path;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_wifi7_agent_capabilities_event(const sMacAddr &agent_al_mac,
+                                                    const std::string &agent_dm_path)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12128,11 +12288,17 @@ bool db::dm_trigger_wifi7_agent_capabilities_event(const sMacAddr &agent_al_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)agent_al_mac;
++    (void)agent_dm_path;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_eht_operations_event(const sMacAddr &bss_mac, const std::string &bss_dm_path,
+                                          const sMacAddr &radio_mac, const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12161,6 +12327,13 @@ bool db::dm_trigger_eht_operations_event(const sMacAddr &bss_mac, const std::str
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)bss_mac;
++    (void)bss_dm_path;
++    (void)radio_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_station_capability_update_event(const sMacAddr &sta_mac,
+@@ -12169,6 +12342,7 @@ bool db::dm_trigger_station_capability_update_event(const sMacAddr &sta_mac,
+                                                     const sMacAddr &radio_mac,
+                                                     const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12201,6 +12375,14 @@ bool db::dm_trigger_station_capability_update_event(const sMacAddr &sta_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)sta_mac;
++    (void)sta_dm_path;
++    (void)bss_mac;
++    (void)radio_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_ap_extended_metrics_event(const sMacAddr &bss_mac,
+@@ -12208,6 +12390,7 @@ bool db::dm_trigger_ap_extended_metrics_event(const sMacAddr &bss_mac,
+                                               const sMacAddr &radio_mac,
+                                               const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12237,6 +12420,13 @@ bool db::dm_trigger_ap_extended_metrics_event(const sMacAddr &bss_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)bss_mac;
++    (void)bss_dm_path;
++    (void)radio_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_assoc_sta_link_metrics_event(const sMacAddr &sta_mac,
+@@ -12246,6 +12436,7 @@ bool db::dm_trigger_assoc_sta_link_metrics_event(const sMacAddr &sta_mac,
+ {
+     LOG(DEBUG) << "[CONTROLLER][TLV 0x96] dm_trigger_assoc_sta_link_metrics_event: sta_mac="
+                << sta_mac << " dm_path=" << sta_dm_path;
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12278,11 +12469,20 @@ bool db::dm_trigger_assoc_sta_link_metrics_event(const sMacAddr &sta_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)sta_mac;
++    (void)sta_dm_path;
++    (void)bss_mac;
++    (void)radio_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_ap_capability_report_event(const sMacAddr &agent_al_mac,
+                                                const std::string &agent_dm_path)
+ {
++#ifdef ENABLE_NBAPI
+     /* Single consolidated event fired once after ALL AP Capability Report TLVs
+      * have been written to the ODL DM by handle_ap_capability_report().
+      * Replaces the previous per-TLV events (HT/VHT/WiFi6/WiFi7/Advanced/AKM/
+@@ -12307,12 +12507,18 @@ bool db::dm_trigger_ap_capability_report_event(const sMacAddr &agent_al_mac,
+                    << " dm_path=" << agent_dm_path;
+     }
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)agent_al_mac;
++    (void)agent_dm_path;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_ap_ht_capabilities_event(const sMacAddr &radio_mac,
+                                              const std::string &radio_dm_path,
+                                              const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12339,12 +12545,19 @@ bool db::dm_trigger_ap_ht_capabilities_event(const sMacAddr &radio_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)radio_mac;
++    (void)radio_dm_path;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_cac_capabilities_event(const sMacAddr &radio_mac,
+                                            const std::string &radio_dm_path,
+                                            const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12371,12 +12584,19 @@ bool db::dm_trigger_cac_capabilities_event(const sMacAddr &radio_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)radio_mac;
++    (void)radio_dm_path;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_channel_scan_capabilities_event(const sMacAddr &radio_mac,
+                                                     const std::string &radio_dm_path,
+                                                     const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12403,12 +12623,19 @@ bool db::dm_trigger_channel_scan_capabilities_event(const sMacAddr &radio_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)radio_mac;
++    (void)radio_dm_path;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_akm_suite_capabilities_event(const sMacAddr &radio_mac,
+                                                  const std::string &radio_dm_path,
+                                                  const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12435,12 +12662,19 @@ bool db::dm_trigger_akm_suite_capabilities_event(const sMacAddr &radio_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)radio_mac;
++    (void)radio_dm_path;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_ap_radio_advanced_capabilities_event(const sMacAddr &radio_mac,
+                                                          const std::string &radio_dm_path,
+                                                          const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12467,11 +12701,18 @@ bool db::dm_trigger_ap_radio_advanced_capabilities_event(const sMacAddr &radio_m
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)radio_mac;
++    (void)radio_dm_path;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_metric_collection_interval_event(const sMacAddr &agent_al_mac,
+                                                      const std::string &agent_dm_path)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12496,11 +12737,17 @@ bool db::dm_trigger_metric_collection_interval_event(const sMacAddr &agent_al_ma
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)agent_al_mac;
++    (void)agent_dm_path;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_profile2_ap_capability_event(const sMacAddr &agent_al_mac,
+                                                  const std::string &agent_dm_path)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12525,12 +12772,18 @@ bool db::dm_trigger_profile2_ap_capability_event(const sMacAddr &agent_al_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)agent_al_mac;
++    (void)agent_dm_path;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_station_connected_event(const sMacAddr &sta_mac, const std::string &sta_dm_path,
+                                             const sMacAddr &bss_mac, const sMacAddr &radio_mac,
+                                             const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12563,11 +12816,20 @@ bool db::dm_trigger_station_connected_event(const sMacAddr &sta_mac, const std::
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)sta_mac;
++    (void)sta_dm_path;
++    (void)bss_mac;
++    (void)radio_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_agent_connected_event(const sMacAddr &agent_al_mac,
+                                           const std::string &agent_dm_path)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12591,11 +12853,17 @@ bool db::dm_trigger_agent_connected_event(const sMacAddr &agent_al_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)agent_al_mac;
++    (void)agent_dm_path;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_agent_disconnected_event(const sMacAddr &agent_al_mac,
+                                              const std::string &agent_dm_path)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12620,12 +12888,18 @@ bool db::dm_trigger_agent_disconnected_event(const sMacAddr &agent_al_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)agent_al_mac;
++    (void)agent_dm_path;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_operating_channel_report_event(const sMacAddr &radio_mac,
+                                                    const std::string &radio_dm_path,
+                                                    const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12652,6 +12926,12 @@ bool db::dm_trigger_operating_channel_report_event(const sMacAddr &radio_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)radio_mac;
++    (void)radio_dm_path;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_assoc_sta_extended_link_metrics_event(const sMacAddr &sta_mac,
+@@ -12660,6 +12940,7 @@ bool db::dm_trigger_assoc_sta_extended_link_metrics_event(const sMacAddr &sta_ma
+                                                           const sMacAddr &radio_mac,
+                                                           const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12692,6 +12973,14 @@ bool db::dm_trigger_assoc_sta_extended_link_metrics_event(const sMacAddr &sta_ma
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)sta_mac;
++    (void)sta_dm_path;
++    (void)bss_mac;
++    (void)radio_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_assoc_sta_traffic_stats_event(const sMacAddr &sta_mac,
+@@ -12700,6 +12989,7 @@ bool db::dm_trigger_assoc_sta_traffic_stats_event(const sMacAddr &sta_mac,
+                                                   const sMacAddr &radio_mac,
+                                                   const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12732,14 +13022,23 @@ bool db::dm_trigger_assoc_sta_traffic_stats_event(const sMacAddr &sta_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
+-}
+-
+-bool db::dm_trigger_assoc_wifi6_sta_status_report_event(const sMacAddr &sta_mac,
+-                                                        const std::string &sta_dm_path,
+-                                                        const sMacAddr &bss_mac,
++#else // !ENABLE_NBAPI
++    (void)sta_mac;
++    (void)sta_dm_path;
++    (void)bss_mac;
++    (void)radio_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
++}
++
++bool db::dm_trigger_assoc_wifi6_sta_status_report_event(const sMacAddr &sta_mac,
++                                                        const std::string &sta_dm_path,
++                                                        const sMacAddr &bss_mac,
+                                                         const sMacAddr &radio_mac,
+                                                         const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12772,6 +13071,14 @@ bool db::dm_trigger_assoc_wifi6_sta_status_report_event(const sMacAddr &sta_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)sta_mac;
++    (void)sta_dm_path;
++    (void)bss_mac;
++    (void)radio_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_station_disconnected_event(const sMacAddr &sta_mac,
+@@ -12779,6 +13086,7 @@ bool db::dm_trigger_station_disconnected_event(const sMacAddr &sta_mac,
+                                                const sMacAddr &bss_mac, const sMacAddr &radio_mac,
+                                                const sMacAddr &agent_al_mac)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12811,6 +13119,14 @@ bool db::dm_trigger_station_disconnected_event(const sMacAddr &sta_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)sta_mac;
++    (void)sta_dm_path;
++    (void)bss_mac;
++    (void)radio_mac;
++    (void)agent_al_mac;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ bool db::dm_trigger_beacon_measurement_event(const sMacAddr &sta_mac,
+@@ -12819,6 +13135,7 @@ bool db::dm_trigger_beacon_measurement_event(const sMacAddr &sta_mac,
+                                              const sMacAddr &agent_al_mac, const sMacAddr &target_bss,
+                                              uint8_t rcpi, uint8_t channel, uint8_t opClass)
+ {
++#ifdef ENABLE_NBAPI
+     amxc_var_t event_data;
+     amxc_var_init(&event_data);
+     amxc_var_set_type(&event_data, AMXC_VAR_ID_HTABLE);
+@@ -12856,6 +13173,18 @@ bool db::dm_trigger_beacon_measurement_event(const sMacAddr &sta_mac,
+     }
+     amxc_var_clean(&event_data);
+     return ok;
++#else // !ENABLE_NBAPI
++    (void)sta_mac;
++    (void)measurement_dm_path;
++    (void)bss_mac;
++    (void)radio_mac;
++    (void)agent_al_mac;
++    (void)target_bss;
++    (void)rcpi;
++    (void)channel;
++    (void)opClass;
++    return true;
++#endif // ENABLE_NBAPI
+ }
+ 
+ void db::dm_trigger_cloning_kpi_breach_event(uint64_t incident_id, const std::string &detected_by,
+@@ -12863,6 +13192,7 @@ void db::dm_trigger_cloning_kpi_breach_event(uint64_t incident_id, const std::st
+                                              uint32_t onboarding_time_ms,
+                                              uint32_t onboarding_threshold_ms)
+ {
++#ifdef ENABLE_NBAPI
+     std::string agent_dm_path;
+     auto agent = get_agent(tlvf::mac_from_string(agent_id));
+     if (agent) {
+@@ -12901,12 +13231,20 @@ void db::dm_trigger_cloning_kpi_breach_event(uint64_t incident_id, const std::st
+                    << " onboarding_time_ms=" << onboarding_time_ms
+                    << " onboarding_threshold_ms=" << onboarding_threshold_ms;
+     }
++#else // !ENABLE_NBAPI
++    (void)incident_id;
++    (void)detected_by;
++    (void)agent_id;
++    (void)onboarding_time_ms;
++    (void)onboarding_threshold_ms;
++#endif // ENABLE_NBAPI
+ }
+ 
+ void db::dm_trigger_cloning_incomplete_event(uint64_t incident_id, const std::string &detected_by,
+                                              const std::string &agent_id, uint32_t elapsed_ms,
+                                              uint32_t incomplete_timeout_ms)
+ {
++#ifdef ENABLE_NBAPI
+     std::string agent_dm_path;
+     auto agent = get_agent(tlvf::mac_from_string(agent_id));
+     if (agent) {
+@@ -12945,12 +13283,20 @@ void db::dm_trigger_cloning_incomplete_event(uint64_t incident_id, const std::st
+                    << " elapsed_ms=" << elapsed_ms
+                    << " incomplete_timeout_ms=" << incomplete_timeout_ms;
+     }
++#else // !ENABLE_NBAPI
++    (void)incident_id;
++    (void)detected_by;
++    (void)agent_id;
++    (void)elapsed_ms;
++    (void)incomplete_timeout_ms;
++#endif // ENABLE_NBAPI
+ }
+ 
+ void db::dm_trigger_renew_failure_event(uint64_t incident_id, const std::string &detected_by,
+                                        const std::string &agent_id, uint32_t elapsed_ms,
+                                        uint32_t renew_timeout_ms)
+ {
++#ifdef ENABLE_NBAPI
+     std::string agent_dm_path;
+     auto agent = get_agent(tlvf::mac_from_string(agent_id));
+     if (agent) {
+@@ -12989,435 +13335,11 @@ void db::dm_trigger_renew_failure_event(uint64_t incident_id, const std::string
+                    << " elapsed_ms=" << elapsed_ms
+                    << " renew_timeout_ms=" << renew_timeout_ms;
+     }
+-}
+-
+ #else // !ENABLE_NBAPI
+-
+-// Dummy implementations when NBAPI is disabled
+-bool db::dm_trigger_qcom_vendor_event(const sMacAddr &mac, const std::string &dm_path,
+-                                      const std::string &event_name)
+-{
+-    (void)mac;
+-    (void)dm_path;
+-    (void)event_name;
+-    return true;
+-}
+-
+-bool db::dm_trigger_ap_radio_basic_capabilities_event(const sMacAddr &radio_mac,
+-                                                      const std::string &radio_dm_path,
+-                                                      const sMacAddr &agent_al_mac)
+-{
+-    (void)radio_mac;
+-    (void)radio_dm_path;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_unassoc_sta_link_metrics_event(const sMacAddr &sta_mac,
+-                                                   const std::string &sta_dm_path,
+-                                                   const sMacAddr &radio_mac,
+-                                                   const sMacAddr &agent_al_mac)
+-{
+-    (void)sta_mac;
+-    (void)sta_dm_path;
+-    (void)radio_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_sta_mld_added_event(const sMacAddr &sta_mld_mac,
+-                                        const std::string &sta_mld_dm_path,
+-                                        const sMacAddr &ap_mld_mac, const sMacAddr &agent_al_mac)
+-{
+-    (void)sta_mld_mac;
+-    (void)sta_mld_dm_path;
+-    (void)ap_mld_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_sta_mld_removed_event(const sMacAddr &sta_mld_mac,
+-                                          const std::string &sta_mld_dm_path,
+-                                          const sMacAddr &ap_mld_mac, const sMacAddr &agent_al_mac)
+-{
+-    (void)sta_mld_mac;
+-    (void)sta_mld_dm_path;
+-    (void)ap_mld_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_ap_mld_added_event(const sMacAddr &ap_mld_mac,
+-                                       const std::string &ap_mld_dm_path,
+-                                       const sMacAddr &agent_al_mac)
+-{
+-    (void)ap_mld_mac;
+-    (void)ap_mld_dm_path;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_ap_mld_removed_event(const sMacAddr &ap_mld_mac,
+-                                         const std::string &ap_mld_dm_path,
+-                                         const sMacAddr &agent_al_mac)
+-{
+-    (void)ap_mld_mac;
+-    (void)ap_mld_dm_path;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_affiliated_ap_added_event(const sMacAddr &bssid,
+-                                              const std::string &affl_ap_dm_path,
+-                                              const sMacAddr &ap_mld_mac,
+-                                              const sMacAddr &agent_al_mac)
+-{
+-    (void)bssid;
+-    (void)affl_ap_dm_path;
+-    (void)ap_mld_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_affiliated_ap_removed_event(const sMacAddr &bssid,
+-                                                const std::string &affl_ap_dm_path,
+-                                                const sMacAddr &ap_mld_mac,
+-                                                const sMacAddr &agent_al_mac)
+-{
+-    (void)bssid;
+-    (void)affl_ap_dm_path;
+-    (void)ap_mld_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_affiliated_sta_added_event(const sMacAddr &sta_mac,
+-                                               const std::string &sta_dm_path,
+-                                               const sMacAddr &sta_mld_mac, const sMacAddr &bss_mac,
+-                                               const sMacAddr &ap_mld_mac,
+-                                               const sMacAddr &agent_al_mac)
+-{
+-    (void)sta_mac;
+-    (void)sta_dm_path;
+-    (void)sta_mld_mac;
+-    (void)bss_mac;
+-    (void)ap_mld_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_affiliated_sta_removed_event(
+-    const sMacAddr &sta_mac, const std::string &sta_dm_path, const sMacAddr &sta_mld_mac,
+-    const sMacAddr &bss_mac, const sMacAddr &ap_mld_mac, const sMacAddr &agent_al_mac)
+-{
+-    (void)sta_mac;
+-    (void)sta_dm_path;
+-    (void)sta_mld_mac;
+-    (void)bss_mac;
+-    (void)ap_mld_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_affiliated_sta_metrics_event(const sMacAddr &sta_mac,
+-                                                 const std::string &sta_dm_path,
+-                                                 const sMacAddr &sta_mld_mac,
+-                                                 const sMacAddr &agent_al_mac)
+-{
+-    (void)sta_mac;
+-    (void)sta_dm_path;
+-    (void)sta_mld_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_assoc_sta_mld_config_report_event(const sMacAddr &sta_mld_mac,
+-                                                       const std::string &sta_mld_dm_path,
+-                                                       const sMacAddr &ap_mld_mac,
+-                                                       const sMacAddr &agent_al_mac)
+-{
+-    (void)sta_mld_mac;
+-    (void)sta_mld_dm_path;
+-    (void)ap_mld_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_radio_added_event(const sMacAddr &radio_mac, const std::string &radio_dm_path,
+-                                      const sMacAddr &agent_al_mac)
+-{
+-    (void)radio_mac;
+-    (void)radio_dm_path;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_radio_removed_event(const sMacAddr &radio_mac, const std::string &radio_dm_path,
+-                                        const sMacAddr &agent_al_mac)
+-{
+-    (void)radio_mac;
+-    (void)radio_dm_path;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_bss_added_event(const sMacAddr &bss_mac, const std::string &bss_dm_path,
+-                                    const sMacAddr &radio_mac, const sMacAddr &agent_al_mac)
+-{
+-    (void)bss_mac;
+-    (void)bss_dm_path;
+-    (void)radio_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_bss_removed_event(const sMacAddr &bss_mac, const std::string &bss_dm_path,
+-                                      const sMacAddr &radio_mac, const sMacAddr &agent_al_mac)
+-{
+-    (void)bss_mac;
+-    (void)bss_dm_path;
+-    (void)radio_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_ap_vht_capabilities_event(const sMacAddr &radio_mac,
+-                                              const std::string &radio_dm_path,
+-                                              const sMacAddr &agent_al_mac)
+-{
+-    (void)radio_mac;
+-    (void)radio_dm_path;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_ap_wifi6_capabilities_event(const sMacAddr &radio_mac,
+-                                                const std::string &radio_dm_path,
+-                                                const sMacAddr &agent_al_mac)
+-{
+-    (void)radio_mac;
+-    (void)radio_dm_path;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_wifi7_agent_capabilities_event(const sMacAddr &agent_al_mac,
+-                                                   const std::string &agent_dm_path)
+-{
+-    (void)agent_al_mac;
+-    (void)agent_dm_path;
+-    return true;
+-}
+-
+-bool db::dm_trigger_eht_operations_event(const sMacAddr &bssid, const std::string &bss_dm_path,
+-                                         const sMacAddr &radio_mac, const sMacAddr &agent_al_mac)
+-{
+-    (void)bssid;
+-    (void)bss_dm_path;
+-    (void)radio_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_station_capability_update_event(const sMacAddr &sta_mac,
+-                                                    const std::string &sta_dm_path,
+-                                                    const sMacAddr &bss_mac,
+-                                                    const sMacAddr &radio_mac,
+-                                                    const sMacAddr &agent_al_mac)
+-{
+-    (void)sta_mac;
+-    (void)sta_dm_path;
+-    (void)bss_mac;
+-    (void)radio_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_ap_extended_metrics_event(const sMacAddr &bssid, const std::string &bss_dm_path,
+-                                              const sMacAddr &radio_mac,
+-                                              const sMacAddr &agent_al_mac)
+-{
+-    (void)bssid;
+-    (void)bss_dm_path;
+-    (void)radio_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_assoc_sta_link_metrics_event(const sMacAddr &sta_mac,
+-                                                 const std::string &sta_dm_path,
+-                                                 const sMacAddr &bss_mac, const sMacAddr &radio_mac,
+-                                                 const sMacAddr &agent_al_mac)
+-{
+-    (void)sta_mac;
+-    (void)sta_dm_path;
+-    (void)bss_mac;
+-    (void)radio_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_ap_capability_report_event(const sMacAddr &agent_al_mac,
+-                                               const std::string &agent_dm_path)
+-{
+-    (void)agent_al_mac;
+-    (void)agent_dm_path;
+-    return true;
+-}
+-
+-bool db::dm_trigger_ap_ht_capabilities_event(const sMacAddr &radio_mac,
+-                                             const std::string &radio_dm_path,
+-                                             const sMacAddr &agent_al_mac)
+-{
+-    (void)radio_mac;
+-    (void)radio_dm_path;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_station_connected_event(const sMacAddr &sta_mac, const std::string &sta_dm_path,
+-                                            const sMacAddr &bss_mac, const sMacAddr &radio_mac,
+-                                            const sMacAddr &agent_al_mac)
+-{
+-    (void)sta_mac;
+-    (void)sta_dm_path;
+-    (void)bss_mac;
+-    (void)radio_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_agent_connected_event(const sMacAddr &agent_al_mac,
+-                                          const std::string &agent_dm_path)
+-{
+-    (void)agent_al_mac;
+-    (void)agent_dm_path;
+-    return true;
+-}
+-
+-bool db::dm_trigger_agent_disconnected_event(const sMacAddr &agent_al_mac,
+-                                             const std::string &agent_dm_path)
+-{
+-    (void)agent_al_mac;
+-    (void)agent_dm_path;
+-    return true;
+-}
+-
+-bool db::dm_trigger_operating_channel_report_event(const sMacAddr &radio_mac,
+-                                                   const std::string &radio_dm_path,
+-                                                   const sMacAddr &agent_al_mac)
+-{
+-    (void)radio_mac;
+-    (void)radio_dm_path;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_assoc_sta_extended_link_metrics_event(const sMacAddr &sta_mac,
+-                                                          const std::string &sta_dm_path,
+-                                                          const sMacAddr &bss_mac,
+-                                                          const sMacAddr &radio_mac,
+-                                                          const sMacAddr &agent_al_mac)
+-{
+-    (void)sta_mac;
+-    (void)sta_dm_path;
+-    (void)bss_mac;
+-    (void)radio_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_assoc_sta_traffic_stats_event(const sMacAddr &sta_mac,
+-                                                  const std::string &sta_dm_path,
+-                                                  const sMacAddr &bss_mac,
+-                                                  const sMacAddr &radio_mac,
+-                                                  const sMacAddr &agent_al_mac)
+-{
+-    (void)sta_mac;
+-    (void)sta_dm_path;
+-    (void)bss_mac;
+-    (void)radio_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_assoc_wifi6_sta_status_report_event(const sMacAddr &sta_mac,
+-                                                        const std::string &sta_dm_path,
+-                                                        const sMacAddr &bss_mac,
+-                                                        const sMacAddr &radio_mac,
+-                                                        const sMacAddr &agent_al_mac)
+-{
+-    (void)sta_mac;
+-    (void)sta_dm_path;
+-    (void)bss_mac;
+-    (void)radio_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_station_disconnected_event(const sMacAddr &sta_mac,
+-                                               const std::string &sta_dm_path,
+-                                               const sMacAddr &bss_mac, const sMacAddr &radio_mac,
+-                                               const sMacAddr &agent_al_mac)
+-{
+-    (void)sta_mac;
+-    (void)sta_dm_path;
+-    (void)bss_mac;
+-    (void)radio_mac;
+-    (void)agent_al_mac;
+-    return true;
+-}
+-
+-bool db::dm_trigger_beacon_measurement_event(const sMacAddr &sta_mac,
+-                                             const std::string &measurement_dm_path,
+-                                             const sMacAddr &bss_mac, const sMacAddr &radio_mac,
+-                                             const sMacAddr &agent_al_mac, const sMacAddr &target_bss,
+-                                             uint8_t rcpi, uint8_t channel, uint8_t opClass)
+-{
+-    (void)sta_mac;
+-    (void)measurement_dm_path;
+-    (void)bss_mac;
+-    (void)radio_mac;
+-    (void)agent_al_mac;
+-    (void)target_bss;
+-    (void)rcpi;
+-    (void)channel;
+-    (void)opClass;
+-    return true;
+-}
+-
+-void db::dm_trigger_cloning_kpi_breach_event(uint64_t incident_id, const std::string &detected_by,
+-                                             const std::string &agent_id,
+-                                             uint32_t onboarding_time_ms,
+-                                             uint32_t onboarding_threshold_ms)
+-{
+-    (void)incident_id;
+-    (void)detected_by;
+-    (void)agent_id;
+-    (void)onboarding_time_ms;
+-    (void)onboarding_threshold_ms;
+-}
+-
+-void db::dm_trigger_cloning_incomplete_event(uint64_t incident_id, const std::string &detected_by,
+-                                             const std::string &agent_id, uint32_t elapsed_ms,
+-                                             uint32_t incomplete_timeout_ms)
+-{
+-    (void)incident_id;
+-    (void)detected_by;
+-    (void)agent_id;
+-    (void)elapsed_ms;
+-    (void)incomplete_timeout_ms;
+-}
+-
+-void db::dm_trigger_renew_failure_event(uint64_t incident_id, const std::string &detected_by,
+-                                       const std::string &agent_id, uint32_t elapsed_ms,
+-                                       uint32_t renew_timeout_ms)
+-{
+     (void)incident_id;
+     (void)detected_by;
+     (void)agent_id;
+     (void)elapsed_ms;
+     (void)renew_timeout_ms;
++#endif // ENABLE_NBAPI
+ }
+-
+-#endif //ENABLE_NBAPI
+diff --git a/controller/src/beerocks/master/db/db.h b/controller/src/beerocks/master/db/db.h
+index 5cc535e61..54d51b0cd 100644
+--- a/controller/src/beerocks/master/db/db.h
++++ b/controller/src/beerocks/master/db/db.h
+@@ -48,6 +48,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <functional>
+ #include <mutex>
+ #include <queue>
+ #include <vector>
+diff --git a/framework/platform/CMakeLists.txt b/framework/platform/CMakeLists.txt
+index f6049a23d..763559e76 100644
+--- a/framework/platform/CMakeLists.txt
++++ b/framework/platform/CMakeLists.txt
+@@ -1,4 +1,9 @@
+ add_subdirectory(bpl)
++
++if (NOT TARGET_PLATFORM STREQUAL "rdkb")
++	add_subdirectory(mqttapi)
++endif()
++
+ if (NOT TARGET_PLATFORM STREQUAL "rdkb")
+ 	add_subdirectory(nbapi)
+ 	if (USE_PRPLMESH_WHM)
+@@ -9,7 +14,3 @@ else()
+ 	# set_ambiorix_impl_ptr are available for linking
+ 	add_subdirectory(nbapi)
+ endif()
+-
+-if (NOT TARGET_PLATFORM STREQUAL "rdkb")
+-	add_subdirectory(mqttapi)
+-endif()
+diff --git a/framework/platform/mqttapi/include/mqtt_client.h b/framework/platform/mqttapi/include/mqtt_client.h
+index 063748cc7..15bd220a6 100644
+--- a/framework/platform/mqttapi/include/mqtt_client.h
++++ b/framework/platform/mqttapi/include/mqtt_client.h
+@@ -17,8 +17,7 @@ enum class MqttState {
+     Uninitialized = 0,
+     Initialized = 1,
+     Connecting = 2,
+-    Reconnecting = 3,
+-    Connected = 4
++    Connected = 3
+ };
+ 
+ 
+diff --git a/framework/platform/mqttapi/include/mqtt_client_impl.h b/framework/platform/mqttapi/include/mqtt_client_impl.h
+index b433c070f..36d0dfdaf 100644
+--- a/framework/platform/mqttapi/include/mqtt_client_impl.h
++++ b/framework/platform/mqttapi/include/mqtt_client_impl.h
+@@ -46,6 +46,9 @@ private:
+     std::vector<std::pair<std::string, int>> m_subscriptions;
+     std::chrono::steady_clock::time_point m_next_connection_retry_time;
+     int m_conn_retry_timeout;
++
++    // flag to prevent mosquitto_loop_write() while publishing in on_message_cb
++    bool m_in_message_callback = false;
+ };
+ 
+ } // namespace mqttapi
+diff --git a/framework/platform/mqttapi/mqtt_client_impl.cpp b/framework/platform/mqttapi/mqtt_client_impl.cpp
+index 5a2dc5bd7..ac5c2aef5 100644
+--- a/framework/platform/mqttapi/mqtt_client_impl.cpp
++++ b/framework/platform/mqttapi/mqtt_client_impl.cpp
+@@ -102,8 +102,8 @@ bool MQTTClientImpl::connect(const std::string& host, int port, int keepalive)
+         }
+     };
+ 
+-    int rc = mosquitto_connect_async(mosq, host.c_str(), port, keepalive);
+-    if(is_fatal(rc)) {
++    int rc = mosquitto_connect(mosq, host.c_str(), port, keepalive);
++    if (is_fatal(rc)) {
+         LOG(ERROR) << "MQTT Connect Fatal error: " << mosquitto_strerror(rc);
+         return false;
+     } else if (rc == MOSQ_ERR_SUCCESS) {
+@@ -111,12 +111,15 @@ bool MQTTClientImpl::connect(const std::string& host, int port, int keepalive)
+         state = MqttState::Connecting;
+         mosquitto_loop_write(mosq, 1);
+     } else {
+-        LOG(DEBUG) << "MQTT connection failed: " << mosquitto_strerror(rc)
+-                          << ", retrying in " << m_conn_retry_timeout << " msec";
+-        state = MqttState::Reconnecting;
++        mosquitto_loop_write(mosq, 1);
++        LOG(DEBUG) << "MQTT connection failed: rc=" << rc << " ("
++                   << (rc == MOSQ_ERR_ERRNO ? strerror(errno) : mosquitto_strerror(rc))
++                   << "), errno=" << errno << " (" << strerror(errno) << ")"
++                   << ", retrying in " << m_conn_retry_timeout << " msec";
++        state = MqttState::Connecting;
+         m_next_connection_retry_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(m_conn_retry_timeout);
+     }
+-    
++
+     return true;
+ }
+ 
+@@ -185,22 +188,31 @@ void MQTTClientImpl::run_loop()
+         return;
+     }
+ 
+-    if (state == MqttState::Reconnecting) {
++    if (state == MqttState::Connecting) {
+         auto now = std::chrono::steady_clock::now();
+         if (now >= m_next_connection_retry_time) {
+             m_next_connection_retry_time = now + std::chrono::milliseconds(m_conn_retry_timeout);
+-            int rc = mosquitto_reconnect_async(mosq);
++            int rc = mosquitto_reconnect(mosq);
+             if (rc == MOSQ_ERR_SUCCESS) {
+-                LOG(DEBUG) << "MQTT recconnection initiated successfully";
+-                state = MqttState::Connecting;
++                LOG(DEBUG) << "MQTT reconnection initiated successfully";
+                 mosquitto_loop_write(mosq, 1);
+             } else {
+-                LOG(DEBUG) << "MQTT reconnection failed: " << mosquitto_strerror(rc)
+-                                  << ", retrying in " << m_conn_retry_timeout << " msec";
++                LOG(DEBUG) << "MQTT reconnection failed: rc=" << rc << " ("
++                           << (rc == MOSQ_ERR_ERRNO ? strerror(errno) : mosquitto_strerror(rc))
++                           << "), errno=" << errno << " (" << strerror(errno) << ")"
++                           << ", retrying in " << m_conn_retry_timeout << " msec";
+                 return;
+-            }       
++            }
+         }
+-    } else if (state == MqttState::Connecting) {
++    }
++
++    // The socket fd can exist (and change) as soon as an async connect/reconnect
++    // is in flight, well before the CONNACK is received. Register it with the
++    // event loop unconditionally so the incoming CONNACK actually gets read and
++    // on_connect() has a chance to fire; gating this on state == Connected would
++    // mean the fd never gets registered, since reaching Connected itself depends
++    // on reading that fd.
++    if (state == MqttState::Connecting || state == MqttState::Connected) {
+         int new_fd = mosquitto_socket(mosq);
+         if (new_fd >= 0 && new_fd != mqtt_fd) {
+             // unregister old fd
+@@ -231,7 +243,7 @@ void MQTTClientImpl::reconnect()
+         LOG(ERROR) << "MQTT reconnect not allowed in this state";
+     } else {
+         LOG(DEBUG) << "MQTT reconnect requested";
+-        state = MqttState::Reconnecting;
++        state = MqttState::Connecting;
+         mqtt_fd = -1;
+     }
+ }
+@@ -258,7 +270,10 @@ int MQTTClientImpl::publish(const std::string& topic, const void* payload, int p
+                   << ": " << mosquitto_strerror(rc);
+     }
+ 
+-    mosquitto_loop_write(mosq, 1);
++    // Skip the immediate flush if publish() was reached from on_message()
++    if (!m_in_message_callback) {
++        mosquitto_loop_write(mosq, 1);
++    }
+     return rc;
+ }
+ int MQTTClientImpl::subscribe(const std::string& topic, int qos)
+@@ -353,8 +368,8 @@ void MQTTClientImpl::on_connect(int rc)
+         }
+         state = MqttState::Connected;
+     } else {
+-        LOG(ERROR) << "MQTT connection failed: " << mosquitto_strerror(rc) << ", Reconnecting!";
+-        state = MqttState::Reconnecting;
++        LOG(ERROR) << "MQTT connection failed: " << mosquitto_strerror(rc) << ", Connecting!";
++        state = MqttState::Connecting;
+     }
+ }
+ 
+@@ -365,7 +380,9 @@ void MQTTClientImpl::on_message(const struct mosquitto_message* msg)
+               << ", QoS: " << msg->qos;
+ 
+     if (m_callbacks.process_msg_cb && msg && msg->topic) {
++        m_in_message_callback = true;
+         m_callbacks.process_msg_cb(msg->topic, msg->payload, msg->payloadlen);
++        m_in_message_callback = false;
+     }
+ }
+ 
+@@ -375,8 +392,9 @@ void MQTTClientImpl::on_disconnect(int rc)
+         state = MqttState::Initialized;
+         LOG(DEBUG) << "MQTT client disconnected from broker on demand";
+     } else {
+-        LOG(DEBUG) << "MQTT client disconnected from broker unexpectedly";
+-        state = MqttState::Reconnecting;
++        LOG(ERROR) << "MQTT client disconnected from broker unexpectedly"
++                   << " (rc=" << rc << ": " << mosquitto_strerror(rc) << ")";
++        state = MqttState::Connecting;
+     }
+ 
+     if (mqtt_fd >= 0 && m_callbacks.unregister_fd_cb) {
+diff --git a/framework/platform/nbapi/CMakeLists.txt b/framework/platform/nbapi/CMakeLists.txt
+index 487f3af35..b1592daeb 100644
+--- a/framework/platform/nbapi/CMakeLists.txt
++++ b/framework/platform/nbapi/CMakeLists.txt
+@@ -29,9 +29,15 @@ if (ENABLE_NBAPI)
+     find_package(amxd REQUIRED)
+     find_package(amxp REQUIRED)
+     find_package(amxo REQUIRED)
++    find_package(amxj REQUIRED)
+     find_package(libamxrt REQUIRED)
+     list(APPEND nbapi_sources ${MODULE_PATH}/ambiorix_impl.cpp)
+-    list(APPEND NBAPI_LIBS amxb amxc amxd amxp amxo libamxrt)
++    list(APPEND NBAPI_LIBS amxb amxc amxd amxp amxo amxj yajl libamxrt)
++endif()
++
++if (ENABLE_NBAPI AND ENABLE_MQTT_DM AND NOT TARGET_PLATFORM STREQUAL "rdkb")
++    list(APPEND nbapi_sources ${MODULE_PATH}/mqtt_nbapi_impl.cpp)
++    list(APPEND NBAPI_LIBS mqttapi json-c)
+ endif()
+ 
+ # Build the library
+@@ -42,6 +48,7 @@ set_target_properties(${PROJECT_NAME} PROPERTIES LINK_FLAGS "-Wl,-z,defs")
+ 
+ if (ENABLE_NBAPI)
+     target_link_libraries(${PROJECT_NAME} PRIVATE ${NBAPI_LIBS} mapfcommon elpp bcl event)
++    target_compile_definitions(${PROJECT_NAME} PUBLIC $<$<BOOL:${ENABLE_MQTT_DM}>:ENABLE_MQTT_DM>)
+ else ()
+     target_link_libraries(${PROJECT_NAME} PRIVATE mapfcommon elpp bcl)
+ endif()
+diff --git a/framework/platform/nbapi/ambiorix_dummy.cpp b/framework/platform/nbapi/ambiorix_dummy.cpp
+index 4112de7d9..4ad13cbc1 100644
+--- a/framework/platform/nbapi/ambiorix_dummy.cpp
++++ b/framework/platform/nbapi/ambiorix_dummy.cpp
+@@ -173,5 +173,24 @@ bool AmbiorixDummy::trigger_event_with_data(const std::string &object_path,
+     return true;
+ }
+ 
++bool AmbiorixDummy::get_object_data(const std::string &object_path, int32_t depth, void *result)
++{
++    return true;
++}
++
++bool AmbiorixDummy::get_object_data_json(const std::string &object_path, int32_t depth,
++                                         std::string &json_result)
++{
++    json_result = "{}";
++    return true;
++}
++
++bool AmbiorixDummy::invoke_function(const std::string &object_path, const std::string &method,
++                                    const std::map<std::string, std::string> &args,
++                                    std::string *result)
++{
++    return true;
++}
++
+ } // namespace nbapi
+ } // namespace beerocks
+diff --git a/framework/platform/nbapi/ambiorix_impl.cpp b/framework/platform/nbapi/ambiorix_impl.cpp
+index 92327691b..cce642a32 100644
+--- a/framework/platform/nbapi/ambiorix_impl.cpp
++++ b/framework/platform/nbapi/ambiorix_impl.cpp
+@@ -13,7 +13,10 @@
+ #include <amxd/amxd_object.h>
+ #include <amxd/amxd_object_event.h>
+ #include <amxd/amxd_transaction.h>
++#include <yajl/yajl_gen.h>
++#include <amxj/amxj_variant.h>
+ 
++#include <algorithm>
+ #include <bcl/network/network_utils.h>
+ #include <mapf/common/utils.h>
+ #include <tlvf/tlvftypes.h>
+@@ -1084,9 +1087,165 @@ bool AmbiorixImpl::trigger_event_with_data(const std::string &object_path,
+ 
+     // Cast void* to amxc_var_t* for the Ambiorix API
+     amxc_var_t *data = static_cast<amxc_var_t *>(event_data);
+-    amxd_object_trigger_signal(event_obj, event_name.c_str(), data);
++
++    // amxd_object_trigger_signal() takes ownership of `data` (it moves/empties
++    // the variant into the constructed event as part of amxd_object_send_signal()'s
++    // signal-emission convention), so pass it a copy - callers of this function
++    // (e.g. db::dm_trigger_*_event()) rely on their event_data still being valid
++    // and populated after this call returns, in particular to also publish the
++    // same data over MQTT below. Emptying the caller's
++    // variant here silently turned every MQTT-published event's data into "{}".
++    amxc_var_t data_copy;
++    amxc_var_init(&data_copy);
++    amxc_var_copy(&data_copy, data);
++    amxd_object_trigger_signal(event_obj, event_name.c_str(), &data_copy);
++    amxc_var_clean(&data_copy);
+ 
+     LOG(DEBUG) << "Triggered event '" << event_name << "' with data at '" << object_path << "'";
++
++#ifdef ENABLE_MQTT_DM
++    dm_publish_mqtt_event(object_path, data);
++#endif // ENABLE_MQTT_DM
++
++    return true;
++}
++
++#ifdef ENABLE_MQTT_DM
++void AmbiorixImpl::dm_publish_mqtt_event(const std::string &object_path, void *event_data)
++{
++    if (m_mqtt_event_publisher) {
++        std::string topic = object_path;
++        std::replace(topic.begin(), topic.end(), '.', '/');
++
++        amxc_var_t *var = static_cast<amxc_var_t *>(event_data);
++        amxc_var_t json_var;
++        amxc_var_init(&json_var);
++        amxc_var_copy(&json_var, var);
++
++        bool ok = (amxc_var_cast(&json_var, AMXC_VAR_ID_JSON) == 0);
++        std::string json_data;
++        if (ok) {
++            const char *json_cstr = amxc_var_constcast(jstring_t, &json_var);
++            ok                    = (json_cstr != nullptr);
++            if (ok) {
++                json_data = json_cstr;
++            }
++        }
++        amxc_var_clean(&json_var);
++
++        if (ok) {
++            m_mqtt_event_publisher(topic, json_data);
++        } else {
++            LOG(ERROR) << "dm_publish_mqtt_event: failed to convert event data to JSON for "
++                      << object_path;
++        }
++    }
++}
++
++void AmbiorixImpl::set_mqtt_event_publisher(MqttEventPublisher mqtt_event_publisher)
++{
++    m_mqtt_event_publisher = std::move(mqtt_event_publisher);
++}
++#endif // ENABLE_MQTT_DM
++
++bool AmbiorixImpl::get_object_data(const std::string &object_path, int32_t depth, void *result)
++{
++    if (!result) {
++        LOG(ERROR) << "Result variant is null";
++        return false;
++    }
++
++    // Cast void* to amxc_var_t*
++    amxc_var_t *result_var = static_cast<amxc_var_t *>(result);
++
++    // Initialize result variant
++    amxc_var_init(result_var);
++
++    // Use amxb_get to get actual parameter values (not metadata)
++    // This uses the bus API which returns values in the format similar to ubus-cli
++    // Convert depth: -1 (unlimited) to UINT32_MAX for bus API
++    uint32_t bus_depth = (depth < 0) ? UINT32_MAX : static_cast<uint32_t>(depth);
++    
++    int status = amxb_get(m_bus_ctx_vect[0], object_path.c_str(), bus_depth, result_var, 5);
++    if (status != 0) {
++        LOG(ERROR) << "Failed to get object values for: " << object_path 
++                   << ", status: " << status;
++        amxc_var_clean(result_var);
++        return false;
++    }
++
++    LOG(DEBUG) << "Successfully retrieved object values for: " << object_path
++               << " with depth: " << depth;
++    return true;
++}
++
++bool AmbiorixImpl::get_object_data_json(const std::string &object_path, int32_t depth,
++                                        std::string &json_result)
++{
++    amxc_var_t result;
++
++    bool success = get_object_data(object_path, depth, &result);
++    if (success) {
++        success = (amxc_var_cast(&result, AMXC_VAR_ID_JSON) == 0);
++        if (success) {
++            const char *json_cstr = amxc_var_constcast(jstring_t, &result);
++            success               = (json_cstr != nullptr);
++            if (success) {
++                json_result = json_cstr;
++            }
++        } else {
++            LOG(ERROR) << "get_object_data_json: failed to convert variant to JSON for "
++                       << object_path;
++        }
++        amxc_var_clean(&result);
++    }
++
++    return success;
++}
++
++bool AmbiorixImpl::invoke_function(const std::string &object_path, const std::string &method,
++                                   const std::map<std::string, std::string> &args,
++                                   std::string *result)
++{
++    amxd_object_t *object = find_object(object_path);
++    if (!object) {
++        LOG(ERROR) << "Failed to find object for invoke: " << object_path;
++        return false;
++    }
++
++    amxc_var_t args_var;
++    amxc_var_init(&args_var);
++    amxc_var_set_type(&args_var, AMXC_VAR_ID_HTABLE);
++    for (const auto &arg : args) {
++        amxc_var_add_new_key_cstring_t(&args_var, arg.first.c_str(), arg.second.c_str());
++    }
++
++    amxc_var_t ret_var;
++    amxc_var_init(&ret_var);
++
++    amxd_status_t status =
++        amxd_object_invoke_function(object, method.c_str(), &args_var, &ret_var);
++
++    amxc_var_clean(&args_var);
++
++    if (status != amxd_status_ok) {
++        LOG(ERROR) << "Failed to invoke function [" << method << "] on " << object_path
++                   << ", status: " << amxd_status_string(status);
++        amxc_var_clean(&ret_var);
++        return false;
++    }
++
++    if (result) {
++        amxc_var_cast(&ret_var, AMXC_VAR_ID_JSON);
++        const char *json_cstr = amxc_var_constcast(jstring_t, &ret_var);
++        if (json_cstr) {
++            *result = json_cstr;
++        }
++    }
++
++    amxc_var_clean(&ret_var);
++
++    LOG(DEBUG) << "Successfully invoked function [" << method << "] on " << object_path;
+     return true;
+ }
+ 
+diff --git a/framework/platform/nbapi/include/ambiorix.h b/framework/platform/nbapi/include/ambiorix.h
+index d1b186f2a..d83228e1e 100644
+--- a/framework/platform/nbapi/include/ambiorix.h
++++ b/framework/platform/nbapi/include/ambiorix.h
+@@ -11,6 +11,7 @@
+ 
+ #include "tlvf/common/sMacAddr.h"
+ #include <easylogging++.h>
++#include <map>
+ 
+ namespace beerocks {
+ namespace nbapi {
+@@ -187,6 +188,53 @@ public:
+      */
+     virtual bool trigger_event_with_data(const std::string &object_path,
+                                          const std::string &event_name, void *event_data) = 0;
++
++    /**
++     * @brief Get object data including all parameters using bus API.
++     * 
++     * Uses amxb_get to retrieve actual parameter values (not metadata).
++     * Returns values in a format similar to ubus-cli output.
++     *
++     * @param object_path Path to the object in datamodel.
++     * @param depth Depth of retrieval: 0 = only this object, -1 = unlimited, >0 = specific depth.
++     * @param result Pointer to amxc_var_t to store the result.
++     * @return True on success, false otherwise.
++     */
++    virtual bool get_object_data(const std::string &object_path, int32_t depth, void *result) = 0;
++
++    /**
++     * @brief Get object data as a JSON-encoded string, wrapping get_object_data() so that
++     * callers outside the nbapi framework never need to deal with the underlying amxc_var_t
++     * representation directly.
++     *
++     * @param object_path Path to the object in datamodel.
++     * @param depth Depth of retrieval: 0 = only this object, -1 = unlimited, >0 = specific depth.
++     * @param[out] json_result JSON-encoded object data on success.
++     * @return True on success, false otherwise.
++     */
++    virtual bool get_object_data_json(const std::string &object_path, int32_t depth,
++                                      std::string &json_result) = 0;
++
++    /**
++     * @brief Invoke a data model RPC method (function) on an object instance.
++     *
++     * Equivalent to `ubus call <object_path> <method> <args>`: looks up the object,
++     * builds the function arguments and calls the registered implementation
++     * (e.g. functions registered via on_action.cpp's get_func_list()).
++     *
++     * @param object_path Path to the object instance in the data model that owns
++     *                     the function (example: "Device.WiFi.DataElements.Network.Device.1.Radio.1").
++     * @param method Name of the RPC function to invoke (example: "ScanTrigger").
++     * @param args Function input arguments as string key/value pairs. Values are
++     *             converted to the argument's declared type as defined in the
++     *             function's data model (ODL) signature.
++     * @param[out] result JSON-encoded string containing the function's return value,
++     *                     or left untouched if the function has no return value.
++     * @return True if the function was found and invoked successfully, false otherwise.
++     */
++    virtual bool invoke_function(const std::string &object_path, const std::string &method,
++                                 const std::map<std::string, std::string> &args,
++                                 std::string *result) = 0;
+ };
+ 
+ inline Ambiorix::~Ambiorix() {}
+diff --git a/framework/platform/nbapi/include/ambiorix_dummy.h b/framework/platform/nbapi/include/ambiorix_dummy.h
+index 57c214ada..84fceeb4d 100644
+--- a/framework/platform/nbapi/include/ambiorix_dummy.h
++++ b/framework/platform/nbapi/include/ambiorix_dummy.h
+@@ -83,6 +83,15 @@ public:
+ 
+     bool trigger_event_with_data(const std::string &object_path, const std::string &event_name,
+                                  void *event_data) override;
++    
++    bool get_object_data(const std::string &object_path, int32_t depth, void *result) override;
++
++    bool get_object_data_json(const std::string &object_path, int32_t depth,
++                              std::string &json_result) override;
++
++    bool invoke_function(const std::string &object_path, const std::string &method,
++                         const std::map<std::string, std::string> &args,
++                         std::string *result) override;
+ };
+ 
+ } // namespace nbapi
+diff --git a/framework/platform/nbapi/include/ambiorix_impl.h b/framework/platform/nbapi/include/ambiorix_impl.h
+index 25dd28619..8415b71dd 100644
+--- a/framework/platform/nbapi/include/ambiorix_impl.h
++++ b/framework/platform/nbapi/include/ambiorix_impl.h
+@@ -21,6 +21,7 @@
+ #include <amxd/amxd_object.h>
+ #include <amxd/amxd_object_event.h>
+ #include <amxd/amxd_transaction.h>
++#include <functional>
+ 
+ namespace beerocks {
+ namespace nbapi {
+@@ -134,6 +135,22 @@ public:
+ 
+     uint32_t get_instance_index(const std::string &specific_path, const std::string &key) override;
+ 
++    /**
++     * @brief Get object or parameter data from data model
++     * @param object_path Path to object/parameter in data model
++     * @param depth Depth of retrieval (0 = only this object, -1 = unlimited depth)
++     * @param result Output variant containing object data (pointer to amxc_var_t)
++     * @return True on success, false otherwise
++     */
++    bool get_object_data(const std::string &object_path, int32_t depth, void *result) override;
++
++    bool get_object_data_json(const std::string &object_path, int32_t depth,
++                              std::string &json_result) override;
++
++    bool invoke_function(const std::string &object_path, const std::string &method,
++                         const std::map<std::string, std::string> &args,
++                         std::string *result) override;
++
+     std::string get_datamodel_time_format() override;
+ 
+     /**
+@@ -183,6 +200,25 @@ public:
+     bool trigger_event_with_data(const std::string &object_path, const std::string &event_name,
+                                  void *event_data) override;
+ 
++#ifdef ENABLE_MQTT_DM
++    /**
++     * @brief Callback used by dm_publish_mqtt_event() to mirror each triggered event over
++     * MQTT. No-op when unset (the default).
++     *
++     * @param topic MQTT topic to publish on.
++     * @param json_data JSON-encoded event data.
++     * @return True on success, false otherwise.
++     */
++    using MqttEventPublisher =
++        std::function<bool(const std::string &topic, const std::string &json_data)>;
++
++    /**
++     * @brief Register the callback dm_publish_mqtt_event() should use to publish each
++     * triggered event over MQTT.
++     */
++    void set_mqtt_event_publisher(MqttEventPublisher mqtt_event_publisher);
++#endif // ENABLE_MQTT_DM
++
+ private:
+     // Methods
+ 
+@@ -248,6 +284,22 @@ private:
+      */
+     amxd_object_t *find_object(const std::string &relative_path);
+ 
++#ifdef ENABLE_MQTT_DM
++    /**
++     * @brief Publish a triggered data model event over MQTT subscribers, mirroring the
++     * same notification already sent to AMX subscribers via trigger_event_with_data().
++     *
++     * No-op when no MQTT event publisher is configured.
++     *
++     * @param object_path Fully-qualified data model path of the event object (dot-separated,
++     *   e.g. "Device.WiFi.DataElements.Network.QCOM_Vendor.StationConnected" — the same path
++     *   passed to trigger_event_with_data()), converted to an MQTT topic by replacing '.' with '/'.
++     * @param event_data Pointer to amxc_var_t containing the event data (same variant
++     *   passed to trigger_event_with_data()), converted to JSON for the MQTT payload.
++     */
++    void dm_publish_mqtt_event(const std::string &object_path, void *event_data);
++#endif // ENABLE_MQTT_DM
++
+     // Variables
+     std::vector<amxb_bus_ctx_t *> m_bus_ctx_vect;
+     std::shared_ptr<EventLoop> m_event_loop;
+@@ -255,6 +307,9 @@ private:
+     std::vector<sActionsCallback> m_on_action_handlers;
+     std::vector<sEvents> m_events_list;
+     std::vector<sFunctions> m_func_list;
++#ifdef ENABLE_MQTT_DM
++    MqttEventPublisher m_mqtt_event_publisher;
++#endif // ENABLE_MQTT_DM
+ };
+ 
+ } // namespace nbapi
+diff --git a/framework/platform/nbapi/include/ambiorix_mock.h b/framework/platform/nbapi/include/ambiorix_mock.h
+index 2bce3b280..f311ed871 100644
+--- a/framework/platform/nbapi/include/ambiorix_mock.h
++++ b/framework/platform/nbapi/include/ambiorix_mock.h
+@@ -120,6 +120,18 @@ public:
+                 (const std::string &path_to_object, const std::string &object), (override));
+     MOCK_METHOD(bool, set_time, (const std::string &path_to_object, const std::string &time_stamp),
+                 (override));
++    MOCK_METHOD(bool, trigger_event_with_data,
++                (const std::string &object_path, const std::string &event_name, void *event_data),
++                (override));
++    MOCK_METHOD(bool, get_object_data,
++                (const std::string &object_path, int32_t depth, void *result), (override));
++    MOCK_METHOD(bool, get_object_data_json,
++                (const std::string &object_path, int32_t depth, std::string &json_result),
++                (override));
++    MOCK_METHOD(bool, invoke_function,
++                (const std::string &object_path, const std::string &method,
++                 const std::map<std::string, std::string> &args, std::string *result),
++                (override));
+ };
+ 
+ } // namespace nbapi
+diff --git a/framework/platform/nbapi/include/mqtt_nbapi_impl.h b/framework/platform/nbapi/include/mqtt_nbapi_impl.h
+new file mode 100644
+index 000000000..c733600e7
+--- /dev/null
++++ b/framework/platform/nbapi/include/mqtt_nbapi_impl.h
+@@ -0,0 +1,193 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#ifndef _MQTT_NBAPI_IMPL_H_
++#define _MQTT_NBAPI_IMPL_H_
++
++#include <mqtt_client.h>
++/*
++ * Forward declaration to avoid hard dependency on controller headers here.
++ * The concrete Ambiorix interface is provided by the controller (db.cpp).
++ */
++namespace beerocks { 
++namespace nbapi { class Ambiorix; }
++class EventLoop;
++}
++#include <string>
++#include <memory>
++
++#define MQTT_DEFAULT_BROKER_ADDRESS "tcp://localhost:1883"
++#define MQTT_DEFAULT_CLIENT_ID "prplmesh_controller"
++
++namespace beerocks {
++namespace nbapi {
++
++/**
++ * @brief MQTT Handler for processing data model requests
++ * 
++ * This class handles incoming MQTT messages on data model paths and responds
++ * with data fetched from the Ambiorix data model.
++ * 
++ * Supported operations:
++ * - GET: Retrieve value from data model path
++ * - RESOLVE: Resolve instance index from MAC address (Key)
++ * - SET: Set value in data model
++ * - CMD: Execute command on data model object
++ */
++class MqttNbapiImpl {
++public:
++    /**
++     * @brief Constructor
++     * @param amx_client Shared pointer to Ambiorix client (controller's existing client)
++     * @param event_loop Shared pointer to event loop for FD registration
++     */
++    MqttNbapiImpl(std::shared_ptr<beerocks::nbapi::Ambiorix> amx_client,
++                std::shared_ptr<beerocks::EventLoop> event_loop);
++
++    /**
++     * @brief Destructor
++     */
++    ~MqttNbapiImpl();
++
++    /**
++     * @brief Initialize the MQTT handler and connect to broker
++     * @param broker_address MQTT broker address (e.g., "tcp://localhost:1883")
++     * @param client_id MQTT client ID (default: "prplmesh_controller")
++     * @return true on success, false on failure
++     */
++    bool init(const std::string &broker_address = MQTT_DEFAULT_BROKER_ADDRESS,
++              const std::string &client_id = MQTT_DEFAULT_CLIENT_ID);
++
++    /**
++     * @brief Publish a data model event notification to MQTT subscribers.
++     *
++     * Used by the data model (e.g. controller's db) to push EVENT notifications
++     * for data model changes that AMX subscribers already receive via
++     * Ambiorix::trigger_event_with_data(), mirroring the same notification over MQTT.
++     *
++     * @param topic MQTT topic to publish on, e.g.
++     *   "Device/WiFi/DataElements/Network/Device/1/Disconnected"
++     * @param json_data JSON-encoded event data (the "data" field of the EVENT payload)
++     * @return true on success, false otherwise (e.g. not connected)
++     */
++    bool publish_event(const std::string &topic, const std::string &json_data);
++
++    /**
++     * @brief Get the MQTT socket file descriptor
++     * @return Socket FD, or -1 if not connected
++     */
++    int get_fd() const;
++
++    /**
++     * @brief Process events on the MQTT socket (called when FD is readable)
++     * @param fd File descriptor that has events
++     * @return true if this was the MQTT FD and was processed, false otherwise
++     */
++    bool process_mqtt_events(int fd);
++
++    /**
++     * @brief Run the MQTT event loop (should be called periodically, e.g., every 1 second)
++     * This handles keepalive and reconnection logic
++     */
++    void run_loop();
++
++    /**
++     * @brief Shutdown the MQTT handler and disconnect from broker
++     */
++    void shutdown();
++
++    /**
++     * @brief Register MQTT FD with event loop
++     * This method should be called by the MQTT client when the socket is ready
++     * @param fd File descriptor to register
++     */
++    void register_mqtt_fd(int fd);
++
++    /**
++     * @brief Unregister MQTT FD from event loop
++     * This method should be called by the MQTT client when the socket is closed
++     * @param fd File descriptor to unregister
++     */
++    void unregister_mqtt_fd(int fd);
++
++private:
++    /**
++     * @brief Handle incoming MQTT message
++     */
++    void handle_message(const char *topic, const void *payload, int payloadlen);
++
++    /**
++     * @brief Handle GET request
++     * Request: {"op":"GET","result_path":"APP/thread_id/GET_RESP"}
++     * Response: {"path":"Device/WiFi/.../ID","status":"OK","data":"00:11:22:33:44:55"}
++     */
++    void handle_get(const std::string &path, const std::string &result_path);
++
++    /**
++     * @brief Handle RESOLVE request
++     * Request: {"op":"RESOLVE","Key":"00:11:22:33:44:55","result_path":"APP/thread_id/RESOLVE_RESP"}
++     * Response: {"path":"Device/WiFi/.../Device","Key":"00:11:22:33:44:55","status":"OK","data":"1"}
++     */
++    void handle_resolve(const std::string &path, const std::string &key,
++                        const std::string &result_path);
++
++    /**
++     * @brief Handle SET request
++     * Request: {"op":"SET","data":"{\"ID\":\"00:11:22:33:44:66\"}","result_path":"APP/thread_id/SET_RESP"}
++     * Response: {"path":"Device/WiFi/.../Device/1", "status":"OK"}
++     */
++    void handle_set(const std::string &path, const std::string &data,
++                    const std::string &result_path);
++
++    /**
++     * @brief Handle CMD request
++     * Invokes the named data model RPC function on the object at path with the
++     * given arguments (equivalent to `ubus call <path> <cmd> <args>`).
++     * Request: {"op":"CMD","cmd":"Disconnect","args":"{\"reason\":\"0x0021\"}","result_path":"APP/thread_id/CMD_RESP"}
++     * Response: {"path":"Device/WiFi/.../Device/1","cmd":"Disconnect","status":"OK"}
++     */
++    void handle_cmd(const std::string &path, const std::string &cmd, const std::string &args,
++                    const std::string &result_path);
++
++    /**
++     * @brief Publish response to result_path
++     */
++    void publish_response(const std::string &result_path, const std::string &payload);
++
++    /**
++     * @brief Parse JSON payload
++     */
++    bool parse_payload(const std::string &payload, std::string &op, std::string &key,
++                       std::string &data, std::string &cmd, std::string &args,
++                       std::string &result_path);
++
++    /**
++     * @brief Build JSON response. Every response carries a "status" field ("OK" or "FAIL")
++     * so the (blocking) requester always knows whether its request was serviced.
++     */
++    std::string build_get_response(const std::string &path, const std::string &status,
++                                   const std::string &data = "");
++    std::string build_resolve_response(const std::string &path, const std::string &key,
++                                       const std::string &status, const std::string &data = "");
++    std::string build_set_response(const std::string &path, const std::string &status);
++    std::string build_cmd_response(const std::string &path, const std::string &cmd,
++                                   const std::string &status, const std::string &result = "");
++
++    /**
++     * @brief Build a minimal {"path","status"} response for requests that couldn't be
++     * matched to a specific op (unknown/missing op, unparseable request), so that a
++     * response is still sent whenever a result_path is known.
++     */
++    std::string build_error_response(const std::string &path, const std::string &status);
++
++    std::shared_ptr<beerocks::mqttapi::MQTTClient> m_mqtt_client;
++    std::shared_ptr<beerocks::nbapi::Ambiorix> m_amx_client;
++    std::shared_ptr<beerocks::EventLoop> m_event_loop;
++    bool m_initialized;
++};
++
++} // namespace nbapi
++} // namespace beerocks
++
++#endif // _MQTT_NBAPI_IMPL_H_
+diff --git a/framework/platform/nbapi/mqtt_nbapi_impl.cpp b/framework/platform/nbapi/mqtt_nbapi_impl.cpp
+new file mode 100644
+index 000000000..e15cc98a1
+--- /dev/null
++++ b/framework/platform/nbapi/mqtt_nbapi_impl.cpp
+@@ -0,0 +1,591 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#include "include/mqtt_nbapi_impl.h"
++#include <algorithm>
++#include <ambiorix.h>
++#include <bcl/beerocks_event_loop.h>
++#include <easylogging++.h>
++#include <json-c/json.h>
++#include <map>
++#include <sstream>
++
++// System includes for pipe, fork, fcntl, waitpid
++#include <unistd.h>
++#include <fcntl.h>
++#include <sys/wait.h>
++#include <errno.h>
++#include <cstring>
++
++namespace beerocks {
++namespace nbapi {
++
++MqttNbapiImpl::MqttNbapiImpl(std::shared_ptr<beerocks::nbapi::Ambiorix> amx_client,
++                         std::shared_ptr<beerocks::EventLoop> event_loop)
++    : m_mqtt_client(nullptr), m_amx_client(amx_client), m_event_loop(event_loop),
++      m_initialized(false)
++{
++}
++
++MqttNbapiImpl::~MqttNbapiImpl()
++{
++    shutdown();
++}
++
++bool MqttNbapiImpl::init(const std::string &broker_address, const std::string &client_id)
++{
++    if (m_initialized) {
++        LOG(WARNING) << "MQTT Handler already initialized";
++        return true;
++    }
++
++    if (!m_amx_client) {
++        LOG(ERROR) << "Ambiorix client is null";
++        return false;
++    }
++
++    LOG(INFO) << "Initializing MQTT Handler...";
++    LOG(INFO) << "Broker: " << broker_address;
++    LOG(INFO) << "Client ID: " << client_id;
++
++    // Parse broker address (format: "tcp://host:port" or "host:port")
++    std::string host = "localhost";
++    int port = 1883;
++    
++    size_t proto_pos = broker_address.find("://");
++    std::string addr = broker_address;
++    if (proto_pos != std::string::npos) {
++        addr = broker_address.substr(proto_pos + 3);
++    }
++    
++    size_t colon_pos = addr.find(':');
++    if (colon_pos != std::string::npos) {
++        host = addr.substr(0, colon_pos);
++        port = std::stoi(addr.substr(colon_pos + 1));
++    } else {
++        host = addr;
++    }
++
++    // Create MQTT client
++    m_mqtt_client = beerocks::mqttapi::mqtt_client_create();
++    if (!m_mqtt_client) {
++        LOG(ERROR) << "Failed to create MQTT client";
++        return false;
++    }
++
++    // Initialize with callbacks
++    beerocks::mqttapi::MQTTClient::Callbacks callbacks;
++    callbacks.process_msg_cb = [this](const char* topic, const void* payload, int len) {
++        this->handle_message(topic, payload, len);
++    };
++    // Use member functions for FD registration/unregistration
++    callbacks.register_fd_cb = [this](int fd) {
++        this->register_mqtt_fd(fd);
++    };
++    callbacks.unregister_fd_cb = [this](int fd) {
++        this->unregister_mqtt_fd(fd);
++    };
++
++    if (!m_mqtt_client->init(client_id, callbacks, /*conn_retry_timeout_ms=*/5000)) {
++        LOG(ERROR) << "Failed to initialize MQTT client";
++        return false;
++    }
++
++    // Connect to broker
++    if (!m_mqtt_client->connect(host, port, /*keepalive=*/60)) {
++        LOG(ERROR) << "Failed to connect MQTT client";
++        return false;
++    }
++
++    LOG(INFO) << "MQTT client connected successfully";
++
++    // Subscribe to DataElements data model paths with wildcard
++    std::string dm_topic = "Device/WiFi/DataElements/#";
++    LOG(INFO) << "Subscribing to data model topic: " << dm_topic;
++    
++    if (m_mqtt_client->subscribe(dm_topic, 1) != 0) {
++        LOG(ERROR) << "Failed to subscribe to " << dm_topic;
++        return false;
++    }
++
++    LOG(INFO) << "Successfully subscribed to data model topics";
++
++    m_initialized = true;
++    LOG(INFO) << "MQTT Handler initialized successfully";
++    return true;
++}
++
++int MqttNbapiImpl::get_fd() const
++{
++    if (!m_mqtt_client) {
++        return -1;
++    }
++    return m_mqtt_client->get_fd();
++}
++
++bool MqttNbapiImpl::process_mqtt_events(int fd)
++{
++    if (!m_mqtt_client || !m_initialized) {
++        return false;
++    }
++
++    if (fd == m_mqtt_client->get_fd()) {
++        // Readable event on the MQTT socket — process to consume incoming data
++        m_mqtt_client->process();
++        return true;
++    }
++    return false;
++}
++
++void MqttNbapiImpl::run_loop()
++{
++    if (!m_initialized || !m_mqtt_client) {
++        return;
++    }
++
++    m_mqtt_client->run_loop();
++}
++
++void MqttNbapiImpl::shutdown()
++{
++    if (m_mqtt_client) {
++        LOG(INFO) << "Shutting down MQTT Handler";
++        m_mqtt_client->deinit();
++        m_mqtt_client.reset();
++    }
++    m_initialized = false;
++}
++
++void MqttNbapiImpl::handle_message(const char *topic, const void *payload, int payloadlen)
++{
++    if (!topic || !payload || payloadlen <= 0) {
++        LOG(ERROR) << "Invalid message received";
++        return;
++    }
++
++    std::string topic_str(topic);
++    std::string payload_str(static_cast<const char *>(payload), payloadlen);
++    LOG(DEBUG) << "Received message on topic: " << topic_str << ", payload: " << payload_str;
++
++    // Parse request
++    std::string op, key, data, cmd, args, result_path;
++    if (!parse_payload(payload_str, op, key, data, cmd, args, result_path)) {
++        LOG(ERROR) << "Failed to parse request payload";
++        if (!result_path.empty()) {
++            publish_response(result_path, build_error_response(topic_str, "FAIL"));
++        }
++        return;
++    }
++
++    // EVENT notifications are published by this controller itself
++    if (op == "EVENT") {
++        LOG(DEBUG) << "Ignoring own EVENT notification received on: " << topic_str;
++        return;
++    }
++
++    LOG(INFO) << "Processing " << op << " request for path: " << topic_str;
++
++    // Handle based on operation type
++    if (op == "GET") {
++        handle_get(topic_str, result_path);
++    } else if (op == "RESOLVE") {
++        handle_resolve(topic_str, key, result_path);
++    } else if (op == "SET") {
++        handle_set(topic_str, data, result_path);
++    } else if (op == "CMD") {
++        handle_cmd(topic_str, cmd, args, result_path);
++    } else {
++        LOG(ERROR) << "Unknown operation: " << op;
++        publish_response(result_path, build_error_response(topic_str, "FAIL"));
++    }
++}
++
++void MqttNbapiImpl::handle_get(const std::string &path, const std::string &result_path)
++{
++    LOG(DEBUG) << "Handling GET request for path: " << path;
++
++    // Convert MQTT topic path (Device/WiFi/...) to data model path (Device.WiFi....)
++    std::string dm_path = path;
++    std::replace(dm_path.begin(), dm_path.end(), '/', '.');
++
++    std::string value;
++
++    // Try to get as object first (works for both object paths and instance paths)
++    // Ensure path ends with '.' for object queries (bus API requirement)
++    std::string query_path = dm_path;
++    if (!query_path.empty() && query_path.back() != '.') {
++        query_path += '.';
++    }
++
++    // Try get_object_data_json first - this works for both object and instance paths
++    bool success = m_amx_client->get_object_data_json(query_path, -1, value);
++    if (success) {
++        LOG(DEBUG) << "Retrieved as object/instance: " << dm_path;
++    } else {
++        // If get_object_data_json fails, try as a parameter
++        LOG(DEBUG) << "get_object_data_json failed, trying as parameter: " << dm_path;
++
++        size_t last_dot = dm_path.find_last_of('.');
++        if (last_dot == std::string::npos) {
++            LOG(ERROR) << "Invalid path format and not an object: " << dm_path;
++            publish_response(result_path, build_get_response(path, "FAIL"));
++            return;
++        }
++
++        std::string obj_path = dm_path.substr(0, last_dot);
++        std::string param_name = dm_path.substr(last_dot + 1);
++
++        LOG(DEBUG) << "Trying as parameter: obj=" << obj_path << ", param=" << param_name;
++
++        // Get single parameter value
++        if (!m_amx_client->read_param(obj_path, param_name, &value)) {
++            LOG(ERROR) << "Failed to get value for path: " << dm_path;
++            publish_response(result_path, build_get_response(path, "FAIL"));
++            return;
++        }
++    }
++
++    LOG(INFO) << "Successfully retrieved value for " << dm_path;
++
++    // Build and publish response
++    std::string response_payload = build_get_response(path, "OK", value);
++    publish_response(result_path, response_payload);
++}
++
++void MqttNbapiImpl::handle_resolve(const std::string &path, const std::string &key,
++                                 const std::string &result_path)
++{
++    LOG(DEBUG) << "Handling RESOLVE request for path: " << path << " with Key: " << key;
++
++    // Convert MQTT topic path to data model path
++    std::string dm_path = path;
++    std::replace(dm_path.begin(), dm_path.end(), '/', '.');
++
++    // Build search path: Device.WiFi.DataElements.Network.Device.[ID == 'key'].
++    std::string search_path = dm_path + ".[ID == '" + key + "'].";
++
++    // Get instance index using Ambiorix client
++    uint32_t instance_index = m_amx_client->get_instance_index(search_path, key);
++    
++    if (instance_index == 0) {
++        LOG(ERROR) << "Failed to resolve instance for Key: " << key;
++        publish_response(result_path, build_resolve_response(path, key, "FAIL"));
++        return;
++    }
++
++    LOG(INFO) << "Successfully resolved instance index: " << instance_index;
++
++    // Build and publish response
++    std::string response_payload =
++        build_resolve_response(path, key, "OK", std::to_string(instance_index));
++    publish_response(result_path, response_payload);
++}
++
++void MqttNbapiImpl::handle_set(const std::string &path, const std::string &data,
++                             const std::string &result_path)
++{
++    LOG(DEBUG) << "Handling SET request for path: " << path << " with data: " << data;
++
++    // Convert MQTT topic path to data model path
++    std::string dm_path = path;
++    std::replace(dm_path.begin(), dm_path.end(), '/', '.');
++
++    // Parse data JSON to extract parameter and value
++    struct json_object *data_obj = json_tokener_parse(data.c_str());
++    if (!data_obj) {
++        LOG(ERROR) << "Failed to parse data JSON";
++        publish_response(result_path, build_set_response(path, "FAIL"));
++        return;
++    }
++
++    bool success = true;
++    json_object_object_foreach(data_obj, param_name, param_value) {
++        const char *value_str = json_object_get_string(param_value);
++        if (!m_amx_client->set(dm_path, param_name, std::string(value_str))) {
++            LOG(ERROR) << "Failed to set " << param_name << " = " << value_str;
++            success = false;
++            break;
++        }
++    }
++
++    json_object_put(data_obj);
++
++    // Build and publish response
++    std::string status = success ? "OK" : "FAIL";
++    std::string response_payload = build_set_response(path, status);
++    publish_response(result_path, response_payload);
++}
++
++void MqttNbapiImpl::handle_cmd(const std::string &path, const std::string &cmd,
++                             const std::string &args, const std::string &result_path)
++{
++    LOG(DEBUG) << "Handling CMD request for path: " << path << ", cmd: " << cmd << ", args: " << args;
++
++    // Convert MQTT topic path to data model path
++    std::string dm_path = path;
++    std::replace(dm_path.begin(), dm_path.end(), '/', '.');
++
++    // Parse args JSON (if any) into a string key/value map for invoke_function
++    std::map<std::string, std::string> args_map;
++    if (!args.empty()) {
++        struct json_object *args_obj = json_tokener_parse(args.c_str());
++        if (!args_obj) {
++            LOG(ERROR) << "Failed to parse args JSON for cmd: " << cmd;
++            std::string response_payload = build_cmd_response(path, cmd, "FAIL");
++            publish_response(result_path, response_payload);
++            return;
++        }
++
++        if (json_object_is_type(args_obj, json_type_object)) {
++            json_object_object_foreach(args_obj, arg_name, arg_value) {
++                const char *value_str = json_object_get_string(arg_value);
++                args_map[arg_name] = value_str ? value_str : "";
++            }
++        }
++
++        json_object_put(args_obj);
++    }
++
++    std::string result;
++    bool success = m_amx_client->invoke_function(dm_path, cmd, args_map, &result);
++
++    if (!success) {
++        LOG(ERROR) << "Failed to invoke function [" << cmd << "] on " << dm_path;
++    } else {
++        LOG(INFO) << "Successfully invoked function [" << cmd << "] on " << dm_path;
++    }
++
++    // Build and publish response
++    std::string response_payload = build_cmd_response(path, cmd, success ? "OK" : "FAIL", result);
++    publish_response(result_path, response_payload);
++}
++
++bool MqttNbapiImpl::publish_event(const std::string &topic, const std::string &json_data)
++{
++    if (!m_mqtt_client || !m_initialized) {
++        LOG(DEBUG) << "MQTT handler not initialized, skipping EVENT publish to " << topic;
++        return false;
++    }
++
++    struct json_object *root = json_object_new_object();
++    json_object_object_add(root, "op", json_object_new_string("EVENT"));
++    json_object_object_add(root, "data", json_object_new_string(json_data.c_str()));
++    const std::string payload(json_object_to_json_string(root));
++    json_object_put(root);
++
++    LOG(DEBUG) << "Publishing EVENT to: " << topic;
++
++    if (m_mqtt_client->publish(topic, payload.c_str(), payload.length(), 0, false) != 0) {
++        LOG(ERROR) << "Failed to publish EVENT to " << topic;
++        return false;
++    }
++
++    LOG(INFO) << "Successfully published EVENT to " << topic;
++    return true;
++}
++
++void MqttNbapiImpl::publish_response(const std::string &result_path, const std::string &payload)
++{
++    LOG(DEBUG) << "Publishing response to: " << result_path;
++
++    if (m_mqtt_client->publish(result_path, payload.c_str(), payload.length(), 0, false) != 0) {
++        LOG(ERROR) << "Failed to publish response to " << result_path;
++        return;
++    }
++
++    LOG(INFO) << "Successfully published response";
++}
++
++bool MqttNbapiImpl::parse_payload(const std::string &payload, std::string &op, std::string &key,
++                                std::string &data, std::string &cmd, std::string &args,
++                                std::string &result_path)
++{
++    struct json_object *root = json_tokener_parse(payload.c_str());
++    if (!root) {
++        LOG(ERROR) << "Failed to parse JSON payload";
++        return false;
++    }
++
++    bool success = true;
++
++    // Parse op
++    struct json_object *op_obj = nullptr;
++    if (json_object_object_get_ex(root, "op", &op_obj)) {
++        op = json_object_get_string(op_obj);
++    } else {
++        LOG(ERROR) << "Missing 'op' field";
++        success = false;
++    }
++
++    // drop EVENT messages
++    if (op == "EVENT") {
++        json_object_put(root);
++        return success;
++    }
++
++    // Parse Key (optional, for RESOLVE)
++    struct json_object *key_obj = nullptr;
++    if (json_object_object_get_ex(root, "Key", &key_obj)) {
++        key = json_object_get_string(key_obj);
++    }
++
++    // Parse data (optional, for SET)
++    struct json_object *data_obj = nullptr;
++    if (json_object_object_get_ex(root, "data", &data_obj)) {
++        data = json_object_get_string(data_obj);
++    }
++
++    // Parse cmd (optional, for CMD)
++    struct json_object *cmd_obj = nullptr;
++    if (json_object_object_get_ex(root, "cmd", &cmd_obj)) {
++        cmd = json_object_get_string(cmd_obj);
++    }
++
++    // Parse args (optional, for CMD)
++    struct json_object *args_obj = nullptr;
++    if (json_object_object_get_ex(root, "args", &args_obj)) {
++        args = json_object_get_string(args_obj);
++    }
++
++    // Parse result_path
++    struct json_object *result_path_obj = nullptr;
++    if (json_object_object_get_ex(root, "result_path", &result_path_obj)) {
++        result_path = json_object_get_string(result_path_obj);
++    } else {
++        LOG(ERROR) << "Missing 'result_path' field";
++        success = false;
++    }
++
++    json_object_put(root);
++    return success;
++}
++
++std::string MqttNbapiImpl::build_get_response(const std::string &path, const std::string &status,
++                                            const std::string &data)
++{
++    struct json_object *root = json_object_new_object();
++    json_object_object_add(root, "path", json_object_new_string(path.c_str()));
++    json_object_object_add(root, "status", json_object_new_string(status.c_str()));
++    json_object_object_add(root, "data", json_object_new_string(data.c_str()));
++
++    const char *json_str = json_object_to_json_string(root);
++    std::string result(json_str);
++    json_object_put(root);
++    return result;
++}
++
++std::string MqttNbapiImpl::build_resolve_response(const std::string &path, const std::string &key,
++                                                const std::string &status, const std::string &data)
++{
++    struct json_object *root = json_object_new_object();
++    json_object_object_add(root, "path", json_object_new_string(path.c_str()));
++    json_object_object_add(root, "Key", json_object_new_string(key.c_str()));
++    json_object_object_add(root, "status", json_object_new_string(status.c_str()));
++    json_object_object_add(root, "data", json_object_new_string(data.c_str()));
++
++    const char *json_str = json_object_to_json_string(root);
++    std::string result(json_str);
++    json_object_put(root);
++    return result;
++}
++
++std::string MqttNbapiImpl::build_error_response(const std::string &path, const std::string &status)
++{
++    struct json_object *root = json_object_new_object();
++    json_object_object_add(root, "path", json_object_new_string(path.c_str()));
++    json_object_object_add(root, "status", json_object_new_string(status.c_str()));
++
++    const char *json_str = json_object_to_json_string(root);
++    std::string result(json_str);
++    json_object_put(root);
++    return result;
++}
++
++std::string MqttNbapiImpl::build_set_response(const std::string &path, const std::string &status)
++{
++    struct json_object *root = json_object_new_object();
++    json_object_object_add(root, "path", json_object_new_string(path.c_str()));
++    json_object_object_add(root, "status", json_object_new_string(status.c_str()));
++
++    const char *json_str = json_object_to_json_string(root);
++    std::string result(json_str);
++    json_object_put(root);
++    return result;
++}
++
++std::string MqttNbapiImpl::build_cmd_response(const std::string &path, const std::string &cmd,
++                                            const std::string &status, const std::string &result)
++{
++    struct json_object *root = json_object_new_object();
++    json_object_object_add(root, "path", json_object_new_string(path.c_str()));
++    json_object_object_add(root, "cmd", json_object_new_string(cmd.c_str()));
++    json_object_object_add(root, "status", json_object_new_string(status.c_str()));
++    if (!result.empty()) {
++        json_object_object_add(root, "result", json_object_new_string(result.c_str()));
++    }
++
++    const char *json_str = json_object_to_json_string(root);
++    std::string response(json_str);
++    json_object_put(root);
++    return response;
++}
++
++void MqttNbapiImpl::register_mqtt_fd(int fd)
++{
++    LOG(DEBUG) << "Registering MQTT FD: " << fd;
++    
++    if (!m_event_loop) {
++        LOG(ERROR) << "Event loop is null, cannot register MQTT FD";
++        return;
++    }
++
++    // Register event handlers for the MQTT socket FD
++    beerocks::EventLoop::EventHandlers handlers{
++        .name = "mqtt_handler",
++        .on_read =
++            [this](int fd, beerocks::EventLoop &loop) {
++                if (!this->process_mqtt_events(fd)) {
++                    LOG(ERROR) << "Failed to process MQTT events on FD: " << fd;
++                    return false;
++                }
++                return true;
++            },
++        .on_write      = nullptr,
++        .on_disconnect =
++            [this](int fd, beerocks::EventLoop &loop) {
++                LOG(WARNING) << "MQTT socket disconnected, FD: " << fd;
++                if (m_mqtt_client) {
++                    m_mqtt_client->reconnect();
++                }
++                return true;
++            },
++        .on_error =
++            [](int fd, beerocks::EventLoop &loop) {
++                LOG(ERROR) << "Error on MQTT socket, FD: " << fd;
++                return true;
++            },
++    };
++
++    if (!m_event_loop->register_handlers(fd, handlers)) {
++        LOG(ERROR) << "Failed to register event handlers for MQTT FD: " << fd;
++    } else {
++        LOG(INFO) << "Successfully registered MQTT FD: " << fd;
++    }
++}
++
++void MqttNbapiImpl::unregister_mqtt_fd(int fd)
++{
++    LOG(DEBUG) << "Unregistering MQTT FD: " << fd;
++    
++    if (!m_event_loop) {
++        LOG(ERROR) << "Event loop is null, cannot unregister MQTT FD";
++        return;
++    }
++
++    m_event_loop->remove_handlers(fd);
++    LOG(INFO) << "Successfully unregistered MQTT FD: " << fd;
++}
++
++} // namespace nbapi
++} // namespace beerocks
+-- 
+2.34.1
+
