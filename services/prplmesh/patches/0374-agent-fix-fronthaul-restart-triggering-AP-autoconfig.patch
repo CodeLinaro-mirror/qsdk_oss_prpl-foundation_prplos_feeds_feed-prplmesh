@@ -1,0 +1,150 @@
+From 2ee9f68ffd1068e9cf210ae166b678848dedfaad Mon Sep 17 00:00:00 2001
+From: Nirmal Raj S <nirm@qti.qualcomm.com>
+Date: Wed, 2 Sep 2026 11:49:12 +0530
+Subject: [PATCH] agent: fix fronthaul restart triggering AP autoconfig for all
+ radios
+
+When a fronthaul process (ap_manager or monitor) restarts while the
+backhaul remains connected, the agent reset cycle was sending
+START_AP_AUTOCONFIGURATION for ALL radios in STATE_BACKHAUL_MANAGER_CONNECTED,
+causing unnecessary re-onboarding of already-CONFIGURED radios.
+
+Root cause: handle_client_disconnected() calls agent_reset() which
+cycles through the FSM and reaches STATE_BACKHAUL_MANAGER_CONNECTED,
+which unconditionally sent START_AP_AUTOCONFIGURATION for all radios.
+
+Fix: Track which specific fronthaul interface(s) caused the reset in
+a new std::set<std::string> m_restarting_fronthaul_ifaces member.
+
+- handle_client_disconnected(): insert the restarting fronthaul iface
+  into the set when m_is_backhaul_disconnected is false (backhaul up).
+  In RDKB single-instance mode, clear the set so all radios restart.
+
+- agent_reset(): clear the set on full backhaul disconnect so
+  STATE_BACKHAUL_MANAGER_CONNECTED restarts all radios.
+
+- STATE_BACKHAUL_MANAGER_CONNECTED: if the set is non-empty, send
+  START_AP_AUTOCONFIGURATION with the specific interface for each
+  affected radio only, then clear the set. If empty (full reset /
+  initial startup / backhaul disconnect), restart all radios as before.
+
+Behavior after fix:
+- Single fronthaul restart: only affected radio restarts autoconfig
+- Multiple fronthaul restarts: each affected radio restarts individually
+- Backhaul disconnect/reconnect: all radios restart (unchanged)
+- Initial startup: all radios start (unchanged)
+- RDKB single-instance mode: all radios restart (unchanged)
+
+Signed-off-by: Nirmal Raj S <nirm@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/son_slave_thread.cpp | 49 ++++++++++++++++++-
+ agent/src/beerocks/slave/son_slave_thread.h   | 14 ++++++
+ 2 files changed, 61 insertions(+), 2 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index f49c19bd7..753019d44 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -628,6 +628,10 @@ void slave_thread::agent_reset()
+     }
+ 
+     if (m_is_backhaul_disconnected) {
++        // Full backhaul disconnect: all radios must restart autoconfiguration.
++        // Clear any fronthaul-specific tracking so STATE_BACKHAUL_MANAGER_CONNECTED
++        // sends START_AP_AUTOCONFIGURATION for all radios (not just specific ones).
++        m_restarting_fronthaul_ifaces.clear();
+         // To ensure ApAutoConfigurationTask is inactive during SLAVE_INIT_DELAY_SEC,
+         // send an INIT_TASK event to reset its state.
+         m_task_pool.send_event(eTaskType::AP_AUTOCONFIGURATION,
+@@ -1448,11 +1452,32 @@ void slave_thread::handle_client_disconnected(int fd)
+                     rm.fronthaul_started = false;
+                     return true;
+                 });
++                // Single-instance mode: all radios restart together — clear any
++                // per-radio tracking so STATE_BACKHAUL_MANAGER_CONNECTED restarts all.
++                m_restarting_fronthaul_ifaces.clear();
+             } else {
+                 radio_manager.fronthaul_started = false;
++                // Track which specific fronthaul caused the reset so that
++                // STATE_BACKHAUL_MANAGER_CONNECTED can restart autoconfiguration
++                // only for this radio, leaving already-CONFIGURED radios undisturbed.
++                // Only applicable when the backhaul itself is still connected.
++                if (!m_is_backhaul_disconnected) {
++                    m_restarting_fronthaul_ifaces.insert(fronthaul_iface);
++                    LOG(INFO) << "Fronthaul restart on " << fronthaul_iface
++                              << " — will restart AP autoconfiguration for this radio only";
++                }
+             }
+ #else
+             radio_manager.fronthaul_started = false;
++            // Track which specific fronthaul caused the reset so that
++            // STATE_BACKHAUL_MANAGER_CONNECTED can restart autoconfiguration
++            // only for this radio, leaving already-CONFIGURED radios undisturbed.
++            // Only applicable when the backhaul itself is still connected.
++            if (!m_is_backhaul_disconnected) {
++                m_restarting_fronthaul_ifaces.insert(fronthaul_iface);
++                LOG(INFO) << "Fronthaul restart on " << fronthaul_iface
++                          << " — will restart AP autoconfiguration for this radio only";
++            }
+ #endif
+             agent_reset();
+             return true;
+@@ -7067,8 +7092,28 @@ bool slave_thread::agent_fsm()
+         LOG(TRACE) << "goto STATE_WAIT_FOR_AUTO_CONFIGURATION_COMPLETE";
+         m_agent_state = STATE_WAIT_FOR_AUTO_CONFIGURATION_COMPLETE;
+         if (db->device_conf.management_mode != BPL_MGMT_MODE_MULTIAP_CONTROLLER) {
+-            m_task_pool.send_event(eTaskType::AP_AUTOCONFIGURATION,
+-                                   ApAutoConfigurationTask::eEvent::START_AP_AUTOCONFIGURATION);
++            if (!m_restarting_fronthaul_ifaces.empty()) {
++                // Only specific fronthaul(s) restarted while the backhaul remained up.
++                // Restart AP autoconfiguration only for the affected radio(s) so that
++                // already-CONFIGURED radios are not unnecessarily re-onboarded.
++                // send_event() is synchronous, so passing &iface (a reference to a set
++                // element) is safe — the element is valid for the duration of the call.
++                LOG(INFO) << "Fronthaul-only restart: restarting AP autoconfiguration "
++                             "for affected radio(s) only:";
++                for (const auto &iface : m_restarting_fronthaul_ifaces) {
++                    LOG(INFO) << "  " << iface;
++                    m_task_pool.send_event(
++                        eTaskType::AP_AUTOCONFIGURATION,
++                        ApAutoConfigurationTask::eEvent::START_AP_AUTOCONFIGURATION,
++                        &iface);
++                }
++                m_restarting_fronthaul_ifaces.clear();
++            } else {
++                // Full reset (backhaul disconnect/reconnect or initial startup):
++                // restart AP autoconfiguration for all radios.
++                m_task_pool.send_event(eTaskType::AP_AUTOCONFIGURATION,
++                                       ApAutoConfigurationTask::eEvent::START_AP_AUTOCONFIGURATION);
++            }
+         } else {
+             m_task_pool.send_event(eTaskType::AP_AUTOCONFIGURATION,
+                                    ApAutoConfigurationTask::eEvent::INIT_TASK);
+diff --git a/agent/src/beerocks/slave/son_slave_thread.h b/agent/src/beerocks/slave/son_slave_thread.h
+index c1e1274c4..1305c3ec0 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.h
++++ b/agent/src/beerocks/slave/son_slave_thread.h
+@@ -413,6 +413,20 @@ private:
+     bool m_is_backhaul_disconnected = false;
+     int m_agent_resets_counter      = 0;
+ 
++    /**
++     * @brief Set of fronthaul interfaces that triggered the current agent reset cycle.
++     *
++     * When a fronthaul process (ap_manager or monitor) restarts without a backhaul
++     * disconnect, only the affected radio(s) need to re-run AP autoconfiguration.
++     * This set is populated in handle_client_disconnected() and consumed in
++     * STATE_BACKHAUL_MANAGER_CONNECTED to send START_AP_AUTOCONFIGURATION only for
++     * the affected radio(s), leaving already-CONFIGURED radios undisturbed.
++     *
++     * The set is cleared when a full backhaul disconnect occurs (agent_reset() with
++     * m_is_backhaul_disconnected=true), in which case all radios must restart.
++     */
++    std::set<std::string> m_restarting_fronthaul_ifaces;
++
+     /**
+      * @brief Physical L2 backhaul connection state as reported by the Backhaul Manager.
+      */
+-- 
+2.34.1
+
