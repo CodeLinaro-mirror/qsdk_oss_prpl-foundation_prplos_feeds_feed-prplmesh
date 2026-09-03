@@ -1,0 +1,333 @@
+From 372bbefcccf3cf54e12463de15c68f5858710054 Mon Sep 17 00:00:00 2001
+From: Muthuchamy Kumar <muthucha@qti.qualcomm.com>
+Date: Sat, 29 Aug 2026 20:47:17 +0530
+Subject: [PATCH] patch: move PCAP capture config from PRPLMESH_PCAP_FILE env
+ var into framework_logging.conf
+
+ieee1905_transport's broker-traffic PCAP capture (used to inspect co-located
+agent<->controller CMDU traffic that never touches a real interface, so
+tcpdump can't see it) was controlled entirely by a PRPLMESH_PCAP_FILE
+environment variable read once at startup: if set and non-empty, capture
+was enabled to that path with no size limit, so the file grew unbounded
+for the life of the process. Env vars aren't part of prplMesh's normal
+config surface and have to be exported before the supervisor starts every
+daemon, not just transport.
+
+Move this into a new top-level "pcap" section of framework_logging.conf -
+the same JSON config file this process already reads for its own logging
+config - with enable/path/size fields. The capture file now lives under
+BEEROCKS_LOG_FILES_PATH (default /tmp/beerocks/logs/broker.pcap) alongside
+the other beerocks log files rather than an arbitrary env-supplied path.
+
+Add a size limit with simple in-process rotation: write_to_pcap() checks
+the dump file's size via pcap_dump_ftell() after each write, and once it
+reaches the configured "size", rotate_pcap_capture() renames the live file
+to a single backup generation ("<path>.1", replacing any previous one) and
+reopens a fresh live file, so capture continues without a gap instead of
+growing unbounded or stopping.
+
+Signed-off-by: Muthuchamy Kumar <muthucha@qti.qualcomm.com>
+---
+ framework/common/framework_logging.conf.in    |  5 ++
+ framework/common/include/mapf/common/logger.h | 10 ++++
+ framework/common/logger.cpp                   | 30 ++++++++++
+ .../ieee1905_transport/PCAP_CAPTURE_README.md | 43 +++++++++++---
+ .../ieee1905_transport/ieee1905_transport.cpp | 10 ++--
+ .../ieee1905_transport/ieee1905_transport.h   |  6 +-
+ .../ieee1905_transport_local_bus.cpp          | 58 +++++++++++++++++--
+ 7 files changed, 144 insertions(+), 18 deletions(-)
+
+diff --git a/framework/common/framework_logging.conf.in b/framework/common/framework_logging.conf.in
+index 809d32ba7..4e474d629 100644
+--- a/framework/common/framework_logging.conf.in
++++ b/framework/common/framework_logging.conf.in
+@@ -21,5 +21,10 @@
+ 		},
+ 		"cli": {
+ 		}
++	},
++	"pcap": {
++		"enable" : false,
++		"path" : "@BEEROCKS_LOG_FILES_PATH@/broker.pcap",
++		"size" : 10000000
+ 	}
+ }
+diff --git a/framework/common/include/mapf/common/logger.h b/framework/common/include/mapf/common/logger.h
+index 170aa96bf..f155f20a1 100644
+--- a/framework/common/include/mapf/common/logger.h
++++ b/framework/common/include/mapf/common/logger.h
+@@ -91,6 +91,16 @@ private:
+     Logger(const Logger &) = delete;
+     void operator=(const Logger &) = delete;
+ };
++
++struct PcapCaptureConfig {
++    bool enable      = false;
++    std::string path = "";
++    size_t max_size  = 10000000;
++};
++
++// Reads the top-level "pcap" section from framework_logging.conf.
++PcapCaptureConfig GetPcapCaptureConfig();
++
+ } // namespace mapf
+ 
+ #endif /* #ifndef __MAPF_COMMON_LOGGER_H__ */
+diff --git a/framework/common/logger.cpp b/framework/common/logger.cpp
+index 0e5da3e0e..d432acb34 100644
+--- a/framework/common/logger.cpp
++++ b/framework/common/logger.cpp
+@@ -228,4 +228,34 @@ std::string Logger::Config::ToEasyLoggingString()
+ 
+     return settings;
+ }
++
++PcapCaptureConfig GetPcapCaptureConfig()
++{
++    PcapCaptureConfig cfg;
++    struct json_object *jobj = json_object_from_file(std::string(CONF_FILE_WRITEABLE_PATH).c_str());
++    if (!jobj) {
++        jobj = json_object_from_file(std::string(CONF_FILE_DEFAULT_PATH).c_str());
++    }
++    if (!jobj) {
++        return cfg;
++    }
++
++    struct json_object *jpcap, *jtmp;
++    if (json_object_object_get_ex(jobj, "pcap", &jpcap)) {
++        if (json_object_object_get_ex(jpcap, "enable", &jtmp)) {
++            cfg.enable = json_object_get_boolean(jtmp);
++        }
++        if (json_object_object_get_ex(jpcap, "path", &jtmp)) {
++            cfg.path = json_object_get_string(jtmp);
++        }
++        if (json_object_object_get_ex(jpcap, "size", &jtmp)) {
++            int64_t size = json_object_get_int64(jtmp);
++            if (size > 0) {
++                cfg.max_size = static_cast<size_t>(size);
++            }
++        }
++    }
++    json_object_put(jobj);
++    return cfg;
++}
+ } // namespace mapf
+diff --git a/framework/transport/ieee1905_transport/PCAP_CAPTURE_README.md b/framework/transport/ieee1905_transport/PCAP_CAPTURE_README.md
+index 373c5f9f0..76312d3f1 100644
+--- a/framework/transport/ieee1905_transport/PCAP_CAPTURE_README.md
++++ b/framework/transport/ieee1905_transport/PCAP_CAPTURE_README.md
+@@ -12,13 +12,24 @@ When the controller and agent run on the same device (local agent configuration)
+ 
+ ### Enable PCAP Capture
+ 
+-Set the `PRPLMESH_PCAP_FILE` environment variable before starting prplMesh services:
+-
+-```bash
+-export PRPLMESH_PCAP_FILE=/tmp/prplmesh_broker.pcap
++Capture is configured via the `"pcap"` section of `/opt/prplmesh/config/framework_logging.conf` (the
++same JSON config file this process already uses for its own logging config):
++
++```json
++"pcap": {
++	"enable" : true,
++	"path" : "/tmp/beerocks/logs/broker.pcap",
++	"size" : 10000000
++}
+ ```
+ 
+-Then start the prplMesh services as usual. All CMDU messages (both TX and RX) will be captured to the specified file.
++- `enable`: set to `true` to turn on capture (default `false`).
++- `path`: the capture file's path. By default this is `<BEEROCKS_LOG_FILES_PATH>/broker.pcap`
++  (e.g. `/tmp/beerocks/logs/broker.pcap`), alongside the other beerocks log files.
++- `size`: rotation threshold in bytes (default 10,000,000 / 10 MB) — see "Log Rotation" below.
++
++Then (re)start the prplMesh services. All CMDU messages (both TX and RX) will be captured to the
++configured file.
+ 
+ ### Analyze with Wireshark
+ 
+@@ -58,10 +69,25 @@ Each captured packet includes:
+ 
+ ### Key Functions
+ 
+-- `init_pcap_capture()`: Initializes libpcap and opens the dump file
+-- `write_to_pcap()`: Writes a message to the PCAP file with Ethernet framing
++- `init_pcap_capture()`: Reads the `"pcap"` config and opens the dump file
++- `write_to_pcap()`: Writes a message to the PCAP file with Ethernet framing, and triggers rotation
++  if the file has reached the configured size
++- `rotate_pcap_capture()`: Renames the live file to a single backup generation and reopens a fresh
++  live file
+ - `close_pcap_capture()`: Closes the PCAP file and cleans up resources
+ 
++## Log Rotation
++
++When the live capture file reaches the configured `size` (in bytes), it is rotated rather than
++capture simply stopping:
++
++1. The current file is renamed to `<path>.1` (e.g. `broker.pcap.1`), overwriting any previous
++   backup.
++2. A fresh file is opened at the original `path` and capture continues without interruption.
++
++Only one old generation (`<path>.1`) is ever kept alongside the live file. This rotation is
++self-contained inside `ieee1905_transport` — it does not use signals or an external script.
++
+ ## Message Types Captured
+ 
+ All IEEE 1905.1 CMDU messages are captured, including:
+@@ -78,9 +104,10 @@ All IEEE 1905.1 CMDU messages are captured, including:
+ - Ensure the directory exists and is writable
+ - Check prplMesh logs for "Initializing PCAP capture" message
+ - Verify `libpcap-dev` is installed in your build environment
++- Confirm `"pcap": { "enable": true, ... }` is set in `/opt/prplmesh/config/framework_logging.conf`
+ 
+ ### No packets in PCAP file
+-- Verify the environment variable is set before starting services
++- Verify `"enable"` is `true` in the `"pcap"` section before starting services
+ - Check that broker communication is actually happening
+ - Look for "PCAP capture initialized successfully" in logs
+ 
+diff --git a/framework/transport/ieee1905_transport/ieee1905_transport.cpp b/framework/transport/ieee1905_transport/ieee1905_transport.cpp
+index aa8b23050..a3493bc02 100644
+--- a/framework/transport/ieee1905_transport/ieee1905_transport.cpp
++++ b/framework/transport/ieee1905_transport/ieee1905_transport.cpp
+@@ -52,11 +52,11 @@ bool Ieee1905Transport::start()
+             handle_bridge_state_change(bridge_name, iface_name, iface_added);
+         });
+ 
+-    // Initialize PCAP capture if environment variable is set
+-    const char *pcap_file = std::getenv("PRPLMESH_PCAP_FILE");
+-    if (pcap_file && pcap_file[0] != '\0') {
+-        LOG(INFO) << "Initializing PCAP capture to file: " << pcap_file;
+-        init_pcap_capture(pcap_file);
++    // Initialize PCAP capture if enabled in framework_logging.conf
++    mapf::PcapCaptureConfig pcap_cfg = mapf::GetPcapCaptureConfig();
++    if (pcap_cfg.enable && !pcap_cfg.path.empty()) {
++        LOG(INFO) << "Initializing PCAP capture to file: " << pcap_cfg.path;
++        init_pcap_capture(pcap_cfg.path, pcap_cfg.max_size);
+     }
+ 
+     return true;
+diff --git a/framework/transport/ieee1905_transport/ieee1905_transport.h b/framework/transport/ieee1905_transport/ieee1905_transport.h
+index e9e24980a..422d0fb13 100644
+--- a/framework/transport/ieee1905_transport/ieee1905_transport.h
++++ b/framework/transport/ieee1905_transport/ieee1905_transport.h
+@@ -434,8 +434,12 @@ private:
+     pcap_t *m_pcap_handle        = nullptr;
+     pcap_dumper_t *m_pcap_dumper = nullptr;
+     bool m_pcap_enabled          = false;
++    std::string m_pcap_path;      // live capture file path, needed for rotation
++    size_t m_pcap_max_size = 0;   // rotation threshold in bytes; 0 = no limit
+ 
+-    void init_pcap_capture(const std::string &filename);
++    void init_pcap_capture(const std::string &filename, size_t max_size);
++    bool open_pcap_dump(const std::string &filename);
++    void rotate_pcap_capture();
+     void write_to_pcap(const uint8_t *data, size_t len, const sMacAddr &src, const sMacAddr &dst,
+                        bool is_tx);
+     void close_pcap_capture();
+diff --git a/framework/transport/ieee1905_transport/ieee1905_transport_local_bus.cpp b/framework/transport/ieee1905_transport/ieee1905_transport_local_bus.cpp
+index 217f3e372..5cd7b3617 100644
+--- a/framework/transport/ieee1905_transport/ieee1905_transport_local_bus.cpp
++++ b/framework/transport/ieee1905_transport/ieee1905_transport_local_bus.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include <arpa/inet.h>
+ #include <chrono>
++#include <cstdio>
+ #include <cstring>
+ #include <iomanip>
+ #include <net/if.h>
+@@ -417,18 +418,31 @@ uint16_t Ieee1905Transport::get_next_message_id()
+     return message_id_;
+ }
+ 
+-void Ieee1905Transport::init_pcap_capture(const std::string &filename)
++void Ieee1905Transport::init_pcap_capture(const std::string &filename, size_t max_size)
+ {
+     if (m_pcap_enabled) {
+         LOG(WARNING) << "PCAP capture already initialized";
+         return;
+     }
+ 
++    m_pcap_path     = filename;
++    m_pcap_max_size = max_size;
++
++    if (!open_pcap_dump(m_pcap_path)) {
++        return;
++    }
++
++    m_pcap_enabled = true;
++    LOG(INFO) << "PCAP capture initialized successfully to file: " << filename;
++}
++
++bool Ieee1905Transport::open_pcap_dump(const std::string &filename)
++{
+     // Create a pcap handle for Ethernet (DLT_EN10MB)
+     m_pcap_handle = pcap_open_dead(DLT_EN10MB, 65535);
+     if (!m_pcap_handle) {
+         LOG(ERROR) << "Failed to create PCAP handle";
+-        return;
++        return false;
+     }
+ 
+     // Open the dump file
+@@ -438,11 +452,40 @@ void Ieee1905Transport::init_pcap_capture(const std::string &filename)
+                    << " - Error: " << pcap_geterr(m_pcap_handle);
+         pcap_close(m_pcap_handle);
+         m_pcap_handle = nullptr;
++        return false;
++    }
++
++    return true;
++}
++
++void Ieee1905Transport::rotate_pcap_capture()
++{
++    if (m_pcap_dumper) {
++        pcap_dump_close(m_pcap_dumper);
++        m_pcap_dumper = nullptr;
++    }
++    if (m_pcap_handle) {
++        pcap_close(m_pcap_handle);
++        m_pcap_handle = nullptr;
++    }
++
++    // keep only one old generation: drop the previous ".1" (if any), then rename the live file onto it
++    std::string backup_path = m_pcap_path + ".1";
++    remove(backup_path.c_str());
++    if (rename(m_pcap_path.c_str(), backup_path.c_str()) != 0) {
++        LOG(ERROR) << "PCAP rotation: failed to rename " << m_pcap_path << " to " << backup_path
++                   << ": " << strerror(errno);
++        m_pcap_enabled = false;
+         return;
+     }
+ 
+-    m_pcap_enabled = true;
+-    LOG(INFO) << "PCAP capture initialized successfully to file: " << filename;
++    LOG(INFO) << "PCAP capture reached size limit (" << m_pcap_max_size << " bytes), rotated to "
++             << backup_path;
++
++    if (!open_pcap_dump(m_pcap_path)) {
++        LOG(ERROR) << "Failed to reopen PCAP capture after rotation";
++        m_pcap_enabled = false;
++    }
+ }
+ 
+ void Ieee1905Transport::write_to_pcap(const uint8_t *data, size_t len, const sMacAddr &src,
+@@ -481,6 +524,13 @@ void Ieee1905Transport::write_to_pcap(const uint8_t *data, size_t len, const sMa
+     // Write to pcap file
+     pcap_dump(reinterpret_cast<u_char *>(m_pcap_dumper), &pkthdr, packet.data());
+     pcap_dump_flush(m_pcap_dumper);
++
++    if (m_pcap_max_size > 0) {
++        long file_size = pcap_dump_ftell(m_pcap_dumper);
++        if (file_size >= 0 && static_cast<size_t>(file_size) >= m_pcap_max_size) {
++            rotate_pcap_capture();
++        }
++    }
+ }
+ 
+ void Ieee1905Transport::close_pcap_capture()
+-- 
+2.34.1
+
