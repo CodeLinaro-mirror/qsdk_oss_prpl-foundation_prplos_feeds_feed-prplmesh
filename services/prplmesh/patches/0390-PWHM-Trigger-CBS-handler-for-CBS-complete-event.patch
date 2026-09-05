@@ -1,0 +1,472 @@
+From 319d29a70555ab38e8684064397c92a2f295bb50 Mon Sep 17 00:00:00 2001
+From: Sudharsan Eswaran <eswaran@qti.qualcomm.com>
+Date: Fri, 4 Sep 2026 20:45:39 +0530
+Subject: [PATCH] PWHM: Trigger CBS, handler for CBS complete event
+
+1. Added Fix to trigger the CBS
+2. In the CBS complete event read ACS/CBS scan report from the whm DM
+   and extract the rank to derive the channel preference value
+
+Signed-off-by: Sudharsan Eswaran <eswaran@qti.qualcomm.com>
+---
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   | 357 +++++++++++++++++-
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.h     |  14 +-
+ common/beerocks/bwl/whm/base_wlan_hal_whm.cpp |  13 +-
+ 3 files changed, 354 insertions(+), 30 deletions(-)
+
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index 07526eb82..45c607ee3 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -17,10 +17,12 @@
+ #include <bcl/network/network_utils.h>
+ #include <bcl/son/son_assoc_frame_utils.h>
+ #include <bcl/son/son_wireless_utils.h>
++#include <cstdlib>
+ #include <easylogging++.h>
+ #include <math.h>
+ #include <numeric>
+ #include <sstream>
++#include <thread>
+ #include <tlvf/tlvftypes.h>
+ #include <vector>
+ using namespace beerocks;
+@@ -67,6 +69,11 @@ static ap_wlan_hal::Event wpaCtrl_to_bwl_event(const std::string &opcode)
+         return ap_wlan_hal::Event::ACL_DENY;
+     } else if (opcode == "INTERFERENCE-DETECTED") {
+         return ap_wlan_hal::Event::AWGN_Detected;
++    } else if (opcode == "ACS-COMPLETED" || opcode == "CBS-COMPLETED" ||
++               opcode == "DYNAMIC-ACS-EVENT-COMPLETED") {
++        return ap_wlan_hal::Event::ACS_Completed;
++    } else if (opcode == "ACS-FAILED") {
++        return ap_wlan_hal::Event::ACS_Failed;
+     }
+ 
+     return ap_wlan_hal::Event::Invalid;
+@@ -1386,8 +1393,280 @@ bool ap_wlan_hal_whm::update_rank_for_channel(
+     return true;
+ }
+ 
++namespace {
++
++// Parses the ASCII table produced by hostapd's acs_extn.c::print_acs_report_to_buf(). The whm
++// backend obtains this text via the pWHM "ACS.showReport()" RPC (confirmed against a live
++// ubus-cli capture to be a single string in the same format the nl80211 backend gets via
++// wpa_ctrl "ACS show_report"). Layout:
++//   " Freq(chan)          BSS    NF   Load  Sec   SRP  Grade  Radar    Eff   Power   Rank"
++//   "-----------------------------------------------------------------------------------"
++//   " 5180( 36 5210)  <...>  <rank>"
++//   " 5180( 36)       <...>  <rank>"
++//   ...
++//   "ACS_SUCCESS: ..." / "Best channel ..." / "ACS Algo: ..." / "Chan sel ..."
++// Extract from each data row: channel (1st paren int), center_freq (2nd paren int, 0 if absent)
++// and the trailing rank (last whitespace-separated integer).
++bool parse_acs_report_table(const std::string &report, std::vector<sAcsChannelRank> &out_ranks)
++{
++    out_ranks.clear();
++
++    std::stringstream ss(report);
++    std::string line;
++    bool past_separator = false;
++
++    auto is_summary_line = [](const std::string &s) {
++        return s.find("ACS_SUCCESS") != std::string::npos ||
++               s.find("Best channel") != std::string::npos ||
++               s.find("ACS Algo") != std::string::npos ||
++               s.find("Chan sel") != std::string::npos ||
++               s.find("Total Time") != std::string::npos ||
++               s.find("No ACS report") != std::string::npos;
++    };
++
++    while (std::getline(ss, line)) {
++        // The "----" divider marks the start of the data rows.
++        if (!past_separator) {
++            if (line.find("---") != std::string::npos) {
++                past_separator = true;
++            }
++            continue;
++        }
++
++        // Stop at the summary section (or a blank line).
++        if (is_summary_line(line)) {
++            break;
++        }
++        // trim
++        auto first = line.find_first_not_of(" \t\r\n");
++        if (first == std::string::npos) {
++            continue; // blank line inside table: skip (do not stop, some drivers pad)
++        }
++
++        // A data row must contain "(<chan>...)".
++        auto lparen = line.find('(');
++        auto rparen = line.find(')', lparen == std::string::npos ? 0 : lparen);
++        if (lparen == std::string::npos || rparen == std::string::npos || rparen <= lparen) {
++            continue;
++        }
++
++        // Parse channel and optional center_freq from inside the parentheses.
++        const std::string inside = line.substr(lparen + 1, rparen - lparen - 1);
++        std::stringstream pss(inside);
++        int chan = 0, center = 0;
++        pss >> chan;
++        if (pss.fail() || chan <= 0) {
++            continue;
++        }
++        pss >> center; // optional; remains 0 if absent
++
++        // The rank is the last whitespace-separated integer token on the line
++        // (after the closing paren).
++        int32_t rank = -1;
++        {
++            std::stringstream tss(line.substr(rparen + 1));
++            std::string tok;
++            while (tss >> tok) {
++                char *endp = nullptr;
++                long v     = std::strtol(tok.c_str(), &endp, 10);
++                if (endp != tok.c_str() && *endp == '\0') {
++                    rank = static_cast<int32_t>(v);
++                }
++            }
++        }
++
++        sAcsChannelRank entry;
++        entry.channel     = static_cast<uint8_t>(chan);
++        entry.center_chan = static_cast<uint16_t>(center < 0 ? 0 : center);
++        entry.rank        = rank;
++        out_ranks.push_back(entry);
++    }
++
++    if (out_ranks.empty()) {
++        LOG(WARNING) << "[CBS] parse_acs_report_table: parsed 0 rows (report empty or format "
++                         "changed)";
++        return false;
++    }
++
++    return true;
++}
++
++// Merges parsed CBS/ACS channel ranks into radio_info.channels_list[chan].bw_info_list[bw],
++// resolving which bandwidth bucket each (channel, center_channel) row belongs to -- including
++// the 6GHz 320MHz-1 vs 320MHz-2 variant disambiguation -- and keeping the best (lowest positive)
++// rank per bucket.
++void merge_acs_ranks_into_channels_list(RadioInfo &radio_info,
++                                         const std::vector<sAcsChannelRank> &ranks)
++{
++    const auto freq_type = radio_info.frequency_band;
++
++    LOG(DEBUG) << "[CBS] merge_acs_ranks_into_channels_list: radio operating bandwidth="
++               << beerocks::utils::convert_bandwidth_to_string(radio_info.bandwidth)
++               << " freq_type=" << int(freq_type);
++
++    for (const auto &hal_entry : ranks) {
++        // Note: rank 0 is VALID here (operable but not ranked by the driver). Only skip truly
++        // unknown entries (rank < 0).
++        if (hal_entry.rank < 0) continue;
++        const uint8_t chan = hal_entry.channel;
++        beerocks::eWiFiBandwidth bw = beerocks::eWiFiBandwidth::BANDWIDTH_UNKNOWN;
++
++        // Determine the bandwidth purely from the reported center channel:
++        //   center==0            -> 20MHz (no wide block; second paren absent)
++        //   center==chan         -> 20MHz
++        //   |center-chan| ~ 2    -> 40MHz   (center at chan+2)
++        //   6GHz 80MHz  centers  : 7,23,39,55,71,87,103,119,135,151,167,183,199,215     (base 7,  step 16)
++        //   6GHz 160MHz centers  : 15,47,79,111,143,175,207                             (base 15, step 32)
++        //   6GHz 320MHz centers  : 31,63,95,127,159,191,223                             (base 31, step 32)
++        // 5GHz uses the same relative offsets.
++        auto center = hal_entry.center_chan;
++        if (center == 0 || center == chan) {
++            bw = beerocks::eWiFiBandwidth::BANDWIDTH_20;
++        } else if (freq_type == beerocks::eFreqType::FREQ_6G) {
++            auto is_in = [](uint16_t v, uint16_t base, uint16_t step) {
++                return (v >= base) && (((v - base) % step) == 0);
++            };
++            if (is_in(center, 31, 32)) {
++                bw = beerocks::eWiFiBandwidth::BANDWIDTH_320;
++            } else if (is_in(center, 15, 32)) {
++                bw = beerocks::eWiFiBandwidth::BANDWIDTH_160;
++            } else if (is_in(center, 7, 16)) {
++                bw = beerocks::eWiFiBandwidth::BANDWIDTH_80;
++            } else {
++                // 40MHz: center is chan+2 (or the paired 40MHz center).
++                bw = beerocks::eWiFiBandwidth::BANDWIDTH_40;
++            }
++        } else {
++            // 5GHz / others: distance-based (channels spaced by 4 in IEEE numbering).
++            const int diff = std::abs(static_cast<int>(center) - static_cast<int>(chan));
++            if (diff <= 2) {
++                bw = beerocks::eWiFiBandwidth::BANDWIDTH_40;
++            } else if (diff <= 6) {
++                bw = beerocks::eWiFiBandwidth::BANDWIDTH_80;
++            } else if (diff <= 14) {
++                bw = beerocks::eWiFiBandwidth::BANDWIDTH_160;
++            } else {
++                bw = beerocks::eWiFiBandwidth::BANDWIDTH_320;
++            }
++        }
++
++        // 6GHz 320MHz is stored by refresh_radio_info() as the SPECIFIC variant
++        // (BANDWIDTH_320_1 or BANDWIDTH_320_2), never the generic BANDWIDTH_320. The specific
++        // variant is fully determined by WHICH 320MHz block the channel belongs to, i.e. by the
++        // reported center channel:
++        //   6GHz 320MHz-1 blocks -> center in {31, 95, 159, 223}
++        //   6GHz 320MHz-2 blocks -> center in {63, 127, 191}
++        if (bw == beerocks::eWiFiBandwidth::BANDWIDTH_320 &&
++            freq_type == beerocks::eFreqType::FREQ_6G) {
++            auto is_320_1_center = [](uint16_t c) {
++                return c == 31 || c == 95 || c == 159 || c == 223;
++            };
++            auto is_320_2_center = [](uint16_t c) { return c == 63 || c == 127 || c == 191; };
++            beerocks::eWiFiBandwidth resolved = beerocks::eWiFiBandwidth::BANDWIDTH_UNKNOWN;
++            if (is_320_1_center(center)) {
++                resolved = beerocks::eWiFiBandwidth::BANDWIDTH_320_1;
++            } else if (is_320_2_center(center)) {
++                resolved = beerocks::eWiFiBandwidth::BANDWIDTH_320_2;
++            }
++
++            auto &cl = radio_info.channels_list[chan].bw_info_list;
++            if (resolved != beerocks::eWiFiBandwidth::BANDWIDTH_UNKNOWN &&
++                cl.find(resolved) != cl.end()) {
++                // Preferred: center-derived variant.
++                bw = resolved;
++            } else if (cl.find(beerocks::eWiFiBandwidth::BANDWIDTH_320_1) != cl.end()) {
++                // Fallback only if the center-derived variant isn't present for this channel.
++                bw = beerocks::eWiFiBandwidth::BANDWIDTH_320_1;
++            } else if (cl.find(beerocks::eWiFiBandwidth::BANDWIDTH_320_2) != cl.end()) {
++                bw = beerocks::eWiFiBandwidth::BANDWIDTH_320_2;
++            }
++            LOG(DEBUG) << "[CBS] merge_acs_ranks_into_channels_list: 320MHz variant resolve chan="
++                       << int(chan) << " center=" << int(center) << " -> "
++                       << beerocks::utils::convert_bandwidth_to_string(bw)
++                       << " rank=" << hal_entry.rank;
++        }
++
++        if (bw != beerocks::eWiFiBandwidth::BANDWIDTH_UNKNOWN) {
++            // Write the driver rank into (chan,bw). refresh_radio_info seeded the baseline to 0,
++            // so:
++            //   - a positive driver rank (>=1) always overwrites the baseline/other 0s;
++            //   - among two positive ranks (wide channels reported on multiple rows) keep the
++            //     best (min);
++            //   - a driver rank 0 just leaves the baseline 0 (operable-but-unranked).
++            auto &chan_info = radio_info.channels_list[chan];
++            auto it         = chan_info.bw_info_list.find(bw);
++            if (it == chan_info.bw_info_list.end()) {
++                chan_info.bw_info_list[bw] = hal_entry.rank;
++            } else {
++                const int32_t cur = it->second;
++                bool take_new     = false;
++                if (hal_entry.rank > 0 && cur <= 0) {
++                    take_new = true; // real rank beats unranked baseline
++                } else if (hal_entry.rank > 0 && cur > 0) {
++                    take_new = (hal_entry.rank < cur); // better (lower) positive rank
++                }
++                if (take_new) {
++                    chan_info.bw_info_list[bw] = hal_entry.rank;
++                }
++            }
++        }
++    }
++}
++
++} // namespace
++
++bool ap_wlan_hal_whm::read_acs_ranks(std::vector<sAcsChannelRank> &out_ranks)
++{
++    out_ranks.clear();
++
++    LOG(ERROR) << "In whm read_acs_ranks";
++    if (m_radio_path.empty()) {
++        m_ambiorix_cl.resolve_path(wbapi_utils::search_path_radio_by_iface(m_radio_info.iface_name),
++                                   m_radio_path);
++    }
++    if (m_radio_path.empty()) {
++        LOG(ERROR) << "read_acs_ranks: could not resolve radio path for iface "
++                   << m_radio_info.iface_name;
++        return false;
++    }
++
++    // WiFi.Radio.{i}.ACS.showReport() returns a list containing a single string holding the
++    // same hostapd acs_extn.c table format nl80211 gets via wpa_ctrl "ACS show_report"
++    // (confirmed against a live ubus-cli capture).
++    AmbiorixVariant result;
++    AmbiorixVariant args(AMXC_VAR_ID_HTABLE);
++    if (!m_ambiorix_cl.call(m_radio_path + "ACS.", "showReport", args, result)) {
++        LOG(ERROR) << "read_acs_ranks: remote function call ACS.showReport Failed!";
++        return false;
++    }
++
++    AmbiorixVariantListSmartPtr report_list = result.read_children<AmbiorixVariantListSmartPtr>();
++    if (!report_list || report_list->empty()) {
++        LOG(ERROR) << "read_acs_ranks: ACS.showReport returned no data";
++        return false;
++    }
++
++    std::string report_text;
++    if (!report_list->front().get(report_text) || report_text.empty()) {
++        LOG(ERROR) << "read_acs_ranks: ACS.showReport returned an empty/unreadable report string";
++        return false;
++    }
++
++    return parse_acs_report_table(report_text, out_ranks);
++}
++
+ bool ap_wlan_hal_whm::read_acs_report()
+ {
++    if (m_hal_conf.cbs_based_chansel_enable || m_hal_conf.chansel_preference_report_refresh_enable) {
++        std::vector<sAcsChannelRank> ranks;
++        if (read_acs_ranks(ranks)) {
++            merge_acs_ranks_into_channels_list(m_radio_info, ranks);
++            return true;
++        }
++        LOG(WARNING) << "read_acs_report: CBS ranks unavailable, falling back to "
++                        "channel-survey-based ranking";
++    }
++
+     std::vector<std::tuple<uint8_t, int32_t>> chan_survey_report;
+     AmbiorixVariant result;
+     AmbiorixVariant args(AMXC_VAR_ID_HTABLE);
+@@ -2554,6 +2833,11 @@ bool ap_wlan_hal_whm::process_wpa_ctrl_event(const beerocks::wbapi::AmbiorixVari
+         event_queue_push(event);
+         break;
+     }
++    case Event::ACS_Completed:
++    case Event::ACS_Failed: {
++        event_queue_push(event);
++        break;
++    }
+     case Event::AWGN_Detected: {
+         // Parse AWGN event: INTERFERENCE-DETECTED type=AWGN
+         std::string interference_type = parsed_obj["type"];
+@@ -3579,26 +3863,63 @@ bool ap_wlan_hal_whm::acs_get_block_chan_list(std::vector<uint8_t> &out_channels
+ 
+ bool ap_wlan_hal_whm::trigger_cbs()
+ {
+-    if (m_radio_path.empty()) {
+-        m_ambiorix_cl.resolve_path(wbapi_utils::search_path_radio_by_iface(m_radio_info.iface_name),
+-                                   m_radio_path);
+-    }
+-    if (m_radio_path.empty()) {
+-        LOG(ERROR) << "trigger_cbs: could not resolve radio path for iface "
+-                   << m_radio_info.iface_name;
+-        return false;
+-    }
++    /*
++     * CBS "Enable=1" retry policy (mirrors ap_wlan_hal_nl80211::trigger_cbs()).
++     *
++     * Right after VAPs stabilize (boot, or a controller-driven WSC M2 clone), the radio path
++     * may not be resolvable yet, or the pWHM/driver may transiently reject the request (busy
++     * settling the just-created interfaces). Unlike nl80211 -- whose hostapd control command
++     * synchronously fails with a "Resource busy"-style FAIL that trigger_cbs() reacts to -- the
++     * whm path has no such synchronous failure signal from update_object() itself, so retry
++     * whenever path-resolution or the Ambiorix call fails, with a bounded count and a short
++     * settle delay. Without this, a one-shot bootstrap/post-autoconfiguration trigger issued
++     * too early (see ChannelSelectionTask::work()) is silently lost forever, since none of its
++     * callers re-arm the one-shot latch on failure.
++     */
++    static constexpr uint8_t CBS_TRIGGER_MAX_RETRIES     = 3;
++    static constexpr uint32_t CBS_TRIGGER_RETRY_SETTLE_MS = 500;
+ 
+-    // One-shot driver CBS trigger: WiFi.Radio.{i}.CBS.Enable = 1.
+-    AmbiorixVariant new_obj(AMXC_VAR_ID_HTABLE);
+-    new_obj.add_child("Enable", true);
+-    if (!m_ambiorix_cl.update_object(m_radio_path + "CBS.", new_obj)) {
+-        LOG(ERROR) << "trigger_cbs: failed to set CBS.Enable=1 for " << m_radio_path << "CBS.";
+-        return false;
+-    }
++    for (uint8_t retry = 0;; ++retry) {
++        if (m_radio_path.empty()) {
++            m_ambiorix_cl.resolve_path(
++                wbapi_utils::search_path_radio_by_iface(m_radio_info.iface_name), m_radio_path);
++        }
+ 
+-    LOG(INFO) << "trigger_cbs: set CBS.Enable=1 for " << m_radio_path << "CBS.";
+-    return true;
++        bool ok = false;
++        if (m_radio_path.empty()) {
++            LOG(WARNING) << "trigger_cbs: could not resolve radio path for iface "
++                         << m_radio_info.iface_name << " (attempt " << int(retry + 1) << "/"
++                         << int(CBS_TRIGGER_MAX_RETRIES + 1) << ")";
++        } else {
++            // One-shot driver CBS trigger: WiFi.Radio.{i}.CBS.Enable = 1.
++            // NOTE: amxb_set previously rejected this with amxd_status_invalid_value (ret=10)
++            // when sent as AMXC_VAR_ID_BOOL. Send it as the plain integer 1 instead, matching
++            // the literal "ubus-cli WiFi.Radio.*.CBS.Enable=1" invocation that is known to work
++            // -- the CBS.Enable parameter on this pWHM build does not accept a bool value.
++            AmbiorixVariant new_obj(AMXC_VAR_ID_HTABLE);
++            new_obj.add_child("Enable", 1);
++            ok = m_ambiorix_cl.update_object(m_radio_path + "CBS.", new_obj);
++            if (!ok) {
++                LOG(WARNING) << "trigger_cbs: failed to set CBS.Enable=1 for " << m_radio_path
++                             << "CBS. (attempt " << int(retry + 1) << "/"
++                             << int(CBS_TRIGGER_MAX_RETRIES + 1) << ")";
++            }
++        }
++
++        if (ok) {
++            LOG(INFO) << "trigger_cbs: set CBS.Enable=1 for " << m_radio_path << "CBS."
++                      << (retry ? " after retry" : "");
++            return true;
++        }
++
++        if (retry >= CBS_TRIGGER_MAX_RETRIES) {
++            LOG(ERROR) << "trigger_cbs: giving up for iface " << m_radio_info.iface_name
++                       << " after " << int(CBS_TRIGGER_MAX_RETRIES) << " retries";
++            return false;
++        }
++
++        std::this_thread::sleep_for(std::chrono::milliseconds(CBS_TRIGGER_RETRY_SETTLE_MS));
++    }
+ }
+ 
+ bool ap_wlan_hal_whm::start_platform_acs(const std::shared_ptr<airties::cACSChannelList> &acs_list)
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
+index d2418203e..29b5d90ea 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
+@@ -125,16 +125,10 @@ public:
+      * @return true on success, fasle on failure
+      */
+     virtual bool read_acs_report() override;
+-    // CBS-based channel selection is only implemented for the nl80211 backend. The pWHM/whm
+-    // backend does not support the driver "ACS show_report"/"CBS enable 1" control commands, so
+-    // provide inert stub overrides here to keep ap_wlan_hal_whm concrete. Returning false means
+-    // "no CBS ranks available", which the backhaul treats as "fall back to the existing
+-    // controller+radio-preference selection" — i.e. the WHM behaviour is unchanged.
+-    virtual bool read_acs_ranks(std::vector<sAcsChannelRank> &out_ranks) override
+-    {
+-        out_ranks.clear();
+-        return false;
+-    }
++    // CBS-based channel selection: WiFi.Radio.{i}.ACS.showReport() returns the same
++    // hostapd acs_extn.c table format as nl80211's wpa_ctrl "ACS show_report", parsed via the
++    // shared bwl::parse_acs_report_table() helper.
++    virtual bool read_acs_ranks(std::vector<sAcsChannelRank> &out_ranks) override;
+     // Triggers a one-shot driver CBS by setting WiFi.Radio.{i}.CBS.Enable=1.
+     virtual bool trigger_cbs() override;
+ 
+diff --git a/common/beerocks/bwl/whm/base_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/base_wlan_hal_whm.cpp
+index 925034ed8..ce8882c53 100644
+--- a/common/beerocks/bwl/whm/base_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/base_wlan_hal_whm.cpp
+@@ -865,8 +865,17 @@ bool base_wlan_hal_whm::refresh_radio_info()
+                     if (bandw_iter > m_radio_info.max_bandwidth) {
+                         continue;
+                     }
+-                    // Fill with the lowest operable preference value
+-                    channel_info.bw_info_list[bandw_iter] = 1;
++                    // GATING: keep the original pre-CBS baseline of 1 when CBS is disabled
++                    // (default), so the reported multiap_preference/ranking is unaffected. Use
++                    // the CBS baseline of 0 (operable-but-unranked) ONLY when enabled;
++                    // read_acs_report() then overlays the driver ranks (>=0) on top of that
++                    // baseline -- otherwise a real driver rank (which starts at 0/1) could never
++                    // beat the "lowest positive rank wins" merge rule against a baseline of 1.
++                    channel_info.bw_info_list[bandw_iter] =
++                        (m_hal_conf.cbs_based_chansel_enable ||
++                         m_hal_conf.chansel_preference_report_refresh_enable)
++                            ? 0
++                            : 1;
+                 }
+             }
+         }
+-- 
+2.34.1
+
