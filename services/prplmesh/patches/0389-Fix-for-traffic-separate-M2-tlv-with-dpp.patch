@@ -1,0 +1,162 @@
+From 0424547c7455448c05021e65b496ef3aac0555af Mon Sep 17 00:00:00 2001
+From: amalganesh <amalgane@qti.qualcomm.com>
+Date: Thu, 3 Sep 2026 12:34:05 +0530
+Subject: [PATCH] Fix for traffic separate M2 tlv with dpp
+
+Signed-off-by: amalganesh <amalgane@qti.qualcomm.com>
+---
+ controller/src/beerocks/master/controller.cpp | 44 +++++++++++++++----
+ .../master/tasks/agent_monitoring_task.cpp    | 24 +++++++---
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     |  2 +-
+ 3 files changed, 54 insertions(+), 16 deletions(-)
+
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index d028100..829fff1 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -997,7 +997,8 @@ bool Controller::handle_cmdu_1905_autoconfiguration_search(const sMacAddr &src_m
+         // Never added for the local (co-located) agent — it onboards via WSC, not DPP,
+         // so it has no DPP-derived PMK to run the 1905 4-way handshake with.
+         bool is_local_agent = (al_mac == database.get_local_bridge_mac());
+-        if (agent_requests_profile3 && security_enabled && !is_local_agent) {
++        bool profile3_granted = agent_requests_profile3 && controller_supports_dpp;
++        if (profile3_granted && security_enabled && !is_local_agent) {
+             auto tlv1905Security = cmdu_tx.addClass<wfa_map::tlv1905LayerSecurityCapability>();
+             if (!tlv1905Security) {
+                 LOG(ERROR) << "addClass wfa_map::tlv1905LayerSecurityCapability failed";
+@@ -1007,12 +1008,15 @@ bool Controller::handle_cmdu_1905_autoconfiguration_search(const sMacAddr &src_m
+             tlv1905Security->mic_algorithm()        = wfa_map::tlv1905LayerSecurityCapability::HMAC_SHA256;
+             tlv1905Security->encryption_algorithm() = wfa_map::tlv1905LayerSecurityCapability::AES_SIV;
+             LOG(INFO) << "DPP: added Device 1905 Layer Security Capability TLV to autoconfig response for " << al_mac;
+-        } else if (agent_requests_profile3 && is_local_agent) {
++         } else if (profile3_granted && is_local_agent) {
+             LOG(DEBUG) << "DPP: skipping 0xA9 TLV for local agent " << al_mac
+                        << " (onboards via WSC)";
+-        } else if (agent_requests_profile3) {
+-            LOG(INFO) << "DPP: Enable1905Security=0 — omitting 0xA9 TLV for " << al_mac
+-                      << " (agent will skip Peer Discovery+EAPOL)";
++               } else if (profile3_granted) {
++                LOG(INFO) << "DPP: Enable1905Security=0 — omitting 0xA9 TLV for " << al_mac
++                     << " (agent will skip Peer Discovery+EAPOL)";
++       } else if (agent_requests_profile3) {
++        LOG(INFO) << "DPP: controller onboardingtype=WSC — omitting 0xA9 TLV for " << al_mac
++                  << " (Profile-1 downgrade, no DPP security)";
+         }
+     }
+ 
+@@ -1133,7 +1137,7 @@ bool Controller::handle_cmdu_1905_autoconfiguration_search(const sMacAddr &src_m
+     bool ret = son_actions::send_cmdu_to_agent(al_mac, cmdu_tx, database);
+ 
+     // THEN trigger DPP auth (extender is now ready to process DPP frames)
+-    if (chirp_tlv_rx && m_dpp_configurator_task) {
++    if (chirp_tlv_rx && m_dpp_configurator_task && controller_supports_dpp) {
+         auto agent = database.m_agents.get(al_mac);
+         if (agent) {
+             if (security_enabled) {
+@@ -1154,6 +1158,20 @@ bool Controller::handle_cmdu_1905_autoconfiguration_search(const sMacAddr &src_m
+         m_dpp_configurator_task->handle_wired_dpp_chirp(al_mac, chirp_tlv_rx.get());
+     }
+ 
++
++   // Controller downgraded to Profile-1 (onboardingtype=WSC) despite a chirping
++   // agent — clear any stale DPP/1905 security state so the plaintext WSC M1/M2
++   // exchange that follows isn't blocked by TASK-26 (mirrors the chirp-less
++   // reset above; this covers the chirp-present downgrade case it doesn't).
++   if (chirp_tlv_rx && !controller_supports_dpp) {
++       auto agent = database.m_agents.get(al_mac);
++       if (agent) {
++          agent->dpp_security_required = false;
++          agent->pmk_1905_valid         = false;
++           agent->tk_1905_installed      = false;
++       }
++   }
++
+     return ret;
+ }
+ 
+@@ -2593,6 +2611,16 @@ bool Controller::handle_cmdu_1905_autoconfiguration_WSC(const sMacAddr &src_mac,
+                    << beerocks::bpl::DEFAULT_IS_TRAFFIC_SEPARATION_ENABLED;
+     }
+ 
++    // A UCC/dev_set_config-injected TS policy (Profile-2 0xB5/0xB6 TLVs) populates the DB
++    // independently of the UCI TrafficSeparation_enable flag (see
++    //  controller_ucc_listener.cpp's TLV_PROFILE2_DEFAULT_802_1Q_SETTINGS
++    // TLV_PROFILE2_TRAFFIC_SEPARATION_POLICY handling). Treat that as an implicit "enabled"
++    // signal too, so an explicitly configured policy is never silently dropped from M2.
++    const bool has_configured_ts_policy =
++    !database.get_traffic_separation_configuration(m1->mac_addr()).empty() ||
++    database.get_default_8021q_setting(m1->mac_addr()).primary_vlan_id != 0;
++
++    const bool should_emit_ts_tlvs = is_custom_ts_enabled || has_configured_ts_policy;
+     const bool has_configured_bss = !database.get_configured_bss_info(ruid).empty();
+ 
+     // If no BSS (either because none are configured, or because they don't match), tear down.
+@@ -2604,7 +2632,7 @@ bool Controller::handle_cmdu_1905_autoconfiguration_WSC(const sMacAddr &src_mac,
+     } else {
+         // Add Traffic Separation policy TLVs as part of WSC Autoconfiguration (M2) message.
+         // (Optional TLVs per Multi-AP profile-2; agent will apply before bringing up VLAN plumbing)
+-        if (is_custom_ts_enabled) {
++        if (should_emit_ts_tlvs) {
+             agent_monitoring_task::add_profile_2default_802q_settings_tlv(database, cmdu_tx,
+                                                                           m1->mac_addr());
+             agent_monitoring_task::add_traffic_separation_policy_tlv(database, cmdu_tx,
+@@ -2612,7 +2640,7 @@ bool Controller::handle_cmdu_1905_autoconfiguration_WSC(const sMacAddr &src_mac,
+         }
+     }
+ 
+-    if (!has_configured_bss && is_custom_ts_enabled) {
++    if (!has_configured_bss && should_emit_ts_tlvs) {
+         LOG(DEBUG) << "Custom traffic separation is enabled, but no configured BSS matched ruid="
+                    << ruid << "; skipping TS TLVs in teardown flow";
+     }
+diff --git a/controller/src/beerocks/master/tasks/agent_monitoring_task.cpp b/controller/src/beerocks/master/tasks/agent_monitoring_task.cpp
+index 90f3909..ab554fb 100644
+--- a/controller/src/beerocks/master/tasks/agent_monitoring_task.cpp
++++ b/controller/src/beerocks/master/tasks/agent_monitoring_task.cpp
+@@ -940,13 +940,23 @@ bool agent_monitoring_task::add_traffic_separation_policy_tlv(db &database,
+         return false;
+     }
+ 
+-    // If custom TS was turned off, drop any stale per-SSID VID mappings left over in the DB from
+-    // a previous enabled period (e.g. auto-derived custom config below, or a UCC-injected TS
+-    // policy) so the Agent receives an explicit disable signal below rather than a stale policy.
+-    if (!is_custom_ts_enabled && !traffic_separation_configs.empty()) {
+-        database.clear_traffic_separation_configurations(al_mac);
+-        traffic_separation_configs.clear();
+-    }
++    // A UCC/dev_set_config-injected TS policy (Profile-2 0xB5/0xB6 TLVs) is stored in the same
++      // DB list as an auto-derived one, but must never be wiped out just because the live UCI
++      // TrafficSeparation.enable toggle happens to be off -- the tester explicitly asked for this
++      // exact SSID/VLAN mapping via dev_set_config. UCC always sets the Default 802.1Q primary VID
++      // (0xB5) alongside the Traffic Separation Policy (0xB6), so a nonzero primary_vlan_id is a
++      // reliable signal that the current config came from an explicit request, not auto-derivation.
++      const bool has_configured_ts_policy =
++          database.get_default_8021q_setting(al_mac).primary_vlan_id != 0;
++
++      // If custom TS was turned off, drop any stale per-SSID VID mappings left over in the DB from
++      // a previous enabled period (e.g. auto-derived custom config below) so the Agent receives an
++      // explicit disable signal below rather than a stale policy. Never clear an explicitly
++      // configured (UCC-injected) policy this way.
++      if (!is_custom_ts_enabled && !has_configured_ts_policy && !traffic_separation_configs.empty()) {
++          database.clear_traffic_separation_configurations(al_mac);
++          traffic_separation_configs.clear();
++      }
+ 
+     // if traffic_separation_configs is empty -> check custom configuration
+     if (traffic_separation_configs.empty() && is_custom_ts_enabled) {
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index dedd357..ea53103 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -4321,7 +4321,7 @@ std::string cfg_get_onboarding_type()
+ bool cfg_get_1905_security_enabled(){
+     char buf[8] = {0};
+     if (cfg_get_prplmesh_param("Enable1905Security", buf, sizeof(buf)) < 0) {
+-        return true; // default: enabled
++        return false; // default: disabled
+     }
+     // Disabled only if explicitly set to "0"
+     return std::string(buf) != "0";
+-- 
+2.34.1
+
