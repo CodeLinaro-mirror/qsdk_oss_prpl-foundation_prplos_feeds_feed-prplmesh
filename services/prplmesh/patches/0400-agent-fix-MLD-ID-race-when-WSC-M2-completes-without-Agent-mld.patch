@@ -1,0 +1,85 @@
+From b849a9ae393d311098ec5ebee2dbe55598b88fc8 Mon Sep 17 00:00:00 2001
+From: Nirmal Raj S <nirm@qti.qualcomm.com>
+Date: Mon, 7 Sep 2026 11:40:10 +0530
+Subject: [PATCH] agent: fix MLD ID race when WSC M2 completes before AP MLD
+ Config TLV (CR 4646290)
+
+When a radio's WSC M2 exchange completes before the controller's AP MLD
+Configuration TLV is processed, the radio can reach the CONFIGURED state
+with mld_id still set to DISABLED_MLDUNIT for its MLD-affiliated BSS.
+This leaves the BSS operating as a standalone SLO interface instead of
+being merged into the correct MLD group.
+
+One complementary fix is applied in ApAutoConfigurationTask:
+
+1. work(): After all radios reach CONFIGURED, scan every AP MLD entry in
+   the database. If any affiliated radio has a BSS whose SSID matches the
+   MLD SSID but whose mld_id is still DISABLED, reset that radio's
+   autoconfiguration state back to SEND_AP_AUTOCONFIGURATION_WSC_M1 and
+   keep the task active so it re-requests M1/M2 and re-applies the MLD
+   grouping. A WARNING log (MLD_RACE_RETRIGGER) is emitted to aid
+   diagnosis.
+
+Signed-off-by: Nirmal Raj S <nirm@qti.qualcomm.com>
+---
+ .../slave/tasks/ap_autoconfiguration_task.cpp | 44 +++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 0ca6c5269..300e05a70 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -570,6 +570,50 @@ void ApAutoConfigurationTask::work()
+     // Update status on the database.
+     auto db = AgentDB::get();
+     if (configured_aps_count > 0 && configured_aps_count == m_radios_conf_params.size()) {
++
++        // Verify every radio affiliated with an AP MLD (per the controller's AP MLD
++        // Configuration TLV) actually got its mld_id assigned. A radio whose WSC M2
++        // completed before the TLV arrived can reach CONFIGURED with mld_id still
++        // DISABLED for its MLD-affiliated BSS (CR 4646290) — retrigger autoconfiguration
++        // for that radio alone so it re-requests and applies the correct MLD grouping.
++        bool retriggered_for_missing_mld = false;
++        for (const auto &ap_mld_conf : db->ap_mld_configurations) {
++            for (const auto &affiliated_ap : ap_mld_conf.affiliated_aps) {
++                auto radio = db->get_radio_by_mac(affiliated_ap.ruid, AgentDB::eMacType::RADIO);
++                bool radio_needs_retrigger =
++                    radio && std::any_of(radio->front.bssids.begin(), radio->front.bssids.end(),
++                                         [&](const AgentDB::sRadio::sFront::sBssid &b) {
++                                             return b.ssid == ap_mld_conf.mld_config.mld_ssid &&
++                                                    b.mld_id == DISABLED_MLDUNIT;
++                                         });
++                auto conf_it = radio_needs_retrigger
++                                  ? m_radios_conf_params.find(radio->front.iface_name)
++                                  : m_radios_conf_params.end();
++                radio_needs_retrigger = radio_needs_retrigger &&
++                                        conf_it != m_radios_conf_params.end() &&
++                                        conf_it->second.state == eState::CONFIGURED;
++
++                if (radio_needs_retrigger) {
++                    const std::string &affiliated_iface = radio->front.iface_name;
++                    LOG(WARNING) << "MLD_RACE_RETRIGGER: radio=" << affiliated_iface
++                                 << " ssid=" << ap_mld_conf.mld_config.mld_ssid
++                                 << " reached CONFIGURED with mld_id still DISABLED"
++                                 << " — retriggering autoconfiguration to obtain MLD IDs";
++
++                    conf_it->second.num_of_bss_available     = 0;
++                    conf_it->second.enabled_bssids.clear();
++                    conf_it->second.sent_vaps_list_update     = false;
++                    conf_it->second.received_vaps_list_update = false;
++                    FSM_MOVE_STATE(affiliated_iface, eState::SEND_AP_AUTOCONFIGURATION_WSC_M1);
++                    retriggered_for_missing_mld = true;
++                }
++            }
++        }
++        if (retriggered_for_missing_mld) {
++            m_task_is_active = true;
++            return;
++        }
++
+         db->statuses.ap_autoconfiguration_completed = true;
+         m_task_is_active                            = false;
+         LOG(DEBUG) << "Link to the controller is established";
+-- 
+2.34.1
+
