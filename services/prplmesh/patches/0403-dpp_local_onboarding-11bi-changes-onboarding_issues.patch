@@ -1,0 +1,2241 @@
+From e4bf75f33add1891cca3124d57d9e1ca3116dab0 Mon Sep 17 00:00:00 2001
+From: Parimalarengan Gururajan <gururaja@qti.qualcomm.com>
+Date: Tue, 8 Sep 2026 09:15:02 +0530
+Subject: [PATCH] dpp_local_onboarding - 11bi changes - onboarding_issues
+
+Re-trigger DPP 1905-security onboarding when the backhaul connection
+type switches between wired and wireless at runtime: clear stale
+peer_1905_security state and the dpp_1905_credentials latch, and reset
+DppAgentTask's wired session so a fresh Auth Request isn't rejected as
+a duplicate after a wired/wireless round trip. Generalize the
+controller's stale-agent cleanup to also cover agents secured via the
+wireless bSTA path before their first wired chirp. Add Wi-Fi Easy
+Connect 11bi WSC attribute support and related BPL/UCI wifi config
+handling.
+
+Signed-off-by: Parimalarengan Gururajan <gururaja@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 |   6 +
+ agent/src/beerocks/slave/agent_db.h           |   4 +-
+ .../backhaul_manager/backhaul_manager.cpp     |  75 ++++++
+ .../slave/backhaul_manager/backhaul_manager.h |  16 ++
+ agent/src/beerocks/slave/son_slave_thread.cpp |  98 ++++++--
+ agent/src/beerocks/slave/son_slave_thread.h   |  11 +
+ .../slave/tasks/ap_autoconfiguration_task.cpp | 134 ++++++++--
+ .../slave/tasks/ap_autoconfiguration_task.h   |   3 +
+ .../beerocks/slave/tasks/dpp_agent_task.cpp   | 159 +++++++-----
+ .../src/beerocks/slave/tasks/dpp_agent_task.h |  38 ++-
+ .../bcl/include/bcl/son/son_wireless_utils.h  |  29 +++
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  39 ++-
+ .../tlvf/beerocks_message_action.yaml         |   3 +-
+ .../tlvf/beerocks_message_backhaul.yaml       |   8 +
+ controller/src/beerocks/master/controller.cpp | 121 ++++++---
+ controller/src/beerocks/master/controller.h   |   7 +
+ .../master/tasks/dpp_configurator_task.cpp    | 233 +++++++++++++-----
+ .../master/tasks/dpp_configurator_task.h      |  20 +-
+ .../beerocks/master/tasks/dpp_key_store.cpp   | 114 ++++++---
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     | 145 +++++++++--
+ .../tlvf/yaml/tlvf/WSC/WSC_Attributes.yaml    |  34 +++
+ 21 files changed, 1027 insertions(+), 270 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index d0ef78fcc..886cbc969 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -2407,6 +2407,12 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+             bss_info_conf.vap_label        = config_data.vap_label_str();
+             bss_info_conf.wifi_compat_mode = config_data.wifi_compat_mode();
+ 
++            // 802.11bi: opaque pass-through strings, echoed verbatim into hostapd by
++            // ap_wlan_hal_nl80211 (sae_groups=/pasn_groups= and security_profiles=).
++            bss_info_conf.enabled_ecp_groups = config_data.enabled_ecp_groups_str();
++            bss_info_conf.security_profiles  = config_data.security_profiles_str();
++            bss_info_conf.rsnxe_capab_mask    = config_data.rsnxe_capab_mask_str();
++
+             // Forward the raw RSN Security IEs (RSNE + RSNOE + RSNO2E + RSNXOE) from the
+             // RSN Parameters Configuration TLV (spec §17.2.107) into sBssInfoConf::security_ies
+             // so apply_rsn_from_security_ies() can program arbitrary Controller-supplied RSN
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 46a4ffc03..f79fb7c7a 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -349,8 +349,8 @@ public:
+         bool valid              = false;    // true when key loaded and validated
+         int wpa_bootstrap_id    = -1;       // id returned by wpa_supplicant's DPP_BOOTSTRAP_GEN,
+                                              // used for DPP_BOOTSTRAP_GET_URI / DPP_CHIRP (bSTA)
+-        int chirp_start_delay_sec    = 120; // delay before first DPP_CHIRP after bootstrap injection
+-        int chirp_retry_interval_sec = 120; // interval between subsequent DPP_CHIRP retries
++        int chirp_start_delay_sec    = 60; // delay before first DPP_CHIRP after bootstrap injection
++        int chirp_retry_interval_sec = 60; // interval between subsequent DPP_CHIRP retries
+ 
+         ~sDppBootstrapKey() {
+             if (private_key) {
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index d1adf9c23..24dba6f3b 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -1199,6 +1199,8 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+                     db->backhaul.selected_iface_radio_mac = net::network_utils::ZERO_MAC;
+                     LOG(DEBUG) << "Moved to WIRED BACKHAUL";
+ 
++                    reset_1905_security_for_connection_switch(true);
++
+                     // Wireless to wired switching - enable all FH VAPs after triggering STA disconnection
+                     if (m_agent_fd != beerocks::net::FileDescriptor::invalid_descriptor) {
+                         auto fh_vaps_notif_wireless_to_wired = message_com::create_vs_message<
+@@ -1273,6 +1275,11 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+                                 }
+                             }
+                         }
++                        // Mark the connection as WIRELESS
++                        db->backhaul.connection_type = AgentDB::sBackhaul::eConnectionType::Wireless;
++
++                        reset_1905_security_for_connection_switch(false);
++
+                         // Wired to wireless switching - disable all FH VAPs after triggering STA reconnection
+                         if (m_agent_fd != beerocks::net::FileDescriptor::invalid_descriptor) {
+                             auto fh_vaps_notif_wired_to_wireless = message_com::create_vs_message<
+@@ -1292,6 +1299,14 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+                     }
+                 }
+ 
++                // If the wired->wireless switch above didn't take the in-place STA-reconnect
++                // path (should_reconnect_sta==false), the full FSM restart below re-selects the
++                // connection type fresh via EState::INIT/CONNECTED — but that restart doesn't
++                // clear stale 1905 security state, so do it here explicitly.
++                if (!m_eth_link_up) {
++                    reset_1905_security_for_connection_switch(false);
++                }
++
+                 // Print backhaul switching message to console
+                 std::string timestamp2 = beerocks::os_utils::get_timestamp();
+                 if (m_eth_link_up) {
+@@ -3261,6 +3276,18 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+             }
+             if (FSM_IS_IN_STATE(OPERATIONAL) || FSM_IS_IN_STATE(CONNECTED)) {
+ 
++                // A genuine (non-steering) backhaul link drop while previously operational — e.g.
++                // the Controller itself rebooted. Any 1905-layer PMK/TK we previously installed
++                // for it may no longer exist on the Controller's side, so drop our own copy and
++                // force a fresh Peer Discovery/EAPOL handshake on reconnect instead of reusing a
++                // TK the Controller no longer has. Steering-caused disconnects are excluded here
++                // — the bSTA is only moving to a sibling BSS of the same Controller, so the
++                // existing 1905 security association is still valid.
++                if (m_backhaul_steering_bssid == beerocks::net::network_utils::ZERO_MAC &&
++                    db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wireless) {
++                    reset_1905_security_for_connection_switch(false);
++                }
++
+ #ifdef USE_PRPLMESH_NLHAL
+                 // If our own reconnect-watchdog is driving disconnect/reconnect for this iface,
+                 // suppress the automatic FSM recovery path entirely - the watchdog's own timers
+@@ -3547,6 +3574,7 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+             LOG(ERROR) << "Dpp_Event: invalid data!";
+             break;
+         }
++        LOG(DEBUG) << "Dpp_Event on iface=" << iface << ": \"" << msg->event_line << "\"";
+         process_dpp_bridge_events(iface, std::string(msg->event_line));
+     } break;
+ 
+@@ -5722,6 +5750,8 @@ void BackhaulManager::process_dpp_bridge_events(const std::string &sta_iface,
+         // DPP-FAIL: wpa_supplicant tears down the exchange and does not resume chirping on its
+         // own.
+         retry_dpp_chirp_after_failure(sta_iface, "DPP-CONF-FAILED");
++    } else {
++        LOG(DEBUG) << "DPP bridge: unhandled event on " << sta_iface << ": \"" << event << "\"";
+     }
+ 
+     if (m_dpp_cred_bridge.connector_1905_received && m_dpp_cred_bridge.nak_received &&
+@@ -5768,6 +5798,51 @@ void BackhaulManager::finalize_dpp_1905_credentials(const std::string &connector
+     }
+ }
+ 
++void BackhaulManager::reset_1905_security_for_connection_switch(bool switching_to_wired)
++{
++    auto db = AgentDB::get();
++    if (db->dpp_extender_config.onboarding_type != AgentDB::OnboardingType::DPP) {
++        return;
++    }
++
++    auto controller_mac = db->controller_info.bridge_mac;
++    if (controller_mac != beerocks::net::network_utils::ZERO_MAC) {
++        db->peer_1905_security.erase(controller_mac);
++        if (m_broker_client) {
++            m_broker_client->install_security_key(controller_mac, {}, {}, 0, false);
++        }
++    }
++
++    if (switching_to_wired) {
++        // Clear the one-way latch so the wired chirp-inclusion gate (dpp_onboarding_active)
++        // can re-arm for this medium. sDpp1905Credentials owns a raw EVP_PKEY* and is
++        // non-copyable, so fields are reset individually rather than via `= {}`.
++        if (db->dpp_1905_credentials.nak_pkey) {
++            EVP_PKEY_free(db->dpp_1905_credentials.nak_pkey);
++            db->dpp_1905_credentials.nak_pkey = nullptr;
++        }
++        db->dpp_1905_credentials.connector.clear();
++        db->dpp_1905_credentials.nak_private_der.clear();
++        db->dpp_1905_credentials.c_sign_key_der.clear();
++        db->dpp_1905_credentials.c_sign_key_jwk.clear();
++        db->dpp_1905_credentials.pp_key_jwk.clear();
++        db->dpp_1905_credentials.initialized = false;
++    }
++
++    LOG(INFO) << "DPP: connection type switched to " << (switching_to_wired ? "Wired" : "Wireless")
++              << " — cleared stale 1905 security state";
++
++    if (m_agent_fd != beerocks::net::FileDescriptor::invalid_descriptor) {
++        auto notify = message_com::create_vs_message<
++            beerocks_message::cACTION_BACKHAUL_CONNECTION_TYPE_CHANGED_NOTIFICATION>(cmdu_tx);
++        if (notify) {
++            send_cmdu(m_agent_fd, cmdu_tx);
++        } else {
++            LOG(ERROR) << "Failed building cACTION_BACKHAUL_CONNECTION_TYPE_CHANGED_NOTIFICATION";
++        }
++    }
++}
++
+ // ---------------------------------------------------------------------------
+ // DPP Connector reboot-restore — pulls the persisted WLAN/backhaul and
+ // 1905-layer Connectors and their key material out of wpa_supplicant via
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+index 6f055566f..bf7257352 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+@@ -456,6 +456,22 @@ private:
+                                        const std::vector<uint8_t> &c_sign_key_der,
+                                        uint16_t df_counter_threshold);
+ 
++    /**
++     * @brief Clears stale DPP 1905-security onboarding state and notifies son_slave_thread when
++     *        the backhaul's dynamic connection type (AgentDB::backhaul.connection_type) switches
++     *        between Wired and Wireless at runtime, or when a previously-operational wireless
++     *        bSTA link drops and needs to re-establish 1905 security on reconnect (e.g. the
++     *        Controller itself rebooted and no longer has our previously-installed TK/PMK).
++     *        Erases the cached per-peer 1905 security association (AgentDB::peer_1905_security),
++     *        removes any locally-installed transport key for the Controller, and — only when
++     *        switching to Wired — resets the dpp_1905_credentials one-way latch so the wired
++     *        chirp-inclusion gate can re-arm. No-op if onboarding_type is not DPP.
++     *
++     * @param switching_to_wired true if the new connection type is Wired, false if Wireless
++     *                           (including a plain wireless disconnect/reconnect).
++     */
++    void reset_1905_security_for_connection_switch(bool switching_to_wired);
++
+     /**
+      * @brief Restores both the WLAN/backhaul (netRole="mapBackhaulSta") and 1905-layer
+      *        (netRole="mapAgent") DPP Connectors and their key material from wpa_supplicant's
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index b1bc41ee4..14591f73d 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -97,6 +97,7 @@
+ #include <algorithm>
+ #include <fstream>
+ #include <string>
++#include <sys/file.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <unistd.h>
+@@ -946,8 +947,8 @@ bool slave_thread::read_platform_configuration()
+     }
+ #endif
+     // DPP onboarding configuration:
+-    // - Controller+Agent combined (GW): local agent always uses WSC — the GW's own
+-    //   agent is not onboarded via DPP, only remote extenders are.
++    // - Controller+Agent combined (GW): local agent honours the UCI onboardingtype too, so the
++    //   GW's own BSSes can get a DPP connector instead of being stuck on WSC.
+     // - All other modes (pure agent, pure controller): honour the UCI onboardingtype.
+     {
+         db->dpp_extender_config.link_encryption = bpl::cfg_get_1905_security_enabled();
+@@ -969,9 +970,11 @@ bool slave_thread::read_platform_configuration()
+                       << " management_mode=" << db->device_conf.management_mode
+                       << " Enable1905Security=" << db->dpp_extender_config.link_encryption;
+         } else {
+-            db->dpp_extender_config.onboarding_type = AgentDB::OnboardingType::WSC;
+-            LOG(DEBUG) << "Controller+Agent (GW) mode: local agent uses WSC onboarding"
+-                       << " (local controller onboardingtype=" << onboarding_type << ")"
++            db->dpp_extender_config.onboarding_type =
++                (onboarding_type == "DPP") ? AgentDB::OnboardingType::DPP
++                                            : AgentDB::OnboardingType::WSC;
++            LOG(DEBUG) << "Controller+Agent (GW) mode: local agent onboarding_type="
++                       << (onboarding_type == "DPP" ? "DPP" : "WSC")
+                        << " Enable1905Security=" << db->dpp_extender_config.link_encryption;
+         }
+     }
+@@ -1170,14 +1173,18 @@ bool slave_thread::load_dpp_provisioned_keys()
+         // Build DPP URI
+         std::string new_uri = "DPP:V:3;K:" + key_b64 + ";;";
+ 
+-        // Save URI
++        // Save URI to the shared whitelist file, which the co-located Controller's
++        // DppConfiguratorTask also reads/rewrites — flock() so the two processes can't
++        // interleave a partial write/read of the same file.
+         FILE *uf = fopen(uri_path.c_str(), "w");
+         if (!uf) {
+             LOG(ERROR) << "DPP: cannot create " << uri_path;
+             EVP_PKEY_free(new_key);
+             return false;
+         }
+-        fprintf(uf, "%s\n", new_uri.c_str());
++        flock(fileno(uf), LOCK_EX);
++        fprintf(uf, "# local-agent\n%s\n", new_uri.c_str());
++        flock(fileno(uf), LOCK_UN);
+         fclose(uf);
+ 
+         LOG(INFO) << "DPP: generated bootstrap key pair";
+@@ -1216,9 +1223,16 @@ bool slave_thread::load_dpp_provisioned_keys()
+         return false;
+     }
+     std::string uri_line;
+-    std::getline(uri_file, uri_line);
+-    // Trim trailing whitespace/newline
+-    uri_line.erase(uri_line.find_last_not_of(" \t\n\r") + 1);
++    while (std::getline(uri_file, uri_line)) {
++        // Trim trailing whitespace/newline
++        uri_line.erase(uri_line.find_last_not_of(" \t\n\r") + 1);
++        // Skip comment/marker lines (e.g. "# local-agent") and blank lines —
++        // the URI is the first real content line.
++        if (uri_line.empty() || uri_line[0] == '#') {
++            continue;
++        }
++        break;
++    }
+ 
+     // Extract K: field from URI
+     const std::string k_prefix = "K:";
+@@ -1370,6 +1384,17 @@ void slave_thread::trigger_dpp_extender_bss_config_request(const sMacAddr &contr
+     }
+ }
+ 
++void slave_thread::trigger_dpp_1905_credentials_ready(const sMacAddr &controller_mac,
++                                                        bool controller_requires_1905_security)
++{
++    if (m_dpp_agent_task) {
++        m_dpp_agent_task->on_1905_credentials_ready(controller_mac,
++                                                     controller_requires_1905_security);
++    } else {
++        LOG(WARNING) << "DPP: DppAgentTask not available for 1905 credentials decision";
++    }
++}
++
+ void slave_thread::platform_notify_error(beerocks::bpl::eErrorCode code,
+                                          const std::string &error_data)
+ {
+@@ -3328,11 +3353,35 @@ bool slave_thread::handle_cmdu_backhaul_manager_message(
+         LOG(INFO) << "DPP: 1905-layer credentials ready (bSTA) — connector, NAK, and C-sign-key "
+                      "all received";
+ 
+-        // Dispatch (BSS Config Request or Peer Discovery) is owned by DppAgentTask::work(),
+-        // which waits for controller_info.bridge_mac to be known before acting.  bridge_mac is
+-        // still ZERO_MAC right here on a fresh restore — Topology Discovery hasn't found the
+-        // Controller yet — so firing immediately used to send the CMDU to a zero/unknown
+-        // destination (flooded onto every bridge port, including fronthaul radios).
++        // Dispatch (BSS Config Request or Peer Discovery) is triggered once, from
++        // ApAutoConfigurationTask's AP-Autoconfig Response handler, the moment the 0xA9 TLV is
++        // parsed there. If a Response was already received (bridge_mac known) before these
++        // credentials became ready, that check already ran with initialized=false and won't
++        // run again on its own — restart the AP-Autoconfiguration task so a fresh Search/Response
++        // round-trip re-evaluates that same single gate, now with credentials ready, instead of
++        // dispatching from a second call site here.
++        if (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP &&
++            db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wireless &&
++            db->controller_info.bridge_mac != network_utils::ZERO_MAC) {
++            LOG(INFO) << "DPP: 1905 credentials arrived after AP-Autoconfig Response — "
++                         "restarting autoconfiguration to re-trigger dispatch";
++            m_task_pool.send_event(eTaskType::AP_AUTOCONFIGURATION,
++                                   ApAutoConfigurationTask::eEvent::INIT_TASK);
++            m_task_pool.send_event(eTaskType::AP_AUTOCONFIGURATION,
++                                   ApAutoConfigurationTask::eEvent::START_AP_AUTOCONFIGURATION);
++        }
++        break;
++    }
++    case beerocks_message::ACTION_BACKHAUL_CONNECTION_TYPE_CHANGED_NOTIFICATION: {
++        LOG(INFO) << "DPP: backhaul connection type changed — resetting onboarding progress and "
++                     "restarting AP-Autoconfiguration";
++        if (m_dpp_agent_task) {
++            m_dpp_agent_task->reset_onboarding_progress();
++        }
++        m_task_pool.send_event(eTaskType::AP_AUTOCONFIGURATION,
++                               ApAutoConfigurationTask::eEvent::INIT_TASK);
++        m_task_pool.send_event(eTaskType::AP_AUTOCONFIGURATION,
++                               ApAutoConfigurationTask::eEvent::START_AP_AUTOCONFIGURATION);
+         break;
+     }
+     default: {
+@@ -7139,21 +7188,16 @@ bool slave_thread::agent_fsm()
+         LOG(TRACE) << "Agent is in STATE_OPERATIONAL";
+ 
+         // Initialize the DPP Agent TCP server (port 8908) for DPP over TCP relay.
+-        // For DPP extender agents (wired or wireless), the TCP server is deferred
+-        // until the 1905-layer onboarding completes (dpp_1905_credentials.initialized
+-        // = true) — before that there is no 1905 path to the controller.
+-        // For controller/WSC modes, start immediately (existing behaviour).
++        // STATE_OPERATIONAL is only ever entered after ap_autoconfiguration_completed
++        // becomes true (see STATE_WAIT_FOR_AUTO_CONFIGURATION_COMPLETE above), which for
++        // a DPP-onboarded radio already implies its own BSS credentials were applied via
++        // the DPP Auth/GAS/BSS-Config flow. So by this point, DPP onboarding is always
++        // already complete — no further gate is needed before starting the relay.
+         {
+             auto db = AgentDB::get();
+-            bool is_dpp_extender =
+-                (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP);
+-
+-            if (m_dpp_agent_task && !is_dpp_extender) {
+-                // Controller or WSC agent: request TCP relay start immediately
++            if (m_dpp_agent_task &&
++                db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP) {
+                 start_dpp_tcp_relay_server();
+-            } else if (is_dpp_extender) {
+-                LOG(INFO) << "DPP: extender mode — deferring TCP relay server until own "
+-                             "onboarding completes";
+             }
+         }
+ 
+diff --git a/agent/src/beerocks/slave/son_slave_thread.h b/agent/src/beerocks/slave/son_slave_thread.h
+index 1305c3ec0..b8bfe2b45 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.h
++++ b/agent/src/beerocks/slave/son_slave_thread.h
+@@ -588,6 +588,17 @@ public:
+     void start_dpp_tcp_relay_server();
+     void trigger_dpp_extender_bss_config_request(const sMacAddr &controller_mac);
+ 
++    /**
++     * @brief Forward to DppAgentTask::on_1905_credentials_ready().
++     *
++     * Called from ApAutoConfigurationTask::handle_ap_autoconfiguration_response() the
++     * moment it finds dpp_1905_credentials already initialized, so the Peer Discovery
++     * vs. BSS Config Request decision fires immediately from the 0xA9 TLV in that
++     * response instead of waiting on DppAgentTask's next work() poll tick.
++     */
++    void trigger_dpp_1905_credentials_ready(const sMacAddr &controller_mac,
++                                             bool controller_requires_1905_security);
++
+ private:
+     /**
+      * @brief check if there was an error in the constructor
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index b77f89bee..47797ebd3 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -1487,10 +1487,11 @@ bool ApAutoConfigurationTask::send_ap_autoconfiguration_search_message(
+         db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP &&
+         db->dpp_bootstrap.valid && !db->dpp_1905_credentials.initialized; // only before onboarding completes
+ 
+-    // Combined Controller+Agent (GW): the co-located agent always onboards itself via
+-    // WSC (no bootstrap key of its own, so it must NOT add a Chirp TLV here), but its
+-    // local controller may be configured as a DPP Configurator for remote/wired
+-    // extenders. Advertise Profile-3 in that case too, matching the controller role.
++    // Combined Controller+Agent (GW): the co-located agent now honours onboardingtype=DPP
++    // for its own onboarding too (son_slave_thread.cpp), so it chirps for itself exactly
++    // like a wired extender does — see the widened gate below. Its local controller may
++    // also be configured as a DPP Configurator for remote/wired extenders independently.
++    // Advertise Profile-3 in either case, matching the controller role.
+     const bool dpp_profile3_required =
+         dpp_onboarding_active || db->device_conf.local_controller_dpp_capable;
+ 
+@@ -1518,11 +1519,15 @@ bool ApAutoConfigurationTask::send_ap_autoconfiguration_search_message(
+         tlvProfile2MultiApProfile->profile() = db->device_conf.multi_ap_profile;
+     }
+ 
+-    // Chirp TLV is only meaningful for a wired extender: a wireless extender's Search
+-    // is sent over the same radio it's trying to onboard, before it has backhaul
++    // Chirp TLV is meaningful for a wired extender (its Search reaches the controller
++    // over the backhaul it already has) and for the co-located Controller+Agent case
++    // (its Search reaches the local controller over the local broker, addressing-agnostic
++    // — see dpp_colocated_agent_onboarding_design_v2.md §4.2.3). A wireless extender's
++    // Search is sent over the same radio it's trying to onboard, before it has backhaul
+     // connectivity to the controller, so chirping here would never reach it anyway.
+     if (dpp_onboarding_active &&
+-        db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wired) {
++        (db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wired ||
++         db->device_conf.local_controller)) {
+         // Add tlvDppChirpValue with bootstrap chirp hash
+         auto chirp_tlv = m_cmdu_tx.addClass<wfa_map::tlvDppChirpValue>();
+         if (chirp_tlv) {
+@@ -2156,6 +2161,19 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_response(
+                << " band, controller bridge_mac=" << src_mac
+                << ", prplmesh_controller=" << prplmesh_controller;
+ 
++    // Wireless bSTA DPP onboarding (and reboot-restore): decide immediately from the 0xA9
++    // TLV just parsed above whether to fire BSS Config Request or Peer Discovery, instead of
++    // waiting on DppAgentTask's next work() poll tick (EasyMesh Figure 15). 1905 credentials
++    // are only ever derived (live or restored) via the backhaul STA's wpa_supplicant, so this
++    // only ever applies to wireless-backhaul DPP onboarding — wired extenders always need the
++    // chirp/Auth/GAS exchange first, regardless of 0xA9, and non-DPP (WSC) agents never carry
++    // dpp_1905_credentials at all.
++    if (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP &&
++        db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wireless &&
++        (db->dpp_1905_credentials.initialized || !controller_has_1905_security)) {
++        m_btl_ctx.trigger_dpp_1905_credentials_ready(src_mac, controller_has_1905_security);
++    }
++
+     // Update the AP Manager with the Multi-AP Controller Profile
+     m_btl_ctx.m_radio_managers.do_on_each_radio_manager(
+         [&](slave_thread::sManagedRadio &radio_manager,
+@@ -2228,6 +2246,9 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+         std::string custom_alias;    // from "customAlias" (HOME/GUEST/VIDEO/BACKHAUL/HOTSPOT role tag)
+         std::string signed_connector; // from "signedConnector" (DPP Connector JWS), empty if AKM has no DPP
+         std::string csign_jwk;       // from "csign" (Configurator C-sign-key, JWK JSON object), empty if AKM has no DPP
++        std::string enabled_ecp_groups; // from "enabledECPGroups" (802.11bi ECP group numbers)
++        std::string security_profiles;  // from "security_profiles" (Table 9-bb22 profile numbers)
++        std::string rsnxe_capab_mask;    // from "extendedRSNCapabilitiesMask" (RSNXE capabilities mask hex string)
+         uint8_t     map_bss_type  = 0;  // 0x40=backhaul BSS, 0x20=fronthaul BSS
+         bool        hidden_ssid   = false;  // from "SSIDAdvertisement": false → hidden
+         bool        ssid_advert_present = false; // true when field was found in JSON
+@@ -2346,6 +2367,12 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+             // Extract custom_alias from "customAlias" (VAP role tag: home/guest/video/backhaul/hotspot)
+             cfg.custom_alias = extract_quoted_field("customAlias");
+ 
++            // Extract enabledECPGroups / security_profiles (802.11bi, opaque pass-through
++            // w.r.t. AKM — re-emitted verbatim into hostapd config on this Agent).
++            cfg.enabled_ecp_groups = extract_quoted_field("enabledECPGroups");
++            cfg.security_profiles  = extract_quoted_field("security_profiles");
++            cfg.rsnxe_capab_mask   = extract_quoted_field("extendedRSNCapabilitiesMask");
++
+             if (!cfg.ssid.empty()) {
+                 LOG(INFO) << "DPP BSS Config: ssid=" << cfg.ssid
+                           << " akm=" << cfg.akm
+@@ -2357,7 +2384,13 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+                           << " vap_label=" << cfg.vap_label
+                           << " custom_alias=" << cfg.custom_alias
+                           << " signedConnector=" << (cfg.signed_connector.empty() ? "(none)" : "(set)")
+-                          << " csign=" << (cfg.csign_jwk.empty() ? "(none)" : "(set)");
++                          << " csign=" << (cfg.csign_jwk.empty() ? "(none)" : "(set)")
++                          << " enabledECPGroups="
++                          << (cfg.enabled_ecp_groups.empty() ? "(none)" : cfg.enabled_ecp_groups)
++                          << " security_profiles="
++                          << (cfg.security_profiles.empty() ? "(none)" : cfg.security_profiles)
++                          << " extendedRSNCapabilitiesMask="
++                          << (cfg.rsnxe_capab_mask.empty() ? "(none)" : cfg.rsnxe_capab_mask);
+                 dpp_configs.push_back(std::move(cfg));
+             } else {
+                 LOG(DEBUG) << "DPP: skipping sub-TLV with no SSID (1905-layer object)";
+@@ -2433,9 +2466,10 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+             //   "psk"      = WPA2-PSK (name form, equivalent to 000FAC02)
+             //   "sae"      = SAE (name form, equivalent to 000FAC08)
+             // The resulting auth_type is the OR of all recognised tokens.
+-            bool has_dpp = false;
++            bool has_dpp  = false;
++            bool has_eppk = false;
+             {
+-                bool has_psk = false, has_sae = false;
++                bool has_psk = false, has_sae = false, has_akm24 = false;
+                 std::string tok;
+                 std::istringstream ss(dpp_cfg.akm);
+                 while (std::getline(ss, tok, '+')) {
+@@ -2446,6 +2480,22 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+                         has_dpp = true;
+                     } else if (tok == "000FAC02" || upper == "PSK" || upper == "WPA-PSK") {
+                         has_psk = true;
++                    } else if (tok.rfind("000FAC29", 0) == 0) {
++                        // 802.11bi EPPKE bracket suite, e.g. "000FAC29[000FAC24]". The
++                        // bracket is a fixed template (always literally "...000FAC24]")
++                        // and carries no AKM information of its own — only the
++                        // presence/absence of a *preceding* base-AKM token in this
++                        // '+'-joined string distinguishes "sae-ext-key"+eppk (bracket
++                        // arrives standalone, since the controller's encoder strips
++                        // AKM24 out of the base before prepending it) from "sae"+eppk
++                        // (bracket arrives prefixed by a "000FAC08"/SAE token). A
++                        // standalone bracket must still resolve to WSC_AUTH_SAE_AKM24
++                        // (not plain SAE) so the HAL emits "SAE-EXT-KEY", not the
++                        // unrelated SAE+SAE-EXT-KEY compatibility mode.
++                        has_eppk = true;
++                        if (!has_sae && !has_psk) {
++                            has_akm24 = true;
++                        }
+                     } else if (tok == "000FAC08" || tok == "000FAC24" ||
+                                upper == "SAE" || upper == "SAE-EXT") {
+                         has_sae = true;
+@@ -2454,10 +2504,20 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+                     }
+                 }
+                 LOG(DEBUG) << "DPP: AKM='" << dpp_cfg.akm << "' → dpp=" << has_dpp
+-                           << " psk=" << has_psk << " sae=" << has_sae;
++                           << " psk=" << has_psk << " sae=" << has_sae << " eppk=" << has_eppk;
++
++                // Testing hook: the controller may trim the DPP AKM token out of the akm
++                // string (wpa_supplicant parsing workaround) while still including
++                // signedConnector/csign in the Config Object. Mirror hostapd's own
++                // dpp_parse_conf_obj() fallback (src/common/dpp.c) — treat the credential
++                // as DPP-connector-bearing if signedConnector+csign are present, even when
++                // the akm string carries only legacy tokens.
++                bool has_dpp_connector =
++                    has_dpp || (!dpp_cfg.signed_connector.empty() && !dpp_cfg.csign_jwk.empty());
+ 
+                 WSC::eWscAuth base_auth_type = WSC::eWscAuth::WSC_AUTH_OPEN;
+-                if (has_dpp && !has_psk && !has_sae && dpp_cfg.passphrase.empty()) {
++                if (has_dpp && !has_psk && !has_sae && !has_akm24 &&
++                           dpp_cfg.passphrase.empty()) {
+                     // DPP-only: connector-based auth, no PSK/SAE passphrase. Per hostapd
+                     // (wpa_key_mgmt=DPP, src/ap/ap_config.h dpp_connector/dpp_csign/
+                     // dpp_netaccesskey), this is RSN-protected (wpa=2, real cipher), not
+@@ -2473,6 +2533,11 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+                 } else if (has_sae) {
+                     base_auth_type                = WSC::eWscAuth::WSC_AUTH_SAE;
+                     info.payload_config.encr_type = WSC::eWscEncr::WSC_ENCR_AES;
++                } else if (has_akm24) {
++                    // Standalone EPPKE bracket (no preceding SAE/PSK token): the
++                    // pre-EPPKE base was SAE-EXT-KEY-only (see comment above).
++                    base_auth_type                = WSC::eWscAuth::WSC_AUTH_SAE_AKM24;
++                    info.payload_config.encr_type = WSC::eWscEncr::WSC_ENCR_AES;
+                 } else if (has_psk) {
+                     base_auth_type                = WSC::eWscAuth::WSC_AUTH_WPA2PSK;
+                     info.payload_config.encr_type = WSC::eWscEncr::WSC_ENCR_AES;
+@@ -2484,20 +2549,24 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+                     info.payload_config.encr_type = WSC::eWscEncr::WSC_ENCR_AES;
+                 }
+ 
+-                // Fold the DPP AKM into the same authentication_type bitfield (per EasyMesh
+-                // AKM bit allocation, WSC_AUTH_DPP = 0x0080) instead of a separate
+-                // additional_auth flag, so the HAL can scope the per-VAP dpp_controller/
+-                // dpp_configurator_connectivity hostapd write off this single field.
+-                info.payload_config.auth_type =
+-                    has_dpp ? static_cast<WSC::eWscAuth>(base_auth_type |
+-                                                          WSC::eWscAuth::WSC_AUTH_DPP)
+-                            : base_auth_type;
++                // Fold the DPP AKM bit into the same authentication_type bitfield (per
++                // EasyMesh AKM bit allocation, WSC_AUTH_DPP = 0x0080) so the HAL can scope
++                // the per-VAP dpp_controller/dpp_configurator_connectivity hostapd writes
++                // off this field. AKM24 (from a standalone EPPKE bracket) is already
++                // folded into base_auth_type above, not OR'd in again here — OR'ing it a
++                // second time would be harmless when standalone, but if it were ever OR'd
++                // in alongside a has_sae-derived base_auth_type it would incorrectly
++                // produce the unrelated SAE+SAE-EXT-KEY compatibility-mode bit pattern.
++                info.payload_config.auth_type = static_cast<WSC::eWscAuth>(
++                    static_cast<uint16_t>(base_auth_type) |
++                    (has_dpp_connector ? static_cast<uint16_t>(WSC::eWscAuth::WSC_AUTH_DPP)
++                                       : uint16_t(0)));
+ 
+                 // Propagate the DPP Connector and Configurator C-sign-key (converted
+                 // from JWK to DER SubjectPublicKeyInfo) parsed from this BSS's DPP
+                 // Configuration Object, so the HAL can write hostapd's dpp_connector=/
+-                // dpp_csign= directives. Only when AKM includes DPP.
+-                if (has_dpp) {
++                // dpp_csign= directives. Only when a connector is actually present.
++                if (has_dpp_connector) {
+                     info.dpp_connector = dpp_cfg.signed_connector;
+                     if (!dpp_cfg.csign_jwk.empty()) {
+                         info.dpp_csign_der = DppAgentTask::jwk_pubkey_to_der(dpp_cfg.csign_jwk);
+@@ -2538,9 +2607,20 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+             info.m2_config.vap_label   = dpp_cfg.vap_label;
+             // bss_index: not present in DPP config objects — leave 0 (unset)
+             info.m2_config.bss_index   = 0;
+-            // additional_auth: DPP connectors handle network access; no MRSNO/RSN override.
++            // additional_auth: DPP connectors handle network access; no MRSNO/RSN override
++            // here, except EPPKE (802.11bi), detected from the "000FAC29[...]" AKM token
++            // above and preserved rather than overwritten.
+             // (DPP itself is now signalled via WSC_AUTH_DPP in auth_type above, not here.)
+-            info.additional_auth = son::wireless_utils::eAdditionalAuth::NONE;
++            if (has_eppk) {
++                info.additional_auth = son::wireless_utils::eAdditionalAuth::EPPKE;
++            } else {
++                info.additional_auth = son::wireless_utils::eAdditionalAuth::NONE;
++            }
++            // enabledECPGroups / security_profiles: opaque pass-through, re-emitted
++            // verbatim into hostapd config by the HAL regardless of EPPKE.
++            info.enabled_ecp_groups = dpp_cfg.enabled_ecp_groups;
++            info.security_profiles  = dpp_cfg.security_profiles;
++            info.rsnxe_capab_mask    = dpp_cfg.rsnxe_capab_mask;
+ 
+             bss_infos.push_back(std::move(info));
+         }
+@@ -6379,6 +6459,12 @@ bool ApAutoConfigurationTask::send_ap_bss_configuration_message(
+         c->smd_mac()  = info.smd_mac;
+         c->wifi_compat_mode() = info.wifi_compat_mode;
+ 
++        // 802.11bi: opaque pass-through strings, echoed verbatim into hostapd by
++        // ap_wlan_hal_nl80211 (sae_groups=/pasn_groups= and security_profiles=).
++        c->set_enabled_ecp_groups(info.enabled_ecp_groups);
++        c->set_security_profiles(info.security_profiles);
++        c->set_rsnxe_capab_mask(info.rsnxe_capab_mask);
++
+         // Forward the raw RSN Security IEs blob captured earlier by
+         // handle_rsn_parameters_configuration_tlv(). These bytes travel end-to-end down
+         // to ap_wlan_hal_nl80211::apply_rsn_from_security_ies() via
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+index 0e2aebebf..eb795a62c 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+@@ -165,6 +165,9 @@ private:
+          */
+         std::string dpp_connector;
+         std::vector<uint8_t> dpp_csign_der;
++        std::string enabled_ecp_groups; ///< From DPP Configuration Object "enabledECPGroups"; echoed to hostapd as both sae_groups= and pasn_groups=.
++        std::string security_profiles;  ///< From DPP Configuration Object "security_profiles"; echoed to hostapd security_profiles=.
++        std::string rsnxe_capab_mask;    ///< From DPP Configuration Object "extendedRSNCapabilitiesMask"; echoed to hostapd rsnxe_capab_mask=.
+     };
+ 
+     /**
+diff --git a/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp b/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
+index 971968627..8af3703bd 100644
+--- a/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
++++ b/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
+@@ -460,63 +460,40 @@ void DppAgentTask::work()
+ 
+     auto now = std::chrono::steady_clock::now();
+ 
+-    // 1905 credentials already available (e.g. restored on reboot, or already
+-    // converted during this run) — don't wait for a wireless Auth Request at all,
+-    // drive Peer Discovery directly over 1905 Direct Encap, retrying until the
+-    // Controller responds.
+-    if (db->dpp_1905_credentials.initialized) {
+-        if (db->controller_info.bridge_mac == beerocks::net::network_utils::ZERO_MAC) {
+-            return;
+-        }
+-        if (!db->dpp_extender_config.controller_requires_1905_security) {
+-            // Mirrors the live-exchange shortcut at the bottom of handle_dpp_wired_gas_response()
+-            // below: no 0xA9 TLV means the 1905 layer doesn't need Peer Discovery+EAPOL, so go
+-            // straight to BSS Config Request — just gated on the Controller's bridge_mac being
+-            // known (it is still ZERO_MAC immediately after a reboot-restore, before Topology
+-            // Discovery has run; firing before that sends the CMDU nowhere useful).
+-            if (!m_bss_config_request_sent) {
+-                LOG(INFO) << "DPP: 1905 credentials ready, no 1905 security required — sending "
+-                             "BSS Config Request directly (not waiting for wireless Auth "
+-                             "Request)";
+-                m_btl_ctx.start_dpp_tcp_relay_server();
+-                trigger_bss_config_request(db->controller_info.bridge_mac);
+-                m_bss_config_request_sent = true;
+-            }
+-            return;
+-        }
+-        if (db->peer_1905_security.count(db->controller_info.bridge_mac)) {
+-            return; // Peer Discovery already completed with the Controller
+-        }
+-        if (m_peer_discovery_sent_time != std::chrono::steady_clock::time_point{} &&
+-            std::chrono::duration_cast<std::chrono::seconds>(now - m_peer_discovery_sent_time)
+-                    .count() < DPP_PEER_DISCOVERY_RETRY_SECONDS) {
+-            return;
+-        }
+-        LOG(INFO) << "DPP: 1905 credentials ready — initiating Peer Discovery over 1905 "
+-                     "Direct Encap (not waiting for wireless Auth Request)";
+-        initiate_peer_discovery(db->controller_info.bridge_mac);
+-        m_peer_discovery_sent_time = now;
+-        return;
+-    }
++    // 1905 credentials already available (e.g. restored on reboot, or already converted
++    // during this run) are now acted on immediately from ApAutoConfigurationTask's
++    // AP-Autoconfig Response handler (see on_1905_credentials_ready() below), the moment
++    // the 0xA9 TLV is parsed there — no need to poll for it here.
++
++    // The chirp-and-wait-for-Auth-Request timeout only applies to onboarding flows that
++    // actually send a Chirp TLV and expect a wired-style DPP Auth Request in response:
++    // wired Extenders, and the co-located Controller+Agent case (which chirps for itself
++    // "over the local broker" — see send_ap_autoconfiguration_search_message()). A wireless
++    // bSTA never chirps, so it must never arm/restart on this timeout.
++    const bool wired_style_onboarding =
++        db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wired ||
++        db->device_conf.local_controller;
+ 
+     if (!sess.active) {
+-        if (db->dpp_bootstrap.valid &&
+-                db->controller_info.bridge_mac != beerocks::net::network_utils::ZERO_MAC &&
+-                m_chirp_sent_time == std::chrono::steady_clock::time_point{}) {
+-            m_chirp_sent_time = now;
+-        }
+-        if (m_chirp_sent_time != std::chrono::steady_clock::time_point{}) {
+-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+-                               now - m_chirp_sent_time).count();
+-            if (elapsed > DPP_AUTH_REQUEST_TIMEOUT_SECONDS) {
+-                LOG(WARNING) << "DPP: Auth Request not received within "
+-                             << DPP_AUTH_REQUEST_TIMEOUT_SECONDS
+-                             << "s after Search+Chirp — restarting Autoconfig Search";
+-                m_chirp_sent_time = {};
+-                m_btl_ctx.task_pool_send_event(eTaskType::AP_AUTOCONFIGURATION,
+-                    static_cast<uint8_t>(ApAutoConfigurationTask::eEvent::INIT_TASK));
+-                m_btl_ctx.task_pool_send_event(eTaskType::AP_AUTOCONFIGURATION,
+-                    static_cast<uint8_t>(ApAutoConfigurationTask::eEvent::START_AP_AUTOCONFIGURATION));
++        if (wired_style_onboarding) {
++            if (db->dpp_bootstrap.valid &&
++                    db->controller_info.bridge_mac != beerocks::net::network_utils::ZERO_MAC &&
++                    m_chirp_sent_time == std::chrono::steady_clock::time_point{}) {
++                m_chirp_sent_time = now;
++            }
++            if (m_chirp_sent_time != std::chrono::steady_clock::time_point{}) {
++                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
++                                   now - m_chirp_sent_time).count();
++                if (elapsed > DPP_AUTH_REQUEST_TIMEOUT_SECONDS) {
++                    LOG(WARNING) << "DPP: Auth Request not received within "
++                                 << DPP_AUTH_REQUEST_TIMEOUT_SECONDS
++                                 << "s after Search+Chirp — restarting Autoconfig Search";
++                    m_chirp_sent_time = {};
++                    m_btl_ctx.task_pool_send_event(eTaskType::AP_AUTOCONFIGURATION,
++                        static_cast<uint8_t>(ApAutoConfigurationTask::eEvent::INIT_TASK));
++                    m_btl_ctx.task_pool_send_event(eTaskType::AP_AUTOCONFIGURATION,
++                        static_cast<uint8_t>(ApAutoConfigurationTask::eEvent::START_AP_AUTOCONFIGURATION));
++                }
+             }
+         }
+         return;
+@@ -689,6 +666,58 @@ bool DppAgentTask::trigger_bss_config_request(const sMacAddr &controller_mac)
+     return send_bss_configuration_request(controller_mac);
+ }
+ 
++// ---------------------------------------------------------------------------
++// Public: on_1905_credentials_ready — called from ApAutoConfigurationTask the moment
++// it parses an AP-Autoconfig Response and finds 1905 credentials already available
++// (wireless bSTA DPP via wpa_supplicant events, or restored across reboot). Decides,
++// from the just-parsed 0xA9 TLV presence, whether to skip straight to BSS Config
++// Request or kick off 1905 Peer Discovery.
++// ---------------------------------------------------------------------------
++
++void DppAgentTask::on_1905_credentials_ready(const sMacAddr &controller_mac,
++                                              bool controller_requires_1905_security)
++{
++    auto db = AgentDB::get();
++
++    if (!controller_requires_1905_security) {
++        // Mirrors the live-exchange shortcut at the bottom of handle_dpp_wired_gas_response()
++        // below: no 0xA9 TLV means the 1905 layer doesn't need Peer Discovery+EAPOL, so go
++        // straight to BSS Config Request.
++        if (!m_bss_config_request_sent) {
++            LOG(INFO) << "DPP: 1905 credentials ready, no 1905 security required — sending "
++                         "BSS Config Request directly";
++            m_btl_ctx.start_dpp_tcp_relay_server();
++            trigger_bss_config_request(controller_mac);
++            m_bss_config_request_sent = true;
++        }
++        return;
++    }
++
++    if (db->peer_1905_security.count(controller_mac)) {
++        return; // Peer Discovery already completed with the Controller
++    }
++
++    LOG(INFO) << "DPP: 1905 credentials ready — initiating Peer Discovery over 1905 Direct Encap";
++    initiate_peer_discovery(controller_mac);
++}
++
++void DppAgentTask::reset_onboarding_progress()
++{
++    m_chirp_sent_time         = {};
++    m_bss_config_request_sent = false;
++
++    // Also drop any in-progress wired DPP Auth exchange left over from before the switch —
++    // otherwise a genuine fresh wired Auth Request after switching back to Wired is rejected
++    // as a duplicate by the stale `active` latch (see the guard at the top of the wired Auth
++    // Request handler).
++    auto db = AgentDB::get();
++    if (db->dpp_wired_session.active) {
++        LOG(INFO) << "DPP: clearing stale wired session (controller="
++                   << db->dpp_wired_session.controller_mac << ") on connection type switch";
++        db->dpp_wired_session.reset();
++    }
++}
++
+ // ---------------------------------------------------------------------------
+ // Public: handle_reconfiguration_trigger — Ack + (DPP-only) BSS Configuration Request
+ // ---------------------------------------------------------------------------
+@@ -3560,14 +3589,7 @@ bool DppAgentTask::send_1905_encap_eapol(const sMacAddr &peer_mac,
+ bool DppAgentTask::handle_direct_encap_dpp(const sMacAddr &src_mac,
+                                             ieee1905_1::CmduMessageRx &cmdu_rx)
+ {
+-    // On a gateway (colocated Controller + local Agent), both processes subscribe to
+-    // DIRECT_ENCAP_DPP_MESSAGE and would otherwise each answer the same Peer Discovery
+-    // Request/Response — DppConfiguratorTask already owns this exchange for the local
+-    // Controller, so the local Agent must not also respond.
+     auto db = AgentDB::get();
+-    if (db->device_conf.local_controller) {
+-        return false;
+-    }
+ 
+     bool is_dpp_wired_extender =
+         (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP &&
+@@ -3600,8 +3622,21 @@ bool DppAgentTask::handle_direct_encap_dpp(const sMacAddr &src_mac,
+             return handle_dpp_wired_auth_confirm(src_mac, frame, frame_len);
+         return false;
+     case DPP_PA_PEER_DISCOVERY_REQUEST:
++        // On a gateway (colocated Controller + local Agent), both processes subscribe
++        // to DIRECT_ENCAP_DPP_MESSAGE and would otherwise each answer the same Peer
++        // Discovery Request/Response — DppConfiguratorTask already owns this exchange
++        // for the local Controller, so the local Agent must not also respond. This does
++        // NOT apply to Auth Request/Confirm/GAS response above/below: those are the
++        // co-located Agent's own onboarding traffic and must reach the wired-extender
++        // handlers, not be dropped here.
++        if (db->device_conf.local_controller) {
++            return false;
++        }
+         return handle_peer_discovery_request(src_mac, frame, frame_len);
+     case DPP_PA_PEER_DISCOVERY_RESPONSE:
++        if (db->device_conf.local_controller) {
++            return false;
++        }
+         return handle_peer_discovery_response(src_mac, frame, frame_len);
+     default:
+         // GAS Initial Response: frame[0] == 0x0B (WLAN_PA_GAS_INITIAL_RESP).
+diff --git a/agent/src/beerocks/slave/tasks/dpp_agent_task.h b/agent/src/beerocks/slave/tasks/dpp_agent_task.h
+index 89eecb139..a04b8b8e2 100644
+--- a/agent/src/beerocks/slave/tasks/dpp_agent_task.h
++++ b/agent/src/beerocks/slave/tasks/dpp_agent_task.h
+@@ -141,6 +141,31 @@ public:
+      */
+     bool initiate_peer_discovery(const sMacAddr &controller_mac);
+ 
++    /**
++     * @brief Decide Peer Discovery vs. BSS Config Request once 1905 credentials are ready.
++     *
++     * Called from ApAutoConfigurationTask (via slave_thread) the moment it parses an
++     * AP-Autoconfig Response and finds dpp_1905_credentials already initialized —
++     * i.e. credentials obtained out-of-band (wireless bSTA DPP via wpa_supplicant
++     * events, or restored across reboot). Decides immediately, from the just-parsed
++     * 0xA9 TLV presence, whether to skip straight to BSS Config Request or kick off
++     * 1905 Peer Discovery.
++     */
++    void on_1905_credentials_ready(const sMacAddr &controller_mac,
++                                    bool controller_requires_1905_security);
++
++    /**
++     * @brief Reset per-session onboarding-progress flags.
++     *
++     * Called (via slave_thread) when the backhaul connection type switches between Wired and
++     * Wireless at runtime, so a stale "chirp already sent"/"BSS Config Request already sent"
++     * flag from onboarding over the previous medium doesn't suppress the fresh onboarding
++     * cycle that follows the switch. Also clears AgentDB::dpp_wired_session if it's still
++     * marked active — otherwise a genuine wired Auth Request after switching back to Wired is
++     * rejected as a duplicate of a session that never completed before the medium changed.
++     */
++    void reset_onboarding_progress();
++
+     // -------------------------------------------------------------------------
+     // External entry points (called from son_slave_thread.cpp)
+     // -------------------------------------------------------------------------
+@@ -599,20 +624,13 @@ private:
+     // Chirp sent time — used to detect Auth Request timeout after Search+Chirp.
+     std::chrono::steady_clock::time_point m_chirp_sent_time{};
+ 
+-    // 1905 Peer Discovery Request sent time — used to retry if no Peer Discovery
+-    // Response arrives. Only relevant once dpp_1905_credentials are already
+-    // available (e.g. restored on reboot), in which case we drive Peer Discovery
+-    // directly instead of waiting on a wireless Auth Request.
+-    std::chrono::steady_clock::time_point m_peer_discovery_sent_time{};
+-
+-    // Set once work() has fired the restored-on-reboot, no-1905-security BSS Config
+-    // Request (see work()) so it isn't resent every tick — there is no response/ack
+-    // to key a retry off of, unlike the Peer Discovery path above.
++    // Set once on_1905_credentials_ready() has fired the no-1905-security BSS Config
++    // Request so it isn't resent if ApAutoConfigurationTask calls in again (e.g. once
++    // per radio's AP-Autoconfig Response) — there is no response/ack to key a retry off of.
+     bool m_bss_config_request_sent = false;
+ 
+     static constexpr int DPP_AUTH_TIMEOUT_SECONDS         = 10;
+     static constexpr int DPP_AUTH_REQUEST_TIMEOUT_SECONDS = 10; // spec §5.3.5 DPP_TIMER
+-    static constexpr int DPP_PEER_DISCOVERY_RETRY_SECONDS = 10;
+ 
+     // DPP frame type constants (Easy Connect §8.2.1)
+     static constexpr uint8_t DPP_PA_AUTHENTICATION_REQUEST  = 0x00;
+diff --git a/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h b/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
+index 406402b29..4d718f720 100644
+--- a/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
++++ b/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
+@@ -320,6 +320,10 @@ public:
+         AIRTIES_WPA3_COMPATIBILITY_AKM8 = 2,
+         AIRTIES_WPA3_COMPATIBILITY_AKM24 = 3,
+         AIRTIES_WPA3_COMPATIBILITY_AKM8_AKM24 = 4,
++        // 802.11bi EPPKE (Enhanced/Extended PASN Privacy Key Exchange): the BSS's AKM
++        // includes the 000FAC29[000FAC24] bracket suite. Orthogonal to the WPA3-PCM/
++        // Airties values above (only one eAdditionalAuth value is active per BSS).
++        EPPKE = 5,
+     };
+ 
+     enum eEstimationStatus {
+@@ -423,6 +427,31 @@ public:
+          */
+         std::vector<uint8_t> dpp_netaccesskey_der;
+ 
++        /**
++         * @brief 802.11bi ECP groups ("sae_groups"+"pasn_groups" UCI options,
++         *        pass-through, `sae_groups` taking precedence) for this BSS. Emitted
++         *        as "enabledECPGroups" in the DPP Configuration Object; not consumed
++         *        by AKM logic, but re-emitted verbatim as both hostapd `sae_groups=`
++         *        and `pasn_groups=` directives on the Agent side.
++         */
++        std::string enabled_ecp_groups;
++
++        /**
++         * @brief 802.11bi security profile numbers ("security_profiles" UCI option,
++         *        e.g. "1 9"), Table 9-bb22. Opaque pass-through: emitted as
++         *        "security_profiles" in the DPP Configuration Object and echoed
++         *        unchanged into hostapd's security_profiles= directive.
++         */
++        std::string security_profiles;
++
++        /**
++         * @brief RSNXE capabilities mask ("rsnxe_capab_mask" UCI option, e.g.
++         *        "2028040020"). Opaque pass-through: emitted as
++         *        "extendedRSNCapabilitiesMask" in the DPP Configuration Object and
++         *        echoed unchanged into hostapd's rsnxe_capab_mask= directive.
++         */
++        std::string rsnxe_capab_mask;
++
+         /** WiFi Compatibility Mode derived from UCI wireless wifi-device options:
+          *   disable_11be = 1                    ->  WIFI_COMPAT_MODE_11AX  (802.11ax / Wi-Fi 6)
+          *   disable_11be = 0, disable_11bn = 1  ->  WIFI_COMPAT_MODE_11BE  (802.11be / Wi-Fi 7)
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 5208a8d7a..199858e31 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -2009,6 +2009,32 @@ static bool assign_auth_encr_parameters(prplmesh::hostapd::Configuration &conf,
+         wpa_key_mgmt.append(" DPP");
+     }
+ 
++    // 802.11bi EPPKE (Enhanced/Extended PASN Privacy Key Exchange): appended to
++    // wpa_key_mgmt plus its two dependent hostapd options, whenever this VAP's
++    // additional_auth is EPPKE (set from either the local UCI "option eppk '1'" or
++    // parsed back out of a received DPP Configuration Object's "akm").
++    if (bss.additional_auth == son::wireless_utils::eAdditionalAuth::EPPKE) {
++        if (!wpa_key_mgmt.empty()) {
++            wpa_key_mgmt.append(" EPPKE");
++        }
++        conf.set_create_value(vap_id, "assoc_frame_encryption", "1");
++        conf.set_create_value(vap_id, "pmksa_caching_privacy", "1");
++    }
++
++    // "security_profiles" (Table 9-bb22), "enabledECPGroups", and
++    // "extendedRSNCapabilitiesMask" are opaque pass-through values, independent of
++    // EPPKE/additional_auth — echoed verbatim into hostapd whenever present.
++    if (!bss.security_profiles.empty()) {
++        conf.set_create_value(vap_id, "security_profiles", bss.security_profiles);
++    }
++    if (!bss.enabled_ecp_groups.empty()) {
++        conf.set_create_value(vap_id, "sae_groups", bss.enabled_ecp_groups);
++        conf.set_create_value(vap_id, "pasn_groups", bss.enabled_ecp_groups);
++    }
++    if (!bss.rsnxe_capab_mask.empty()) {
++        conf.set_create_value(vap_id, "rsnxe_capab_mask", bss.rsnxe_capab_mask);
++    }
++
+     conf.set_create_value(vap_id, "wpa", wpa);
+     conf.set_create_value(vap_id, "okc", okc);
+     conf.set_create_value(vap_id, "wpa_key_mgmt", wpa_key_mgmt);
+@@ -5589,7 +5615,14 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                         continue;
+                     }
+                     //set uci persist for the particular vapid
+-                    if(beerocks::bpl::cfg_is_master()==0 && (!bss_it.teardown)) /* set wifi credentials require mld_id that have to be populated in bss_it, extract from mld entrant file */
++                    // A DPP-onboarded master (co-located Controller+Agent) also needs this write:
++                    // unlike WSC, where the master's own SSID/passphrase already live in UCI (the
++                    // source the Controller read them from in the first place), the DPP connector/
++                    // csign/netaccesskey fields are newly generated by this exchange and only exist
++                    // in-memory until persisted here.
++                    if((beerocks::bpl::cfg_is_master()==0 ||
++                        beerocks::bpl::cfg_get_onboarding_type() == "DPP") &&
++                       (!bss_it.teardown)) /* set wifi credentials require mld_id that have to be populated in bss_it, extract from mld entrant file */
+                     {
+                         set_wifi_credentials_from_vap(vap_id, bss_it, conf,m_radio_info.radio_id);
+                     }
+@@ -9395,7 +9428,9 @@ bool ap_wlan_hal_nl80211::create_new_hostapd_conf_file(std::string &ifname, son:
+     LOG(DEBUG) << "New BSS configuration: " << conf;
+ 
+     //set uci persist for the particular vapid
+-    if(beerocks::bpl::cfg_is_master()==0)
++    // See update_vap_credentials() for why the DPP case also needs this write on a master.
++    if(beerocks::bpl::cfg_is_master()==0 ||
++       beerocks::bpl::cfg_get_onboarding_type() == "DPP")
+     {
+         set_wifi_credentials_from_vap(vap_id, bss_conf, conf,m_radio_info.radio_id);
+     }
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
+index cdadb7695..4bafcd613 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
+@@ -169,8 +169,9 @@ eActionOp_BACKHAUL:
+   ACTION_BACKHAUL_RADIO_STATE_NOTIFICATION: 93
+   ACTION_BACKHAUL_DPP_CREDENTIALS_NOTIFICATION: 94
+   ACTION_BACKHAUL_DPP_1905_CREDENTIALS_NOTIFICATION: 95
++  ACTION_BACKHAUL_CONNECTION_TYPE_CHANGED_NOTIFICATION: 96
+ 
+-  ACTION_BACKHAUL_ENUM_END: 96
++  ACTION_BACKHAUL_ENUM_END: 97
+ 
+ ####################################################
+ ####################################################
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
+index 0eebd34d7..42022591c 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
+@@ -305,3 +305,11 @@ cACTION_BACKHAUL_DPP_CREDENTIALS_NOTIFICATION:
+ # bSTA analog of the wired DPP Extender's handle_dpp_wired_gas_response() trigger.
+ cACTION_BACKHAUL_DPP_1905_CREDENTIALS_NOTIFICATION:
+   _type: class
++
++# Sent by BackhaulManager to son_slave_thread when the backhaul's dynamic connection type
++# (AgentDB::backhaul.connection_type) switches between Wired and Wireless at runtime. Carries no
++# payload — the new type is written directly into the shared AgentDB before this is sent. Tells
++# son_slave_thread to reset stale DPP 1905-security onboarding progress and restart
++# ApAutoConfigurationTask so onboarding re-evaluates for the new medium.
++cACTION_BACKHAUL_CONNECTION_TYPE_CHANGED_NOTIFICATION:
++  _type: class
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index ab075fd4d..acb7735b7 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -932,6 +932,12 @@ bool Controller::handle_cmdu_1905_autoconfiguration_search(const sMacAddr &src_m
+     // Read once — used both for 0xA9 TLV gate and dpp_security_required gate.
+     const bool security_enabled = beerocks::bpl::cfg_get_1905_security_enabled();
+ 
++    // Read once — the local (co-located) agent never runs EAPOL/installs a TK
++    // (it onboards itself directly over the local broker, with no 1905 link
++    // security), so both the 0xA9 TLV gate and the dpp_security_required gate
++    // below must exclude it.
++    const bool is_local_agent = (al_mac == database.get_local_bridge_mac());
++
+     // Reuse onboardingtype UCI on the controller: in combined controller+agent
+     // (gateway) mode the local co-located agent always forces WSC regardless of
+     // this option (son_slave_thread.cpp), so it is otherwise unused here. We
+@@ -1107,7 +1113,7 @@ bool Controller::handle_cmdu_1905_autoconfiguration_search(const sMacAddr &src_m
+ 
+     // DPP: Check for DPP Chirp Value TLV (wired DPP onboarding intent, EasyMesh §5.3.5)
+     auto chirp_tlv_rx = cmdu_rx.getClass<wfa_map::tlvDppChirpValue>();
+-    if (chirp_tlv_rx) {
++    if (chirp_tlv_rx && controller_supports_dpp) {
+         LOG(INFO) << "DPP: wired onboarding detected from " << al_mac
+                   << " (DPP Chirp Value TLV in AP-Autoconfiguration Search)";
+ 
+@@ -1162,7 +1168,18 @@ bool Controller::handle_cmdu_1905_autoconfiguration_search(const sMacAddr &src_m
+     if (chirp_tlv_rx && m_dpp_configurator_task && controller_supports_dpp) {
+         auto agent = database.m_agents.get(al_mac);
+         if (agent) {
+-            if (security_enabled && controller_supports_dpp) {
++            if (is_local_agent && controller_supports_dpp) {
++                // Local (co-located) agent: 0xA9 TLV was never sent to it (see above),
++                // so it will never run EAPOL and will never install a TK. Do not arm
++                // the plaintext block for it, or all post-onboarding CMDUs to this
++                // agent would be dropped forever. Must be checked before
++                // security_enabled/controller_supports_dpp below, which are otherwise
++                // true for a DPP-onboarding co-located agent regardless of is_local_agent.
++                agent->dpp_security_required = false;
++                LOG(INFO) << "DPP: agent " << al_mac
++                          << " is the local agent — no 1905 security required"
++                          << " (dpp_security_required=false)";
++            } else if (security_enabled && controller_supports_dpp) {
+                 // 0xA9 TLV was included — agent will run Peer Discovery + EAPOL.
+                 // Block plaintext CMDUs until TK is installed.
+                 agent->dpp_security_required = true;
+@@ -1177,7 +1194,8 @@ bool Controller::handle_cmdu_1905_autoconfiguration_search(const sMacAddr &src_m
+                           << " — no 0xA9 TLV, no encryption (dpp_security_required=false)";
+             }
+         }
+-        m_dpp_configurator_task->handle_wired_dpp_chirp(al_mac, chirp_tlv_rx.get());
++        if (controller_supports_dpp)
++            m_dpp_configurator_task->handle_wired_dpp_chirp(al_mac, chirp_tlv_rx.get());
+     }
+ 
+ 
+@@ -1896,17 +1914,21 @@ static bool add_backhaul_sta_mld_configuration_tlv(db &database, ieee1905_1::Cmd
+             bh_sta_mld_configuration->modes().emlsr = mld_configuration.at(backhaul_mld_id).emlsr;
+             bh_sta_mld_configuration->modes().emlmr = mld_configuration.at(backhaul_mld_id).emlmr;
+ 
+-            LOG(DEBUG) << "Creating bSTA MLD configuration for " << backhaul_ssid << "\n"
+-                       << "[ MLDID: " << backhaul_mld_id << "]\n"
+-                       << "[ STR  : " << mld_configuration.at(backhaul_mld_id).str << "]\n"
+-                       << "[ NSTR : " << mld_configuration.at(backhaul_mld_id).nstr << "]\n"
+-                       << "[ EMLSR: " << mld_configuration.at(backhaul_mld_id).emlsr << "]\n"
+-                       << "[ EMLMR: " << mld_configuration.at(backhaul_mld_id).emlmr << "]";
++            LOG(DEBUG) << "Creating bSTA MLD configuration for " << backhaul_ssid;
++            LOG(DEBUG) << "[ MLDID: " << backhaul_mld_id << "]";
++            LOG(DEBUG) << "[ STR  : " << mld_configuration.at(backhaul_mld_id).str << "]";
++            LOG(DEBUG) << "[ NSTR : " << mld_configuration.at(backhaul_mld_id).nstr << "]";
++            LOG(DEBUG) << "[ EMLSR: " << mld_configuration.at(backhaul_mld_id).emlsr << "]";
++            LOG(DEBUG) << "[ EMLMR: " << mld_configuration.at(backhaul_mld_id).emlmr << "]";
+         }
+ 
+         if (!backhaul_mld_id.empty() && bss_conf.mld_id == backhaul_mld_id &&
+             bss_conf.ssid == backhaul_ssid) {
+ 
++            LOG(DEBUG) << "bSTA MLD: evaluating " << agent.radios.size()
++                       << " radio(s) of agent " << agent.al_mac << " against mld_id="
++                       << backhaul_mld_id << " ssid=" << backhaul_ssid;
++
+             for (const auto &affiliated_radio : agent.radios) {
+                 if (!affiliated_radio.second) {
+                     LOG(ERROR) << "Radio " << affiliated_radio.first << " doesn't exist";
+@@ -1916,6 +1938,9 @@ static bool add_backhaul_sta_mld_configuration_tlv(db &database, ieee1905_1::Cmd
+                 const auto op_classes = son::wireless_utils::get_operating_classes_of_freq_type(
+                     affiliated_radio.second->band);
+                 if (op_classes.size() == 0) {
++                    LOG(DEBUG) << "bSTA MLD: radio " << affiliated_radio.first
++                               << " has no operating classes for band "
++                               << int(affiliated_radio.second->band) << " — skipping";
+                     continue;
+                 }
+ 
+@@ -1935,6 +1960,15 @@ static bool add_backhaul_sta_mld_configuration_tlv(db &database, ieee1905_1::Cmd
+                                        (mld_conf.emlmr && mld_cap.emlmr_support);
+ 
+                 if (!radio_band_found || !affiliated_radio.second->eht_supported || !any_match) {
++                    LOG(DEBUG) << "bSTA MLD: radio " << affiliated_radio.first
++                               << " skipped — radio_band_found=" << radio_band_found
++                               << " eht_supported=" << affiliated_radio.second->eht_supported
++                               << " any_match=" << any_match
++                               << " (mld str/nstr/emlsr/emlmr=" << mld_conf.str << "/"
++                               << mld_conf.nstr << "/" << mld_conf.emlsr << "/" << mld_conf.emlmr
++                               << ", radio str/nstr/emlsr/emlmr=" << mld_cap.str_support << "/"
++                               << mld_cap.nstr_support << "/" << mld_cap.emlsr_support << "/"
++                               << mld_cap.emlmr_support << ")";
+                     continue;
+                 }
+ 
+@@ -2094,19 +2128,13 @@ static bool add_agent_ap_mld_configuration_tlv(db &database, ieee1905_1::CmduMes
+                                            (mld_conf.emlsr && mld_cap.emlsr_support) ||
+                                            (mld_conf.emlmr && mld_cap.emlmr_support);
+ 
+-                    if (!has_matching_op_class ||
+-                        !affiliated_radio.second->eht_supported) {
++                    if (!has_matching_op_class || !affiliated_radio.second->eht_supported ||
++                        !any_match) {
+                         LOG(ERROR) << "MLD TLV: skip radio " << affiliated_radio.first
+                                    << " ssid=" << bss_conf.ssid
+                                    << " has_match=" << has_matching_op_class
+-                                   << " eht=" << affiliated_radio.second->eht_supported;
+-                        continue;
+-                    }
+-                    // For DPP-onboarded agents, skip the WiFi7 STR/NSTR/EMLSR capability match
+-                    // check. The MLD mode requirements come from the GW's UCI and may not match
+-                    // what the DPP extender reports in its WiFi7AgentCapabilities TLV. Since the
+-                    // extender is MLO-capable (mlo_capable=1, max_num_mlds>0), trust it.
+-                    if (!agent.dpp_onboarding_support && !any_match) {
++                                   << " eht=" << affiliated_radio.second->eht_supported
++                                   << " any_match=" << any_match;
+                         continue;
+                     }
+ 
+@@ -7559,14 +7587,35 @@ bool Controller::handle_cmdu_1905_bss_configuration_request_message(
+     const sMacAddr &src_mac, ieee1905_1::CmduMessageRx &cmdu_rx)
+ {
+     auto mid = cmdu_rx.getMessageId();
+-    LOG(DEBUG) << "Received BSS_CONFIGURATION_REQUEST_MESSAGE, mid=" << std::hex << mid;
++    LOG(DEBUG) << "DPP: Received BSS_CONFIGURATION_REQUEST_MESSAGE, mid=" << std::hex << mid;
+ 
+     auto agent = database.m_agents.get(src_mac);
+     if (!agent) {
+-        LOG(ERROR) << "Agent with mac is not found in database mac=" << src_mac;
++        LOG(ERROR) << "DPP: Agent with mac is not found in database mac=" << src_mac;
+         return false;
+     }
+ 
++    // DPP-onboarded agents never send a WSC M1 (radio->band is normally set from
++    // m1->rf_bands()) or a standalone AP_CAPABILITY_REPORT — CapabilityReportingTask
++    // instead bundles AP Radio Basic Capabilities TLVs directly into this same
++    // BSS_CONFIGURATION_REQUEST_MESSAGE (see DppAgentTask::send_bss_configuration_request()).
++    // Parse them here, mirroring handle_cmdu_1905_ap_capability_report_message(), so that
++    // radio->band is populated before add_backhaul_sta_mld_configuration_tlv() runs below —
++    // otherwise every radio is skipped for "no operating classes for band 255" and the
++    // Backhaul STA MLD Configuration TLV always reports 0 Affiliated bSTAs.
++    for (auto radio_tlv : cmdu_rx.getClassList<wfa_map::tlvApRadioBasicCapabilities>()) {
++        LOG(DEBUG) << "DPP: Radio reported in BSS Config Request with ruid="
++                   << radio_tlv->radio_uid();
++        database.add_radio(radio_tlv->radio_uid(), agent->al_mac);
++        database.clear_ap_capabilities(radio_tlv->radio_uid());
++        autoconfig_wsc_parse_radio_caps(radio_tlv->radio_uid(), radio_tlv);
++    }
++    for (const auto &radio : agent->radios) {
++        if (radio.second && radio.second->supported_channels.size() > 0) {
++            radio.second->band = radio.second->supported_channels[0].get_freq_type();
++        }
++    }
++
+     // dpp_security_required is already false here on both paths:
+     // - Secure path:     cleared in the EAPOL M4 handler when install_security_key() succeeded.
+     // - No-security path: never set (guarded by security_enabled at AP-Autoconfig Response time).
+@@ -7577,24 +7626,24 @@ bool Controller::handle_cmdu_1905_bss_configuration_request_message(
+         if (tlvProfile2MultiApProfile) {
+             agent->profile = tlvProfile2MultiApProfile->profile();
+             if (!database.dm_set_device_multi_ap_profile(*agent)) {
+-                LOG(ERROR) << "Failed to set Multi-AP profile in DM for Agent " << agent->al_mac;
++                LOG(ERROR) << "DPP: Failed to set Multi-AP profile in DM for Agent " << agent->al_mac;
+                 return false;
+             }
+         }
+     }
+ 
+     if (!handle_tlv_profile2_ap_capability(agent, cmdu_rx)) {
+-        LOG(ERROR) << "Couldn't handle Profile-2 AP Capability TLV from Agent " << src_mac;
++        LOG(ERROR) << "DPP: Couldn't handle Profile-2 AP Capability TLV from Agent " << src_mac;
+     }
+ 
+     if (agent->profile > wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_2 &&
+         !handle_tlv_profile3_akm_suite_capabilities(*agent, cmdu_rx)) {
+-        LOG(ERROR) << "Profile-3 AKM Suite Capabilities is not supplied for Agent " << agent->al_mac
++        LOG(ERROR) << "DPP: Profile-3 AKM Suite Capabilities is not supplied for Agent " << agent->al_mac
+                    << " with profile enum " << agent->profile;
+     }
+ 
+     if (!handle_tlv_profile2_ap_radio_advanced_capabilities(*agent, cmdu_rx)) {
+-        LOG(ERROR) << "Couldn't handle AP Radio Advanced Capabilities TLV from Agent "
++        LOG(ERROR) << "DPP: Couldn't handle AP Radio Advanced Capabilities TLV from Agent "
+                    << agent->al_mac;
+     }
+ 
+@@ -7614,7 +7663,7 @@ bool Controller::handle_cmdu_1905_bss_configuration_request_message(
+             for (const auto &mld_pair : mld_configuration) {
+                 if (mld_pair.second.ssid == bss_conf.ssid) {
+                     bss_conf.mld_id = mld_pair.first;
+-                    LOG(DEBUG) << "BSS Config: set mld_id=" << bss_conf.mld_id
++                    LOG(DEBUG) << "DPP: BSS Config: set mld_id=" << bss_conf.mld_id
+                                << " for ssid=" << bss_conf.ssid;
+                     break;
+                 }
+@@ -7627,7 +7676,7 @@ bool Controller::handle_cmdu_1905_bss_configuration_request_message(
+     auto cmdu_tx_header =
+         m_dpp_bss_config_cmdu_tx.create(mid, ieee1905_1::eMessageType::BSS_CONFIGURATION_RESPONSE_MESSAGE);
+     if (!cmdu_tx_header) {
+-        LOG(ERROR) << "cmdu creation of type BSS_CONFIGURATION_RESPONSE_MESSAGE, has failed";
++        LOG(ERROR) << "DPP: cmdu creation of type BSS_CONFIGURATION_RESPONSE_MESSAGE, has failed";
+         return false;
+     }
+ 
+@@ -7651,12 +7700,12 @@ bool Controller::handle_cmdu_1905_bss_configuration_request_message(
+         for (const auto &radio_cap : radio_caps_list) {
+             if (radio_cap) {
+                 radio_uids.push_back(radio_cap->radio_uid());
+-                LOG(DEBUG) << "BSS Config Request: radio_uid=" << radio_cap->radio_uid();
++                LOG(DEBUG) << "DPP: BSS Config Request: radio_uid=" << radio_cap->radio_uid();
+ 
+                 // Add radio to DB if not already present (DPP path — no WSC M1 ran before).
+                 auto radio = database.get_radio_by_uid(radio_cap->radio_uid());
+                 if (!radio) {
+-                    LOG(INFO) << "BSS Config Request: adding new radio ruid="
++                    LOG(INFO) << "DPP: BSS Config Request: adding new radio ruid="
+                               << radio_cap->radio_uid() << " for agent " << src_mac;
+                     database.add_radio(radio_cap->radio_uid(), src_mac);
+                     apply_pending_dpp_radio_info(radio_cap->radio_uid());
+@@ -7688,14 +7737,14 @@ bool Controller::handle_cmdu_1905_bss_configuration_request_message(
+             auto stale_radios = agent->radios.keep_new_remove_old();
+             for (const auto &stale_radio : stale_radios) {
+                 if (stale_radio) {
+-                    LOG(INFO) << "BSS Config Request: pruning stale radio "
++                    LOG(INFO) << "DPP: BSS Config Request: pruning stale radio "
+                               << stale_radio->radio_uid
+                               << " no longer reported by agent " << src_mac;
+                 }
+             }
+         }
+         if (!m_dpp_configurator_task->add_bss_config_response_tlvs(src_mac, m_dpp_bss_config_cmdu_tx, radio_uids)) {
+-            LOG(DEBUG) << "No DPP BSS Config Response TLVs added for agent " << src_mac
++            LOG(DEBUG) << "DPP: No DPP BSS Config Response TLVs added for agent " << src_mac
+                        << " (no active DPP session — normal for non-DPP onboarding)";
+         }
+ 
+@@ -7705,7 +7754,7 @@ bool Controller::handle_cmdu_1905_bss_configuration_request_message(
+         // The early call site was removed because set_wifi7_agent_capabilities fails when
+         // radios don't exist yet (getClass consumes the TLV, so the second call finds nothing).
+         if (!handle_tlv_wifi7_agent_capabilities(cmdu_rx, agent)) {
+-            LOG(DEBUG) << "No Wifi7AgentCapabilities TLV in BSS Config Request from " << src_mac;
++            LOG(DEBUG) << "DPP: No Wifi7AgentCapabilities TLV in BSS Config Request from " << src_mac;
+         }
+ 
+         // DPP extender: populate per-agent BSS config AFTER radio op_classes are set above.
+@@ -7746,13 +7795,13 @@ bool Controller::handle_cmdu_1905_bss_configuration_request_message(
+     }
+ 
+     if (!agent_monitoring_task::add_profile_2default_802q_settings_tlv(database, m_dpp_bss_config_cmdu_tx, src_mac)) {
+-        LOG(ERROR) << "Failed to add Profile-2 Default 802.1Q Settings TLV for agent: " << src_mac;
++        LOG(ERROR) << "DPP: Failed to add Profile-2 Default 802.1Q Settings TLV for agent: " << src_mac;
+         return false;
+     }
+ 
+     // Add Traffic Separation Policy TLV (Zero or one per spec §17.1.54)
+     if (!agent_monitoring_task::add_traffic_separation_policy_tlv(database, m_dpp_bss_config_cmdu_tx, src_mac)) {
+-        LOG(DEBUG) << "No Traffic Separation Policy TLV added for agent: " << src_mac;
++        LOG(DEBUG) << "DPP: No Traffic Separation Policy TLV added for agent: " << src_mac;
+     }
+ 
+     // Add Agent AP MLD Configuration and Backhaul STA MLD Configuration TLVs for Wi-Fi 7 agents
+@@ -7763,10 +7812,10 @@ bool Controller::handle_cmdu_1905_bss_configuration_request_message(
+         }
+         if (agent->max_num_mlds != 0 && any_eht) {
+             if (!add_backhaul_sta_mld_configuration_tlv(database, m_dpp_bss_config_cmdu_tx, *agent)) {
+-                LOG(DEBUG) << "No Backhaul STA MLD Configuration TLV added for agent: " << src_mac;
++                LOG(DEBUG) << "DPP: No Backhaul STA MLD Configuration TLV added for agent: " << src_mac;
+             }
+             if (!add_agent_ap_mld_configuration_tlv(database, m_dpp_bss_config_cmdu_tx, *agent)) {
+-                LOG(DEBUG) << "No Agent AP MLD Configuration TLV added for agent: " << src_mac;
++                LOG(DEBUG) << "DPP: No Agent AP MLD Configuration TLV added for agent: " << src_mac;
+             }
+         }
+     }
+diff --git a/controller/src/beerocks/master/controller.h b/controller/src/beerocks/master/controller.h
+index 019951ee5..ffddc9daf 100644
+--- a/controller/src/beerocks/master/controller.h
++++ b/controller/src/beerocks/master/controller.h
+@@ -493,6 +493,13 @@ public:
+         const sMacAddr &agent_mac,
+         const std::map<sMacAddr, std::vector<sBssExtendedConfig>, sMacAddrLess> &per_radio_bss);
+ 
++    /**
++     * @brief Marks the local agent as onboarded (DPP flow equivalent of the WSC M1 join hook).
++     *
++     * @param status New value for local_agent_onboarding_status.
++     */
++    void set_local_agent_onboarding_status(int8_t status) { local_agent_onboarding_status = status; }
++
+ private:
+     /**
+      * @brief Handles the client-connected event in the CMDU server.
+diff --git a/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp b/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp
+index 6b381aad2..6713f5269 100644
+--- a/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp
++++ b/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "dpp_configurator_task.h"
+ 
++#include "../controller.h"
+ #include "../son_actions.h"
+ #include <beerocks/tlvf/beerocks_message.h>
+ #include <mapf/common/logger.h>
+@@ -16,6 +17,8 @@
+ #include <tlvf/wfa_map/tlvDppChirpValue.h>
+ #include <tlvf/wfa_map/tlvDppMessage.h>
+ 
++#include <json-c/json.h>
++
+ #include <openssl/core_names.h>
+ #include <openssl/ec.h>
+ #include <openssl/obj_mac.h>
+@@ -26,6 +29,7 @@
+ #include <fstream>
+ #include <set>
+ #include <sstream>
++#include <sys/file.h>
+ #include <sys/inotify.h>
+ #include <thread>
+ #include <unistd.h>
+@@ -263,19 +267,25 @@ void DppConfiguratorTask::load_dpp_uris()
+     m_uri_cache.clear();
+ 
+     // /etc/prplmesh/dpp_uri — one DPP URI per line; blank lines and '#' comments skipped.
+-    std::ifstream f(DPP_URIS_FILE);
+-    if (!f.good()) {
++    // flock(LOCK_SH) so this read can't observe a partial write from save_dpp_uri()/
++    // write_dpp_uris() (both take LOCK_EX) or from the co-located agent's own write.
++    FILE *f = fopen(DPP_URIS_FILE, "r");
++    if (!f) {
+         LOG(DEBUG) << "DPP: " << DPP_URIS_FILE << " not found — no enrollee URIs loaded";
+         return;
+     }
+-    std::string line;
++    flock(fileno(f), LOCK_SH);
++
+     int loaded = 0, skipped = 0;
+-    while (std::getline(f, line)) {
+-        // Strip trailing CR/space
+-        while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
++    char line_buf[1024];
++    while (fgets(line_buf, sizeof(line_buf), f)) {
++        std::string line(line_buf);
++        while (!line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' '))
+             line.pop_back();
+         if (add_uri_to_cache(line)) ++loaded; else ++skipped;
+     }
++    flock(fileno(f), LOCK_UN);
++    fclose(f);
+     LOG(INFO) << "DPP: loaded " << loaded << " URI(s) from " << DPP_URIS_FILE
+               << " (" << skipped << " skipped)";
+ }
+@@ -416,7 +426,11 @@ bool DppConfiguratorTask::handle_wired_dpp_chirp(const sMacAddr &agent_mac,
+                << " hash=" << DppCryptoHelper::to_hex(hash.data(), 8) << "...";
+ 
+     auto agent = m_database.m_agents.get(agent_mac);
+-    if (agent && agent->dpp_wired_onboarding_complete) {
++    if (agent && (agent->dpp_wired_onboarding_complete || agent->tk_1905_installed ||
++                  agent->pmk_1905_valid)) {
++        // tk_1905_installed/pmk_1905_valid alone (without dpp_wired_onboarding_complete) covers
++        // an agent that was previously secured via the wireless bSTA path and has now switched
++        // to wired backhaul — its first wired chirp still needs the stale state torn down.
+         LOG(INFO) << "DPP: wired chirp from already-onboarded agent " << agent_mac
+                   << " — treating as restart, clearing stale DPP/1905 security state";
+         agent->dpp_wired_onboarding_complete = false;
+@@ -755,6 +769,20 @@ bool DppConfiguratorTask::handle_bss_configuration_result(const sMacAddr &src_ma
+         agent->dpp_wired_onboarding_complete = true;
+     }
+ 
++    // DPP-onboarded local agent never sends WSC M1 (controller.cpp's join hook), so this is
++    // the equivalent "local agent has joined" signal for the DPP flow — without it,
++    // handle_cmdu_1905_autoconfiguration_search keeps dropping every other agent's Search.
++    if (src_mac == m_database.get_local_bridge_mac()) {
++        auto controller = m_database.get_controller_ctx();
++        if (controller) {
++            LOG(DEBUG) << "DPP: BSS Config Result from local agent - set "
++                          "local_agent_onboarding_status as 1";
++            controller->set_local_agent_onboarding_status(1);
++        } else {
++            LOG(ERROR) << "DPP: failed to get controller context";
++        }
++    }
++
+     // Per EasyMesh Figure 17: controller sends Agent List after receiving BSS Config Result.
+     // The extender receives Agent List and responds with BSS Config Request.
+     LOG(INFO) << "DPP: sending Agent List after BSS Config Result from " << src_mac;
+@@ -874,13 +902,26 @@ bool DppConfiguratorTask::handle_1905_decryption_failure(const sMacAddr &src_mac
+ //   000FAC08 = SAE      (AKM suite 8)
+ //   000FAC24 = SAE-EXT-KEY (AKM suite 24, WPA3-PCM)
+ //   506F9A02 = DPP      (Wi-Fi Alliance OUI, type 2)
+-static std::string wsc_auth_to_fh_akm(WSC::eWscAuth auth)
++static std::string
++wsc_auth_to_fh_akm(WSC::eWscAuth auth,
++                   son::wireless_utils::eAdditionalAuth additional_auth =
++                       son::wireless_utils::eAdditionalAuth::NONE)
+ {
+     // WSC_AUTH_DPP may be OR'd into auth alongside a standard AKM (a BSS can be both
+     // DPP-onboarded and use a standard AKM for its primary RSNE); mask it out here so the
+     // switch/bitfield checks below match on the base AKM only. The DPP OUI is prepended by
+     // the caller when that bit is set.
+     auth = static_cast<WSC::eWscAuth>(auth & ~WSC::eWscAuth::WSC_AUTH_DPP);
++
++    // 802.11bi EPPKE: the AKM becomes (optional base AKM)+000FAC29[000FAC24]. AKM24, if
++    // present in the base AKM, is folded into the bracket rather than listed twice.
++    if (additional_auth == son::wireless_utils::eAdditionalAuth::EPPKE) {
++        auth = static_cast<WSC::eWscAuth>(auth & ~WSC::eWscAuth::WSC_AUTH_SAE_AKM24);
++        std::string prefix =
++            (auth == WSC::eWscAuth::WSC_AUTH_OPEN) ? "" : wsc_auth_to_fh_akm(auth) + "+";
++        return prefix + "000FAC29[000FAC24]";
++    }
++
+     switch (auth) {
+     case WSC::eWscAuth::WSC_AUTH_WPA2PSK:
+         return "000FAC02";
+@@ -901,10 +942,14 @@ static std::string wsc_auth_to_fh_akm(WSC::eWscAuth auth)
+     }
+ }
+ 
+-// For BH BSS, DPP is always prepended (agent uses DPP connector to authenticate).
+-static std::string wsc_auth_to_bh_akm(WSC::eWscAuth auth)
++static std::string
++wsc_auth_to_bh_akm(WSC::eWscAuth auth,
++                    son::wireless_utils::eAdditionalAuth additional_auth =
++                        son::wireless_utils::eAdditionalAuth::NONE)
+ {
+-    return "506F9A02+" + wsc_auth_to_fh_akm(auth);
++    // Testing hook: wpa_supplicant has a bug parsing "dpp+psk+sae" in the Config Object's
++    // cred.akm — drop the 506F9A02 (DPP) AKM token so it sees "psk+sae" instead.
++    return wsc_auth_to_fh_akm(auth, additional_auth);
+ }
+ 
+ bool DppConfiguratorTask::add_bss_config_response_tlvs(const sMacAddr &agent_mac,
+@@ -1095,10 +1140,13 @@ bool DppConfiguratorTask::add_bss_config_response_tlvs(const sMacAddr &agent_mac
+                              << " for radio ruid=" << ruid;
+                 continue;
+             }
+-            std::string akm = wsc_auth_to_bh_akm(adjust_auth(bss.authentication_type));
++            std::string akm = wsc_auth_to_bh_akm(adjust_auth(bss.authentication_type),
++                                                 bss.additional_auth);
+             std::string custom_alias = son::wireless_utils::vap_type_to_string(bss.vap_type);
++            bool dpp_enabled = (bss.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP) != 0;
+             std::string cfg = generate_backhaul_bss_config(*session, ruid, bss.ssid,
+-                                                            bss.network_key, akm, custom_alias);
++                                                            bss.network_key, akm, custom_alias,
++                                                            dpp_enabled);
+             if (!cfg.empty()) configs.push_back(cfg);
+         }
+         for (const auto &bss : bss_info) {
+@@ -1109,16 +1157,16 @@ bool DppConfiguratorTask::add_bss_config_response_tlvs(const sMacAddr &agent_mac
+                              << " for radio ruid=" << ruid;
+                 continue;
+             }
+-            std::string akm = wsc_auth_to_fh_akm(adjust_auth(bss.authentication_type));
+-            // Only prepend the DPP AKM for fronthaul BSSes explicitly flagged DPP
+-            // (option dpp '1' on the gateway, or akm=dpp parsed by an extender) —
+-            // unlike backhaul, which always uses a DPP connector by design.
+-            if (bss.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP) {
+-                akm = "506F9A02+" + akm;
+-            }
++            // Testing hook: wpa_supplicant has a bug parsing "dpp+..." in the Config
++            // Object's cred.akm — drop the 506F9A02 (DPP) AKM token here too.
++            std::string akm = wsc_auth_to_fh_akm(adjust_auth(bss.authentication_type),
++                                                 bss.additional_auth);
+             std::string custom_alias = son::wireless_utils::vap_type_to_string(bss.vap_type);
+-            std::string cfg = generate_fronthaul_bss_config(*session, ruid, bss.ssid,
+-                                                              bss.network_key, akm, custom_alias);
++            bool dpp_enabled = (bss.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP) != 0;
++            std::string cfg = generate_fronthaul_bss_config(
++                *session, ruid, bss.ssid, bss.network_key, akm, custom_alias,
++                bss.enabled_ecp_groups, bss.security_profiles, bss.rsnxe_capab_mask,
++                dpp_enabled);
+             if (!cfg.empty()) configs.push_back(cfg);
+         }
+     }
+@@ -1736,6 +1784,15 @@ bool DppConfiguratorTask::send_config_response(sDppSession &session)
+         return false;
+     }
+ 
++    // Testing hook: enrollee's configRequest carries wi-fi_tech=infra for a plain Wi-Fi Easy
++    // Connect client (netRole=sta/ap) rather than wi-fi_tech=map for EasyMesh's own agent
++    // request (netRole=mapAgent) — needed below both to skip the 1905-layer object and to sign
++    // the backhaul-STA connector with net_role="sta"/group_id="*" instead of the EasyMesh
++    // mapBackhaulSta/mapNW values.
++    std::string requested_wifi_tech = extract_config_request_field(session.config_request_json,
++                                                                     "wi-fi_tech");
++    bool is_infra_request = (requested_wifi_tech == "infra");
++
+     // Generate Configuration Objects
+     // Get backhaul SSID/passphrase from DB first — needed by generate_1905_layer_config
+     std::string config_bsta;
+@@ -1745,8 +1802,12 @@ bool DppConfiguratorTask::send_config_response(sDppSession &session)
+         if (bss.backhaul) {
+             bh_ssid       = bss.ssid;
+             bh_passphrase = bss.network_key;
+-            bh_akm        = wsc_auth_to_bh_akm(bss.authentication_type);
+-            config_bsta   = generate_backhaul_sta_config(session, bh_ssid, bh_passphrase, bh_akm);
++            bh_akm        = wsc_auth_to_bh_akm(bss.authentication_type, bss.additional_auth);
++            config_bsta   = is_infra_request
++                               ? generate_backhaul_sta_config(session, bh_ssid, bh_passphrase,
++                                                               bh_akm, "sta", "*")
++                               : generate_backhaul_sta_config(session, bh_ssid, bh_passphrase,
++                                                               bh_akm);
+             LOG(INFO) << "DPP: GAS Config — bh_ssid='" << bh_ssid
+                       << "' auth=0x" << std::hex << int(bss.authentication_type) << std::dec
+                       << " bh_akm='" << bh_akm << "'";
+@@ -1754,7 +1815,14 @@ bool DppConfiguratorTask::send_config_response(sDppSession &session)
+         }
+     }
+ 
+-    std::string config_1905 = generate_1905_layer_config(session);
++    std::string config_1905;
++    if (is_infra_request) {
++        // Testing hook: skip the 1905-layer/mapAgent config object for a non-EasyMesh enrollee.
++        LOG(INFO) << "DPP: enrollee requested wi-fi_tech=infra — skipping 1905-layer/mapAgent "
++                     "config object in Config Response";
++    } else {
++        config_1905 = generate_1905_layer_config(session);
++    }
+ 
+     LOG(INFO) << "DPP: Config Response objects — config_1905_len=" << config_1905.size()
+               << " config_bsta_len=" << config_bsta.size()
+@@ -1911,6 +1979,31 @@ bool DppConfiguratorTask::handle_config_result(sDppSession &session, const uint8
+ // Configuration Object generators
+ // ============================================================================
+ 
++std::string DppConfiguratorTask::extract_config_request_field(
++    const std::string &config_request_json, const std::string &field_name) const
++{
++    if (config_request_json.empty()) {
++        return {};
++    }
++
++    json_object *root = json_tokener_parse(config_request_json.c_str());
++    if (!root) {
++        LOG(DEBUG) << "DPP: failed to parse configRequest JSON for field '" << field_name << "'";
++        return {};
++    }
++
++    std::string value;
++    json_object *field_obj = nullptr;
++    if (json_object_object_get_ex(root, field_name.c_str(), &field_obj)) {
++        const char *str = json_object_get_string(field_obj);
++        if (str) {
++            value = str;
++        }
++    }
++    json_object_put(root);
++    return value;
++}
++
+ std::string DppConfiguratorTask::generate_1905_layer_config(const sDppSession &session,
+                                                               uint16_t df_counter_threshold) const
+ {
+@@ -1938,15 +2031,20 @@ std::string DppConfiguratorTask::generate_1905_layer_config(const sDppSession &s
+ std::string DppConfiguratorTask::generate_backhaul_sta_config(const sDppSession &session,
+                                                                 const std::string &ssid,
+                                                                 const std::string &passphrase,
+-                                                                const std::string &akm) const
++                                                                const std::string &akm,
++                                                                const std::string &net_role,
++                                                                const std::string &group_id) const
+ {
+     if (!session.enrollee_protocol_key || ssid.empty()) return {};
+-
+-    std::string connector = m_keystore.sign_connector("mapBackhaulSta", "mapNW",
+-                                                        session.enrollee_protocol_key);
++    std::string connector =
++        m_keystore.sign_connector(net_role, group_id, session.enrollee_protocol_key);
+     if (connector.empty()) return {};
+ 
+-    std::string config = "{\"wi-fi_tech\":\"map\","
++    // Testing hook: a plain infra STA connector uses wi-fi_tech=infra to match net_role="sta",
++    // rather than the EasyMesh wi-fi_tech=map used for net_role="mapBackhaulSta".
++    std::string wifi_tech = (net_role == "sta") ? "infra" : "map";
++
++    std::string config = "{\"wi-fi_tech\":\"" + wifi_tech + "\","
+                          "\"discovery\":{\"ssid\":\"" + ssid + "\",\"BSSID\":\"000000000000\"},"
+                          "\"cred\":{"
+                          "\"akm\":\"" + akm + "\","
+@@ -1963,24 +2061,27 @@ std::string DppConfiguratorTask::generate_backhaul_bss_config(const sDppSession
+                                                                 const std::string &ssid,
+                                                                 const std::string &passphrase,
+                                                                 const std::string &akm,
+-                                                                const std::string &custom_alias) const
++                                                                const std::string &custom_alias,
++                                                                bool dpp_enabled) const
+ {
+-    if (!session.enrollee_protocol_key || ssid.empty()) return {};
++    if (ssid.empty()) return {};
+ 
+-    std::string connector = m_keystore.sign_connector("mapBackhaulBss", "mapNW",
+-                                                        session.enrollee_protocol_key);
+-    if (connector.empty()) return {};
++    std::string cred = "\"akm\":\"" + akm + "\","
++                       "\"pass\":\"" + passphrase + "\"";
++    if (dpp_enabled) {
++        if (!session.enrollee_protocol_key) return {};
++        std::string connector = m_keystore.sign_connector("mapBackhaulBss", "mapNW",
++                                                            session.enrollee_protocol_key);
++        if (connector.empty()) return {};
++        cred += ",\"signedConnector\":\"" + connector + "\","
++                "\"csign\":" + m_keystore.c_sign_key_jwk();
++    }
+ 
+     std::string config = "{\"wi-fi_tech\":\"map\","
+                          "\"map_bss_type\":64,"
+                          "\"discovery\":{\"ssid\":\"" + ssid + "\","
+                          "\"RUID\":\"" + ruid + "\",\"BSSID\":\"000000000000\"},"
+-                         "\"cred\":{"
+-                         "\"akm\":\"" + akm + "\","
+-                         "\"pass\":\"" + passphrase + "\","
+-                         "\"signedConnector\":\"" + connector + "\","
+-                         "\"csign\":" + m_keystore.c_sign_key_jwk() +
+-                         "}";
++                         "\"cred\":{" + cred + "}";
+     if (!custom_alias.empty()) {
+         config += ",\"customAlias\":\"" + custom_alias + "\"";
+     }
+@@ -1988,33 +2089,51 @@ std::string DppConfiguratorTask::generate_backhaul_bss_config(const sDppSession
+     return config;
+ }
+ 
+-std::string DppConfiguratorTask::generate_fronthaul_bss_config(const sDppSession &session,
+-                                                                 const std::string &ruid,
+-                                                                 const std::string &ssid,
+-                                                                 const std::string &passphrase,
+-                                                                 const std::string &akm,
+-                                                                 const std::string &custom_alias) const
++std::string DppConfiguratorTask::generate_fronthaul_bss_config(
++    const sDppSession &session, const std::string &ruid, const std::string &ssid,
++    const std::string &passphrase, const std::string &akm,
++    const std::string &custom_alias, const std::string &enabled_ecp_groups,
++    const std::string &security_profiles, const std::string &rsnxe_capab_mask,
++    bool dpp_enabled) const
+ {
+-    if (!session.enrollee_protocol_key || ssid.empty()) return {};
++    if (ssid.empty()) return {};
+ 
+-    std::string connector = m_keystore.sign_connector("ap", "mapNW",
+-                                                        session.enrollee_protocol_key);
+-    if (connector.empty()) return {};
++    std::string cred = "\"akm\":\"" + akm + "\","
++                       "\"pass\":\"" + passphrase + "\"";
++    if (dpp_enabled) {
++        if (!session.enrollee_protocol_key) return {};
++        std::string connector = m_keystore.sign_connector("ap", "mapNW",
++                                                            session.enrollee_protocol_key);
++        if (connector.empty()) return {};
++        cred += ",\"signedConnector\":\"" + connector + "\","
++                "\"csign\":" + m_keystore.c_sign_key_jwk();
++    }
+ 
+     std::string config = "{\"wi-fi_tech\":\"inframap\","
+                          "\"map_bss_type\":32,"
+                          "\"discovery\":{\"ssid\":\"" + ssid + "\","
+                          "\"RUID\":\"" + ruid + "\",\"BSSID\":\"000000000000\"},"
+-                         "\"cred\":{"
+-                         "\"akm\":\"" + akm + "\","
+-                         "\"pass\":\"" + passphrase + "\","
+-                         "\"signedConnector\":\"" + connector + "\","
+-                         "\"csign\":" + m_keystore.c_sign_key_jwk() +
+-                         "}";
++                         "\"cred\":{" + cred + "}";
+     if (!custom_alias.empty()) {
+         config += ",\"customAlias\":\"" + custom_alias + "\"";
+     }
++    if (!enabled_ecp_groups.empty()) {
++        config += ",\"enabledECPGroups\":\"" + enabled_ecp_groups + "\"";
++    }
++    if (!security_profiles.empty()) {
++        config += ",\"security_profiles\":\"" + security_profiles + "\"";
++    }
++    if (!rsnxe_capab_mask.empty()) {
++        config += ",\"extendedRSNCapabilitiesMask\":\"" + rsnxe_capab_mask + "\"";
++    }
+     config += "}";
++    LOG(DEBUG) << "DPP: fronthaul BSS config ssid=" << ssid << " akm=" << akm
++               << " enabledECPGroups="
++               << (enabled_ecp_groups.empty() ? "(none)" : enabled_ecp_groups)
++               << " security_profiles="
++               << (security_profiles.empty() ? "(none)" : security_profiles)
++               << " extendedRSNCapabilitiesMask="
++               << (rsnxe_capab_mask.empty() ? "(none)" : rsnxe_capab_mask);
+     return config;
+ }
+ 
+diff --git a/controller/src/beerocks/master/tasks/dpp_configurator_task.h b/controller/src/beerocks/master/tasks/dpp_configurator_task.h
+index f12c902f7..879f6d32a 100644
+--- a/controller/src/beerocks/master/tasks/dpp_configurator_task.h
++++ b/controller/src/beerocks/master/tasks/dpp_configurator_task.h
+@@ -297,23 +297,37 @@ private:
+     bool send_config_response(sDppSession &session);
+     bool handle_config_result(sDppSession &session, const uint8_t *frame, size_t len);
+ 
++    // Testing hook: extract a top-level string field (e.g. "wi-fi_tech", "netRole") out of
++    // the raw configRequest JSON captured in handle_config_request(), so
++    // send_config_response() can skip the 1905-layer/mapAgent config object for a
++    // non-EasyMesh (wi-fi_tech=infra) enrollee.
++    std::string extract_config_request_field(const std::string &config_request_json,
++                                              const std::string &field_name) const;
++
+     // DPP Configuration Object generators
+     std::string generate_1905_layer_config(const sDppSession &session,
+                                             uint16_t df_counter_threshold = 5) const;
+     std::string generate_backhaul_sta_config(const sDppSession &session,
+                                               const std::string &ssid,
+                                               const std::string &passphrase,
+-                                              const std::string &akm) const;
++                                              const std::string &akm,
++                                              const std::string &net_role = "mapBackhaulSta",
++                                              const std::string &group_id = "mapNW") const;
+     std::string generate_backhaul_bss_config(const sDppSession &session, const std::string &ruid,
+                                               const std::string &ssid,
+                                               const std::string &passphrase,
+                                               const std::string &akm,
+-                                              const std::string &custom_alias = {}) const;
++                                              const std::string &custom_alias = {},
++                                              bool dpp_enabled = true) const;
+     std::string generate_fronthaul_bss_config(const sDppSession &session, const std::string &ruid,
+                                                const std::string &ssid,
+                                                const std::string &passphrase,
+                                                const std::string &akm,
+-                                               const std::string &custom_alias = {}) const;
++                                               const std::string &custom_alias = {},
++                                               const std::string &enabled_ecp_groups = {},
++                                               const std::string &security_profiles = {},
++                                               const std::string &rsnxe_capab_mask = {},
++                                               bool dpp_enabled = true) const;
+ 
+     // -------------------------------------------------------------------------
+     // 1905-layer security
+diff --git a/controller/src/beerocks/master/tasks/dpp_key_store.cpp b/controller/src/beerocks/master/tasks/dpp_key_store.cpp
+index 65e4c5ef3..95de239a5 100644
+--- a/controller/src/beerocks/master/tasks/dpp_key_store.cpp
++++ b/controller/src/beerocks/master/tasks/dpp_key_store.cpp
+@@ -10,6 +10,7 @@
+ #include <cstring>
+ #include <fstream>
+ #include <sstream>
++#include <sys/file.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+ 
+@@ -348,25 +349,37 @@ bool DppKeyStore::save_dpp_uri(const std::string &dpp_uri) const
+ {
+     // Append to /etc/prplmesh/dpp_uri (one URI per line, multiple extenders supported).
+     // Skip if already present to avoid duplicates across restarts.
++    // flock() the whole dedup-check-then-append as one critical section — the co-located
++    // Agent (son_slave_thread.cpp) and write_dpp_uris() below also lock this same file.
+     constexpr const char *uris_file = "/etc/prplmesh/dpp_uri";
+-    {
+-        std::ifstream in(uris_file);
+-        if (in.good()) {
+-            std::string line;
+-            while (std::getline(in, line)) {
+-                while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+-                    line.pop_back();
+-                if (line == dpp_uri) return true; // already present
+-            }
+-        }
+-    }
+-    std::ofstream out(uris_file, std::ios::app);
+-    if (!out.good()) {
++
++    FILE *f = fopen(uris_file, "a+");
++    if (!f) {
+         MAPF_ERR("DppKeyStore: failed to open " << uris_file << " for append");
+         return false;
+     }
+-    out << dpp_uri << "\n";
+-    return out.good();
++    flock(fileno(f), LOCK_EX);
++
++    rewind(f);
++    char line_buf[1024];
++    while (fgets(line_buf, sizeof(line_buf), f)) {
++        std::string line(line_buf);
++        while (!line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' '))
++            line.pop_back();
++        if (line == dpp_uri) {
++            flock(fileno(f), LOCK_UN);
++            fclose(f);
++            return true; // already present
++        }
++    }
++
++    fseek(f, 0, SEEK_END);
++    fprintf(f, "%s\n", dpp_uri.c_str());
++    fflush(f);
++    bool ok = (ferror(f) == 0);
++    flock(fileno(f), LOCK_UN);
++    fclose(f);
++    return ok;
+ }
+ 
+ std::string DppKeyStore::load_dpp_uri() const
+@@ -376,32 +389,73 @@ std::string DppKeyStore::load_dpp_uri() const
+ 
+ bool DppKeyStore::write_dpp_uris(const std::vector<std::string> &uris) const
+ {
+-    constexpr const char *uris_file = "/etc/prplmesh/dpp_uri";
++    constexpr const char *uris_file       = "/etc/prplmesh/dpp_uri";
++    constexpr const char *local_agent_tag = "# local-agent";
++
++    FILE *f = fopen(uris_file, "a+");
++    if (!f) {
++        MAPF_ERR("DppKeyStore: failed to open " << uris_file << " for write");
++        return false;
++    }
++    flock(fileno(f), LOCK_EX);
++
++    // Read the existing file so the co-located agent's self-written line (marked by the
++    // "# local-agent" tag on the line above it, see son_slave_thread.cpp) survives this
++    // NBAPI-driven rewrite — the local agent's own URI never enters the ProvisionDPP table
++    // that drives `uris`, so a plain truncate+rewrite would silently erase it on every
++    // whitelist edit. Also track whether any *other* (non-local-agent) content already
++    // exists, to preserve the pre-existing "refuse to clear with an empty list" guard.
++    rewind(f);
++    std::string local_agent_line;
++    bool has_other_content = false;
++    {
++        char rd_buf[1024];
++        std::string prev;
++        while (fgets(rd_buf, sizeof(rd_buf), f)) {
++            std::string line(rd_buf);
++            while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
++                line.pop_back();
++            if (prev == local_agent_tag) {
++                local_agent_line = line;
++            } else if (line != local_agent_tag && !line.empty()) {
++                has_other_content = true;
++            }
++            prev = line;
++        }
++    }
+ 
+-    if (uris.empty()) {
++    if (uris.empty() && has_other_content) {
+         // An empty list here is indistinguishable from "the ProvisionDPP table hasn't
+         // finished (re)loading yet" (e.g. right after a datamodel restore, an instance can
+         // be signalled before its persisted DPPURI value is reapplied to it) vs. "the user
+         // genuinely removed the last entry". Refuse to destructively truncate a mirror file
+-        // that still holds previously-persisted URIs; only allow it if the file is already
+-        // empty/missing, so this call stays a harmless no-op in the startup-race case.
+-        if (!load_string(uris_file).empty()) {
+-            MAPF_WARN("DppKeyStore: refusing to clear non-empty " << uris_file
+-                                                                   << " with an empty URI list");
+-            return false;
+-        }
+-        return true;
++        // that still holds previously-persisted (non-local-agent) URIs.
++        MAPF_WARN("DppKeyStore: refusing to clear non-empty " << uris_file
++                                                                 << " with an empty URI list");
++        flock(fileno(f), LOCK_UN);
++        fclose(f);
++        return false;
+     }
+ 
+-    std::ofstream out(uris_file, std::ios::trunc);
+-    if (!out.good()) {
+-        MAPF_ERR("DppKeyStore: failed to open " << uris_file << " for write");
++    if (ftruncate(fileno(f), 0) != 0) {
++        MAPF_ERR("DppKeyStore: failed to truncate " << uris_file);
++        flock(fileno(f), LOCK_UN);
++        fclose(f);
+         return false;
+     }
++    rewind(f);
++
++    if (!local_agent_line.empty()) {
++        fprintf(f, "%s\n%s\n", local_agent_tag, local_agent_line.c_str());
++    }
+     for (const auto &uri : uris) {
+-        out << uri << "\n";
++        fprintf(f, "%s\n", uri.c_str());
+     }
+-    return out.good();
++    fflush(f);
++    bool ok = (ferror(f) == 0);
++    flock(fileno(f), LOCK_UN);
++    fclose(f);
++    return ok;
+ }
+ 
+ bool DppKeyStore::file_exists(const std::string &filename) const
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index ea53103d1..1a4ddca0d 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -522,7 +522,34 @@ static bool bpl_cfg_get_bss_configuration(const std::string &section_name,
+         }
+     }
+ 
+-    
++    // option eppk '1' — 802.11bi Enhanced/Extended PASN Privacy Key Exchange (EPPKE)
++    // for this VAP. Folds into the akm bracket suite 000FAC29[000FAC24] in the DPP
++    // Configuration Object, and wpa_key_mgmt += EPPKE / assoc_frame_encryption=1 /
++    // pmksa_caching_privacy=1 in hostapd config. Must be applied after the RSN
++    // Override read above, which unconditionally sets additional_auth to either
++    // WPA3_PERSONAL_COMPATIBILITY or NONE and would otherwise clobber this.
++    if (options["eppk"] == "1") {
++        configuration.additional_auth = son::wireless_utils::eAdditionalAuth::EPPKE;
++    }
++
++    // option sae_groups / pasn_groups — space-separated ECP group numbers. Whichever
++    // is present (non-empty) is copied verbatim into "enabledECPGroups" in the DPP
++    // Configuration Object (sae_groups takes precedence when both are set). Opaque
++    // pass-through: not consumed for AKM logic.
++    configuration.enabled_ecp_groups = !options["sae_groups"].empty() ? options["sae_groups"]
++                                                                       : options["pasn_groups"];
++
++    // option security_profiles '1 9' — space-separated security profile numbers
++    // (Table 9-bb22, 0-15), passed through opaquely as "security_profiles" in the
++    // DPP Configuration Object and echoed to hostapd unchanged.
++    configuration.security_profiles = options["security_profiles"];
++
++    // option rsnxe_capab_mask '2028040020' — RSNXE capabilities mask hex string,
++    // passed through opaquely as "extendedRSNCapabilitiesMask" in the DPP
++    // Configuration Object and echoed to hostapd unchanged.
++    configuration.rsnxe_capab_mask = options["rsnxe_capab_mask"];
++
++
+     auto get_mld_id = [&](const std::string &mld) {
+ 	if (mld.empty()) {
+ 	    return -1;
+@@ -1234,6 +1261,29 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+ 		    options["dpp_netaccesskey"] = "";
+ 	    }
+ 
++	    // Persist 802.11bi EPPKE / security_profiles / ECP groups so UCI matches
++	    // the wpa_key_mgmt+=EPPKE, assoc_frame_encryption, pmksa_caching_privacy,
++	    // security_profiles=, sae_groups=/pasn_groups= directives written directly
++	    // into hostapd.conf by ap_wlan_hal_nl80211, and survives a UCI-driven
++	    // hostapd.conf regeneration / reboot.
++	    options["eppk"] = (configuration.additional_auth ==
++	                        son::wireless_utils::eAdditionalAuth::EPPKE)
++	                           ? "1"
++	                           : "";
++	    // assoc_frame_encryption/pmksa_caching_privacy are not independent JSON
++	    // fields — ap_wlan_hal_nl80211 always writes them as "1" alongside EPPKE,
++	    // so mirror that 1:1 dependency on the eppk bit here rather than adding
++	    // separate configuration fields for them.
++	    options["assoc_frame_encryption"] = options["eppk"];
++	    options["pmksa_caching_privacy"]  = options["eppk"];
++	    options["security_profiles"] = configuration.security_profiles;
++	    options["rsnxe_capab_mask"] = configuration.rsnxe_capab_mask;
++	    // enabled_ecp_groups is re-emitted to hostapd as both sae_groups= and
++	    // pasn_groups= regardless of which UCI option originally supplied it
++	    // (see ap_wlan_hal_nl80211.cpp); mirror that here for symmetry.
++	    options["sae_groups"] = configuration.enabled_ecp_groups;
++	    options["pasn_groups"] = configuration.enabled_ecp_groups;
++
+ 	    if(!configuration.multi_ap.empty()) {
+ 		    options["multi_ap"] = configuration.multi_ap;
+ 	    }
+@@ -1403,6 +1453,9 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+                             "rsn_override_key_mgmt_2", "rsn_override_pairwise_2", "rsn_override_mfp_2",
+                             "dpp", "dpp_controller", "dpp_configurator_connectivity",
+                             "dpp_connector", "dpp_csign", "dpp_netaccesskey",
++                            "eppk", "assoc_frame_encryption", "pmksa_caching_privacy",
++                            "security_profiles", "sae_groups", "pasn_groups",
++                            "rsnxe_capab_mask",
+                             "disabled",
+                             "ifname",  // must be last before nullptr so ifname is always written
+                             nullptr
+@@ -1729,6 +1782,29 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+                 options["dpp_netaccesskey"] = "";
+             }
+ 
++            // Persist 802.11bi EPPKE / security_profiles / ECP groups so UCI matches
++            // the wpa_key_mgmt+=EPPKE, assoc_frame_encryption, pmksa_caching_privacy,
++            // security_profiles=, sae_groups=/pasn_groups= directives written directly
++            // into hostapd.conf by ap_wlan_hal_nl80211, and survives a UCI-driven
++            // hostapd.conf regeneration / reboot.
++            options["eppk"] = (config.additional_auth ==
++                                son::wireless_utils::eAdditionalAuth::EPPKE)
++                                   ? "1"
++                                   : "";
++            // assoc_frame_encryption/pmksa_caching_privacy are not independent JSON
++            // fields — ap_wlan_hal_nl80211 always writes them as "1" alongside EPPKE,
++            // so mirror that 1:1 dependency on the eppk bit here rather than adding
++            // separate configuration fields for them.
++            options["assoc_frame_encryption"] = options["eppk"];
++            options["pmksa_caching_privacy"]  = options["eppk"];
++            options["security_profiles"] = config.security_profiles;
++            options["rsnxe_capab_mask"] = config.rsnxe_capab_mask;
++            // enabled_ecp_groups is re-emitted to hostapd as both sae_groups= and
++            // pasn_groups= regardless of which UCI option originally supplied it
++            // (see ap_wlan_hal_nl80211.cpp); mirror that here for symmetry.
++            options["sae_groups"] = config.enabled_ecp_groups;
++            options["pasn_groups"] = config.enabled_ecp_groups;
++
+             // Decode the SecurityIEs blob and persist the six rsn_override_* UCI options
+             // so UCI matches hostapd.conf and survives a regeneration / reboot.
+             if (!config.security_ies.empty()) {
+@@ -1789,32 +1865,21 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+             return false;
+         }
+ 
++        std::string candidate_section; // device+mld match, no ifname set yet
+         for (const auto &section : all_iface_sections) {
+             std::string ifname_val, device_val, mld_val;
+-            if (!uci_get_option(package_name, section_type, section, "ifname", ifname_val)) {
+-                LOG(DEBUG) << "Failed to get 'ifname' from section " << section;
+-                continue;
+-            }
+             if (!uci_get_option(package_name, section_type, section, "device", device_val)) {
+                 LOG(DEBUG) << "Failed to get 'device' from section " << section;
+                 continue;
+             }
+-            // mld option is optional, so we don't check return value
+-            uci_get_option(package_name, section_type, section, "mld", mld_val);
+ 
+             // Match by device first
+             if (device_val != device_section) {
+                 continue;
+             }
+ 
+-            bool ifname_matches = false;
+-            if (!configuration.old_iface_name.empty()) {
+-                // If old_iface_name provided, match by old name OR new name
+-                ifname_matches = (ifname_val == configuration.old_iface_name) || (ifname_val == iface);
+-            } else {
+-                // If old_iface_name NOT provided, only match by new name
+-                ifname_matches = (ifname_val == iface);
+-            }
++            // mld option is optional, so we don't check return value
++            uci_get_option(package_name, section_type, section, "mld", mld_val);
+ 
+             bool mld_matches = false;
+             if (mld_val.empty()) {
+@@ -1825,8 +1890,34 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+                 mld_matches = true;
+             }
+             // If mld_val has different MLD ID, don't match (mld_matches stays false)
++            if (!mld_matches) {
++                continue;
++            }
++
++            // Hand-written MLD-link sections (e.g. the original config's un-named
++            // backhaul/home wifi-iface entries) carry no "ifname" — it is assigned
++            // dynamically by hostapd/mac80211 at runtime. Such a section is still
++            // the right target, matched by device+mld alone; remember it as a
++            // fallback candidate and keep looking for an exact ifname match first.
++            bool has_ifname =
++                uci_get_option(package_name, section_type, section, "ifname", ifname_val);
++            if (!has_ifname) {
++                if (candidate_section.empty()) {
++                    candidate_section = section;
++                }
++                continue;
++            }
+ 
+-            if (ifname_matches && mld_matches) {
++            bool ifname_matches = false;
++            if (!configuration.old_iface_name.empty()) {
++                // If old_iface_name provided, match by old name OR new name
++                ifname_matches = (ifname_val == configuration.old_iface_name) || (ifname_val == iface);
++            } else {
++                // If old_iface_name NOT provided, only match by new name
++                ifname_matches = (ifname_val == iface);
++            }
++
++            if (ifname_matches) {
+                 target_section = section;
+                 section_found = true;
+                 LOG(INFO) << "Found existing section: " << section
+@@ -1836,6 +1927,13 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+             }
+         }
+ 
++        if (!section_found && !candidate_section.empty()) {
++            target_section = candidate_section;
++            section_found = true;
++            LOG(INFO) << "Found section " << target_section << " for device " << device_section
++                      << " (device+mld match, no ifname yet) -> " << MLD_ID;
++        }
++
+         // Check if credential-relevant fields have actually changed before ANY commit.
+         // Both the wifi-mld and wifi-iface commits trigger netifd to reload hostapd;
+         // skip both when credentials are unchanged to prevent interface cycling.
+@@ -1852,6 +1950,8 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+                 "rsn_override_key_mgmt_2", "rsn_override_pairwise_2", "rsn_override_mfp_2",
+                 "dpp", "dpp_controller", "dpp_configurator_connectivity",
+                 "dpp_connector", "dpp_csign", "dpp_netaccesskey",
++                "eppk", "assoc_frame_encryption", "pmksa_caching_privacy",
++                "security_profiles", "sae_groups", "pasn_groups", "rsnxe_capab_mask",
+                 "disabled", nullptr
+             };
+             bool changed = false;
+@@ -1924,6 +2024,19 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+ 	mldOptions["ieee80211k"] = "1";
+         mldOptions["disabled"] = "0";
+ 
++        // 802.11bi EPPKE: assoc_frame_encryption/pmksa_caching_privacy protect the
++        // (re)association frames for the whole MLO association, which is
++        // established at the MLD, not per-link — mirror them into the wifi-mld
++        // section here in addition to the per-link wifi-iface section (`options`)
++        // set via build_map_options() above.
++        if (configuration.additional_auth == son::wireless_utils::eAdditionalAuth::EPPKE) {
++            mldOptions["assoc_frame_encryption"] = "1";
++            mldOptions["pmksa_caching_privacy"] = "1";
++        } else {
++            mldOptions["assoc_frame_encryption"] = "";
++            mldOptions["pmksa_caching_privacy"] = "";
++        }
++
+ 
+         if (!uci_set_section(package_name, mld_section_type, mld_section_name, mldOptions, true)) {
+             LOG(ERROR) << "Failed to set wireless configuration for MLD: " << mld_id_val << " at section " << mld_section_name;
+diff --git a/framework/tlvf/yaml/tlvf/WSC/WSC_Attributes.yaml b/framework/tlvf/yaml/tlvf/WSC/WSC_Attributes.yaml
+index efa890a0f..dce91adb7 100644
+--- a/framework/tlvf/yaml/tlvf/WSC/WSC_Attributes.yaml
++++ b/framework/tlvf/yaml/tlvf/WSC/WSC_Attributes.yaml
+@@ -192,6 +192,40 @@ cEncryptedSettingsPayload:
+       ap_wlan_hal_nl80211::apply_rsn_from_security_ies() can program arbitrary
+       Controller-supplied RSN parameters (not just the canned WPA3-PCM blobs)
+       into hostapd. Zero-length when absent.
++  enabled_ecp_groups_length:
++    _type: uint8_t
++    _length_var: True
++  enabled_ecp_groups:
++    _type: char
++    _length: [enabled_ecp_groups_length]
++    _comment: |
++      802.11bi ECP group numbers ("sae_groups"+"pasn_groups" UCI options, or
++      "enabledECPGroups" from a DPP Configuration Object), space-separated,
++      e.g. "21 20 19". Propagated Controller/agent -> AP manager -> HAL and
++      echoed verbatim into hostapd's sae_groups=/pasn_groups= directives.
++      Zero-length when absent.
++  security_profiles_length:
++    _type: uint8_t
++    _length_var: True
++  security_profiles:
++    _type: char
++    _length: [security_profiles_length]
++    _comment: |
++      802.11bi security profile numbers (Table 9-bb22), space-separated, e.g.
++      "1 9" ("security_profiles" UCI option or DPP Configuration Object
++      field). Opaque pass-through, echoed verbatim into hostapd's
++      security_profiles= directive. Zero-length when absent.
++  rsnxe_capab_mask_length:
++    _type: uint8_t
++    _length_var: True
++  rsnxe_capab_mask:
++    _type: char
++    _length: [rsnxe_capab_mask_length]
++    _comment: |
++      RSNXE capabilities mask hex string, e.g. "2028040020" ("rsnxe_capab_mask"
++      UCI option or DPP Configuration Object "extendedRSNCapabilitiesMask"
++      field). Opaque pass-through, echoed verbatim into hostapd's
++      rsnxe_capab_mask= directive. Zero-length when absent.
+ 
+ cWscAttrEncryptedSettings:
+   _type: class
+-- 
+2.34.1
+
