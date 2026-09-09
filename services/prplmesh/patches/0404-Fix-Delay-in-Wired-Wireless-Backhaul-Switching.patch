@@ -1,0 +1,222 @@
+From 63cd648c77f469ab31dcbb22edc633c268898ee1 Mon Sep 17 00:00:00 2001
+From: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+Date: Sun, 30 Aug 2026 22:56:23 +0530
+Subject: [PATCH 1/2] Fix Delay in Wired-Wireless Backhaul Switching
+
+Signed-off-by: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+---
+ .../backhaul_manager/backhaul_manager.cpp     | 11 +++++---
+ .../slave/backhaul_manager/backhaul_manager.h |  3 +-
+ framework/platform/bpl/cfg/dm/bpl_cfg.cpp     | 28 +++++++++++++++++--
+ .../platform/bpl/cfg/dummy/bpl_cfg_dummy.cpp  |  2 +-
+ framework/platform/bpl/cfg/linux/bpl_cfg.cpp  | 12 ++++++--
+ framework/platform/bpl/cfg/rdk/bpl_cfg.cpp    |  9 ++++--
+ framework/platform/bpl/cfg/uci/bpl_cfg.cpp    | 12 ++++++--
+ framework/platform/bpl/include/bpl/bpl_cfg.h  |  5 +++-
+ 8 files changed, 67 insertions(+), 15 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index d1adf9c23..23998e662 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -2126,12 +2126,12 @@ bwl::WiFiSec BackhaulManager::wsc_to_bwl_authentication(WSC::eWscAuth authtype)
+     }
+ }
+ 
+-bool BackhaulManager::resolve_gateway_ip(std::string &gw_ip)
++bool BackhaulManager::resolve_gateway_ip(const std::string &iface, std::string &gw_ip)
+ {
+     // Use BPL function to get gateway IP
+     // For PrplOS: retrieves from Device.DHCPv4.Client.*.DHCPServer
+     // For OpenWrt: uses ip route command
+-    if (!beerocks::bpl::cfg_get_dhcp_gateway_ip(gw_ip)) {
++    if (!beerocks::bpl::cfg_get_dhcp_gateway_ip(iface, gw_ip)) {
+         LOG(WARNING) << "Could not resolve gateway IP";
+         return false;
+     }
+@@ -5443,9 +5443,12 @@ bool BackhaulManager::is_gateway_reachable_via_interface(const std::string &ifac
+         return true;
+     }
+ 
+-    // Resolve gateway IP
++    // Resolve gateway IP. The DHCP-installed default route lives on the bridge
++    // device (e.g. br-lan), not on the individual enslaved port - a bridge member
++    // port such as eth0 never carries its own default route, so the lookup must
++    // be scoped to the bridge, not to the physical port passed in as `iface`.
+     std::string gw_ip;
+-    if (!resolve_gateway_ip(gw_ip)) {
++    if (!resolve_gateway_ip(bridge_iface, gw_ip)) {
+         LOG(WARNING) << "Could not resolve gateway IP, treating " << iface
+                      << " as not gateway reachable (non-certification mode)";
+         return false;
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+index 6f055566f..3f763d62f 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+@@ -392,10 +392,11 @@ private:
+     /**
+      * @brief Resolves the default gateway IP address.
+      *
++     * @param[in] iface Interface to scope the gateway resolution to.
+      * @param[out] gw_ip The resolved gateway IP address.
+      * @return true if gateway IP was resolved successfully, false otherwise.
+      */
+-    bool resolve_gateway_ip(std::string &gw_ip);
++    bool resolve_gateway_ip(const std::string &iface, std::string &gw_ip);
+ 
+     /**
+      * @brief Confirms gateway reachability using ARP ping (arping).
+diff --git a/framework/platform/bpl/cfg/dm/bpl_cfg.cpp b/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
+index 117dc004b..04bcb4e81 100644
+--- a/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
+@@ -731,8 +731,13 @@ bool cfg_set_wifi_iface_multi_ap_vlanid(const std::string &iface_name, uint16_t
+     return true;
+ }
+ 
+-bool cfg_get_dhcp_gateway_ip(std::string &gw_ip)
++bool cfg_get_dhcp_gateway_ip(const std::string &iface, std::string &gw_ip)
+ {
++    if (iface.empty()) {
++        MAPF_ERR("cfg_get_dhcp_gateway_ip: interface name is empty");
++        return false;
++    }
++
+     // Resolve all Device.DHCPv4.Client.* instance paths
+     std::vector<std::string> client_paths;
+     if (!m_ambiorix_cl_ubus.resolve_path_multi("Device.DHCPv4.Client.*", client_paths)) {
+@@ -745,10 +750,29 @@ bool cfg_get_dhcp_gateway_ip(std::string &gw_ip)
+         return false;
+     }
+ 
+-    // Iterate through all DHCPv4.Client instances to find enabled one with gateway IP
++    // Iterate through all DHCPv4.Client instances to find the one bound to the
++    // requested interface, enabled, and with a resolved gateway IP. Filtering by
++    // Interface prevents an unrelated interface's DHCP lease (e.g. a guest network)
++    // from being mistaken for the WAN gateway.
+     for (const auto &client_path : client_paths) {
+         MAPF_DBG("cfg_get_dhcp_gateway_ip: Checking client path: " << client_path);
+ 
++        std::string client_iface;
++        if (!m_ambiorix_cl_ubus.get_param(client_iface, client_path, "Interface")) {
++            MAPF_DBG("cfg_get_dhcp_gateway_ip: Failed to read Interface for " << client_path);
++            continue;
++        }
++
++        // Exact match required: a substring check here (e.g. client_iface.find(iface))
++        // would false-positive when iface is a suffix of an unrelated interface name,
++        // such as requested iface "lan" matching client_iface "wlan0".
++        if (client_iface != iface) {
++            MAPF_DBG("cfg_get_dhcp_gateway_ip: Client "
++                      << client_path << " Interface " << client_iface
++                      << " does not match requested iface " << iface);
++            continue;
++        }
++
+         // Check if Enable parameter is true
+         bool enabled = false;
+         if (!m_ambiorix_cl_ubus.get_param(enabled, client_path, "Enable")) {
+diff --git a/framework/platform/bpl/cfg/dummy/bpl_cfg_dummy.cpp b/framework/platform/bpl/cfg/dummy/bpl_cfg_dummy.cpp
+index 8533bf6a2..b65f517ad 100644
+--- a/framework/platform/bpl/cfg/dummy/bpl_cfg_dummy.cpp
++++ b/framework/platform/bpl/cfg/dummy/bpl_cfg_dummy.cpp
+@@ -123,7 +123,7 @@ bool get_ruid_chipset_vendor(const sMacAddr &ruid, std::string &chipset_vendor)
+     return false;
+ }
+ 
+-bool cfg_get_dhcp_gateway_ip(std::string &gw_ip)
++bool cfg_get_dhcp_gateway_ip(const std::string &iface, std::string &gw_ip)
+ {
+     LOG(ERROR) << __func__ << ":not Supported in Dummy";
+     return false;
+diff --git a/framework/platform/bpl/cfg/linux/bpl_cfg.cpp b/framework/platform/bpl/cfg/linux/bpl_cfg.cpp
+index c75c09e51..819ea2fba 100644
+--- a/framework/platform/bpl/cfg/linux/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/linux/bpl_cfg.cpp
+@@ -1066,9 +1066,17 @@ bool cfg_set_wifi_iface_multi_ap_vlanid(const std::string &iface_name, uint16_t
+     return true;
+ }
+ 
+-bool cfg_get_dhcp_gateway_ip(std::string &gw_ip)
++bool cfg_get_dhcp_gateway_ip(const std::string &iface, std::string &gw_ip)
+ {
+-    std::string cmd = "ip r | awk '/^def/{print $3}'";
++    if (iface.empty()) {
++        MAPF_ERR("cfg_get_dhcp_gateway_ip: interface name is empty");
++        return false;
++    }
++
++    // Scope the default-route lookup to the given interface so that a default
++    // route installed on an unrelated interface (e.g. a guest network) is not
++    // mistaken for the WAN gateway.
++    std::string cmd = "ip r show dev " + iface + " default | awk '{print $3}'";
+     FILE *fp = popen(cmd.c_str(), "r");
+     if (fp) {
+         char buffer[128];
+diff --git a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+index f413dcd95..31c870dac 100644
+--- a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+@@ -1779,9 +1779,14 @@ bool cfg_set_onboarding_type(const std::string &onboarding_type) { return true;
+ 
+ bool cfg_set_1905_security_enabled(bool link_encryption_enable) { return true; }
+ 
+-bool cfg_get_dhcp_gateway_ip(std::string &gw_ip)
++bool cfg_get_dhcp_gateway_ip(const std::string &iface, std::string &gw_ip)
+ {
+-    std::string cmd = "ip r | awk '/^def/{print $3}'";
++    if (iface.empty()) {
++        LOG(ERROR) << "cfg_get_dhcp_gateway_ip: interface name is empty";
++        return false;
++    }
++
++    std::string cmd = "ip r show dev " + iface + " default | awk '{print $3}'";
+     FILE *fp = popen(cmd.c_str(), "r");
+     if (fp) {
+         char buffer[128];
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
+index e67635542..c06883801 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
+@@ -1400,9 +1400,17 @@ bool cfg_get_fh_vaps_state_control(bool &fh_vaps_state_control)
+     return true;
+ }
+ 
+-bool cfg_get_dhcp_gateway_ip(std::string &gw_ip)
++bool cfg_get_dhcp_gateway_ip(const std::string &iface, std::string &gw_ip)
+ {
+-    std::string cmd = "ip r | awk '/^def/{print $3}'";
++    if (iface.empty()) {
++        MAPF_ERR("cfg_get_dhcp_gateway_ip: interface name is empty");
++        return false;
++    }
++
++    // Scope the default-route lookup to the given interface so that a default
++    // route installed on an unrelated interface (e.g. a guest network) is not
++    // mistaken for the WAN gateway.
++    std::string cmd = "ip r show dev " + iface + " default | awk '{print $3}'";
+     FILE *fp = popen(cmd.c_str(), "r");
+     if (fp) {
+         char buffer[128];
+diff --git a/framework/platform/bpl/include/bpl/bpl_cfg.h b/framework/platform/bpl/include/bpl/bpl_cfg.h
+index 3d69cba8e..e0945a6e5 100644
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -2005,10 +2005,13 @@ bool bpl_cfg_set_rsn_override(const std::string &iface_name, const std::string &
+  * where Device.DHCPv4.Client.*.Enable is set to true.
+  * For OpenWrt: Uses ip route command to get default gateway.
+  *
++ * @param [in] iface Interface to scope the gateway resolution to (e.g. the WAN
++ * interface). This prevents picking up a default route from an unrelated
++ * interface (e.g. a guest network) that happens to also have one installed.
+  * @param [out] gw_ip Gateway IP address.
+  * @return true on success, false otherwise.
+  */
+-bool cfg_get_dhcp_gateway_ip(std::string &gw_ip);
++bool cfg_get_dhcp_gateway_ip(const std::string &iface, std::string &gw_ip);
+ 
+ #ifdef BEEROCKS_RDKB
+ /**
+-- 
+2.34.1
+
