@@ -1,0 +1,100 @@
+From 2be6f07b11c65937eebcd39d83891026d0e98451 Mon Sep 17 00:00:00 2001
+From: Manoj Sekar <sekar@qti.qualcomm.com>
+Date: Thu, 10 Sep 2026 12:04:17 +0530
+Subject: [PATCH] [Channel Planning]Make Timer registration agnostic and robust
+
+Signed-off-by: Manoj Sekar <sekar@qti.qualcomm.com>
+---
+ .../slave/tasks/channel_selection_task.cpp    | 67 ++++++++++++++-----
+ 1 file changed, 51 insertions(+), 16 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+index 73e8af8..f741dba 100644
+--- a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+@@ -1629,8 +1629,26 @@ cbs_periodic_after_bootstrap:
+         if (effective_interval > 0) {
+             auto now = std::chrono::steady_clock::now();
+ 
+-            if (m_cbs_next_trigger_time == std::chrono::steady_clock::time_point::min() ||
+-                now >= m_cbs_next_trigger_time) {
++            // Register the periodic schedule independently of onboarding/controller state.
++            // m_cbs_next_trigger_time is process-local state, so it is recreated after a
++            // beerocks_backhaul restart. Arm it on the first work() pass rather than waiting for
++            // a bootstrap or post-autoconfiguration trigger to succeed. The periodic CBS path
++            // must remain available even when controller discovery or AP autoconfiguration is
++            // incomplete; those conditions only govern the optional bootstrap scan.
++            if (m_cbs_next_trigger_time == std::chrono::steady_clock::time_point::min()) {
++                // Arm the first periodic opportunity immediately. This preserves the original
++                // startup behavior: when bootstrap finds an already-valid CBS cache, the periodic
++                // path still issues the first agent-owned CBS trigger in the same work cycle.
++                // Bootstrap-without-cache and post-autoconfiguration paths explicitly advance
++                // this deadline after they issue their own one-shot trigger, preventing a
++                // duplicate CBS request. On a process restart, the newly constructed task again
++                // starts with an immediately due periodic opportunity.
++                m_cbs_next_trigger_time = now;
++                LOG(DEBUG) << "[CBS] work: registered periodic CBS timer for "
++                           << effective_interval << "s (first trigger due immediately)";
++            }
++
++            if (now >= m_cbs_next_trigger_time) {
+ 
+                 // Count how many radios we actually issued the trigger for. On the very first
+                 // work() ticks the AgentDB radio list can still be EMPTY (radios are registered
+@@ -1650,22 +1668,39 @@ cbs_periodic_after_bootstrap:
+                     // Leave m_cbs_next_trigger_time unchanged (min()) so we retry once ready.
+                     goto cbs_periodic_done;
+                 }
+-                // Match bootstrap policy: onboarding waits for completion, while a controller-less
+-                // reboot is allowed after the bounded discovery grace period.
+-                const bool periodic_onboarding_complete =
+-                    db->statuses.ap_autoconfiguration_completed;
+-                const bool periodic_discovery_started =
+-                    db->statuses.controller_discovery_completed;
+-                const bool periodic_controllerless_reboot =
+-                    m_cbs_controller_discovery_grace_expiry !=
+-                        std::chrono::steady_clock::time_point::min() &&
+-                    !periodic_discovery_started &&
+-                    std::chrono::steady_clock::now() >=
+-                        m_cbs_controller_discovery_grace_expiry;
+-                if (!periodic_onboarding_complete && !periodic_controllerless_reboot) {
++                // The periodic path is intentionally independent of controller discovery and AP
++                // autoconfiguration. Those readiness conditions belong to the bootstrap path only.
++                // Once this schedule is due, CBS is an agent-owned periodic operation and must be
++                // issued after every process restart as well, provided the Agent socket/radios are
++                // ready. If the socket or radio list is not ready, the deadline remains due and the
++                // next work() tick retries instead of silently consuming the interval.
++                //
++                // IMPORTANT (full-radio-set readiness): the FIRST periodic opportunity is armed
++                // immediately on process start (see above), which can be reached before every
++                // configured radio has completed its fronthaul CONFIGURE handshake and registered
++                // a real MAC in the AgentDB. If we trigger only the subset that happens to be
++                // registered at that instant and then advance the schedule by a full
++                // effective_interval, the remaining radios silently miss this cycle and wait a
++                // whole interval before their first CBS trigger. Require the FULL configured radio
++                // set (per device_conf.front_radio.config) to be registered before triggering, and
++                // otherwise defer without consuming the deadline so the very next work() tick
++                // retries as soon as the remaining radios finish registering (this happens quickly
++                // during boot, so it does not meaningfully delay the periodic schedule).
++                const size_t expected_radio_count = db->device_conf.front_radio.config.size();
++                size_t ready_radio_count = 0;
++                for (const auto radio : db->get_radios_list()) {
++                    if (radio && radio->front.iface_mac != beerocks::net::network_utils::ZERO_MAC) {
++                        ++ready_radio_count;
++                    }
++                }
++                if (expected_radio_count > 0 && ready_radio_count < expected_radio_count) {
++                    LOG(DEBUG) << "[CBS] work: periodic - only " << ready_radio_count << "/"
++                               << expected_radio_count
++                               << " configured radios are registered in AgentDB yet; deferring "
++                                  "periodic CBS trigger to a later work() tick (schedule not "
++                                  "consumed)";
+                     goto cbs_periodic_done;
+                 }
+-
+                 size_t triggered = 0;
+                 for (const auto radio : db->get_radios_list()) {
+                     if (!radio) {
+-- 
+2.34.1
+
