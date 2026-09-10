@@ -1,0 +1,224 @@
+From 893130e76972200552f28f11d07a08103d307082 Mon Sep 17 00:00:00 2001
+From: Arockiasathish S <arocs@qti.qualcomm.com>
+Date: Thu, 10 Sep 2026 15:53:04 +0530
+Subject: [PATCH] [RDK][QMESH] Add dynamic bridge LAN interface synchronization
+
+- Monitor bridge membership changes using NETLINK_ROUTE events.
+- Add BridgeStateManager support in Backhaul Manager.
+- Dynamically add/remove bridge member interfaces in db->ethernet.lan.
+- Synchronize Ethernet and veth interfaces added after startup.
+- Ensure topology and link metric reporting includes runtime bridge members.
+
+Signed-off-by: Arockiasathish S <arocs@qti.qualcomm.com>
+---
+ .../backhaul_manager/backhaul_manager.cpp     | 133 ++++++++++++++++++
+ .../slave/backhaul_manager/backhaul_manager.h |  14 ++
+ 2 files changed, 147 insertions(+)
+
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index a1230772d..04d673566 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -26,6 +26,12 @@
+ #include <bcl/beerocks_wifi_channel.h>
+ #include <bcl/son/son_wireless_utils.h>
+ #include <bcl/transaction.h>
++#ifdef BEEROCKS_RDKB
++#include <bcl/network/bridge_state_manager_impl.h>
++#include <bcl/network/bridge_state_monitor_impl.h>
++#include <bcl/network/bridge_state_reader_impl.h>
++#include <bcl/network/netlink_event_listener_impl.h>
++#endif
+ #include <btl/broker_client_factory_factory.h>
+ #include <easylogging++.h>
+ 
+@@ -333,6 +339,74 @@ bool BackhaulManager::thread_init()
+         return false;
+     }
+ 
++#ifdef BEEROCKS_RDKB
++    // Build a NETLINK_ROUTE listener and BridgeStateManager so we can react to bridge
++    // membership changes (RTM_NEWLINK) instead of polling. When a new interface is attached
++    // to the bridge at runtime (e.g. a veth pair brought up by a co-located controller),
++    // sync_bridge_lan_interfaces() updates db->ethernet.lan so link metric responses and
++    // topology reports cover all bridge members from that point on.
++    {
++        auto netlink_socket = std::make_shared<beerocks::net::NetlinkRouteSocket>();
++        // client is stack-local and used only for bind(); the fd stays open because
++        // netlink_socket is kept alive by connection -> netlink_listener below.
++        beerocks::net::ClientSocketImpl<beerocks::net::NetlinkRouteSocket> client(netlink_socket);
++        if (client.bind(beerocks::net::NetlinkAddress(RTMGRP_LINK))) {
++            auto connection =
++                std::make_shared<beerocks::net::SocketConnectionImpl>(netlink_socket);
++            auto netlink_listener =
++                std::make_shared<beerocks::net::NetlinkEventListenerImpl>(connection, m_event_loop);
++            auto monitor =
++                std::make_unique<beerocks::net::BridgeStateMonitorImpl>(netlink_listener);
++            auto reader = std::make_unique<beerocks::net::BridgeStateReaderImpl>();
++            m_bridge_state_manager = std::make_shared<beerocks::net::BridgeStateManagerImpl>(
++                std::move(monitor), std::move(reader));
++            transaction.add_rollback_action([&]() { m_bridge_state_manager.reset(); });
++            m_bridge_state_manager->set_handler(
++                [this](const std::string &bridge_name, const std::string &iface_name,
++                       bool iface_added) {
++                    auto db = AgentDB::get();
++                    if (bridge_name != db->bridge.iface_name) {
++                        return;
++                    }
++                    if (iface_added) {
++                        LOG(DEBUG) << "Bridge member added: " << iface_name << " -> "
++                                   << bridge_name << "; refreshing LAN interface list";
++                        sync_bridge_lan_interfaces();
++                    } else {
++                        LOG(DEBUG) << "Bridge member removed: " << iface_name << " from "
++                                   << bridge_name << "; removing from LAN interface list";
++                        auto &lan = db->ethernet.lan;
++                        auto it = std::find_if(lan.begin(), lan.end(), [&](const auto &port) {
++                            return port.iface_name == iface_name;
++                        });
++                        if (it != lan.end()) {
++                            LOG(INFO) << "LAN interface dynamically removed: " << iface_name;
++                            lan.erase(it);
++                        }
++                    }
++                });
++
++            // Prime the BridgeStateManagerImpl cache so that bridge netlink events are not
++            // silently discarded. The manager only forwards events for bridges whose state has
++            // been read at least once (cache-gate in bridge_state_manager_impl.cpp).
++            std::string bridge_iface;
++            std::set<std::string> initial_bridge_members;
++            auto bridge_state_ok =
++                bpl::cfg_get_private_bridge_iface(bridge_iface) &&
++                m_bridge_state_manager->read_state(bridge_iface, initial_bridge_members);
++            LOG_IF(!bridge_state_ok, ERROR)
++                << "Unable to read initial bridge state for " << bridge_iface
++                << "; bridge netlink events will be silently discarded";
++            LOG_IF(bridge_state_ok, INFO)
++                << "Bridge state event monitor started for " << bridge_iface
++                << " (" << initial_bridge_members.size() << " initial members)";
++        } else {
++            LOG(WARNING) << "Failed to bind NETLINK_ROUTE socket; bridge member changes will "
++                            "not update db->ethernet.lan dynamically";
++        }
++    }
++#endif
++
+     transaction.commit();
+ 
+     LOG(DEBUG) << "started";
+@@ -346,6 +420,15 @@ void BackhaulManager::on_thread_stop()
+         m_cmdu_server->disconnect(m_agent_fd);
+     }
+ 
++#ifdef BEEROCKS_RDKB
++    // clear_handler() deregisters the lambda before the shared_ptr refcount drops,
++    // ensuring no callback fires during teardown.
++    if (m_bridge_state_manager) {
++        m_bridge_state_manager->clear_handler();
++        m_bridge_state_manager.reset();
++    }
++#endif
++
+     while (m_radios_info.size() > 0) {
+         auto radio_info = m_radios_info.back();
+         if (radio_info) {
+@@ -5578,6 +5661,56 @@ bool BackhaulManager::is_collocated_veth_wired_onboarding() const
+     return true;
+ }
+ 
++#ifdef BEEROCKS_RDKB
++void BackhaulManager::sync_bridge_lan_interfaces()
++{
++    // In RDKB co-located controller+agent setups, interfaces such as veth pairs may be
++    // attached to the bridge dynamically at runtime (after agent startup). The static
++    // read_platform_configuration() only captures interfaces present at boot time, so
++    // any interface added later would be missing from db->ethernet.lan. This function
++    // is called from the bridge state event handler when a new interface is added to the
++    // bridge, ensuring topology reporting and link metric response cover all bridge members.
++    auto db = AgentDB::get();
++
++    // Physical ethernet interfaces from bridge (same filter as read_platform_configuration).
++    auto lan_ifaces = beerocks::net::network_utils::linux_get_lan_interfaces();
++    for (const auto &iface : lan_ifaces) {
++        std::string iface_mac;
++        if (!beerocks::net::network_utils::linux_iface_get_mac(iface, iface_mac)) {
++            continue;
++        }
++        auto mac = tlvf::mac_from_string(iface_mac);
++        auto it  = std::find_if(db->ethernet.lan.begin(), db->ethernet.lan.end(),
++                                [&](const auto &port) { return port.iface_name == iface; });
++        if (it == db->ethernet.lan.end()) {
++            db->ethernet.lan.emplace_back(iface, mac);
++            LOG(INFO) << "LAN interface dynamically added: " << iface << " - " << iface_mac;
++        }
++    }
++
++    // veth interfaces from config (same as read_platform_configuration BEEROCKS_RDKB block).
++    std::vector<std::string> veth_ifaces;
++    if (!bpl::cfg_get_veth_ifaces(veth_ifaces)) {
++        LOG(WARNING) << "Failed to read veth interfaces from config; skipping veth LAN sync";
++        return;
++    }
++    for (const auto &veth_iface : veth_ifaces) {
++        std::string iface_mac;
++        if (!beerocks::net::network_utils::linux_iface_get_mac(veth_iface, iface_mac)) {
++            continue;
++        }
++        auto mac = tlvf::mac_from_string(iface_mac);
++        auto it  = std::find_if(db->ethernet.lan.begin(), db->ethernet.lan.end(),
++                                [&](const auto &port) { return port.iface_name == veth_iface; });
++        if (it == db->ethernet.lan.end()) {
++            db->ethernet.lan.emplace_back(veth_iface, mac);
++            LOG(INFO) << "veth LAN interface dynamically added: " << veth_iface
++                      << " - " << iface_mac;
++        }
++    }
++}
++#endif
++
+ bool BackhaulManager::select_gateway_reachable_eth_interface(std::string &selected_iface)
+ {
+     auto db = AgentDB::get();
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+index 463953308..2e6165146 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+@@ -22,6 +22,9 @@
+ #include <bcl/beerocks_ucc_server.h>
+ #include <bcl/network/network_utils.h>
+ #include <bcl/network/sockets_impl.h>
++#ifdef BEEROCKS_RDKB
++#include <bcl/network/bridge_state_manager.h>
++#endif
+ #include <btl/broker_client.h>
+ #include <btl/broker_client_factory.h>
+ #include <bwl/sta_wlan_hal.h>
+@@ -655,6 +658,14 @@ private:
+ 
+     wan_monitor wan_mon;
+ 
++#ifdef BEEROCKS_RDKB
++    /**
++     * @brief Scans bridge members and adds any new non-wireless interfaces to db->ethernet.lan.
++     * Called from the bridge state event handler when an interface is added to the bridge.
++     */
++    void sync_bridge_lan_interfaces();
++#endif
++
+     // Future to hold the DHCP client process exit code
+     std::future<int> m_ftDHCPRetCode;
+ 
+@@ -706,6 +717,9 @@ private:
+     std::chrono::steady_clock::time_point eth_link_poll_timer;
+     bool m_eth_link_up  = false;
+     bool m_backhaul_switch  = false;
++#ifdef BEEROCKS_RDKB
++    std::shared_ptr<beerocks::net::BridgeStateManager> m_bridge_state_manager;
++#endif
+ 
+     enum class backhaul_connection { Invalid = -1, Wireless, Wired};
+ 
+-- 
+2.34.1
+
