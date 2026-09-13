@@ -1,0 +1,1790 @@
+From 835503989e3435a6875b219f83df4567a037c5f4 Mon Sep 17 00:00:00 2001
+From: Anurag Sethi <anurseth@qti.qualcomm.com>
+Date: Thu, 3 Sep 2026 20:41:35 -0700
+Subject: [PATCH] CoTDMA Task and Handling in Controller
+
+Signed-off-by: Anurag Sethi <anurseth@qti.qualcomm.com>
+---
+ controller/config/beerocks_controller.conf.in |   3 +
+ .../beerocks/master/beerocks_master_main.cpp  |   6 +
+ controller/src/beerocks/master/controller.cpp | 258 ++++-
+ controller/src/beerocks/master/controller.h   |  43 +
+ controller/src/beerocks/master/db/agent.h     |  62 ++
+ controller/src/beerocks/master/db/db.cpp      |   8 +
+ controller/src/beerocks/master/db/db.h        |   5 +
+ .../master/tasks/coordinated_tdma_task.cpp    | 887 ++++++++++++++++++
+ .../master/tasks/coordinated_tdma_task.h      | 329 +++++++
+ 9 files changed, 1600 insertions(+), 1 deletion(-)
+ create mode 100644 controller/src/beerocks/master/tasks/coordinated_tdma_task.cpp
+ create mode 100644 controller/src/beerocks/master/tasks/coordinated_tdma_task.h
+
+diff --git a/controller/config/beerocks_controller.conf.in b/controller/config/beerocks_controller.conf.in
+index ea0615f51..21b7a09d5 100644
+--- a/controller/config/beerocks_controller.conf.in
++++ b/controller/config/beerocks_controller.conf.in
+@@ -34,6 +34,9 @@ smd_profile_count=0 # Number of active SMD profiles
+ # smd_0_type=0                        # SMD type: 0=per-AP MLD MAC SAPs, 1=one MAC SAP
+ # smd_0_default_dl_drain_time=10      # Default DL drain time (TU units)
+ 
++#   CoTDMA feature:
++enable_cotdma=0 # 0 - disabled, 1 - enabled (CoTDMA - MAPC Coordinated-TDMA)
++
+ #   Measurement feature:
+ load_backhaul_measurements=0
+ load_front_measurements=1
+diff --git a/controller/src/beerocks/master/beerocks_master_main.cpp b/controller/src/beerocks/master/beerocks_master_main.cpp
+index 9a7125bca..985e5576b 100644
+--- a/controller/src/beerocks/master/beerocks_master_main.cpp
++++ b/controller/src/beerocks/master/beerocks_master_main.cpp
+@@ -75,6 +75,7 @@ BEEROCKS_INIT_BEEROCKS_VERSION
+ extern "C" void register_qca_smd_tlvs(bool enable_smd, bool is_controller);
+ extern "C" void add_qca_smd_profile_entry(const qca::sQcaSmdPolicyProfile *profile);
+ extern "C" void clear_qca_smd_profiles();
++extern "C" void register_qca_cotdma_tlvs(bool enable_cotdma, bool is_controller);
+ 
+ static bool g_running     = true;
+ static bool s_kill_master = false;
+@@ -228,6 +229,8 @@ static void fill_master_config(son::db::sDbMasterConfig &master_conf,
+         }
+     }
+ 
++    master_conf.enable_cotdma              = (main_master_conf.enable_cotdma == "1");
++
+     master_conf.enable_unicast_renew = (main_master_conf.enable_unicast_renew == "1");
+ 
+     master_conf.load_backhaul_measurements = (main_master_conf.load_backhaul_measurements == "1");
+@@ -895,6 +898,9 @@ int main(int argc, char *argv[])
+     // Register SMD TLVs based on configuration (controller role)
+     register_qca_smd_tlvs(master_conf.enable_smd, true);
+ 
++    // Register CoTDMA TLVs based on configuration (controller role)
++    register_qca_cotdma_tlvs(master_conf.enable_cotdma, true);
++
+     // Set Network.ID to the Data Model
+     if (!amb_dm_obj->set(DATAELEMENTS_ROOT_DM ".Network", "ID", bridge_info.mac)) {
+         LOG(ERROR) << "Failed to add Network.ID, mac: " << bridge_info.mac;
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index ab075fd4d..99b4e563c 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -21,6 +21,7 @@
+ #include "tasks/neighbor_db_ctrl_task.h"
+ #include "tasks/optimal_path_task.h"
+ #include "tasks/service_prioritization_task.h"
++#include "tasks/coordinated_tdma_task.h"
+ #include "tasks/topology_task.h"
+ #include "tasks/dpp_configurator_task.h"
+ #include <tlvf/wfa_map/tlvDppChirpValue.h>
+@@ -132,6 +133,7 @@ extern "C" void set_qca_wifi_compat_entries(const char **ssids, const uint8_t *m
+ #if defined(IEEE80211_BN)
+ #include <tlvf/wfa_map/tlvWifi8AgentCapabilities.h>
+ #endif /* defined(IEEE80211_BN) */
++#include <tlvf/wfa_map/tlvMapcConfigurationPolicy.h>
+ #include <tlvf/qca/tlvQcaWifi8Capabilities.h>
+ using qca::cQcaWifi8RadioEntry;
+ 
+@@ -362,6 +364,7 @@ bool Controller::start()
+             ieee1905_1::eMessageType::BSS_CONFIGURATION_RESULT_MESSAGE,
+             ieee1905_1::eMessageType::IEEE1905_ENCAP_EAPOL_MESSAGE,
+             ieee1905_1::eMessageType::IEEE1905_DECRYPTION_FAILURE_MESSAGE,
++            ieee1905_1::eMessageType::MAPC_REPORT_MESSAGE,
+         })) {
+         LOG(ERROR) << "Failed subscribing to the Bus";
+         return false;
+@@ -409,7 +412,7 @@ bool Controller::stop()
+ 
+ void Controller::start_mandatory_tasks()
+ {
+-    LOG(DEBUG) << "Start mandatory periodic tasks";
++    LOG(INFO) << "Start mandatory periodic tasks";
+ 
+     LOG_IF(!m_task_pool.add_task(std::make_shared<bml_task>(database, cmdu_tx, m_task_pool)), FATAL)
+         << "Failed adding BML task!";
+@@ -444,6 +447,15 @@ void Controller::start_mandatory_tasks()
+            FATAL)
+         << "Failed adding service_prioritization_task!";
+ 
++    if (database.config.enable_cotdma) {
++        LOG_IF(!m_task_pool.add_task(
++                   std::make_shared<coordinated_tdma_task>(database, cmdu_tx, m_task_pool)),
++               FATAL)
++            << "Failed adding coordinated_tdma_task!";
++    } else {
++        LOG(DEBUG) << "CoTDMA is disabled - coordinated_tdma_task not added";
++    }
++
+     // NOTE: DPP Configurator Task initialization moved to start() method
+     // to ensure broker client is available for PTK installation
+ 
+@@ -769,6 +781,8 @@ bool Controller::handle_cmdu_1905_1_message(const sMacAddr &src_mac,
+     case ieee1905_1::eMessageType::CLIENT_CAPABILITY_REPORT_MESSAGE:
+     case ieee1905_1::eMessageType::CHANNEL_PREFERENCE_REPORT_MESSAGE:
+     case ieee1905_1::eMessageType::CHANNEL_SELECTION_RESPONSE_MESSAGE:
++    case ieee1905_1::eMessageType::MAPC_REPORT_MESSAGE:
++    case ieee1905_1::eMessageType::COTDMA_CONFIGURATION_MESSAGE:
+ 
+         return true;
+     case ieee1905_1::eMessageType::VENDOR_SPECIFIC_MESSAGE:
+@@ -3241,6 +3255,248 @@ bool Controller::handle_tlv_wifi7_agent_capabilities(ieee1905_1::CmduMessageRx &
+     return true;
+ }
+ 
++#if defined(IEEE80211_BN)
++bool Controller::handle_tlv_wifi8_agent_capabilities(ieee1905_1::CmduMessageRx &cmdu_rx,
++                                                     std::shared_ptr<Agent> agent)
++{
++    auto wifi8_agt_caps_tlv = cmdu_rx.getClass<wfa_map::tlvWifi8AgentCapabilities>();
++    if (!wifi8_agt_caps_tlv) {
++        LOG(DEBUG) << "No WiFi 8 Agent Capabilities TLV in AP Capability Report";
++        return true;
++    }
++
++    if (!agent) {
++        LOG(ERROR) << "handle_tlv_wifi8_agent_capabilities: agent is null";
++        return false;
++    }
++
++    // Set of Agents whose shared_bssids list was updated as a result of processing this
++    // Agent's new sharing BSSIDs, so we know which OTHER Agents need to receive an updated
++    // MAPC Configuration Policy TLV.
++    std::set<sMacAddr> other_agents_to_update;
++
++    bool any_cotdma_radio = false;
++
++    for (size_t i = 0; i < wifi8_agt_caps_tlv->num_radio(); i++) {
++        auto result = wifi8_agt_caps_tlv->radio_wifi8_capabilities(i);
++        if (!std::get<0>(result)) {
++            LOG(ERROR) << "Failed to get radio_wifi8_capabilities entry " << i;
++            continue;
++        }
++        auto &radio_cap = std::get<1>(result);
++
++        if (!radio_cap.flags1().coord_tdma_support) {
++            continue; // radio does not support Co-TDMA
++        }
++        any_cotdma_radio = true;
++
++        const sMacAddr &ruid = radio_cap.ruid();
++        auto radio           = agent->radios.get(ruid);
++        if (!radio) {
++            LOG(WARNING) << "handle_tlv_wifi8_agent_capabilities: no radio found for ruid="
++                         << ruid << " on agent " << agent->al_mac;
++            continue;
++        }
++
++        const beerocks::eFreqType radio_band = radio->band;
++
++        // Gather this radio's fronthaul BSSes — each becomes a sharing BSSID for this Agent.
++        std::vector<std::shared_ptr<Agent::sRadio::sBss>> sharing_bsses_this_radio;
++        for (const auto &bss_entry : radio->bsses) {
++            if (!bss_entry.second || !bss_entry.second->fronthaul) {
++                continue;
++            }
++            sharing_bsses_this_radio.push_back(bss_entry.second);
++        }
++
++        for (const auto &sharing_bss : sharing_bsses_this_radio) {
++            const sMacAddr &sharing_bssid = sharing_bss->bssid;
++            auto &sharing_entry           = sharing_bss->mapc_sharing_bss;
++            sharing_entry.is_valid        = true;
++            sharing_entry.mapc_capability_bitmap =
++                static_cast<uint16_t>(wfa_map::eMapcCapabilityBit::CO_TDMA);
++            // cotdma_profile is populated later via MAPC discovery/negotiation with a peer;
++            // this TLV does not carry the actual Co-TDMA profile bits, so it is left at its
++            // zero-initialized default here.
++
++            // Populate shared_bssids with all BSSIDs from OTHER Agents on the same
++            // frequency band, and, symmetrically, register this sharing_bssid as a shared
++            // BSSID under any of those other Agents' own (already Co-TDMA capable) sharing
++            // BSSes.
++            for (auto &other_agent_pair : database.m_agents) {
++                auto &other_agent = other_agent_pair.second;
++                if (!other_agent || other_agent->al_mac == agent->al_mac) {
++                    continue;
++                }
++                for (auto &other_radio_pair : other_agent->radios) {
++                    auto &other_radio = other_radio_pair.second;
++                    if (!other_radio || other_radio->band != radio_band) {
++                        continue;
++                    }
++                    for (auto &other_bss_pair : other_radio->bsses) {
++                        auto &other_bss = other_bss_pair.second;
++                        if (!other_bss || !other_bss->fronthaul) {
++                            continue;
++                        }
++                        const sMacAddr &shared_bssid = other_bss_pair.first;
++
++                        // Add/refresh the shared BSSID entry under this Agent's sharing BSSID.
++                        auto &shared_entry = sharing_entry.shared_bssids[shared_bssid];
++                        shared_entry.discovery_status =
++                            Agent::sRadio::sBss::sMapcSharedBss::eDiscoveryStatus::PENDING;
++                        shared_entry.negotiation_status =
++                            Agent::sRadio::sBss::sMapcSharedBss::eNegotiationStatus::IDLE;
++
++                        // Symmetric update: if the other Agent's BSS is itself already a
++                        // sharing BSSID (it previously reported Wi-Fi 8 Co-TDMA capability),
++                        // add the current Agent's sharing BSSID to ITS shared_bssids list.
++                        if (other_bss->mapc_sharing_bss.is_valid) {
++                            auto &other_shared_entry =
++                                other_bss->mapc_sharing_bss.shared_bssids[sharing_bssid];
++                            other_shared_entry.discovery_status =
++                                Agent::sRadio::sBss::sMapcSharedBss::eDiscoveryStatus::PENDING;
++                            other_shared_entry.negotiation_status =
++                                Agent::sRadio::sBss::sMapcSharedBss::eNegotiationStatus::IDLE;
++                            other_agents_to_update.insert(other_agent->al_mac);
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    if (!any_cotdma_radio) {
++        LOG(DEBUG) << "handle_tlv_wifi8_agent_capabilities: no radio reports Co-TDMA support "
++                      "for agent "
++                   << agent->al_mac;
++        return true;
++    }
++
++    // Send MAPC Configuration Policy to this Agent, with the complete (updated) list of
++    // sharing BSSIDs.
++    if (!send_mapc_configuration_policy(agent->al_mac)) {
++        LOG(ERROR) << "Failed sending MAPC Configuration Policy to agent " << agent->al_mac;
++    }
++
++    // Send MAPC Configuration Policy to every other Agent whose shared_bssids list was
++    // updated as a result of processing this Agent's Co-TDMA capability report.
++    for (const auto &other_al_mac : other_agents_to_update) {
++        if (!send_mapc_configuration_policy(other_al_mac)) {
++            LOG(ERROR) << "Failed sending MAPC Configuration Policy to agent " << other_al_mac;
++        }
++    }
++
++    return true;
++}
++#endif /* defined(IEEE80211_BN) */
++
++bool Controller::send_mapc_configuration_policy(const sMacAddr &agent_mac)
++{
++    auto agent = database.m_agents.get(agent_mac);
++    if (!agent) {
++        LOG(ERROR) << "send_mapc_configuration_policy: agent " << agent_mac << " not found";
++        return false;
++    }
++
++    // Collect all BSSes on this Agent that are active MAPC sharing BSSIDs (i.e. have a
++    // non-zero mapc_capability_bitmap set on their mapc_sharing_bss member).
++    std::vector<std::shared_ptr<Agent::sRadio::sBss>> sharing_bsses;
++    for (auto &radio_pair : agent->radios) {
++        auto &radio = radio_pair.second;
++        if (!radio) {
++            continue;
++        }
++        for (auto &bss_pair : radio->bsses) {
++            auto &bss = bss_pair.second;
++            if (bss && bss->mapc_sharing_bss.mapc_capability_bitmap != 0) {
++                sharing_bsses.push_back(bss);
++            }
++        }
++    }
++
++    if (sharing_bsses.empty()) {
++        LOG(DEBUG) << "send_mapc_configuration_policy: agent " << agent_mac
++                   << " has no sharing BSSIDs configured, nothing to send";
++        return true;
++    }
++
++    if (!cmdu_tx.create(0, ieee1905_1::eMessageType::MULTI_AP_POLICY_CONFIG_REQUEST_MESSAGE)) {
++        LOG(ERROR) << "Failed building MULTI_AP_POLICY_CONFIG_REQUEST_MESSAGE for MAPC "
++                      "Configuration Policy to agent "
++                   << agent_mac;
++        return false;
++    }
++
++    auto mapc_policy_tlv = cmdu_tx.addClass<wfa_map::tlvMapcConfigurationPolicy>();
++    if (!mapc_policy_tlv) {
++        LOG(ERROR) << "addClass wfa_map::tlvMapcConfigurationPolicy failed";
++        return false;
++    }
++    mapc_policy_tlv->flags() = 0; // leaderBSSIDConfigurationValid not used by this flow
++
++    for (auto &sharing_bss : sharing_bsses) {
++        const sMacAddr &sharing_bssid = sharing_bss->bssid;
++        auto &sharing_entry           = sharing_bss->mapc_sharing_bss;
++
++        auto local_bss = mapc_policy_tlv->create_local_bss_list();
++        if (!local_bss) {
++            LOG(ERROR) << "create_local_bss_list() failed";
++            continue;
++        }
++        local_bss->local_bssid()               = sharing_bssid;
++        local_bss->leader_bssid_configuration() = 0;
++        local_bss->mapc_feature_enable_bitmap() = sharing_entry.mapc_capability_bitmap;
++
++        // Group this sharing BSSID's shared_bssids by the remote Agent that owns each one.
++        std::map<sMacAddr, std::vector<sMacAddr>, sMacAddrLess> remote_bssids_per_agent;
++        for (auto &shared_pair : sharing_entry.shared_bssids) {
++            const sMacAddr &shared_bssid = shared_pair.first;
++            auto owning_agent            = database.get_bss_parent_agent(shared_bssid);
++            if (owning_agent == beerocks::net::network_utils::ZERO_MAC) {
++                LOG(WARNING) << "send_mapc_configuration_policy: could not resolve owning "
++                                "agent for shared BSSID "
++                             << shared_bssid << ", skipping";
++                continue;
++            }
++            remote_bssids_per_agent[owning_agent].push_back(shared_bssid);
++        }
++
++        for (auto &remote_agent_pair : remote_bssids_per_agent) {
++            auto remote_agent_entry = local_bss->create_remote_agent_list();
++            if (!remote_agent_entry) {
++                LOG(ERROR) << "create_remote_agent_list() failed";
++                continue;
++            }
++            remote_agent_entry->remote_agent_al_mac_address() = remote_agent_pair.first;
++
++            for (const auto &permitted_bssid : remote_agent_pair.second) {
++                auto permitted_entry = remote_agent_entry->create_permitted_remote_bss_list();
++                if (!permitted_entry) {
++                    LOG(ERROR) << "create_permitted_remote_bss_list() failed";
++                    continue;
++                }
++                permitted_entry->permitted_remote_bssid() = permitted_bssid;
++                if (!remote_agent_entry->add_permitted_remote_bss_list(permitted_entry)) {
++                    LOG(ERROR) << "add_permitted_remote_bss_list() failed";
++                }
++            }
++            if (!local_bss->add_remote_agent_list(remote_agent_entry)) {
++                LOG(ERROR) << "add_remote_agent_list() failed";
++            }
++        }
++
++        if (!mapc_policy_tlv->add_local_bss_list(local_bss)) {
++            LOG(ERROR) << "add_local_bss_list() failed";
++        }
++    }
++
++    LOG(INFO) << "Sending MULTI_AP_POLICY_CONFIG_REQUEST_MESSAGE with "
++                 "TLV_MAPC_CONFIGURATION_POLICY to agent "
++              << agent_mac << " (" << sharing_bsses.size() << " sharing BSSID(s))";
++
++    return son_actions::send_cmdu_to_agent(agent_mac, cmdu_tx, database);
++}
++
+ bool Controller::handle_tlv_eht_operations(ieee1905_1::CmduMessageRx &cmdu_rx,
+                                            const sMacAddr &al_mac)
+ {
+diff --git a/controller/src/beerocks/master/controller.h b/controller/src/beerocks/master/controller.h
+index 019951ee5..ea637b5ab 100644
+--- a/controller/src/beerocks/master/controller.h
++++ b/controller/src/beerocks/master/controller.h
+@@ -493,6 +493,23 @@ public:
+         const sMacAddr &agent_mac,
+         const std::map<sMacAddr, std::vector<sBssExtendedConfig>, sMacAddrLess> &per_radio_bss);
+ 
++    /**
++     * @brief Build and send a MULTI_AP_POLICY_CONFIG_REQUEST_MESSAGE carrying a
++     * TLV_MAPC_CONFIGURATION_POLICY TLV to the given Agent, reflecting the current
++     * state of all of the Agent's BSSes with an active mapc_sharing_bss (as local
++     * BSSIDs) and their shared_bssids (grouped per remote Agent, as permitted remote
++     * BSSIDs).
++     *
++     * No-op (returns true) if the Agent has no sharing BSSIDs configured.
++     *
++     * Public so that coordinated_tdma_task (via db::get_controller_ctx()) can trigger it
++     * directly after processing a MAPC Capability Update TLV.
++     *
++     * @param agent_mac AL MAC of the target Agent.
++     * @return True on success, false otherwise.
++    */
++    bool send_mapc_configuration_policy(const sMacAddr &agent_mac);
++
+ private:
+     /**
+      * @brief Handles the client-connected event in the CMDU server.
+@@ -665,6 +682,32 @@ private:
+     bool handle_tlv_wifi7_agent_capabilities(ieee1905_1::CmduMessageRx &cmdu_rx,
+                                              std::shared_ptr<Agent> agent);
+ 
++    /**
++     * @brief Get info from 'WIFI8 Agent Capabilities' TLV (wfa_map::tlvWifi8AgentCapabilities),
++     * and update the Controller-DB MAPC sharing-BSSID structures for radios that report
++     * Co-TDMA support (flags1().coord_tdma_support).
++     *
++     * For each radio that reports Co-TDMA support:
++     *  - Every fronthaul BSSID of that radio becomes a "sharing BSSID" entry for this Agent
++     *    (Agent::sRadio::sBss::mapc_sharing_bss), with mapc_capability_bitmap set to CO_TDMA
++     *    and discovery/negotiation state (re)initialized for its candidate shared BSSIDs.
++     *  - Every fronthaul BSSID belonging to OTHER Agents' radios operating on the same
++     *    frequency band becomes a candidate "shared BSSID" for that sharing BSSID
++     *    (discovery_status=PENDING, negotiation_status=IDLE).
++     *  - Symmetrically, this Agent's new sharing BSSIDs are added to the shared-BSSID list
++     *    of any other Agent's existing sharing BSSIDs on the same band.
++     *
++     * After updating the DB, sends MULTI_AP_POLICY_CONFIG_REQUEST_MESSAGE (with
++     * TLV_MAPC_CONFIGURATION_POLICY) to this Agent and to every other Agent whose
++     * shared-BSSID list was updated as a result.
++     *
++     * @param cmdu_rx AP Capability Report message.
++     * @param agent shared ptr of agent sending the message.
++     * @return True on success, false otherwise.
++    */
++    bool handle_tlv_wifi8_agent_capabilities(ieee1905_1::CmduMessageRx &cmdu_rx,
++                                             std::shared_ptr<Agent> agent);
++
+     /**
+      * @brief Get info from 'EHT Operations' TLV,
+      * set data to EHT Operatons data element.
+diff --git a/controller/src/beerocks/master/db/agent.h b/controller/src/beerocks/master/db/agent.h
+index 96d336be3..1b9efa85c 100644
+--- a/controller/src/beerocks/master/db/agent.h
++++ b/controller/src/beerocks/master/db/agent.h
+@@ -568,6 +568,68 @@ public:
+                 bool eht_default_pe_duration = false;
+             } eht_operations;
+ 
++            /**
++             * @brief MAPC (Multi-AP Coordination) / Co-TDMA sharing state for this BSS,
++             * when this BSS is used as a "sharing BSSID".
++             *
++             * Populated when the owning Agent reports Wi-Fi 8 (802.11bn) capabilities with
++             * Co-TDMA support (wfa_map::tlvWifi8AgentCapabilities, flags1().coord_tdma_support)
++             * in an AP_CAPABILITY_REPORT_MESSAGE, for a Co-TDMA-capable radio's fronthaul BSS.
++             * Such a BSS becomes a "sharing BSSID", and maintains a list of "shared BSSID"
++             * candidates — BSSIDs belonging to OTHER Agents operating on the same frequency
++             * band — together with their MAPC discovery/negotiation state.
++             *
++             * Structure:
++             *   sBss -> mapc_sharing_bss -> { mapc_capability_bitmap, cotdma_profile,
++             *                                  shared_bssid -> { mapc_capability_bitmap,
++             *                                                    discovery_status,
++             *                                                    negotiation_status } }
++             */
++            struct sMapcSharedBss {
++                /** MAPC capability bitmap reported for the shared (peer) BSSID
++                 *  (see wfa_map::eMapcCapabilityBit). */
++                uint16_t mapc_capability_bitmap = 0;
++
++                enum class eDiscoveryStatus : uint8_t { PENDING = 0, DISCOVERED = 1 };
++                enum class eNegotiationStatus : uint8_t {
++                    IDLE              = 0,
++                    ESTABLISH_PENDING = 1,
++                    ESTABLISHED       = 2,
++                    TEARDOWN_PENDING  = 3,
++                    TORN              = 4,
++                };
++
++                eDiscoveryStatus discovery_status     = eDiscoveryStatus::PENDING;
++                eNegotiationStatus negotiation_status = eNegotiationStatus::IDLE;
++            };
++
++            struct sMapcSharingBss {
++                /** True once this BSS has actually been established/reported as a MAPC
++                 *  sharing BSSID (either via Wi-Fi 8 Co-TDMA capability report, or via a
++                 *  MAPC Capability Update TLV naming this BSSID as local_bssid). The other
++                 *  fields of this struct are only meaningful when is_valid is true. */
++                bool is_valid = false;
++
++                /** MAPC capability bitmap of this local (sharing) BSSID — set to Co-TDMA once
++                 *  Wi-Fi 8 capabilities with Co-TDMA support are received for the owning radio. */
++                uint16_t mapc_capability_bitmap = 0;
++
++                /** Co-TDMA profile (802.11 Co-TDMA Info/BW/CCFS/BSS-color etc.), mirroring
++                 *  wfa_map::sMapcBssCapability::ctdma_profile. Zero-initialized until an actual
++                 *  profile is learned via MAPC discovery/negotiation with a peer. */
++                uint64_t cotdma_profile    = 0;
++                uint8_t cotdma_profile_len = 0;
++
++                /** Candidate shared (peer) BSSIDs for MAPC discovery/negotiation with this
++                 *  sharing BSSID. Key: shared BSSID (owned by some other Agent). */
++                std::unordered_map<sMacAddr, sMapcSharedBss> shared_bssids;
++            };
++
++            /** MAPC sharing state for this BSS, when used as a sharing BSSID. Empty
++             *  (mapc_capability_bitmap == 0) until Wi-Fi 8 Co-TDMA capability is reported for
++             *  the owning radio. */
++            sMapcSharingBss mapc_sharing_bss;
++
+             /**
+              * @brief Updates vap_id with valid value, if is was undefined
+              * @param[in] vap_id_ : new vap_id value, only applied when valid
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 8c7c489cf..7f5cda13a 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -6352,6 +6352,14 @@ bool db::assign_agent_monitoring_task_id(int new_task_id)
+ 
+ int db::get_agent_monitoring_task_id() { return agent_monitoring_task_id; }
+ 
++bool db::assign_coordinated_tdma_task_id(int new_task_id)
++{
++    coordinated_tdma_task_id = new_task_id;
++    return true;
++}
++
++int db::get_coordinated_tdma_task_id() { return coordinated_tdma_task_id; }
++
+ bool db::assign_dynamic_channel_selection_task_id(const sMacAddr &mac, int new_task_id)
+ {
+     std::shared_ptr<Agent::sRadio> radio = get_radio_by_uid(mac);
+diff --git a/controller/src/beerocks/master/db/db.h b/controller/src/beerocks/master/db/db.h
+index 7616df2c4..8d2b91bf6 100644
+--- a/controller/src/beerocks/master/db/db.h
++++ b/controller/src/beerocks/master/db/db.h
+@@ -172,6 +172,7 @@ public:
+             uint8_t default_dl_drain_time = 0; ///< Default DL drain time (TU units)
+         };
+         std::vector<sSmdProfileConfig> smd_profiles;
++        bool enable_cotdma = false;
+         bool load_ire_roaming;
+         bool load_load_balancing;
+         bool load_service_fairness;
+@@ -3611,6 +3612,9 @@ public:
+     bool assign_agent_monitoring_task_id(int new_task_id);
+     int get_agent_monitoring_task_id();
+ 
++    bool assign_coordinated_tdma_task_id(int new_task_id);
++    int get_coordinated_tdma_task_id();
++
+     bool assign_statistics_polling_task_id(int new_task_id);
+     int get_statistics_polling_task_id();
+ 
+@@ -4040,6 +4044,7 @@ private:
+     int persistent_db_data_commit_operation_id = -1;
+     int dhcp_task_id                           = -1;
+     int agent_monitoring_task_id               = -1;
++    int coordinated_tdma_task_id               = -1;
+     int statistics_polling_task_id             = -1;
+     int vbss_task_id                           = -1;
+     int link_metrics_task_id                   = -1;
+diff --git a/controller/src/beerocks/master/tasks/coordinated_tdma_task.cpp b/controller/src/beerocks/master/tasks/coordinated_tdma_task.cpp
+new file mode 100644
+index 000000000..d36f5eef8
+--- /dev/null
++++ b/controller/src/beerocks/master/tasks/coordinated_tdma_task.cpp
+@@ -0,0 +1,887 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#include "coordinated_tdma_task.h"
++#include "../db/db.h"
++#include "../son_actions.h"
++#include "../controller.h"
++
++#include <bcl/beerocks_logging.h>
++#include <memory>
++#include <tlvf/ieee_1905_1/eMessageType.h>
++#include <tlvf/ieee_1905_1/sVendorOUI.h>
++#include <tlvf/wfa_map/tlvCoTDMASharingApConfiguration.h>
++#include <tlvf/wfa_map/tlvMapcCapabilityUpdate.h>
++#include <tlvf/wfa_map/tlvMapcNegotiationStatus.h>
++#include <tlvf/qca/eQcaTlvTypeMap.h>
++#include <tlvf/qca/eQcaTLVId.h>
++#include <tlvf/qca/tlvQcaCoTDMASharingApDlScsMsduFwdConfig.h>
++#include <tlvf/qca/tlvQcaCoTDMASharedApDlScsMsduFwdConfig.h>
++
++namespace son {
++
++coordinated_tdma_task::coordinated_tdma_task(db &database, ieee1905_1::CmduMessageTx &cmdu_tx,
++                                             task_pool &tasks_)
++    : task("coordinated_tdma_task"), database(database), cmdu_tx(cmdu_tx), tasks(tasks_)
++{
++    // Register this task's ID in the database so other tasks
++    // can push events to it (Such as SETUP_COTDMA_FOR_QOS_PATH).
++    database.assign_coordinated_tdma_task_id(id);
++
++    TASK_LOG(INFO) << "coordinated_tdma_task created on Controller";
++}
++
++void coordinated_tdma_task::work()
++{
++    // No periodic work required.  The task is entirely event-driven:
++    //   - MAPC Capability Report from Agent - Update Cooridnating APs DB and send policy config is any changes.
++    //   - MAPC Negotiation Status - Update Coordinating APs DB and send CoTDMA Config for impacted QoS Flows
++    //   - CoTDMA Config Trigger from application
++}
++
++void coordinated_tdma_task::handle_event(int event_type, void *obj)
++{
++    switch (event_type) {
++    case eEvent::SETUP_COTDMA_FOR_QOS_PATH: {
++        std::unique_ptr<sSetupCotdmaForQosPathEvent> ev(
++            static_cast<sSetupCotdmaForQosPathEvent *>(obj));
++        if (ev) {
++            handle_setup_cotdma_for_qos_path(*ev);
++        }
++        // unique_ptr destructor frees memory automatically at end of scope
++        break;
++    }
++    default:
++        TASK_LOG(WARNING) << "Unhandled event_type " << event_type;
++        break;
++    }
++}
++
++void coordinated_tdma_task::handle_setup_cotdma_for_qos_path(
++    const sSetupCotdmaForQosPathEvent &event)
++{
++    // Rebuild the Agent path from the AL-MAC list supplied
++    std::vector<std::shared_ptr<Agent>> path;
++    path.reserve(event.agent_path.size());
++    for (const auto &al_mac : event.agent_path) {
++        auto agent = database.m_agents.get(al_mac);
++        if (!agent) {
++            TASK_LOG(WARNING) << "handle_setup_cotdma_for_qos_path: agent " << al_mac
++                              << " not found in DB, aborting Co-TDMA setup for client "
++                              << event.client_mac;
++            return;
++        }
++        path.push_back(agent);
++    }
++
++    const int total_hops = static_cast<int>(path.size());
++    if (total_hops < 2) {
++        // Nothing to configure for a single-hop (directly-connected) client.
++        return;
++    }
++
++    TASK_LOG(DEBUG) << "handle_setup_cotdma_for_qos_path: client=" << event.client_mac
++                    << " qmid=" << event.qmid << " total_hops=" << total_hops;
++
++    // Walk the path from the root-most agent (path[last]) down to the serving agent
++    // (path[0]), pairing each adjacent hop as (sharing_agent, shared_agent).
++    for (int i = total_hops - 1; i >= 1; --i) {
++        const auto &sharing_agent = path[i];
++        const auto &shared_agent  = path[i - 1];
++
++        TASK_LOG(DEBUG) << "handle_setup_cotdma_for_qos_path: --- iteration i=" << i
++                        << " sharing_agent=" << sharing_agent->al_mac
++                        << " shared_agent=" << shared_agent->al_mac << " ---";
++
++        // Get all radio UIDs on sharing_agent that carry the wireless backhaul link to
++        // shared_agent (may be more than one for an MLO backhaul spanning multiple bands).
++        auto backhaul_radio_uids = get_backhaul_radio_uids(sharing_agent, shared_agent);
++        if (backhaul_radio_uids.empty()) {
++            TASK_LOG(DEBUG) << "handle_setup_cotdma_for_qos_path: no wireless backhaul radio(s) "
++                               "resolved between "
++                            << shared_agent->al_mac << " and " << sharing_agent->al_mac
++                            << ", skipping pair";
++            continue;
++        }
++
++        // Determine the downstream radio on shared_agent: either the radio serving the
++        // client directly (if shared_agent is the serving agent, i.e. i == 1) or the
++        // radio hosting the backhaul link down to the next agent in the path.
++        sMacAddr downstream_radio_uid = beerocks::net::network_utils::ZERO_MAC;
++        if (i == 1) {
++            auto serving_bss = database.get_bss(event.serving_bssid, shared_agent->al_mac);
++            if (!serving_bss) {
++                TASK_LOG(WARNING) << "handle_setup_cotdma_for_qos_path: serving BSSID "
++                                  << event.serving_bssid << " not found on agent "
++                                  << shared_agent->al_mac << ", skipping pair";
++                continue;
++            }
++            downstream_radio_uid = serving_bss->radio.radio_uid;
++            TASK_LOG(DEBUG) << "handle_setup_cotdma_for_qos_path: downstream_radio_uid "
++                               "(client-serving radio on shared_agent)="
++                            << downstream_radio_uid;
++        } else {
++            const auto &next_hop_down       = path[i - 2];
++            const sMacAddr &next_hop_bssid = next_hop_down->backhaul.parent_interface;
++            if (next_hop_bssid == beerocks::net::network_utils::ZERO_MAC) {
++                TASK_LOG(DEBUG) << "handle_setup_cotdma_for_qos_path: wired/unknown backhaul "
++                                   "between "
++                                << next_hop_down->al_mac << " and " << shared_agent->al_mac
++                                << ", skipping pair";
++                continue;
++            }
++            auto next_hop_bss = database.get_bss(next_hop_bssid, shared_agent->al_mac);
++            if (!next_hop_bss) {
++                TASK_LOG(WARNING) << "handle_setup_cotdma_for_qos_path: next-hop BSSID "
++                                  << next_hop_bssid << " not found on agent "
++                                  << shared_agent->al_mac << ", skipping pair";
++                continue;
++            }
++            downstream_radio_uid = next_hop_bss->radio.radio_uid;
++            TASK_LOG(DEBUG) << "handle_setup_cotdma_for_qos_path: downstream_radio_uid "
++                               "(next-hop radio on shared_agent)="
++                            << downstream_radio_uid;
++        }
++
++        // Find a sharing BSS + corresponding shared BSSID pair. Two requirements must hold:
++        //  1. The sharing BSS must be on a radio that is part of the backhaul link between
++        //     sharing_agent and shared_agent (backhaul_radio_uids - may be more than one
++        //     radio for an MLO backhaul spanning multiple bands).
++        //  2. That sharing BSS must have a corresponding shared BSSID entry owned by
++        //     shared_agent, on shared_agent's downstream_radio_uid.
++        std::shared_ptr<Agent::sRadio::sBss> sharing_bss;
++        sMacAddr matched_shared_bssid = beerocks::net::network_utils::ZERO_MAC;
++
++        for (const auto &candidate_radio_uid : backhaul_radio_uids) {
++            auto radio_it = sharing_agent->radios.find(candidate_radio_uid);
++            if (radio_it == sharing_agent->radios.end() || !radio_it->second) {
++                TASK_LOG(WARNING) << "handle_setup_cotdma_for_qos_path: backhaul radio "
++                                  << candidate_radio_uid << " not found on agent "
++                                  << sharing_agent->al_mac << ", skipping";
++                continue;
++            }
++            const auto &candidate_radio = radio_it->second;
++
++            for (const auto &bss_pair : candidate_radio->bsses) {
++                const auto &candidate_sharing_bss = bss_pair.second;
++                if (!candidate_sharing_bss || !candidate_sharing_bss->mapc_sharing_bss.is_valid) {
++                    continue;
++                }
++
++                TASK_LOG(DEBUG) << "handle_setup_cotdma_for_qos_path:   trying sharing-BSS "
++                                   "candidate="
++                                << candidate_sharing_bss->bssid << " on sharing_agent radio="
++                                << candidate_radio->radio_uid;
++
++                for (const auto &shared_entry :
++                     candidate_sharing_bss->mapc_sharing_bss.shared_bssids) {
++                    TASK_LOG(DEBUG)
++                        << "handle_setup_cotdma_for_qos_path:     examining shared_bssid="
++                        << shared_entry.first << " negotiation_status="
++                        << static_cast<int>(shared_entry.second.negotiation_status);
++
++                    auto candidate_bss = database.get_bss(shared_entry.first, shared_agent->al_mac);
++                    if (!candidate_bss) {
++                        // Not owned by shared_agent - not a match for this pair.
++                        TASK_LOG(DEBUG) << "handle_setup_cotdma_for_qos_path:       not "
++                                           "owned by shared_agent "
++                                        << shared_agent->al_mac << ", skip";
++                        continue;
++                    }
++                    if (candidate_bss->radio.radio_uid != downstream_radio_uid) {
++                        TASK_LOG(DEBUG) << "handle_setup_cotdma_for_qos_path:       "
++                                           "radio_uid="
++                                        << candidate_bss->radio.radio_uid
++                                        << " != downstream_radio_uid=" << downstream_radio_uid
++                                        << ", skip";
++                        continue;
++                    }
++                    sharing_bss           = candidate_sharing_bss;
++                    matched_shared_bssid  = shared_entry.first;
++                    TASK_LOG(DEBUG) << "handle_setup_cotdma_for_qos_path:       MATCH: "
++                                       "sharing_bssid="
++                                    << sharing_bss->bssid
++                                    << " shared_bssid=" << matched_shared_bssid;
++                    break;
++                }
++                if (sharing_bss) {
++                    break;
++                }
++            }
++            if (sharing_bss) {
++                break;
++            }
++        }
++
++        if (!sharing_bss || matched_shared_bssid == beerocks::net::network_utils::ZERO_MAC) {
++            TASK_LOG(DEBUG) << "handle_setup_cotdma_for_qos_path: no corresponding shared "
++                               "BSSID found on any radio of sharing_agent="
++                            << sharing_agent->al_mac << " -> shared agent "
++                            << shared_agent->al_mac << " on downstream radio "
++                            << downstream_radio_uid << ", skipping pair";
++            continue;
++        }
++
++        sCoTDMAQMIDConfig qmid_config{};
++        qmid_config.bsta_mac = shared_agent->backhaul.backhaul_interface;
++        qmid_config.qmid     = event.qmid;
++
++        TASK_LOG(DEBUG) << "handle_setup_cotdma_for_qos_path: configuring Co-TDMA for client "
++                        << event.client_mac << " qmid=" << event.qmid
++                        << " sharing_bssid=" << sharing_bss->bssid << " (agent "
++                        << sharing_agent->al_mac << ") shared_bssid=" << matched_shared_bssid
++                        << " (agent " << shared_agent->al_mac
++                        << ") bsta_mac=" << qmid_config.bsta_mac;
++
++        if (!send_cotdma_configuration_message(
++                sharing_bss->bssid, matched_shared_bssid,
++                static_cast<uint8_t>(wfa_map::eCoTDMAConfigMode::ADD), nullptr, &qmid_config)) {
++            TASK_LOG(ERROR) << "handle_setup_cotdma_for_qos_path: failed to send Co-TDMA "
++                               "DL SCS MSDU forwarding configuration for sharing_bssid="
++                            << sharing_bss->bssid << " shared_bssid=" << matched_shared_bssid;
++        }
++    }
++}
++
++bool coordinated_tdma_task::handle_ieee1905_1_msg(const sMacAddr &src_mac,
++                                                  ieee1905_1::CmduMessageRx &cmdu_rx)
++{
++    switch (cmdu_rx.getMessageType()) {
++    case ieee1905_1::eMessageType::MAPC_REPORT_MESSAGE:
++        return handle_mapc_report_message(src_mac, cmdu_rx);
++    default: {
++        return false;
++    }
++    }
++}
++
++bool coordinated_tdma_task::handle_mapc_report_message(const sMacAddr &src_mac,
++                                                       ieee1905_1::CmduMessageRx &cmdu_rx)
++{
++    TASK_LOG(DEBUG) << "Received MAPC_REPORT_MESSAGE from agent " << src_mac;
++
++    bool handled = false;
++
++    // Try tlvMapcCapabilityUpdate
++    auto cap_tlv = cmdu_rx.getClass<wfa_map::tlvMapcCapabilityUpdate>();
++    if (cap_tlv) {
++        handle_mapc_capability_update(src_mac, *cap_tlv);
++        handled = true;
++    }
++
++    // Try tlvMapcNegotiationStatus
++    auto neg_tlv = cmdu_rx.getClass<wfa_map::tlvMapcNegotiationStatus>();
++    if (neg_tlv) {
++        handle_mapc_negotiation_status(src_mac, *neg_tlv);
++        handled = true;
++    }
++
++    if (!handled) {
++        TASK_LOG(WARNING) << "MAPC_REPORT_MESSAGE from " << src_mac
++                          << " contains neither tlvMapcCapabilityUpdate nor "
++                             "tlvMapcNegotiationStatus";
++    }
++
++    return handled;
++}
++
++void coordinated_tdma_task::handle_mapc_capability_update(
++    const sMacAddr &src_mac, wfa_map::tlvMapcCapabilityUpdate &tlv)
++{
++    const sMacAddr &local_bssid = tlv.local_bssid();
++
++    TASK_LOG(DEBUG) << "Processing MAPC Capability Update from " << src_mac
++                    << " local_bssid=" << local_bssid
++                    << " peer_bss_count=" << static_cast<int>(tlv.peer_bss_count());
++
++    auto agent = database.get_agent(src_mac);
++    if (!agent) {
++        TASK_LOG(ERROR) << "handle_mapc_capability_update: agent not found for " << src_mac;
++        return;
++    }
++
++    // Sanity: local_bssid reported must be one of the BSSID entries on the Agent
++    // corresponding to src_mac.
++    auto local_bss = database.get_bss(local_bssid, src_mac);
++    if (!local_bss) {
++        TASK_LOG(ERROR) << "handle_mapc_capability_update: local_bssid " << local_bssid
++                        << " is not a BSSID of agent " << src_mac << ", discarding TLV";
++        return;
++    }
++
++    // Currently, MAPC negotiations are enabled only on FH VAPS. Check if BSSID is fronthaul
++    if (!local_bss->fronthaul) {
++        TASK_LOG(DEBUG) << "handle_mapc_capability_update: local_bssid " << local_bssid
++                        << " is not a fronthaul BSSID, discarding TLV";
++        return;        
++    }
++
++    auto &sharing_entry             = local_bss->mapc_sharing_bss;
++    const bool is_new_sharing_bssid = !sharing_entry.is_valid;
++
++    if (is_new_sharing_bssid) {
++        sharing_entry.is_valid = true;
++        sharing_entry.mapc_capability_bitmap =
++            static_cast<uint16_t>(wfa_map::eMapcCapabilityBit::CO_TDMA);
++        TASK_LOG(DEBUG) << "New MAPC sharing BSSID " << local_bssid << " (agent " << src_mac
++                        << ") marked valid, bitmap=0x" << std::hex
++                        << sharing_entry.mapc_capability_bitmap << std::dec;
++    }
++
++    // Sanity + apply: bssid in peer_bss_capabilities must be present on any OTHER Agent.
++    // If not found on any Agent, discard that peer_bss_capabilities entry.
++    bool shared_bssid_list_changed = false;
++
++    // Newly-added shared BSSIDs (for this sharing BSSID) that have the CO_TDMA capability
++    // bit set - a COTDMA_CONFIGURATION_MESSAGE (Sharing AP Configuration TLV, with default
++    // sCoTDMAExtendedConfig values) needs to be sent for each of these once the MAPC
++    // Configuration Policy has been (re-)sent below, covering both:
++    //  - a brand-new sharing BSSID (every processed entry is by definition new), and
++    //  - an already-existing sharing BSSID that gained a new shared BSSID.
++    std::vector<sMacAddr> new_cotdma_shared_bssids;
++
++    for (size_t i = 0; i < tlv.peer_bss_count(); ++i) {
++        auto result = tlv.peer_bss_capabilities(i);
++        if (!std::get<0>(result)) {
++            TASK_LOG(ERROR) << "Failed to read peer_bss_capabilities[" << i << "]";
++            continue;
++        }
++        auto &entry = std::get<1>(result);
++
++        auto peer_owning_agent = database.get_bss_parent_agent(entry.bssid);
++        if (peer_owning_agent == beerocks::net::network_utils::ZERO_MAC) {
++            TASK_LOG(WARNING) << "handle_mapc_capability_update: peer BSSID " << entry.bssid
++                              << " not found on any Agent in DB, discarding entry";
++            continue;
++        }
++
++        auto shared_it = sharing_entry.shared_bssids.find(entry.bssid);
++        if (shared_it == sharing_entry.shared_bssids.end()) {
++            // Not present yet - add a new shared_bssids entry for this peer BSSID.
++            auto &shared_entry                  = sharing_entry.shared_bssids[entry.bssid];
++            shared_entry.mapc_capability_bitmap = entry.mapc_capability_bitmap;
++            // discovery_status / negotiation_status keep their default values
++            // (PENDING / IDLE) as set by sMapcSharedBss's member initializers.
++            shared_bssid_list_changed = true;
++            TASK_LOG(DEBUG) << "Added new shared BSSID " << entry.bssid << " for sharing_bssid="
++                            << local_bssid << " (agent " << src_mac << ") bitmap=0x" << std::hex
++                            << entry.mapc_capability_bitmap << std::dec;
++
++            if (entry.mapc_capability_bitmap &
++                static_cast<uint16_t>(wfa_map::eMapcCapabilityBit::CO_TDMA)) {
++                new_cotdma_shared_bssids.push_back(entry.bssid);
++            }
++        } else if (shared_it->second.mapc_capability_bitmap != entry.mapc_capability_bitmap) {
++            // Already present - update the existing entry only if the bitmap changed.
++            const bool cotdma_was_enabled =
++                (shared_it->second.mapc_capability_bitmap &
++                 static_cast<uint16_t>(wfa_map::eMapcCapabilityBit::CO_TDMA)) != 0;
++            const bool cotdma_now_enabled =
++                (entry.mapc_capability_bitmap &
++                 static_cast<uint16_t>(wfa_map::eMapcCapabilityBit::CO_TDMA)) != 0;
++
++            shared_it->second.mapc_capability_bitmap = entry.mapc_capability_bitmap;
++            shared_bssid_list_changed                = true;
++            TASK_LOG(DEBUG) << "Updated mapc_capability_bitmap for shared BSSID " << entry.bssid
++                            << " under sharing_bssid=" << local_bssid << " (agent " << src_mac
++                            << ") bitmap=0x" << std::hex << entry.mapc_capability_bitmap
++                            << std::dec;
++
++            if (!cotdma_was_enabled && cotdma_now_enabled) {
++                // CO_TDMA capability transitioned from disabled to enabled for this
++                // already-existing shared BSSID - treat it the same as a newly-added
++                // CO_TDMA-capable shared BSSID.
++                new_cotdma_shared_bssids.push_back(entry.bssid);
++                TASK_LOG(DEBUG) << "CO_TDMA capability newly enabled for shared BSSID "
++                                << entry.bssid << " under sharing_bssid=" << local_bssid;
++            }
++        }
++    }
++
++    auto controller = database.get_controller_ctx();
++    if (!controller) {
++        TASK_LOG(ERROR) << "handle_mapc_capability_update: controller context not available, "
++                          "cannot send MAPC Configuration Policy";
++        return;
++    }
++
++    if (is_new_sharing_bssid) {
++        // New sharing BSSID established - every Agent may need the updated permitted-remote-BSS
++        // list (this sharing BSSID is now a valid candidate shared BSSID for other Agents'
++        // sharing BSSIDs too), so refresh the policy for ALL Agents.
++        for (auto &agent_pair : database.m_agents) {
++            if (!agent_pair.second) {
++                continue;
++            }
++            if (!controller->send_mapc_configuration_policy(agent_pair.second->al_mac)) {
++                TASK_LOG(ERROR) << "Failed sending MAPC Configuration Policy to agent "
++                                << agent_pair.second->al_mac;
++            }
++        }
++    } else if (shared_bssid_list_changed) {
++        // No new sharing BSSID, but the shared_bssids list (or an existing entry's bitmap)
++        // changed - only the reporting Agent needs a refreshed policy.
++        if (!controller->send_mapc_configuration_policy(src_mac)) {
++            TASK_LOG(ERROR) << "Failed sending MAPC Configuration Policy to agent " << src_mac;
++        }
++    }
++
++    // Send the initial Co-TDMA Sharing AP Configuration (default sCoTDMAExtendedConfig
++    // values, config_mode=ADD) for every newly-added CO_TDMA-capable shared BSSID, now that
++    // the MAPC Configuration Policy has been (re-)sent to the relevant Agent(s) above.
++    for (const auto &shared_bssid : new_cotdma_shared_bssids) {
++        sCoTDMAExtendedConfig extended_config{};
++        if (!send_cotdma_configuration_message(
++                local_bssid, shared_bssid, static_cast<uint8_t>(wfa_map::eCoTDMAConfigMode::ADD),
++                &extended_config, nullptr)) {
++            TASK_LOG(ERROR) << "Failed to send initial Co-TDMA Sharing AP Configuration for "
++                               "sharing_bssid="
++                            << local_bssid << " shared_bssid=" << shared_bssid;
++        }
++    }
++}
++
++void coordinated_tdma_task::handle_mapc_negotiation_status(
++    const sMacAddr &src_mac, wfa_map::tlvMapcNegotiationStatus &tlv)
++{
++    // flags: Bit 7: negotiationType (0=Teardown, 1=Establishment),
++    //        Bit 6: negotiationStatus (0=Fail, 1=Success)
++    const uint8_t flags        = tlv.flags();
++    const bool is_establishment = (flags & 0x80) != 0;
++    const bool is_success        = (flags & 0x40) != 0;
++
++    const sMacAddr &local_bssid  = tlv.local_mapc_bssid();
++    const sMacAddr &remote_bssid = tlv.remote_mapc_bssid();
++
++    TASK_LOG(DEBUG) << "Processing MAPC Negotiation Status from " << src_mac
++                    << " type=" << (is_establishment ? "Establishment" : "Teardown")
++                    << " status=" << (is_success ? "SUCCESS" : "FAIL")
++                    << " local_mapc_bssid=" << local_bssid
++                    << " remote_mapc_bssid=" << remote_bssid;
++
++    // Determine the target negotiation status to apply.
++    using sMapcSharedBss = Agent::sRadio::sBss::sMapcSharedBss;
++    sMapcSharedBss::eNegotiationStatus target_status;
++    if (is_establishment) {
++        target_status = is_success ? sMapcSharedBss::eNegotiationStatus::ESTABLISHED
++                                    : sMapcSharedBss::eNegotiationStatus::IDLE;
++    } else {
++        target_status = is_success ? sMapcSharedBss::eNegotiationStatus::TORN
++                                    : sMapcSharedBss::eNegotiationStatus::ESTABLISHED;
++    }
++
++    // Find and update the corresponding entry. The pairing may be recorded in either
++    // direction (sharing_bssid -> shared_bssid) across any BSS's mapc_sharing_bss.shared_bssids
++    // map, since the Controller DB may hold symmetric entries for both the initiator and the
++    // responder side of the negotiation.
++    bool found = false;
++    for (auto &agent_pair : database.m_agents) {
++        auto &agent = agent_pair.second;
++        if (!agent) {
++            continue;
++        }
++
++        for (auto &radio_pair : agent->radios) {
++            auto &radio = radio_pair.second;
++            if (!radio) {
++                continue;
++            }
++            for (auto &bss_pair : radio->bsses) {
++                auto &bss = bss_pair.second;
++                if (!bss) {
++                    continue;
++                }
++
++                // Direction 1: local_bssid is this sharing BSSID, remote_bssid is one of its
++                // shared BSSIDs.
++                if (bss->bssid == local_bssid) {
++                    auto shared_it = bss->mapc_sharing_bss.shared_bssids.find(remote_bssid);
++                    if (shared_it != bss->mapc_sharing_bss.shared_bssids.end()) {
++                        shared_it->second.negotiation_status = target_status;
++                        TASK_LOG(DEBUG) << "Updated negotiation_status for sharing_bssid="
++                                        << local_bssid << " shared_bssid=" << remote_bssid
++                                        << " (agent " << agent->al_mac << ")";
++                        found = true;
++                    }
++                }
++
++                // Direction 2 (symmetric entry): remote_bssid is this sharing BSSID,
++                // local_bssid is one of its shared BSSIDs.
++                if (bss->bssid == remote_bssid) {
++                    auto shared_it2 = bss->mapc_sharing_bss.shared_bssids.find(local_bssid);
++                    if (shared_it2 != bss->mapc_sharing_bss.shared_bssids.end()) {
++                        shared_it2->second.negotiation_status = target_status;
++                        TASK_LOG(DEBUG) << "Updated negotiation_status for sharing_bssid="
++                                        << remote_bssid << " shared_bssid=" << local_bssid
++                                        << " (agent " << agent->al_mac << ")";
++                        found = true;
++                    }
++                }
++            }
++        }
++
++        // ToDo If negotiation is torn down, check impacted DL SCS E2E MSDU forwarding
++        // Look up QoS Database, and check if impacted Agent's BSSID is in path to client
++    }
++
++    if (!found) {
++        TASK_LOG(WARNING) << "handle_mapc_negotiation_status: no matching DB entry found for "
++                             "local_mapc_bssid="
++                          << local_bssid << " remote_mapc_bssid=" << remote_bssid;
++    }
++}
++
++bool coordinated_tdma_task::send_cotdma_configuration_message(
++    const sMacAddr &sharing_bssid, const sMacAddr &shared_bssid, uint8_t config_mode,
++    const sCoTDMAExtendedConfig *extended_config, const sCoTDMAQMIDConfig *qmid_config)
++{
++    if (!extended_config && !qmid_config) {
++        TASK_LOG(ERROR) << "send_cotdma_configuration_message: both extended_config and "
++                           "qmid_config are null, nothing to send";
++        return false;
++    }
++
++    // --- Message to the Agent owning the Sharing AP BSSID ---
++    // Sent if either the Sharing AP Configuration TLV or the Sharing AP DL SCS MSDU
++    // forwarding TLV needs to be delivered.
++    if (extended_config || qmid_config) {
++        auto sharing_agent_mac = database.get_bss_parent_agent(sharing_bssid);
++        if (sharing_agent_mac == beerocks::net::network_utils::ZERO_MAC) {
++            TASK_LOG(ERROR) << "send_cotdma_configuration_message: could not resolve owning "
++                               "agent for sharing_bssid "
++                            << sharing_bssid;
++            return false;
++        }
++
++        if (!cmdu_tx.create(0, ieee1905_1::eMessageType::COTDMA_CONFIGURATION_MESSAGE)) {
++            TASK_LOG(ERROR) << "Failed to create COTDMA_CONFIGURATION_MESSAGE CMDU (sharing)";
++            return false;
++        }
++
++        // TLV_COTDMA_SHARING_AP_CONFIGURATION - Relevant when initiating MAPC negotiation
++        // without any QMIDs established for a client on Sharing BSSID
++        if (extended_config) {
++            if (!add_sharing_ap_configuration_tlv(sharing_bssid, shared_bssid, config_mode,
++                                                  *extended_config)) {
++                TASK_LOG(ERROR) << "Failed to add TLV_COTDMA_SHARING_AP_CONFIGURATION";
++                return false;
++            }
++        }
++
++        // QCA_TLV_COTDMA_SHARING_AP_DL_SCS_MSDU_FWD_CONFIG - sent to the Agent owning the
++        // Sharing AP BSSID.
++        if (qmid_config) {
++            if (!add_sharing_ap_dl_scs_msdu_fwd_config_tlv(sharing_bssid, shared_bssid,
++                                                           config_mode, *qmid_config)) {
++                TASK_LOG(ERROR)
++                    << "Failed to add QCA_TLV_COTDMA_SHARING_AP_DL_SCS_MSDU_FWD_CONFIG";
++                return false;
++            }
++        }
++
++        if (!son_actions::send_cmdu_to_agent(sharing_agent_mac, cmdu_tx, database)) {
++            TASK_LOG(ERROR) << "Failed to send COTDMA_CONFIGURATION_MESSAGE to "
++                            << sharing_agent_mac;
++            return false;
++        }
++
++        TASK_LOG(DEBUG) << "Sent COTDMA_CONFIGURATION_MESSAGE to " << sharing_agent_mac
++                       << " (sharing_bssid=" << sharing_bssid << ")";
++    }
++
++    // --- Message to the Agent owning the Shared AP BSSID ---
++    // QCA_TLV_COTDMA_SHARED_AP_DL_SCS_MSDU_FWD_CONFIG - sent to the Agent owning the
++    // Shared AP BSSID.
++    if (qmid_config) {
++        auto shared_agent_mac = database.get_bss_parent_agent(shared_bssid);
++        if (shared_agent_mac == beerocks::net::network_utils::ZERO_MAC) {
++            TASK_LOG(ERROR) << "send_cotdma_configuration_message: could not resolve owning "
++                               "agent for shared_bssid "
++                            << shared_bssid;
++            return false;
++        }
++
++        if (!cmdu_tx.create(0, ieee1905_1::eMessageType::COTDMA_CONFIGURATION_MESSAGE)) {
++            TASK_LOG(ERROR) << "Failed to create COTDMA_CONFIGURATION_MESSAGE CMDU (shared)";
++            return false;
++        }
++
++        if (!add_shared_ap_dl_scs_msdu_fwd_config_tlv(sharing_bssid, shared_bssid, config_mode,
++                                                      *qmid_config)) {
++            TASK_LOG(ERROR)
++                << "Failed to add QCA_TLV_COTDMA_SHARED_AP_DL_SCS_MSDU_FWD_CONFIG";
++            return false;
++        }
++
++        if (!son_actions::send_cmdu_to_agent(shared_agent_mac, cmdu_tx, database)) {
++            TASK_LOG(ERROR) << "Failed to send COTDMA_CONFIGURATION_MESSAGE to "
++                            << shared_agent_mac;
++            return false;
++        }
++
++        TASK_LOG(DEBUG) << "Sent COTDMA_CONFIGURATION_MESSAGE to " << shared_agent_mac
++                       << " (shared_bssid=" << shared_bssid << ")";
++    }
++
++    return true;
++}
++
++bool coordinated_tdma_task::add_sharing_ap_configuration_tlv(
++    const sMacAddr &sharing_bssid, const sMacAddr &shared_bssid, uint8_t config_mode,
++    const sCoTDMAExtendedConfig &extended_config)
++{
++    auto tlv = cmdu_tx.addClass<wfa_map::tlvCoTDMASharingApConfiguration>();
++    if (!tlv) {
++        TASK_LOG(ERROR) << "Failed to allocate tlvCoTDMASharingApConfiguration";
++        return false;
++    }
++
++    tlv->sharing_bssid() = sharing_bssid;
++    tlv->config_mode()   = config_mode;
++
++    // shared_bss_count is 1 for now.
++    if (!tlv->alloc_shared_bss_list(1)) {
++        TASK_LOG(ERROR) << "Failed to allocate shared_bss_list in TLV";
++        return false;
++    }
++    auto result = tlv->shared_bss_list(0);
++    if (!std::get<0>(result)) {
++        TASK_LOG(ERROR) << "Failed to access shared_bss_list[0]";
++        return false;
++    }
++    auto &entry                     = std::get<1>(result);
++    entry.shared_bssid              = shared_bssid;
++    entry.primary_ac                = extended_config.primary_ac;
++    entry.max_shared_txop_duration  = extended_config.max_shared_txop_duration;
++    entry.min_shared_txop_duration  = extended_config.min_shared_txop_duration;
++    entry.service_start_time        = extended_config.service_start_time;
++    entry.service_interval          = extended_config.service_interval;
++    entry.service_end_time          = extended_config.service_end_time;
++    entry.priority                  = extended_config.priority;
++
++    return true;
++}
++
++bool coordinated_tdma_task::add_sharing_ap_dl_scs_msdu_fwd_config_tlv(
++    const sMacAddr &sharing_bssid, const sMacAddr &shared_bssid, uint8_t config_mode,
++    const sCoTDMAQMIDConfig &qmid_config)
++{
++    auto tlv = cmdu_tx.addClass<qca::tlvQcaCoTDMASharingApDlScsMsduFwdConfig>();
++    if (!tlv) {
++        TASK_LOG(ERROR) << "Failed to allocate tlvQcaCoTDMASharingApDlScsMsduFwdConfig";
++        return false;
++    }
++
++    tlv->vendor_oui() = sVendorOUI(qca::qcaVendorOUI::OUI_QCA);
++    tlv->tlv_id() =
++        static_cast<uint16_t>(qca::eQcaTlVId::QCA_TLV_COTDMA_SHARING_AP_DL_SCS_MSDU_FWD_CONFIG);
++
++    // qmid_count is 1 for now.
++    if (!tlv->alloc_qmid_entries(1)) {
++        TASK_LOG(ERROR) << "Failed to allocate qmid_entries in Sharing AP forwarding TLV";
++        return false;
++    }
++    auto result = tlv->qmid_entries(0);
++    if (!std::get<0>(result)) {
++        TASK_LOG(ERROR) << "Failed to access sharing qmid_entries[0]";
++        return false;
++    }
++    auto &entry = std::get<1>(result);
++    // Bit 7: Remove/Add QMID (0=Remove, 1=Add)
++    entry.config_mode =
++        (config_mode == static_cast<uint8_t>(wfa_map::eCoTDMAConfigMode::ADD)) ? 0x80 : 0x00;
++    entry.sharing_bssid = sharing_bssid;
++    entry.bsta_mac      = qmid_config.bsta_mac;
++    entry.shared_bssid  = shared_bssid;
++    entry.qmid          = qmid_config.qmid;
++
++    return true;
++}
++
++bool coordinated_tdma_task::add_shared_ap_dl_scs_msdu_fwd_config_tlv(
++    const sMacAddr &sharing_bssid, const sMacAddr &shared_bssid, uint8_t config_mode,
++    const sCoTDMAQMIDConfig &qmid_config)
++{
++    auto tlv = cmdu_tx.addClass<qca::tlvQcaCoTDMASharedApDlScsMsduFwdConfig>();
++    if (!tlv) {
++        TASK_LOG(ERROR) << "Failed to allocate tlvQcaCoTDMASharedApDlScsMsduFwdConfig";
++        return false;
++    }
++
++    tlv->vendor_oui() = sVendorOUI(qca::qcaVendorOUI::OUI_QCA);
++    tlv->tlv_id() =
++        static_cast<uint16_t>(qca::eQcaTlVId::QCA_TLV_COTDMA_SHARED_AP_DL_SCS_MSDU_FWD_CONFIG);
++
++    // qmid_count is 1 for now.
++    if (!tlv->alloc_qmid_entries(1)) {
++        TASK_LOG(ERROR) << "Failed to allocate qmid_entries in Shared AP forwarding TLV";
++        return false;
++    }
++    auto result = tlv->qmid_entries(0);
++    if (!std::get<0>(result)) {
++        TASK_LOG(ERROR) << "Failed to access shared qmid_entries[0]";
++        return false;
++    }
++    auto &entry = std::get<1>(result);
++    // Bit 7: Remove/Add QMID (0=Remove, 1=Add)
++    entry.config_mode =
++        (config_mode == static_cast<uint8_t>(wfa_map::eCoTDMAConfigMode::ADD)) ? 0x80 : 0x00;
++    entry.shared_bssid = shared_bssid;
++    // peer_bssid is the sharing_bssid, per spec.
++    entry.peer_bssid = sharing_bssid;
++    entry.qmid     = qmid_config.qmid;
++
++    return true;
++}
++
++std::vector<sMacAddr>
++coordinated_tdma_task::get_backhaul_radio_uids(const std::shared_ptr<Agent> &sharing_agent,
++                                               const std::shared_ptr<Agent> &shared_agent)
++{
++    std::vector<sMacAddr> radio_uids;
++
++    if (!sharing_agent || !shared_agent) {
++        return radio_uids;
++    }
++
++    // MLO backhaul: shared_agent's bSTA MLD is associated to an AP MLD on sharing_agent.
++    // Every affiliated AP of that AP MLD is a radio on sharing_agent that is part of THIS
++    // specific backhaul link to shared_agent (regardless of which single band
++    // shared_agent->backhaul.parent_interface happens to record).
++    const sMacAddr &ap_mld_mac = shared_agent->bsta_mld.ap_mld_mac;
++    if (ap_mld_mac != beerocks::net::network_utils::ZERO_MAC) {
++        auto ap_mld_it = sharing_agent->ap_mlds.find(ap_mld_mac);
++        if (ap_mld_it != sharing_agent->ap_mlds.end()) {
++            for (const auto &affiliated_ap_pair : ap_mld_it->second.affiliated_aps) {
++                radio_uids.push_back(affiliated_ap_pair.second.ruid);
++                TASK_LOG(DEBUG) << "get_backhaul_radio_uids: MLO backhaul, ap_mld_mac="
++                                << ap_mld_mac << " affiliated radio="
++                                << affiliated_ap_pair.second.ruid << " bssid="
++                                << affiliated_ap_pair.second.bssid;
++            }
++            if (!radio_uids.empty()) {
++                return radio_uids;
++            }
++            TASK_LOG(WARNING) << "get_backhaul_radio_uids: ap_mld_mac=" << ap_mld_mac
++                              << " found on sharing_agent=" << sharing_agent->al_mac
++                              << " but has no affiliated_aps, falling back to "
++                                 "parent_interface resolution";
++        } else {
++            TASK_LOG(WARNING) << "get_backhaul_radio_uids: shared_agent="
++                              << shared_agent->al_mac << " bsta_mld.ap_mld_mac=" << ap_mld_mac
++                              << " not found in sharing_agent=" << sharing_agent->al_mac
++                              << " ap_mlds, falling back to parent_interface resolution";
++        }
++    }
++
++    // Legacy (non-MLO) wireless backhaul: resolve shared_agent's backhaul.parent_interface
++    // as a BSSID on sharing_agent, and return its single owning radio.
++    const sMacAddr &backhaul_bssid = shared_agent->backhaul.parent_interface;
++    if (backhaul_bssid == beerocks::net::network_utils::ZERO_MAC) {
++        TASK_LOG(DEBUG) << "get_backhaul_radio_uids: shared_agent=" << shared_agent->al_mac
++                        << " has wired/unknown backhaul (parent_interface == ZERO_MAC)";
++        return radio_uids;
++    }
++
++    auto backhaul_bss = database.get_bss(backhaul_bssid, sharing_agent->al_mac);
++    if (!backhaul_bss) {
++        TASK_LOG(WARNING) << "get_backhaul_radio_uids: backhaul BSSID " << backhaul_bssid
++                          << " not found on sharing_agent=" << sharing_agent->al_mac;
++        return radio_uids;
++    }
++
++    radio_uids.push_back(backhaul_bss->radio.radio_uid);
++    TASK_LOG(DEBUG) << "get_backhaul_radio_uids: legacy (non-MLO) backhaul, radio="
++                    << backhaul_bss->radio.radio_uid;
++
++    return radio_uids;
++}
++
++void coordinated_tdma_task::log_mapc_sharing_bssids_map()
++{
++    using sMapcSharedBss = Agent::sRadio::sBss::sMapcSharedBss;
++
++    auto discovery_status_to_str = [](sMapcSharedBss::eDiscoveryStatus status) -> const char * {
++        switch (status) {
++        case sMapcSharedBss::eDiscoveryStatus::PENDING:
++            return "PENDING";
++        case sMapcSharedBss::eDiscoveryStatus::DISCOVERED:
++            return "DISCOVERED";
++        default:
++            return "UNKNOWN";
++        }
++    };
++
++    auto negotiation_status_to_str = [](sMapcSharedBss::eNegotiationStatus status) -> const char * {
++        switch (status) {
++        case sMapcSharedBss::eNegotiationStatus::IDLE:
++            return "IDLE";
++        case sMapcSharedBss::eNegotiationStatus::ESTABLISH_PENDING:
++            return "ESTABLISH_PENDING";
++        case sMapcSharedBss::eNegotiationStatus::ESTABLISHED:
++            return "ESTABLISHED";
++        case sMapcSharedBss::eNegotiationStatus::TEARDOWN_PENDING:
++            return "TEARDOWN_PENDING";
++        case sMapcSharedBss::eNegotiationStatus::TORN:
++            return "TORN";
++        default:
++            return "UNKNOWN";
++        }
++    };
++
++    TASK_LOG(DEBUG) << "==== MAPC Sharing BSSIDs Map (begin) ====";
++
++    bool any_sharing_bssid_found = false;
++
++    for (const auto &agent_pair : database.m_agents) {
++        const auto &agent = agent_pair.second;
++        if (!agent) {
++            continue;
++        }
++
++        for (const auto &radio_pair : agent->radios) {
++            const auto &radio = radio_pair.second;
++            if (!radio) {
++                continue;
++            }
++
++            for (const auto &bss_pair : radio->bsses) {
++                const auto &bss = bss_pair.second;
++                if (!bss || !bss->mapc_sharing_bss.is_valid) {
++                    continue;
++                }
++
++                any_sharing_bssid_found = true;
++
++                TASK_LOG(DEBUG) << "Sharing BSSID=" << bss->bssid << " (agent=" << agent->al_mac
++                                << ") mapc_capability_bitmap=0x" << std::hex
++                                << bss->mapc_sharing_bss.mapc_capability_bitmap << std::dec
++                                << " shared_bssids_count="
++                                << bss->mapc_sharing_bss.shared_bssids.size();
++
++                for (const auto &shared_pair : bss->mapc_sharing_bss.shared_bssids) {
++                    const sMacAddr &shared_bssid  = shared_pair.first;
++                    const sMapcSharedBss &shared_entry = shared_pair.second;
++
++                    TASK_LOG(DEBUG) << "    -> shared_bssid=" << shared_bssid
++                                    << " mapc_capability_bitmap=0x" << std::hex
++                                    << shared_entry.mapc_capability_bitmap << std::dec
++                                    << " discovery_status="
++                                    << discovery_status_to_str(shared_entry.discovery_status)
++                                    << " negotiation_status="
++                                    << negotiation_status_to_str(
++                                           shared_entry.negotiation_status);
++                }
++            }
++        }
++    }
++
++    if (!any_sharing_bssid_found) {
++        TASK_LOG(DEBUG) << "(no valid MAPC sharing BSSIDs found in DB)";
++    }
++
++    TASK_LOG(DEBUG) << "==== MAPC Sharing BSSIDs Map (end) ====";
++}
++
++} // namespace son
+diff --git a/controller/src/beerocks/master/tasks/coordinated_tdma_task.h b/controller/src/beerocks/master/tasks/coordinated_tdma_task.h
+new file mode 100644
+index 000000000..a1ea43515
+--- /dev/null
++++ b/controller/src/beerocks/master/tasks/coordinated_tdma_task.h
+@@ -0,0 +1,329 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#ifndef _CONTROLLER_COORDINATED_TDMA_TASK_H_
++#define _CONTROLLER_COORDINATED_TDMA_TASK_H_
++
++#include "../db/db.h"
++#include "task.h"
++#include "task_pool.h"
++#include <tlvf/CmduMessageTx.h>
++#include <tlvf/common/sMacAddr.h>
++#include <tlvf/wfa_map/tlvCoTDMASharingApConfiguration.h>
++#include <tlvf/wfa_map/tlvMapcCapabilityUpdate.h>
++#include <tlvf/wfa_map/tlvMapcNegotiationStatus.h>
++#include <tlvf/qca/eQcaTLVId.h>
++#include <tlvf/qca/tlvQcaCoTDMASharingApDlScsMsduFwdConfig.h>
++#include <tlvf/qca/tlvQcaCoTDMASharedApDlScsMsduFwdConfig.h>
++
++#include <chrono>
++#include <string>
++#include <vector>
++
++namespace son {
++
++class db;
++
++/**
++ * @brief Controller-side Coordinated TDMA (Co-TDMA) task.
++ *
++ * Responsibilities:
++ *  - Builds and sends COTDMA_CONFIGURATION_MESSAGE (0x8051) to a single target Agent.
++ *  - The message may carry up to 3 Co-TDMA TLVs, depending on the role of the target Agent
++ *    with respect to this task's configuration:
++ *      * TLV_COTDMA_SHARING_AP_CONFIGURATION (wfa_map::tlvCoTDMASharingApConfiguration) -
++ *        sent to the Agent that owns the Sharing AP BSSID.
++ *      * QCA_TLV_COTDMA_SHARING_AP_DL_SCS_MSDU_FWD_CONFIG
++ *        (qca::tlvQcaCoTDMASharingApDlScsMsduFwdConfig) - sent to the Agent that owns the
++ *        Sharing AP BSSID.
++ *      * QCA_TLV_COTDMA_SHARED_AP_DL_SCS_MSDU_FWD_CONFIG
++ *        (qca::tlvQcaCoTDMASharedApDlScsMsduFwdConfig) - sent to the Agent that owns the
++ *        Shared AP BSSID (which may be a different Agent than the Sharing AP owner; the
++ *        caller is responsible for instantiating a separate task targeting that Agent
++ *        with only shared_scs_entries populated when needed).
++ *  - Waits for ACK from the target Agent.
++ *  - Retries on timeout (up to MAX_RETRIES times).
++ *  - Marks the task as done once the Agent has ACKed or all retries are exhausted.
++ *  - Handles MAPC_REPORT_MESSAGE (0x8050) received from any Agent, carrying either:
++ *      * TLV_MAPC_CAPABILITY_UPDATE (wfa_map::tlvMapcCapabilityUpdate)
++ *      * TLV_MAPC_NEGOTIATION_STATUS (wfa_map::tlvMapcNegotiationStatus)
++ *    and updates the Controller DB (Agent::sRadio::sBss::mapc_sharing_bss) accordingly.
++ *
++ * Usage:
++ *   auto task = std::make_shared<coordinated_tdma_task>(database, cmdu_tx, config);
++ *   task_pool.add_task(task);
++ */
++class coordinated_tdma_task : public task {
++public:
++    /**
++     * @brief Per-Shared-BSS TXOP sharing parameters for TLV_COTDMA_SHARING_AP_CONFIGURATION.
++     *
++     * Mirrors wfa_map::sSharedBssEntry, minus the shared_bssid (passed separately to
++     * send_cotdma_configuration_message()).
++     */
++    struct sCoTDMAExtendedConfig {
++        uint8_t primary_ac                 = 2; ///< Access Category for TXOP sharing (BE/BK/VI/VO).
++        uint8_t max_shared_txop_duration   = 30; ///< Max shared TXOP duration, units of 100us.
++        uint16_t min_shared_txop_duration  = 10; ///< Min shared TXOP duration, units of 100us.
++        uint16_t service_start_time        = 0; ///< Service start time, units of 100us.
++        uint16_t service_interval          = 0; ///< Service interval, units of 100us (0: share unconditionally).
++        uint16_t service_end_time          = 0; ///< Service end time, units of 100us.
++        uint8_t priority                   = 1; ///< Priority (lower value = higher priority).
++    };
++
++    /**
++     * @brief QMID configuration parameters shared by the two Q2Q DL SCS MSDU forwarding
++     * TLVs (QCA_TLV_COTDMA_SHARING_AP_DL_SCS_MSDU_FWD_CONFIG and
++     * QCA_TLV_COTDMA_SHARED_AP_DL_SCS_MSDU_FWD_CONFIG).
++     */
++    struct sCoTDMAQMIDConfig {
++        sMacAddr bsta_mac; ///< BSTA MAC Address for the Repeater to which the QMID applies.
++        uint16_t qmid;     ///< QMID configured for the Peer.
++    };
++
++    /**
++     * @brief Construct a new coordinated_tdma_task.
++     *
++     * @param database  Reference to the controller database.
++     * @param cmdu_tx   Reference to the CMDU transmit buffer.
++     * @param tasks_    Reference to the task pool.
++     */
++    coordinated_tdma_task(db &database, ieee1905_1::CmduMessageTx &cmdu_tx,
++                          task_pool &tasks_);
++
++    ~coordinated_tdma_task() override = default;
++
++    /**
++     * @brief Handle incoming IEEE 1905.1 messages.
++     *
++     * Handles:
++     *  - ACK_MESSAGE from the target Agent in response to COTDMA_CONFIGURATION_MESSAGE.
++     *  - MAPC_REPORT_MESSAGE from any Agent (TLV_MAPC_CAPABILITY_UPDATE or
++     *    TLV_MAPC_NEGOTIATION_STATUS).
++     *
++     * @param src_mac  AL MAC address of the sender.
++     * @param cmdu_rx  Received CMDU.
++     * @return true if the message was handled by this task.
++     */
++    bool handle_ieee1905_1_msg(const sMacAddr &src_mac,
++                               ieee1905_1::CmduMessageRx &cmdu_rx) override;
++
++    /**
++     * @brief Events that can be pushed to this task via task_pool::push_event().
++     */
++    enum eEvent {
++        /**
++         * @brief Set up Co-TDMA sharing/shared configuration for the multi-hop agent
++         * path of a NETWORK_LEVEL QoS descriptor.
++         *
++         */
++        SETUP_COTDMA_FOR_QOS_PATH,
++    };
++
++    /**
++     * @brief Payload for SETUP_COTDMA_FOR_QOS_PATH.
++     *
++     * agent_path is ordered from the client-serving agent (index 0) to the
++     * root/gateway-most agent (last index)
++     */
++    struct sSetupCotdmaForQosPathEvent {
++        std::vector<sMacAddr> agent_path; ///< AL-MACs, path[0]=serving agent .. path[last]=root-most agent.
++        sMacAddr serving_bssid = beerocks::net::network_utils::ZERO_MAC; ///< BSSID on path[0] serving the client.
++        sMacAddr client_mac    = beerocks::net::network_utils::ZERO_MAC; ///< Client MAC address.
++        uint16_t qmid          = 0;                                     ///< Controller-assigned QMID.
++    };
++
++private:
++    /**
++     * @brief Handle an event pushed via task_pool::push_event().
++     *
++     * @param event_type  One of the eEvent values.
++     * @param obj         Pointer to the corresponding event payload struct.
++     */
++    void handle_event(int event_type, void *obj) override;
++
++    /**
++     * @brief Handle SETUP_COTDMA_FOR_QOS_PATH event.
++     *
++     * Walks the agent path from the root-most agent (path[last]) down to the
++     * serving agent (path[0]), pairing each adjacent (sharing_agent, shared_agent)
++     * hop and - if a valid, established Co-TDMA sharing/shared BSSID pair is found
++     * on the correct radios - configures DL SCS MSDU forwarding for the given QMID
++     * via send_cotdma_configuration_message().
++     *
++     * @param event  Parsed sSetupCotdmaForQosPathEvent payload.
++     */
++    void handle_setup_cotdma_for_qos_path(const sSetupCotdmaForQosPathEvent &event);
++
++    /**
++     * @brief Handle MAPC_REPORT_MESSAGE from an Agent.
++     *
++     * Dispatches to either handle_mapc_capability_update() or
++     * handle_mapc_negotiation_status() depending on which TLV is present.
++     *
++     * @param src_mac  AL MAC address of the sending Agent.
++     * @param cmdu_rx  Received CMDU.
++     * @return true if handled.
++     */
++    bool handle_mapc_report_message(const sMacAddr &src_mac, ieee1905_1::CmduMessageRx &cmdu_rx);
++
++    /**
++     * @brief Process tlvMapcCapabilityUpdate and update the DB.
++     *
++     * TLV carries a single local_bssid (the reporting Agent's sharing BSSID) plus a list of
++     * peer_bss_capabilities (candidate shared BSSIDs and their MAPC capability bitmaps).
++     *
++     * Sanity checks performed before applying any update:
++     *  - local_bssid must be one of the BSSID entries on the Agent identified by src_mac
++     *    (looked up via Agent::sRadio::sBss). If not found, the whole TLV is discarded.
++     *  - Each peer_bss_capabilities[i].bssid must belong to some OTHER Agent in the DB
++     *    (via db::get_bss_parent_agent()). Entries that don't resolve to any Agent are
++     *    discarded individually (the rest of the TLV is still processed).
++     *
++     * DB updates (on Agent::sRadio::sBss::mapc_sharing_bss for local_bssid's BSS):
++     *  - If mapc_sharing_bss.is_valid was not yet set (new sharing BSSID): sets is_valid,
++     *    sets mapc_capability_bitmap to the CO_TDMA default, and populates shared_bssids
++     *    with the (sanity-checked) peer BSSIDs.
++     *  - If mapc_sharing_bss.is_valid was already set: for each peer BSSID, either adds a
++     *    new sMapcSharedBss entry to shared_bssids (if not already present) or updates the
++     *    existing entry's mapc_capability_bitmap (if changed).
++     *
++     * Triggers Controller::send_mapc_configuration_policy():
++     *  - For ALL Agents, if a new sharing BSSID was marked valid (is_valid transitioned to
++     *    true) — since that sharing BSSID is now itself a valid candidate shared BSSID for
++     *    every other Agent's own sharing BSSIDs.
++     *  - For src_mac's Agent only, if no new sharing BSSID was marked valid but the
++     *    shared_bssids list changed (new entry added) or an existing entry's
++     *    mapc_capability_bitmap changed.
++     *
++     * @param src_mac  AL MAC address of the sending Agent.
++     * @param tlv      Parsed tlvMapcCapabilityUpdate.
++     */
++    void handle_mapc_capability_update(const sMacAddr &src_mac,
++                                       wfa_map::tlvMapcCapabilityUpdate &tlv);
++
++    /**
++     * @brief Process tlvMapcNegotiationStatus and update the DB.
++     *
++     * Looks up the sharing/shared BSSID pair (local_mapc_bssid / remote_mapc_bssid) across
++     * all known Agents' radios/BSSes (Agent::sRadio::sBss::mapc_sharing_bss.shared_bssids)
++     * and updates the matching sMapcSharedBss::negotiation_status entry to ESTABLISHED (on
++     * success) or TORN (on failure/teardown), based on the flags() field of the TLV.
++     *
++     * @param src_mac  AL MAC address of the sending Agent.
++     * @param tlv      Parsed tlvMapcNegotiationStatus.
++     */
++    void handle_mapc_negotiation_status(const sMacAddr &src_mac,
++                                        wfa_map::tlvMapcNegotiationStatus &tlv);
++
++    /**
++     * @brief Get the set of radio UIDs on @p sharing_agent that carry the wireless backhaul
++     * link to @p shared_agent.
++     *
++     * For an MLO backhaul (shared_agent->bsta_mld.ap_mld_mac != ZERO_MAC), this looks up the
++     * corresponding AP MLD on sharing_agent (sharing_agent->ap_mlds[ap_mld_mac]) and returns
++     * the RUID of every affiliated AP - i.e. every band/radio that is actually part of that
++     * specific MLO backhaul link between the two Agents (NOT just any radio on sharing_agent).
++     *
++     * For a legacy (non-MLO / single-link) wireless backhaul, falls back to resolving
++     * shared_agent->backhaul.parent_interface as a BSSID on sharing_agent and returning its
++     * single owning radio's UID.
++     *
++     * Returns an empty vector if the backhaul is wired/unknown, or if the link cannot be
++     * resolved (DB inconsistency).
++     *
++     * @param sharing_agent  The (potential) Sharing AP Agent (root-ward side of the hop).
++     * @param shared_agent   The (potential) Shared AP Agent (client-ward side of the hop).
++     * @return Vector of radio UIDs on sharing_agent that carry the backhaul link to
++     *         shared_agent.
++     */
++    std::vector<sMacAddr> get_backhaul_radio_uids(const std::shared_ptr<Agent> &sharing_agent,
++                                                  const std::shared_ptr<Agent> &shared_agent);
++
++    /**
++     * @brief Debug helper: dump the full MAPC sharing/shared BSSID map for every Agent
++     * currently known in the Controller DB.
++     *
++     * For every BSS across all Agents/radios that has a valid MAPC sharing BSSID
++     * (Agent::sRadio::sBss::mapc_sharing_bss.is_valid == true), logs the sharing BSSID
++     * (with its owning Agent's AL-MAC and mapc_capability_bitmap) followed by each of its
++     * candidate shared BSSIDs (with their mapc_capability_bitmap, discovery_status and
++     * negotiation_status).
++     *
++     * Intended to be called after any update to the MAPC sharing/shared BSSID DB state
++     * (e.g. at the end of handle_mapc_capability_update()) for debugging purposes.
++     */
++    void log_mapc_sharing_bssids_map();
++
++protected:
++    /**
++     * @brief Main task work function.
++     *
++     * Drives the state machine: sends the COTDMA_CONFIGURATION_MESSAGE, waits for ACK,
++     * and retries on timeout.
++     */
++    void work() override;
++
++private:
++    /**
++     * @brief Build and send COTDMA_CONFIGURATION_MESSAGE(s) for a Co-TDMA sharing/shared
++     * BSSID pair.
++     *
++     * Depending on which of @p extended_config / @p qmid_config are non-null, this may
++     * send up to two separate COTDMA_CONFIGURATION_MESSAGE CMDUs:
++     *  - To the Agent owning @p sharing_bssid: TLV_COTDMA_SHARING_AP_CONFIGURATION (if
++     *    @p extended_config is non-null) and/or QCA_TLV_COTDMA_SHARING_AP_DL_SCS_MSDU_FWD_CONFIG
++     *    (if @p qmid_config is non-null).
++     *  - To the Agent owning @p shared_bssid: QCA_TLV_COTDMA_SHARED_AP_DL_SCS_MSDU_FWD_CONFIG
++     *    (if @p qmid_config is non-null).
++     *
++     * @param sharing_bssid   Sharing AP BSSID.
++     * @param shared_bssid    Shared AP BSSID.
++     * @param config_mode     0=Add, 1=Remove (see wfa_map::eCoTDMAConfigMode).
++     * @param extended_config Optional pointer to Sharing AP Configuration TLV fields.
++     *                        May be nullptr if not applicable.
++     * @param qmid_config     Optional pointer to QMID forwarding configuration fields.
++     *                        May be nullptr if not applicable.
++     * @return true on success.
++     */
++    bool send_cotdma_configuration_message(const sMacAddr &sharing_bssid,
++                                           const sMacAddr &shared_bssid, uint8_t config_mode,
++                                           const sCoTDMAExtendedConfig *extended_config,
++                                           const sCoTDMAQMIDConfig *qmid_config);
++
++    /**
++     * @brief Add TLV_COTDMA_SHARING_AP_CONFIGURATION to the CMDU.
++     * @return true on success.
++     */
++    bool add_sharing_ap_configuration_tlv(const sMacAddr &sharing_bssid,
++                                          const sMacAddr &shared_bssid, uint8_t config_mode,
++                                          const sCoTDMAExtendedConfig &extended_config);
++
++    /**
++     * @brief Add QCA_TLV_COTDMA_SHARING_AP_DL_SCS_MSDU_FWD_CONFIG to the CMDU.
++     * @return true on success.
++     */
++    bool add_sharing_ap_dl_scs_msdu_fwd_config_tlv(const sMacAddr &sharing_bssid,
++                                                   const sMacAddr &shared_bssid,
++                                                   uint8_t config_mode,
++                                                   const sCoTDMAQMIDConfig &qmid_config);
++
++    /**
++     * @brief Add QCA_TLV_COTDMA_SHARED_AP_DL_SCS_MSDU_FWD_CONFIG to the CMDU.
++     * @return true on success.
++     */
++    bool add_shared_ap_dl_scs_msdu_fwd_config_tlv(const sMacAddr &sharing_bssid,
++                                                  const sMacAddr &shared_bssid,
++                                                  uint8_t config_mode,
++                                                  const sCoTDMAQMIDConfig &qmid_config);
++
++private:
++    db &database;
++    ieee1905_1::CmduMessageTx &cmdu_tx;
++    task_pool &tasks;
++};
++
++} // namespace son
++
++#endif // _CONTROLLER_COORDINATED_TDMA_TASK_H_
+-- 
+2.34.1
+
