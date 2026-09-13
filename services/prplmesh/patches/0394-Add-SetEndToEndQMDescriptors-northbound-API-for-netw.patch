@@ -1,0 +1,394 @@
+From ccc8f90386c9dd9952b46007cf2c4ad6d6d2d927 Mon Sep 17 00:00:00 2001
+From: mpaluri <mpaluri@qti.qualcomm.com>
+Date: Mon, 31 Aug 2026 21:43:40 -0700
+Subject: [PATCH] Add SetEndToEndQMDescriptors northbound API for network-level
+ QoS
+
+Introduce the SetEndToEndQMDescriptors command at the Network level of
+the data model.  The handler resolves each client's serving BSSID,
+validates the descriptor, and stores it in the controller database with
+source_type=APPLICATION and descriptor_config_type=NETWORK_LEVEL.
+
+A new set_endtoend_qm_descriptor() DB function writes the descriptor
+to the EndToEndQMDescriptor DM table (with QMID, ClientMAC, and
+DescriptorElement fields), while BSS-level descriptors continue to use
+the existing set_qm_descriptor() path.  The DM branch is selected in
+set_controller_qm_descriptor() based on descriptor_config_type.
+
+Signed-off-by: Manaswini Paluri <mpaluri@qti.qualcomm.com>
+
+diff --git a/controller/nbapi/odl/controller.odl.in b/controller/nbapi/odl/controller.odl.in
+index e40e6897a..e0792fdb2 100644
+--- a/controller/nbapi/odl/controller.odl.in
++++ b/controller/nbapi/odl/controller.odl.in
+@@ -550,6 +550,18 @@
+                         %in %mandatory list SCSDisallowedStaList
+                     );
+ 
++                    string SetEndToEndQMDescriptors(
++                        %in %mandatory list EndToEndQMDescriptor
++                    );
++
++                    %read-only object EndToEndQMDescriptor [] {
++                        %read-only uint32 QMID = 0;
++
++                        %read-only string ClientMAC = "0";
++
++                        %read-only string DescriptorElement = "";
++                    }
++
+                     void ClientSteering(
+                         %in %mandatory string station_mac,
+                         %in %mandatory string target_bssid
+diff --git a/controller/nbapi/on_action.cpp b/controller/nbapi/on_action.cpp
+index 0c15dad08..002e801de 100644
+--- a/controller/nbapi/on_action.cpp
++++ b/controller/nbapi/on_action.cpp
+@@ -1316,6 +1316,7 @@ bool is_strict_hex_string(const std::string &value)
+  */
+ struct sPendingQmDescriptor {
+     sMacAddr client_mac = beerocks::net::network_utils::ZERO_MAC;
++    sMacAddr serving_bssid = beerocks::net::network_utils::ZERO_MAC;
+     std::string descriptor_element;
+     uint8_t scsid = 0;
+ };
+@@ -1415,7 +1416,7 @@ amxd_status_t set_qm_descriptors(amxd_object_t *bss_instance, amxd_function_t *f
+             return amxd_status_invalid_value;
+         }
+ 
+-        pending_descriptors.push_back({client_mac, std::move(descriptor_element), descriptor_info.scsid});
++        pending_descriptors.push_back({client_mac, bssid, std::move(descriptor_element), descriptor_info.scsid});
+     }
+ 
+     if (pending_descriptors.empty()) {
+@@ -2757,6 +2758,125 @@ amxd_status_t simulate_awgn_6ghz(amxd_object_t *object, amxd_function_t *func,
+     return amxd_status_ok;
+ }
+ 
++/**
++ * @brief Handler for Device.WiFi.DataElements.Network.SetEndToEndQMDescriptors().
++ *
++ * Accepts a list of EndToEndQMDescriptor entries (each carrying ClientMAC and
++ * DescriptorElement), validates them, and stores each one in the controller
++ * database as APPLICATION-sourced, NETWORK_LEVEL so the controller can later
++ * push it to every agent on the end-to-end path to the client.
++ */
++amxd_status_t set_end_to_end_qm_descriptors(amxd_object_t * /*network_obj*/,
++                                             amxd_function_t * /*func*/,
++                                             amxc_var_t *args, amxc_var_t *ret)
++{
++    if (!g_database) {
++        LOG(ERROR) << "Invalid database access";
++        amxc_var_set(cstring_t, ret, "Error_Other");
++        return amxd_status_unknown_error;
++    }
++
++    auto controller = g_database->get_controller_ctx();
++    if (!controller) {
++        LOG(ERROR) << "Failed to get controller context";
++        amxc_var_set(cstring_t, ret, "Error_Other");
++        return amxd_status_unknown_error;
++    }
++
++    auto descriptors = get_list_argument(args, "EndToEndQMDescriptor");
++    if (!descriptors) {
++        LOG(ERROR) << "EndToEndQMDescriptor list is missing";
++        amxc_var_set(cstring_t, ret, "Error_Invalid_Input");
++        return amxd_status_invalid_value;
++    }
++
++    std::vector<sPendingQmDescriptor> pending;
++    std::set<std::pair<std::string, uint8_t>> descriptor_keys;
++
++    amxc_var_for_each(entry, descriptors)
++    {
++        std::string client_mac_str;
++        std::string descriptor_element;
++
++        if (!read_string_value(entry, "ClientMAC", client_mac_str) ||
++            !read_string_value(entry, "DescriptorElement", descriptor_element)) {
++            LOG(ERROR) << "EndToEndQMDescriptor entry is missing required fields";
++            amxc_var_set(cstring_t, ret, "Error_Invalid_Input");
++            return amxd_status_invalid_value;
++        }
++
++        if (!network_utils::is_valid_mac(client_mac_str)) {
++            LOG(ERROR) << "Invalid ClientMAC: " << client_mac_str;
++            amxc_var_set(cstring_t, ret, "Error_Invalid_Input");
++            return amxd_status_invalid_value;
++        }
++
++        if (!is_strict_hex_string(descriptor_element)) {
++            LOG(ERROR) << "Invalid DescriptorElement for client " << client_mac_str;
++            amxc_var_set(cstring_t, ret, "Error_Invalid_Input");
++            return amxd_status_invalid_value;
++        }
++
++        const auto descriptor_bytes =
++            beerocks::string_utils::hex_to_bytes<std::vector<uint8_t>>(descriptor_element);
++        if (!qos_management::is_valid_qos_management_descriptor_element(descriptor_bytes)) {
++            LOG(ERROR) << "Invalid DescriptorElement content for client " << client_mac_str;
++            amxc_var_set(cstring_t, ret, "Error_Invalid_Input");
++            return amxd_status_invalid_value;
++        }
++
++        const auto client_mac            = tlvf::mac_from_string(client_mac_str);
++        const auto normalized_client_mac = tlvf::mac_to_string(client_mac);
++        const auto descriptor_info =
++            qos_management::parse_qos_management_descriptor_element(descriptor_bytes);
++
++        if (!descriptor_keys.insert({normalized_client_mac, descriptor_info.scsid}).second) {
++            LOG(ERROR) << "Duplicate EndToEndQMDescriptor entry for client "
++                       << normalized_client_mac << " scsid "
++                       << static_cast<unsigned>(descriptor_info.scsid);
++            amxc_var_set(cstring_t, ret, "Error_Invalid_Input");
++            return amxd_status_invalid_value;
++        }
++
++        /* Validate client association during the input-validation phase so
++         * all preconditions are checked before any DB writes occur. */
++        const auto serving_bssid_str =
++            g_database->get_sta_parent(tlvf::mac_to_string(client_mac));
++        if (serving_bssid_str.empty() ||
++            !network_utils::is_valid_mac(serving_bssid_str)) {
++            LOG(ERROR) << "Client " << client_mac
++                       << " is not associated to any BSS; cannot store end-to-end descriptor";
++            amxc_var_set(cstring_t, ret, "Error_Invalid_Input");
++            return amxd_status_invalid_value;
++        }
++
++        const auto serving_bssid = tlvf::mac_from_string(serving_bssid_str);
++        pending.push_back({client_mac, serving_bssid, std::move(descriptor_element), descriptor_info.scsid});
++    }
++
++    if (pending.empty()) {
++        LOG(ERROR) << "EndToEndQMDescriptor list is empty";
++        amxc_var_set(cstring_t, ret, "Error_Invalid_Input");
++        return amxd_status_invalid_value;
++    }
++
++    for (const auto &desc : pending) {
++        if (!g_database->set_controller_qm_descriptor(
++                desc.serving_bssid, desc.client_mac, desc.descriptor_element,
++                son::db::eDescriptorSource::APPLICATION,
++                son::db::eDescriptorConfigType::NETWORK_LEVEL)) {
++            LOG(ERROR) << "Failed to store end-to-end QMDescriptor for client "
++                       << desc.client_mac;
++            amxc_var_set(cstring_t, ret, "Error_Other");
++            return amxd_status_unknown_error;
++        }
++    }
++
++    controller->trigger_prioritization_config();
++    amxc_var_set(cstring_t, ret, "Success");
++    return amxd_status_ok;
++}
++
+ std::vector<beerocks::nbapi::sActionsCallback> get_actions_callback_list(void)
+ {
+     const std::vector<beerocks::nbapi::sActionsCallback> actions_list = {
+@@ -2837,7 +2957,10 @@ std::vector<beerocks::nbapi::sFunctions> get_func_list(void)
+         {"send_beacon_metrics_query", DATAELEMENTS_ROOT_DM ".Network.Device.SendBeaconMetricsQuery",
+          send_beacon_metrics_query},
+         {"simulate_awgn_6ghz", DATAELEMENTS_ROOT_DM ".Network.Device.Radio.SimulateAWGN6GHz",
+-         simulate_awgn_6ghz}};
++         simulate_awgn_6ghz},
++        {"set_end_to_end_qm_descriptors",
++         DATAELEMENTS_ROOT_DM ".Network.SetEndToEndQMDescriptors",
++         set_end_to_end_qm_descriptors}};
+     return functions_list;
+ }
+ 
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 0a27cb2b9..ebb1cc4ca 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -8331,6 +8331,48 @@ bool db::remove_qm_descriptor(const sMacAddr &bssid, const sMacAddr &client_mac)
+     return m_ambiorix_datamodel->remove_instance(qm_descriptor_path, index);
+ }
+ 
++bool db::set_endtoend_qm_descriptor(const sMacAddr &client_mac, uint16_t qmid,
++                                    const std::string &descriptor_element)
++{
++    const std::string e2e_descriptor_path =
++        std::string(DATAELEMENTS_ROOT_DM) + ".Network.EndToEndQMDescriptor";
++
++    auto index = m_ambiorix_datamodel->get_instance_index(
++        e2e_descriptor_path + ".[ClientMAC == '%s'].", tlvf::mac_to_string(client_mac));
++
++    std::string instance_path;
++    if (index) {
++        instance_path = e2e_descriptor_path + "." + std::to_string(index);
++    } else {
++        instance_path = m_ambiorix_datamodel->add_instance(e2e_descriptor_path);
++        if (instance_path.empty()) {
++            LOG(ERROR) << "Failed to add EndToEndQMDescriptor instance for client "
++                       << client_mac;
++            return false;
++        }
++    }
++
++    bool ret_val = true;
++    ret_val &= m_ambiorix_datamodel->set(instance_path, "QMID",
++                                         static_cast<uint32_t>(qmid));
++    ret_val &= m_ambiorix_datamodel->set(instance_path, "ClientMAC", client_mac);
++    ret_val &= m_ambiorix_datamodel->set(instance_path, "DescriptorElement",
++                                         descriptor_element);
++    return ret_val;
++}
++
++bool db::remove_endtoend_qm_descriptor(const sMacAddr &client_mac)
++{
++    const std::string e2e_descriptor_path =
++        std::string(DATAELEMENTS_ROOT_DM) + ".Network.EndToEndQMDescriptor";
++    auto index = m_ambiorix_datamodel->get_instance_index(
++        e2e_descriptor_path + ".[ClientMAC == '%s'].", tlvf::mac_to_string(client_mac));
++    if (!index) {
++        return true;
++    }
++    return m_ambiorix_datamodel->remove_instance(e2e_descriptor_path, index);
++}
++
+ bool db::set_controller_qm_descriptor(const sMacAddr &bssid, const sMacAddr &client_mac,
+                                       const std::string &descriptor_element,
+                                       eDescriptorSource     source_type,
+@@ -8373,8 +8415,14 @@ bool db::set_controller_qm_descriptor(const sMacAddr &bssid, const sMacAddr &cli
+         qmid = m_next_qmid;
+     }
+ 
+-    if (!set_qm_descriptor(bssid, client_mac, descriptor_element)) {
+-        return false;
++    if (descriptor_config_type == eDescriptorConfigType::NETWORK_LEVEL) {
++        if (!set_endtoend_qm_descriptor(client_mac, qmid, descriptor_element)) {
++            return false;
++        }
++    } else {
++        if (!set_qm_descriptor(bssid, client_mac, descriptor_element)) {
++             return false;
++         }
+     }
+ 
+     sStoredQmDescriptor &entry   = key_map[key];
+@@ -8438,7 +8486,8 @@ bool db::clear_transient_controller_qm_descriptors(const sMacAddr &al_mac)
+ 
+         for (auto client_entry = bss_entry->second.begin();
+              client_entry != bss_entry->second.end();) {
+-            bool any_removed = false;
++            bool any_bss_level_removed     = false;
++            bool any_network_level_removed = false;
+             for (auto key_entry = client_entry->second.begin();
+                  key_entry != client_entry->second.end();) {
+                 if (key_entry->second.request_type !=
+@@ -8446,17 +8495,29 @@ bool db::clear_transient_controller_qm_descriptors(const sMacAddr &al_mac)
+                     ++key_entry;
+                     continue;
+                 }
++                if (key_entry->second.descriptor_config_type ==
++                    eDescriptorConfigType::NETWORK_LEVEL) {
++                    any_network_level_removed = true;
++                } else {
++                    any_bss_level_removed = true;
++                }
+                 key_entry = client_entry->second.erase(key_entry);
+-                any_removed = true;
+             }
+ 
+-            if (any_removed) {
++            if (any_bss_level_removed) {
+                 if (!remove_qm_descriptor(bss_entry->first, client_entry->first)) {
+                     LOG(ERROR) << "Failed removing transient QMDescriptor for BSSID "
+                                << bss_entry->first << ", client " << client_entry->first;
+                     ret_val = false;
+                 }
+             }
++            if (any_network_level_removed) {
++                if (!remove_endtoend_qm_descriptor(client_entry->first)) {
++                    LOG(ERROR) << "Failed removing transient E2E QMDescriptor for client "
++                               << client_entry->first;
++                    ret_val = false;
++                }
++            }
+ 
+             if (client_entry->second.empty()) {
+                 client_entry = bss_entry->second.erase(client_entry);
+@@ -8476,6 +8537,25 @@ bool db::clear_transient_controller_qm_descriptors(const sMacAddr &al_mac)
+     return ret_val;
+ }
+ 
++void db::clear_need_send_network_level_descriptor(const sMacAddr &bssid,
++                                                   const sMacAddr &client_mac,
++                                                   uint16_t descriptor_key)
++{
++    auto bss_it = m_controller_qm_descriptors.find(bssid);
++    if (bss_it == m_controller_qm_descriptors.end()) {
++        return;
++    }
++    auto cli_it = bss_it->second.find(client_mac);
++    if (cli_it == bss_it->second.end()) {
++        return;
++    }
++    auto key_it = cli_it->second.find(descriptor_key);
++    if (key_it == cli_it->second.end()) {
++        return;
++    }
++    key_it->second.need_send = false;
++}
++
+ bool db::set_mscs_disallowed_sta_list(const std::vector<sMacAddr> &sta_list)
+ {
+     std::vector<sMacAddr> previous_mscs_list = std::move(m_mscs_disallowed_sta_list);
+diff --git a/controller/src/beerocks/master/db/db.h b/controller/src/beerocks/master/db/db.h
+index cbb9f1cbb..f1d747a24 100644
+--- a/controller/src/beerocks/master/db/db.h
++++ b/controller/src/beerocks/master/db/db.h
+@@ -2522,6 +2522,28 @@ public:
+     bool set_qm_descriptor(const sMacAddr &bssid, const sMacAddr &client_mac,
+                            const std::string &descriptor_element);
+ 
++    /**
++     * @brief Set a network-level (end-to-end) QoS management descriptor in the Data Model.
++     *
++     * Data model path example:
++     * "Device.WiFi.DataElements.Network.EndToEndQMDescriptor.1.DescriptorElement"
++     *
++     * @param[in] client_mac MAC address of the end client for which the descriptor applies.
++     * @param[in] qmid Controller-assigned QoS Management ID for this descriptor.
++     * @param[in] descriptor_element Hex-encoded descriptor element payload.
++     * @return True on success, otherwise false.
++     */
++    bool set_endtoend_qm_descriptor(const sMacAddr &client_mac, uint16_t qmid,
++                                    const std::string &descriptor_element);
++
++    /**
++     * @brief Remove a network-level (end-to-end) QoS management descriptor from the Data Model.
++     *
++     * @param[in] client_mac MAC address of the end client for which the descriptor applies.
++     * @return True on success, otherwise false.
++     */
++    bool remove_endtoend_qm_descriptor(const sMacAddr &client_mac);
++
+     /**
+      * @brief Remove a QoS management descriptor from the Data Model.
+      *
+@@ -2574,6 +2596,18 @@ public:
+      */
+     bool clear_transient_controller_qm_descriptors(const sMacAddr &al_mac);
+ 
++    /**
++     * clear_need_send_network_level_descriptor - mark one NETWORK_LEVEL descriptor
++     *   as sent so it is not retransmitted.
++     *
++     * @bssid:          BSSID key of the outer map.
++     * @client_mac:     Client MAC key of the middle map.
++     * @descriptor_key: Packed (scsid, source_type) key of the inner map.
++     */
++    void clear_need_send_network_level_descriptor(const sMacAddr &bssid,
++                                                   const sMacAddr &client_mac,
++                                                   uint16_t descriptor_key);
++
+     /**
+      * @brief Set the controller MSCS disallowed STA list.
+      *
+-- 
+2.34.1
+
