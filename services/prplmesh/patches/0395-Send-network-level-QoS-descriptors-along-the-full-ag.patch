@@ -1,0 +1,318 @@
+From 36d6a92520b15ba50143e5873204b8bad701d7a2 Mon Sep 17 00:00:00 2001
+From: mpaluri <mpaluri@qti.qualcomm.com>
+Date: Sat, 29 Aug 2026 15:26:36 -0700
+Subject: [PATCH] Send network-level QoS descriptors along the full agent path
+
+For NETWORK_LEVEL descriptors with need_send=true, send_prioritization()
+now builds the agent path from the serving agent to the root, divides the
+SCS QoS Characteristics Delay Bound by total_hops at each hop, and
+sends a SERVICE_PRIORITIZATION_REQUEST_MESSAGE to every wireless agent in
+the path using the same QMID.
+
+Signed-off-by: Manaswini Paluri <mpaluri@qti.qualcomm.com>
+
+diff --git a/common/beerocks/bcl/include/bcl/beerocks_qos_utils.h b/common/beerocks/bcl/include/bcl/beerocks_qos_utils.h
+index c55aa8d17..a618f3b1e 100644
+--- a/common/beerocks/bcl/include/bcl/beerocks_qos_utils.h
++++ b/common/beerocks/bcl/include/bcl/beerocks_qos_utils.h
+@@ -112,6 +112,27 @@ bool is_valid_qos_management_descriptor_element(const std::vector<uint8_t> &desc
+  */
+ bool is_remove_qos_management_descriptor(const std::vector<uint8_t> &descriptor_bytes);
+ 
++/**
++ * @brief Scale the Delay Bound in an SCS descriptor for end-to-end delivery.
++ *
++ * Divides the Delay Bound field in the QoS Characteristics subelement
++ * (IEEE 802.11-2020 §9.4.2.316, offset 12, uint32 µs) by @p total_hops
++ * so that each agent in the path receives an equal share of the budget.
++ * The scaled value is floored to a minimum of 1.  All other fields are
++ * left unchanged.
++ *
++ * If the descriptor is not an SCS element, or no QoS Characteristics
++ * subelement is present, the descriptor is returned unchanged.
++ *
++ * @param descriptor_bytes Original SCS descriptor element bytes.
++ * @param hop_index        Zero-based index of the current hop (unused;
++ *                         every hop receives the same scaled budget).
++ * @param total_hops       Total number of hops from serving agent to root.
++ * @return Modified descriptor bytes for this hop.
++ */
++std::vector<uint8_t> scale_qos_parameters(const std::vector<uint8_t> &descriptor_bytes,
++                                           int hop_index, int total_hops);
++
+ } // namespace qos_management
+ } // namespace beerocks
+ 
+diff --git a/common/beerocks/bcl/source/beerocks_qos_utils.cpp b/common/beerocks/bcl/source/beerocks_qos_utils.cpp
+index 6c1f1bca7..adb79a146 100644
+--- a/common/beerocks/bcl/source/beerocks_qos_utils.cpp
++++ b/common/beerocks/bcl/source/beerocks_qos_utils.cpp
+@@ -8,9 +8,74 @@
+ 
+ #include <bcl/beerocks_qos_utils.h>
+ 
++#include <algorithm>
++#include <cstring>
++
+ namespace beerocks {
+ namespace qos_management {
+ 
++/* IEEE 802.11-2020 §9.4.2.316 QoS Characteristics subelement ID */
++static constexpr uint8_t  qos_characteristics_subelement_id = 110;
++/*
++ * Offsets within the QoS Characteristics subelement body (after the
++ * 2-byte subelement header [ID][Length]):
++ *   [12..15] Delay Bound (µs, uint32)  — divided by total_hops
++ * Minimum body length to safely access Delay Bound is 16 bytes.
++ */
++static constexpr size_t qos_char_delay_bound_offset = 12;
++static constexpr size_t qos_char_min_body_len        = 16;
++
++/* Read a little-endian uint32 from buf[offset]. */
++static uint32_t read_le32(const uint8_t *buf, size_t offset)
++{
++    return static_cast<uint32_t>(buf[offset])
++         | static_cast<uint32_t>(buf[offset + 1]) << 8
++         | static_cast<uint32_t>(buf[offset + 2]) << 16
++         | static_cast<uint32_t>(buf[offset + 3]) << 24;
++}
++
++/* Write a little-endian uint32 into buf[offset]. */
++static void write_le32(uint8_t *buf, size_t offset, uint32_t value)
++{
++    buf[offset]     = static_cast<uint8_t>(value);
++    buf[offset + 1] = static_cast<uint8_t>(value >> 8);
++    buf[offset + 2] = static_cast<uint8_t>(value >> 16);
++    buf[offset + 3] = static_cast<uint8_t>(value >> 24);
++}
++
++/*
++ * Walk subelements in an SCS descriptor starting at body_start
++ * (byte index 4, just after [EID][len][SCSID][request_type]) up to
++ * total_len.  When the QoS Characteristics subelement is found, divide
++ * the Delay Bound field (uint32, offset 12) by divisor (minimum 1).
++ */
++static void scale_qos_characteristics(std::vector<uint8_t> &bytes,
++                                       size_t body_start, size_t total_len,
++                                       uint32_t divisor)
++{
++    size_t pos = body_start;
++    while (pos + 2 <= total_len) {
++        const uint8_t  sub_id  = bytes[pos];
++        const uint8_t  sub_len = bytes[pos + 1];
++        const size_t   sub_end = pos + 2 + sub_len;
++
++        if (sub_end > total_len) {
++            break;
++        }
++
++        if (sub_id == qos_characteristics_subelement_id &&
++            sub_len >= qos_char_min_body_len) {
++            uint8_t *body = bytes.data() + pos + 2;
++
++            const uint32_t v = read_le32(body, qos_char_delay_bound_offset);
++            write_le32(body, qos_char_delay_bound_offset,
++                       std::max(uint32_t{1}, v / divisor));
++        }
++
++        pos = sub_end;
++    }
++}
++
+ bool sDescriptorElementInfo::is_valid() const
+ {
+     return element_type != eDescriptorElementType::Invalid &&
+@@ -96,5 +161,25 @@ bool is_remove_qos_management_descriptor(const std::vector<uint8_t> &descriptor_
+            eDescriptorRequestType::Remove;
+ }
+ 
++std::vector<uint8_t> scale_qos_parameters(const std::vector<uint8_t> &descriptor_bytes,
++                                           int /*hop_index*/, int total_hops)
++{
++    if (total_hops <= 1 || descriptor_bytes.size() < 4) {
++        return descriptor_bytes;
++    }
++
++    if (!is_scs_descriptor_element(descriptor_bytes.data(), descriptor_bytes.size())) {
++        return descriptor_bytes;
++    }
++
++    std::vector<uint8_t> scaled = descriptor_bytes;
++    const uint32_t divisor = static_cast<uint32_t>(total_hops);
++
++    /* SCS: [EID][len][SCSID][request_type][subelements...] */
++    scale_qos_characteristics(scaled, 4, scaled.size(), divisor);
++
++    return scaled;
++}
++
+ } // namespace qos_management
+ } // namespace beerocks
+diff --git a/controller/src/beerocks/master/tasks/agent_monitoring_task.cpp b/controller/src/beerocks/master/tasks/agent_monitoring_task.cpp
+index 677fd1eec..8b34ef7a1 100644
+--- a/controller/src/beerocks/master/tasks/agent_monitoring_task.cpp
++++ b/controller/src/beerocks/master/tasks/agent_monitoring_task.cpp
+@@ -10,6 +10,7 @@
+ #include "../db/db_algo.h"
+ #include "../son_actions.h"
+ #include "neighbor_db_ctrl_task.h"
++#include <bcl/beerocks_qos_utils.h>
+ #include <bcl/beerocks_string_utils.h>
+ #include <beerocks/tlvf/beerocks_message_control.h>
+ #include <bpl/bpl_cfg.h>
+@@ -34,6 +35,7 @@
+ #include <limits>
+ #include <set>
+ #include <string>
++#include <unordered_set>
+ #include <vector>
+ 
+ using namespace beerocks;
+@@ -757,6 +759,111 @@ bool agent_monitoring_task::send_prioritization(const Agent &agent)
+         return true;
+     }
+ 
++    /* Pass 1: NETWORK_LEVEL descriptors — each uses cmdu_tx independently
++     * via its own cmdu_tx.create() inside the hop loop.  Processed first so
++     * they never overwrite the BSS-level batch message assembled in Pass 2. */
++    for (const auto &descriptor : descriptors) {
++        if (descriptor.descriptor_config_type !=
++            son::db::eDescriptorConfigType::NETWORK_LEVEL) {
++            continue;
++        }
++
++        if (!descriptor.need_send) {
++            continue;
++        }
++
++        std::vector<std::shared_ptr<Agent>> path;
++        const sMacAddr serving_al_mac =
++            database.get_bss_parent_agent(descriptor.bssid);
++        if (serving_al_mac != beerocks::net::network_utils::ZERO_MAC) {
++            std::shared_ptr<Agent> current =
++                database.m_agents.get(serving_al_mac);
++            std::unordered_set<sMacAddr> visited;
++            while (current && !visited.count(current->al_mac)) {
++                visited.insert(current->al_mac);
++                path.push_back(current);
++                current = current->backhaul.parent_agent.lock();
++            }
++        }
++
++        if (path.empty()) {
++            LOG(WARNING) << "Empty path for client " << descriptor.client_mac
++                         << "; deferring network-level descriptor";
++            continue;
++        }
++
++        const int total_hops = static_cast<int>(path.size());
++        bool descriptor_ok   = true;
++
++
++        const auto original_bytes =
++            beerocks::string_utils::hex_to_bytes<std::vector<uint8_t>>(
++                descriptor.descriptor_element);
++
++        for (int hop = 0; hop < total_hops; ++hop) {
++            const auto &hop_agent = *path[hop];
++
++            const auto scaled_bytes =
++                beerocks::qos_management::scale_qos_parameters(
++                    original_bytes, hop, total_hops);
++
++            const sMacAddr hop_bssid = (hop == 0)
++                ? descriptor.bssid
++                : path[hop - 1]->backhaul.parent_interface;
++
++            if (hop > 0 &&
++                hop_bssid == beerocks::net::network_utils::ZERO_MAC) {
++                LOG(DEBUG) << "Skipping network-level descriptor for agent "
++                           << hop_agent.al_mac
++                           << " (wired backhaul, no BSSID)";
++                continue;
++            }
++
++            if (!cmdu_tx.create(0,
++                    ieee1905_1::eMessageType::SERVICE_PRIORITIZATION_REQUEST_MESSAGE)) {
++                LOG(ERROR) << "Failed creating SERVICE_PRIORITIZATION_REQUEST_MESSAGE"
++                           << " for agent " << hop_agent.al_mac;
++                descriptor_ok = false;
++                break;
++            }
++
++            auto descriptor_tlv =
++                cmdu_tx.addClass<wfa_map::tlvQoSManagementDescriptor>();
++            if (!descriptor_tlv) {
++                LOG(ERROR) << "Failed adding QoS Management Descriptor TLV"
++                           << " for agent " << hop_agent.al_mac;
++                descriptor_ok = false;
++                break;
++            }
++
++            descriptor_tlv->qmid()       = descriptor.qmid;
++            descriptor_tlv->bssid()      = hop_bssid;
++            descriptor_tlv->client_mac() = descriptor.client_mac;
++            if (!descriptor_tlv->set_descriptor_element(scaled_bytes.data(),
++                                                        scaled_bytes.size())) {
++                LOG(ERROR) << "Failed setting descriptor element for client "
++                           << descriptor.client_mac
++                           << " at agent " << hop_agent.al_mac;
++                descriptor_ok = false;
++                break;
++            }
++
++            if (!son_actions::send_cmdu_to_agent(hop_agent.al_mac, cmdu_tx, database)) {
++                LOG(ERROR) << "Failed sending network-level descriptor to agent "
++                           << hop_agent.al_mac;
++                descriptor_ok = false;
++                break;
++            }
++        }
++
++        if (descriptor_ok) {
++            database.clear_need_send_network_level_descriptor(
++                descriptor.bssid, descriptor.client_mac, descriptor.descriptor_key);
++        }
++    }
++
++    /* Pass 2: BSS-level batch — service prioritization rule + BSS_LEVEL TLVs
++     * assembled into one message and sent once to agent.al_mac. */
+     if (!cmdu_tx.create(0, ieee1905_1::eMessageType::SERVICE_PRIORITIZATION_REQUEST_MESSAGE)) {
+         LOG(ERROR) << "Failed creating Service Prioritization request message";
+         return false;
+@@ -774,12 +881,18 @@ bool agent_monitoring_task::send_prioritization(const Agent &agent)
+ 
+         constexpr uint8_t USE_DSCP{0x08};
+         if (priorityRequest->rule_params().output == USE_DSCP) {
+-
+             //TODO add DSCP map if exists (PPM 2386)
+         }
+     }
+ 
++    bool has_bss_level_descriptor = false;
+     for (const auto &descriptor : descriptors) {
++        if (descriptor.descriptor_config_type ==
++            son::db::eDescriptorConfigType::NETWORK_LEVEL) {
++            continue;
++        }
++
++        has_bss_level_descriptor = true;
+         auto descriptor_tlv = cmdu_tx.addClass<wfa_map::tlvQoSManagementDescriptor>();
+         if (!descriptor_tlv) {
+             LOG(ERROR) << "Failed adding QoS Management Descriptor TLV";
+@@ -804,8 +917,10 @@ bool agent_monitoring_task::send_prioritization(const Agent &agent)
+         }
+     }
+ 
+-    if (!son_actions::send_cmdu_to_agent(agent.al_mac, cmdu_tx, database)) {
+-        return false;
++    if (should_include_service_prioritization_rule || has_bss_level_descriptor) {
++        if (!son_actions::send_cmdu_to_agent(agent.al_mac, cmdu_tx, database)) {
++            return false;
++        }
+     }
+ 
+     if (!database.clear_transient_controller_qm_descriptors(agent.al_mac)) {
+-- 
+2.34.1
+
