@@ -1,0 +1,1329 @@
+From f31ca5fb333e2b29506e6f128e3ce5937ef69dc5 Mon Sep 17 00:00:00 2001
+From: Girija P <gpandiya@qti.qualcomm.com>
+Date: Mon, 14 Sep 2026 21:58:49 +0530
+Subject: [PATCH] Fix WHM wireless power-save recovery after radio disable
+
+Add confirmed VAP teardown notifications, persist disabled-radio state,
+and gate backhaul recovery on complete teardown. Also update WHM build
+definitions and related action/message handling.
+
+Signed-off-by: Girija P <gpandiya@qti.qualcomm.com>
+---
+ CMakeLists.txt                                |   5 +
+ .../ap_manager/ap_manager.cpp                 |  46 +-
+ .../fronthaul_manager/ap_manager/ap_manager.h |   3 +
+ .../backhaul_manager/backhaul_manager.cpp     | 631 ++++++++++++++++--
+ .../slave/backhaul_manager/backhaul_manager.h |  60 +-
+ agent/src/beerocks/slave/son_slave_thread.cpp |  21 +
+ common/beerocks/bwl/include/bwl/ap_wlan_hal.h |  16 +-
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   |   8 +-
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.h     |   4 +-
+ .../tlvf/beerocks_message_action.yaml         |   6 +-
+ .../tlvf/beerocks_message_apmanager.yaml      |   7 +
+ .../tlvf/beerocks_message_backhaul.yaml       |   7 +
+ .../tasks/ap_config_renew_sequencer_task.cpp  |  11 +-
+ .../tasks/ap_config_renew_sequencer_task.h    |   9 +-
+ framework/platform/wbapi/wbapi_utils.cpp      |  14 +-
+ 15 files changed, 752 insertions(+), 96 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f62187cc6..6ca453457 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -14,6 +14,11 @@ option(USE_PRPLMESH_NLHAL "Use prplMesh NLHAL" ON)
+ 
+ if (USE_PRPLMESH_WHM)
+     set(KEEP_UCI_GENERAL_OPTIONS ON)
++    # USE_PRPLMESH_WHM is consumed by sources in multiple sibling targets
++    # (including beerocks_cli). Define it at the top-level so the option is
++    # propagated to every target, instead of relying on a subdirectory's
++    # CMAKE_CXX_FLAGS.
++    add_compile_definitions(USE_PRPLMESH_WHM)
+ else()
+     set(KEEP_UCI_GENERAL_OPTIONS OFF)
+ endif()
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 910b7d406..799077c55 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -2370,6 +2370,17 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+ 
+         std::string bridge_name = request->bridge_ifname_str();
+ 
++#ifdef USE_PRPLMESH_WHM
++        auto powersave_wait = m_powersave_disable_wait_until - std::chrono::steady_clock::now();
++        if (powersave_wait > std::chrono::steady_clock::duration::zero()) {
++            auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(powersave_wait);
++            LOG(INFO) << "Waiting " << wait_ms.count()
++                      << " ms before applying M2 VAP credentials after powersave-disable";
++            UTILS_SLEEP_MSEC(static_cast<unsigned int>(wait_ms.count()));
++            m_powersave_disable_wait_until = {};
++        }
++#endif
++
+         LOG(DEBUG) << "handle ACTION_APMANAGER_WIFI_CREDENTIALS_UPDATE_REQUEST";
+         std::list<son::wireless_utils::sBssInfoConf> bss_info_conf_list;
+         auto wifi_credentials_size = request->wifi_credentials_size();
+@@ -2748,6 +2759,23 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+             response->number_of_bss_available() = radio_vaps.size();
+             send_cmdu(cmdu_tx);
+ 
++#ifdef USE_PRPLMESH_WHM
++            // Report the platform-confirmed VAP teardown state.  The radio-disable
++            // notification is an intent; this notification is sent only after the
++            // credentials update has refreshed the actual VAP list.
++            auto teardown_confirmation = message_com::create_vs_message<
++                beerocks_message::cACTION_APMANAGER_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION>(
++                cmdu_tx);
++            if (!teardown_confirmation) {
++                LOG(ERROR) << "Failed building RADIO_TEARDOWN_CONFIRMED_NOTIFICATION";
++            } else {
++                teardown_confirmation->radio_mac() =
++                    tlvf::mac_from_string(ap_wlan_hal->get_radio_mac());
++                teardown_confirmation->radio_disable() = radio_vaps.empty() ? 1 : 0;
++                send_cmdu(cmdu_tx);
++            }
++#endif
++
+ #ifdef USE_PRPLMESH_NLHAL
+             // This M2-driven credentials-update path (unlike the async Event::AP_Disabled /
+             // handle_ap_enabled cases) never goes through the hostapd AP-ENABLED/AP-DISABLED
+@@ -2880,6 +2908,12 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+             // RADIO_DISABLE_REQUEST, otherwise it stays stuck true forever and permanently blocks
+             // the WIFI_CREDENTIALS_UPDATE_REQUEST handler's radio_state_lock check below.
+             radio_state_lock = false;
++            if (!ap_wlan_hal->powersave_disable()) {
++                LOG(ERROR) << "Failed disabling powersave while processing radio enable for iface: "
++                           << ap_wlan_hal->get_iface_name();
++            }
++            m_powersave_disable_wait_until =
++                std::chrono::steady_clock::now() + std::chrono::seconds(15);
+ #endif
+             return;
+         }
+@@ -2894,6 +2928,14 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+         LOG(DEBUG) << "ap_wlan_hal->enable() returned success for iface: "
+                    << ap_wlan_hal->get_iface_name();
+         radio_state_lock = false;
++#ifdef USE_PRPLMESH_WHM
++        if (!ap_wlan_hal->powersave_disable()) {
++            LOG(ERROR) << "Failed disabling powersave while processing radio enable for iface: "
++                       << ap_wlan_hal->get_iface_name();
++        }
++        m_powersave_disable_wait_until =
++            std::chrono::steady_clock::now() + std::chrono::seconds(15);
++#endif
+         auto timeout     = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+         while (std::chrono::steady_clock::now() < timeout) {
+             UTILS_SLEEP_MSEC(500);
+@@ -2908,7 +2950,7 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+ #ifdef USE_PRPLMESH_WHM
+     case beerocks_message::ACTION_APMANAGER_RADIO_POWERSAVE_ENABLE_REQUEST: {
+         LOG(DEBUG) << "Got ACTION_APMANAGER_RADIO_POWERSAVE_ENABLE_REQUEST";
+-        if (!ap_wlan_hal->powersave_enable()) {
++        if (!ap_wlan_hal->powersave_enable(true)) {
+             LOG(ERROR) << "Failed enabling powersave on iface: "
+                        << ap_wlan_hal->get_iface_name();
+         }
+@@ -2916,7 +2958,7 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+     }
+     case beerocks_message::ACTION_APMANAGER_RADIO_POWERSAVE_DISABLE_REQUEST: {
+         LOG(DEBUG) << "Got ACTION_APMANAGER_RADIO_POWERSAVE_DISABLE_REQUEST";
+-        if (!ap_wlan_hal->powersave_disable()) {
++        if (!ap_wlan_hal->powersave_disable(true)) {
+             LOG(ERROR) << "Failed disabling powersave on iface: "
+                        << ap_wlan_hal->get_iface_name();
+         }
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
+index 7d8c37dbe..c3e4478bb 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
+@@ -397,6 +397,9 @@ private:
+     // process in cACTION_APMANAGER_CONFIGURE (beerocks_agent.conf).
+     bool chansel_preference_report_refresh_enable = false;
+     bool radio_state_lock   = false;
++#ifdef USE_PRPLMESH_WHM
++    std::chrono::steady_clock::time_point m_powersave_disable_wait_until{};
++#endif
+     uint8_t multi_ap_profile =
+         wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_2;
+ 
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index b995bf720..403bed741 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -77,6 +77,11 @@ constexpr auto tasks_timer_period = std::chrono::milliseconds(90);
+  */
+ constexpr auto fsm_timer_period = std::chrono::milliseconds(500);
+ 
++#ifdef USE_PRPLMESH_WHM
++constexpr auto powersave_disable_endpoint_settle_time = std::chrono::seconds(15);
++constexpr auto powersave_radio_spacing_time              = std::chrono::seconds(10);
++#endif
++
+ /**
+  * Timeout to process a Backhaul Steering Request message.
+  */
+@@ -177,6 +182,20 @@ BackhaulManager::BackhaulManager(const config_file::sConfigSlave &config,
+ 
+ BackhaulManager::~BackhaulManager()
+ {
++#ifdef USE_PRPLMESH_WHM
++    if (m_timer_manager &&
++        m_wired_teardown_powersave_timer != beerocks::net::FileDescriptor::invalid_descriptor) {
++        m_timer_manager->remove_timer(m_wired_teardown_powersave_timer);
++    }
++    if (m_timer_manager) {
++        for (auto &radio_info : m_radios_info) {
++            if (radio_info->powersave_disable_endpoint_wait_timer !=
++                beerocks::net::FileDescriptor::invalid_descriptor) {
++                m_timer_manager->remove_timer(radio_info->powersave_disable_endpoint_wait_timer);
++            }
++        }
++    }
++#endif
+     if (m_cmdu_server) {
+         m_cmdu_server->clear_handlers();
+     }
+@@ -1247,10 +1266,14 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+             }
+ 
+ #ifdef USE_PRPLMESH_WHM
++            if (m_eth_link_up) {
++                schedule_wired_teardown_powersave_enable();
++            }
+             // Backend-generic backhaul-loss recovery cycle: if there's no backhaul
+-            // connectivity at all and every radio is currently disabled, start the EP
+-            // toggle / 6G-powersave cycle (independent of the NLHAL-only watchdog above).
+-            maybe_start_backhaul_recovery_cycle();
++            // connectivity at all and every radio's VAP teardown is confirmed, start the
++            // EP toggle / 6G-powersave cycle. The event-driven path also calls this helper
++            // when the last teardown or bSTA disconnect notification arrives.
++            maybe_start_backhaul_recovery_cycle_if_ready();
+ #endif
+ 
+             if (eth_link_up != m_eth_link_up) {
+@@ -2411,6 +2434,16 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+             }
+ 
+             radio_info->radio_mac = radio->front.iface_mac;
++#ifdef USE_PRPLMESH_WHM
++            // radio_disable is persisted in AgentDB/UCI and may have been set before the
++            // backhaul FSM restarted.  Rehydrate it when rebuilding m_radios_info; otherwise
++            // a disabled bSTA is treated as enabled after RESTART and the normal reconnect FSM
++            // will eventually scan the down radio and restart again.
++            radio_info->radio_disabled = radio->radio_disable;
++            if (!radio_info->radio_disabled) {
++                radio_info->vaps_teardown_confirmed = false;
++            }
++#endif
+ 
+             LOG(DEBUG) << "ACTION_BACKHAUL_ENABLE: radios_info entry"
+                        << " radio_mac=" << radio_info->radio_mac
+@@ -2684,6 +2717,7 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+         break;
+     }
+ 
++#if defined(USE_PRPLMESH_NLHAL) || defined(USE_PRPLMESH_WHM)
+     case beerocks_message::ACTION_BACKHAUL_RADIO_STATE_NOTIFICATION: {
+         auto request =
+             beerocks_header->addClass<beerocks_message::cACTION_BACKHAUL_RADIO_STATE_NOTIFICATION>();
+@@ -2713,11 +2747,62 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+             }
+             matched                    = true;
+             radio_info->radio_disabled = disable;
++#ifdef USE_PRPLMESH_WHM
++            if (!disable) {
++                radio_info->vaps_teardown_confirmed = false;
++            }
++#endif
+             LOG(INFO) << "backhaul_manager radio_disabled=" << disable << " for radio "
+                       << radio_mac << " (sta_iface=" << radio_info->sta_iface << ")";
+             if (disable) {
++#ifdef USE_PRPLMESH_WHM
++                if (radio_info->powersave_disable_endpoint_wait_timer !=
++                    beerocks::net::FileDescriptor::invalid_descriptor) {
++                    m_timer_manager->remove_timer(radio_info->powersave_disable_endpoint_wait_timer);
++                    radio_info->powersave_disable_endpoint_wait_timer =
++                        beerocks::net::FileDescriptor::invalid_descriptor;
++                }
++                radio_info->powersave_disable_endpoint_wait_until = {};
++#endif
+                 start_backhaul_reconnect_watchdog(radio_info);
+             } else {
++#ifdef USE_PRPLMESH_WHM
++                if (m_wired_teardown_powersave_enabled) {
++                    LOG(INFO) << "Radio enable received - disabling wired teardown powersave";
++                    if (m_wired_teardown_powersave_timer !=
++                        beerocks::net::FileDescriptor::invalid_descriptor) {
++                        m_timer_manager->remove_timer(m_wired_teardown_powersave_timer);
++                        m_wired_teardown_powersave_timer =
++                            beerocks::net::FileDescriptor::invalid_descriptor;
++                    }
++
++                    if (is_wifi8_platform()) {
++                        send_5g_powersave_request(false);
++                        arm_powersave_disable_endpoint_settle(
++                            powersave_radio_spacing_time + powersave_disable_endpoint_settle_time);
++                        m_wired_teardown_powersave_timer = m_timer_manager->add_timer(
++                            "Wired Teardown 6 GHz Powersave Disable", powersave_radio_spacing_time,
++                            std::chrono::milliseconds::zero(),
++                            [this](int secondary_fd, beerocks::EventLoop &secondary_loop) {
++                                m_timer_manager->remove_timer(secondary_fd);
++                                m_wired_teardown_powersave_timer =
++                                    beerocks::net::FileDescriptor::invalid_descriptor;
++                                send_6g_powersave_request(false);
++                                return true;
++                            });
++                    } else {
++                        send_6g_powersave_request(false);
++                        arm_powersave_disable_endpoint_settle(
++                            powersave_disable_endpoint_settle_time);
++                    }
++                    m_wired_teardown_powersave_enabled = false;
++                } else if (m_wired_teardown_powersave_timer !=
++                    beerocks::net::FileDescriptor::invalid_descriptor) {
++                    m_timer_manager->remove_timer(m_wired_teardown_powersave_timer);
++                    m_wired_teardown_powersave_timer =
++                        beerocks::net::FileDescriptor::invalid_descriptor;
++                }
++#endif
+                 handle_backhaul_radio_enabled(radio_info);
+             }
+         }
+@@ -2727,6 +2812,45 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+         }
+         break;
+     }
++#endif
++
++#ifdef USE_PRPLMESH_WHM
++    case beerocks_message::ACTION_BACKHAUL_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION: {
++        auto request = beerocks_header->addClass<
++            beerocks_message::cACTION_BACKHAUL_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION>();
++        if (!request) {
++            LOG(ERROR) << "addClass cACTION_BACKHAUL_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION failed";
++            return false;
++        }
++
++        bool disable              = (request->radio_disable() != 0);
++        const sMacAddr &radio_mac = request->radio_mac();
++        LOG(INFO) << "Received RADIO_TEARDOWN_CONFIRMED_NOTIFICATION for radio_mac="
++                  << radio_mac << ", disable=" << disable;
++
++        for (auto &radio_info : m_radios_info) {
++            if (radio_info->radio_mac != radio_mac) {
++                continue;
++            }
++
++            // A confirmed teardown also establishes the disabled state when the
++            // original radio-disable intent notification was lost during startup.
++            radio_info->radio_disabled          = disable;
++            radio_info->vaps_teardown_confirmed = disable;
++            LOG(INFO) << "backhaul_manager vaps_teardown_confirmed=" << disable
++                      << " for radio " << radio_mac;
++
++#ifdef USE_PRPLMESH_WHM
++            if (disable && m_eth_link_up) {
++                schedule_wired_teardown_powersave_enable();
++            }
++            maybe_start_backhaul_recovery_cycle_if_ready();
++#endif
++            break;
++        }
++        break;
++    }
++#endif
+ 
+     case beerocks_message::ACTION_BACKHAUL_SUPPLICANT_RESTART: {
+         LOG(INFO) << "Received ACTION_BACKHAUL_SUPPLICANT_RESTART";
+@@ -3351,6 +3475,27 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+             return true;
+         }
+         auto db = AgentDB::get();
++#ifdef USE_PRPLMESH_WHM
++        bool recovery_cycle_owns_disconnect = false;
++        // A disabled bSTA must not enter the ordinary WIRELESS_WAIT_FOR_RECONNECT ->
++        // INITIATE_SCAN -> RESTART path.  The radio is intentionally down, so scanning it
++        // cannot recover anything and only destroys the in-memory radio state.  On this event
++        // the bSTA itself is known to be disconnected, so allow the recovery cycle to start
++        // without waiting for the separate AP-manager teardown confirmation.
++        auto radio_info = get_radio_info_by_iface(iface);
++        if (radio_info && radio_info->sta_wlan_hal && radio_info->radio_disabled) {
++            LOG(INFO) << "Disabled bSTA " << iface
++                      << " disconnected - prioritizing backhaul recovery cycle";
++            maybe_start_backhaul_recovery_cycle(false);
++            recovery_cycle_owns_disconnect = m_backhaul_recovery_cycle_active;
++        }
++
++        // The bSTA disconnect may arrive after AP-manager teardown confirmation.
++        // Re-evaluate the normal, confirmation-gated readiness path too.
++        if (radio_info && radio_info->radio_disabled) {
++            maybe_start_backhaul_recovery_cycle_if_ready();
++        }
++#endif
+         if (db->device_conf.certification_mode) {
+             /* When the station is disconnected we wanted to disable
+                3addr multicast packets entering the system.
+@@ -3395,6 +3540,13 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+                     LOG(ERROR) << "Failed sending ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION";
+                 }
+             }
++#ifdef USE_PRPLMESH_WHM
++            if (recovery_cycle_owns_disconnect) {
++                LOG(DEBUG) << "Recovery cycle owns disabled bSTA disconnect for " << iface
++                           << " - suppressing routine wireless reconnect FSM";
++                return true;
++            }
++#endif
+             if (FSM_IS_IN_STATE(OPERATIONAL) || FSM_IS_IN_STATE(CONNECTED)) {
+ 
+                 // A genuine (non-steering) backhaul link drop while previously operational — e.g.
+@@ -4664,7 +4816,173 @@ bool BackhaulManager::all_radios_disabled()
+                         });
+ }
+ 
+-void BackhaulManager::maybe_start_backhaul_recovery_cycle()
++bool BackhaulManager::all_radios_teardown_confirmed()
++{
++    if (m_radios_info.empty()) {
++        return false;
++    }
++
++    return std::all_of(m_radios_info.begin(), m_radios_info.end(),
++                       [](const std::shared_ptr<sRadioInfo> &radio_info) {
++                           return radio_info->radio_disabled &&
++                                  radio_info->vaps_teardown_confirmed;
++                       });
++}
++
++void BackhaulManager::maybe_start_backhaul_recovery_cycle_if_ready()
++{
++    LOG(DEBUG) << "Recovery readiness: all_radios_disabled=" << all_radios_disabled()
++               << ", all_vaps_teardown_confirmed=" << all_radios_teardown_confirmed()
++               << ", fully_disconnected=" << is_backhaul_fully_disconnected();
++
++    if (!all_radios_disabled() || !all_radios_teardown_confirmed() ||
++        !is_backhaul_fully_disconnected()) {
++        return;
++    }
++
++    maybe_start_backhaul_recovery_cycle();
++}
++
++bool BackhaulManager::is_wifi8_platform()
++{
++    auto db = AgentDB::get();
++    for (const auto &radio : db->get_radios_list()) {
++        if (!radio) {
++            continue;
++        }
++
++        std::string htmode;
++        if (beerocks::bpl::bpl_cfg_get_radio_htmode(radio->front.iface_name, htmode) &&
++            htmode.size() >= 3 && htmode.compare(0, 3, "UHR") == 0) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
++void BackhaulManager::send_powersave_request(eFreqType freq, bool enable)
++{
++    auto radio_mac = freq_to_radio_mac(freq);
++    if (radio_mac.empty()) {
++        LOG(DEBUG) << "No " << (freq == eFreqType::FREQ_5G ? "5 GHz" : "6 GHz")
++                   << " radio found for powersave request";
++        return;
++    }
++
++    auto radio = std::find_if(m_radios_info.begin(), m_radios_info.end(),
++                              [&](const std::shared_ptr<sRadioInfo> &info) {
++                                  return info->radio_mac == tlvf::mac_from_string(radio_mac);
++                              });
++    if (radio == m_radios_info.end()) {
++        LOG(DEBUG) << (freq == eFreqType::FREQ_5G ? "5 GHz" : "6 GHz") << " radio " << radio_mac
++                   << " not present in m_radios_info";
++        return;
++    }
++
++    if (enable) {
++        auto request = message_com::create_vs_message<
++            beerocks_message::cACTION_BACKHAUL_RADIO_POWERSAVE_ENABLE_REQUEST>(cmdu_tx);
++        if (!request) {
++            LOG(ERROR) << "Failed building powersave-enable request for "
++                       << (freq == eFreqType::FREQ_5G ? "5 GHz" : "6 GHz");
++            return;
++        }
++        request->set_iface((*radio)->hostap_iface);
++    } else {
++        auto request = message_com::create_vs_message<
++            beerocks_message::cACTION_BACKHAUL_RADIO_POWERSAVE_DISABLE_REQUEST>(cmdu_tx);
++        if (!request) {
++            LOG(ERROR) << "Failed building powersave-disable request for "
++                       << (freq == eFreqType::FREQ_5G ? "5 GHz" : "6 GHz");
++            return;
++        }
++        request->set_iface((*radio)->hostap_iface);
++    }
++    send_cmdu(m_agent_fd, cmdu_tx);
++    LOG(INFO) << "Sent " << (freq == eFreqType::FREQ_5G ? "5 GHz" : "6 GHz")
++              << " powersave-" << (enable ? "enable" : "disable")
++              << " request for " << (*radio)->hostap_iface;
++}
++
++void BackhaulManager::send_5g_powersave_request(bool enable)
++{
++    send_powersave_request(eFreqType::FREQ_5G, enable);
++}
++
++void BackhaulManager::send_6g_powersave_request(bool enable)
++{
++    send_powersave_request(eFreqType::FREQ_6G, enable);
++}
++
++void BackhaulManager::schedule_wired_teardown_powersave_enable()
++{
++    if (!m_eth_link_up || !all_radios_disabled() || !all_radios_teardown_confirmed()) {
++        return;
++    }
++
++    if (m_wired_teardown_powersave_enabled ||
++        m_wired_teardown_powersave_timer != beerocks::net::FileDescriptor::invalid_descriptor) {
++        return;
++    }
++
++    LOG(INFO) << "All APs/endpoints are torn down with wired backhaul available - scheduling "
++                 "powersave-enable after 15 seconds";
++    m_wired_teardown_powersave_timer = m_timer_manager->add_timer(
++        "Wired Teardown Powersave Enable", std::chrono::seconds(15),
++        std::chrono::milliseconds::zero(), [this](int fd, beerocks::EventLoop &loop) {
++            m_timer_manager->remove_timer(fd);
++            m_wired_teardown_powersave_timer = beerocks::net::FileDescriptor::invalid_descriptor;
++            if (!m_eth_link_up || !all_radios_disabled() || !all_radios_teardown_confirmed()) {
++                LOG(INFO) << "Wired teardown powersave-enable cancelled because conditions changed";
++                return true;
++            }
++            m_wired_teardown_powersave_enabled = true;
++
++            if (is_wifi8_platform()) {
++                LOG(INFO) << "Wi-Fi 8 platform: enabling 5 GHz powersave; scheduling 6 GHz "
++                              "powersave-enable after 10 seconds";
++                send_5g_powersave_request(true);
++                m_wired_teardown_powersave_timer = m_timer_manager->add_timer(
++                    "Wired Teardown 6 GHz Powersave Enable", powersave_radio_spacing_time,
++                    std::chrono::milliseconds::zero(), [this](int secondary_fd,
++                                                               beerocks::EventLoop &secondary_loop) {
++                        m_timer_manager->remove_timer(secondary_fd);
++                        m_wired_teardown_powersave_timer =
++                            beerocks::net::FileDescriptor::invalid_descriptor;
++                        if (!m_eth_link_up || !all_radios_disabled() ||
++                            !all_radios_teardown_confirmed()) {
++                            m_wired_teardown_powersave_enabled = false;
++                            LOG(INFO) << "Wired teardown 6 GHz powersave-enable cancelled because "
++                                         "conditions changed";
++                            return true;
++                        }
++                        send_6g_powersave_request(true);
++                        return true;
++                    });
++            } else {
++                send_6g_powersave_request(true);
++            }
++            return true;
++        });
++}
++
++void BackhaulManager::arm_powersave_disable_endpoint_settle(std::chrono::seconds settle_time)
++{
++    const auto deadline = std::chrono::steady_clock::now() + settle_time;
++
++    for (auto &radio_info : m_radios_info) {
++        if (radio_info->powersave_disable_endpoint_wait_timer !=
++            beerocks::net::FileDescriptor::invalid_descriptor) {
++            m_timer_manager->remove_timer(radio_info->powersave_disable_endpoint_wait_timer);
++            radio_info->powersave_disable_endpoint_wait_timer =
++                beerocks::net::FileDescriptor::invalid_descriptor;
++        }
++        radio_info->powersave_disable_endpoint_wait_until = deadline;
++    }
++}
++
++void BackhaulManager::maybe_start_backhaul_recovery_cycle(bool require_teardown_confirmation)
+ {
+     if (m_backhaul_recovery_cycle_active) {
+         return;
+@@ -4678,7 +4996,8 @@ void BackhaulManager::maybe_start_backhaul_recovery_cycle()
+         return;
+     }
+ 
+-    if (!is_backhaul_fully_disconnected() || !all_radios_disabled()) {
++    if (!is_backhaul_fully_disconnected() || !all_radios_disabled() ||
++        (require_teardown_confirmation && !all_radios_teardown_confirmed())) {
+         return;
+     }
+ 
+@@ -4697,12 +5016,132 @@ void BackhaulManager::recovery_cycle_stage1_enable_ep()
+         return;
+     }
+ 
++    // Give all APs/endpoints time to finish teardown before waking the radios. This is
++    // deliberately asynchronous so the backhaul event loop remains responsive.
++    m_timer_manager->remove_timer(m_recovery_cycle_timer);
++    m_recovery_cycle_timer = m_timer_manager->add_timer(
++        "Backhaul Recovery Cycle Stage 1 PowerSave Wake", std::chrono::seconds(15),
++        std::chrono::milliseconds::zero(), [this](int fd, beerocks::EventLoop &loop) {
++            m_timer_manager->remove_timer(fd);
++            m_recovery_cycle_timer = beerocks::net::FileDescriptor::invalid_descriptor;
++            recovery_cycle_stage1_wake_powersave();
++            return true;
++        });
++}
++
++void BackhaulManager::recovery_cycle_stage1_wake_powersave()
++{
++    if (!is_backhaul_fully_disconnected()) {
++        LOG(INFO) << "Backhaul connectivity restored before powersave wake - stopping cycle";
++        recovery_cycle_stop();
++        return;
++    }
++
++    // Teardown gating leaves the endpoint unavailable. On Wi-Fi 8, wake 5 GHz first and
++    // 6 GHz ten seconds later; Wi-Fi 7 keeps the existing 6 GHz-only behavior.
++    if (is_wifi8_platform()) {
++        send_5g_powersave_request(true);
++        m_timer_manager->remove_timer(m_recovery_cycle_timer);
++        m_recovery_cycle_timer = m_timer_manager->add_timer(
++            "Backhaul Recovery Cycle 6 GHz PowerSave Wake", powersave_radio_spacing_time,
++            std::chrono::milliseconds::zero(), [this](int fd, beerocks::EventLoop &loop) {
++                m_timer_manager->remove_timer(fd);
++                m_recovery_cycle_timer = beerocks::net::FileDescriptor::invalid_descriptor;
++                if (!is_backhaul_fully_disconnected()) {
++                    LOG(INFO) << "Backhaul connectivity restored before 6 GHz powersave wake - "
++                                 "stopping cycle";
++                    recovery_cycle_stop();
++                    return true;
++                }
++                send_6g_powersave_request(true);
++                recovery_cycle_schedule_powersave_dwell();
++                return true;
++            });
++        return;
++    }
++
++    send_6g_powersave_request(true);
++    recovery_cycle_schedule_powersave_dwell();
++}
++
++void BackhaulManager::recovery_cycle_schedule_powersave_dwell()
++{
++    // The endpoint reconnect attempt begins four minutes after powersave-enable(true).
++    m_timer_manager->remove_timer(m_recovery_cycle_timer);
++    m_recovery_cycle_timer = m_timer_manager->add_timer(
++        "Backhaul Recovery Cycle Powersave Dwell", std::chrono::minutes(4),
++        std::chrono::milliseconds::zero(), [this](int fd, beerocks::EventLoop &loop) {
++            m_timer_manager->remove_timer(fd);
++            m_recovery_cycle_timer = beerocks::net::FileDescriptor::invalid_descriptor;
++            recovery_cycle_stage4_powersave_disable();
++            return true;
++        });
++}
++
++void BackhaulManager::recovery_cycle_stage1_enable_endpoints()
++{
++    if (!is_backhaul_fully_disconnected()) {
++        LOG(INFO) << "Backhaul connectivity restored before endpoint enable - stopping cycle";
++        recovery_cycle_stop();
++        return;
++    }
++
++    // The recovery-cycle timer owns endpoint re-enable.  Clear any per-radio settle timers
++    // that may have been created by an asynchronous radio-enable notification so that the
++    // notification cannot reconnect a bSTA a second time after this function runs.
++    for (auto &radio_info : m_radios_info) {
++        if (radio_info->powersave_disable_endpoint_wait_timer !=
++            beerocks::net::FileDescriptor::invalid_descriptor) {
++            m_timer_manager->remove_timer(radio_info->powersave_disable_endpoint_wait_timer);
++            radio_info->powersave_disable_endpoint_wait_timer =
++                beerocks::net::FileDescriptor::invalid_descriptor;
++        }
++        radio_info->powersave_disable_endpoint_wait_until = {};
++    }
++
+     LOG(INFO) << "Backhaul recovery cycle: re-enabling EP on all radios with a bSTA";
+     for (auto &radio_info : m_radios_info) {
+         if (radio_info->sta_wlan_hal) {
+             if (!radio_info->sta_wlan_hal->enable_disable_ep(true)) {
+                 LOG(WARNING) << "Backhaul recovery cycle: enable_disable_ep(true) failed on iface "
+                              << radio_info->sta_iface;
++                continue;
++            }
++
++            // Reapply the cached bSTA credentials before reconnecting.  The recovery cycle may
++            // run after the endpoint was administratively disabled for long enough that the
++            // backend no longer has an active profile/connection state.
++            if (radio_info->bSta_conf.ssid.empty() ||
++                radio_info->bSta_conf.network_key.empty()) {
++                son::wireless_utils::sBssInfoConf cached_conf;
++                if (beerocks::bpl::bpl_cfg_get_wifi_credentials(radio_info->sta_iface,
++                                                                  cached_conf)) {
++                    radio_info->bSta_conf = cached_conf;
++                    LOG(DEBUG) << "Backhaul recovery cycle: restored cached bSTA credentials for "
++                               << radio_info->sta_iface;
++                }
++            }
++
++            if (!radio_info->bSta_conf.ssid.empty() &&
++                !radio_info->bSta_conf.network_key.empty()) {
++                if (radio_info->sta_wlan_hal->add_new_network(radio_info->bSta_conf)) {
++                    radio_info->added_network_status = true;
++                    LOG(INFO) << "Backhaul recovery cycle: reapplied bSTA credentials on "
++                              << radio_info->sta_iface;
++                } else {
++                    LOG(WARNING) << "Backhaul recovery cycle: failed to reapply bSTA credentials on "
++                                 << radio_info->sta_iface;
++                }
++            } else {
++                LOG(WARNING) << "Backhaul recovery cycle: no cached bSTA credentials for "
++                             << radio_info->sta_iface;
++            }
++
++            // Enabling the endpoint alone is not an explicit reconnect request in WHM.  Always
++            // issue the HAL reconnect operation after restoring the endpoint/profile state.
++            if (!radio_info->sta_wlan_hal->reconnect_backhaul_sta()) {
++                LOG(WARNING) << "Backhaul recovery cycle: reconnect_backhaul_sta() failed on iface "
++                             << radio_info->sta_iface;
+             }
+         }
+     }
+@@ -4732,7 +5171,9 @@ void BackhaulManager::recovery_cycle_stage2_recheck()
+                 }
+             }
+         }
+-        recovery_cycle_stage3_powersave_enable();
++        // Start a fresh round. It will wait 15 seconds before sending powersave-enable(true),
++        // then wait four minutes before sending powersave-disable(false).
++        recovery_cycle_stage1_enable_ep();
+         return;
+     }
+ 
+@@ -4742,58 +5183,83 @@ void BackhaulManager::recovery_cycle_stage2_recheck()
+ 
+ void BackhaulManager::recovery_cycle_stage3_powersave_enable()
+ {
+-    LOG(INFO) << "Backhaul recovery cycle: requesting 6G powersave-enable on all radios";
+-    for (auto &radio_info : m_radios_info) {
+-        auto request = message_com::create_vs_message<
+-            beerocks_message::cACTION_BACKHAUL_RADIO_POWERSAVE_ENABLE_REQUEST>(cmdu_tx);
+-        if (!request) {
+-            LOG(ERROR) << "Failed building cACTION_BACKHAUL_RADIO_POWERSAVE_ENABLE_REQUEST for "
+-                       << radio_info->hostap_iface;
+-            continue;
+-        }
+-        request->set_iface(radio_info->hostap_iface);
+-        send_cmdu(m_agent_fd, cmdu_tx);
+-        LOG(DEBUG) << "Backhaul recovery cycle: sent powersave-enable request for "
+-                  << radio_info->hostap_iface;
++    // Keep an explicit 15-second settle interval after powersave-enable before trying to
++    // re-enable endpoints and reconnect the bSTA.
++    auto schedule_endpoint_enable = [this]() {
++        m_timer_manager->remove_timer(m_recovery_cycle_timer);
++        m_recovery_cycle_timer = m_timer_manager->add_timer(
++            "Backhaul Recovery Cycle Stage 3 Endpoint Settle",
++            powersave_disable_endpoint_settle_time,
++            std::chrono::milliseconds::zero(), [this](int fd, beerocks::EventLoop &loop) {
++                m_timer_manager->remove_timer(fd);
++                m_recovery_cycle_timer = beerocks::net::FileDescriptor::invalid_descriptor;
++                recovery_cycle_stage1_enable_endpoints();
++                return true;
++            });
++    };
++
++    if (is_wifi8_platform()) {
++        LOG(INFO) << "Backhaul recovery cycle: requesting 5 GHz powersave-enable; scheduling "
++                     "6 GHz powersave-enable after 10 seconds";
++        send_5g_powersave_request(true);
++        m_timer_manager->remove_timer(m_recovery_cycle_timer);
++        m_recovery_cycle_timer = m_timer_manager->add_timer(
++            "Backhaul Recovery Cycle 6 GHz PowerSave Enable", powersave_radio_spacing_time,
++            std::chrono::milliseconds::zero(), [this, schedule_endpoint_enable](
++                                                    int fd, beerocks::EventLoop &loop) {
++                m_timer_manager->remove_timer(fd);
++                m_recovery_cycle_timer = beerocks::net::FileDescriptor::invalid_descriptor;
++                send_6g_powersave_request(true);
++                schedule_endpoint_enable();
++                return true;
++            });
++        return;
+     }
+ 
+-    m_timer_manager->remove_timer(m_recovery_cycle_timer);
+-    m_recovery_cycle_timer = m_timer_manager->add_timer(
+-        "Backhaul Recovery Cycle Stage 4", std::chrono::minutes(4),
+-        std::chrono::milliseconds::zero(), [this](int fd, beerocks::EventLoop &loop) {
+-            m_timer_manager->remove_timer(fd);
+-            m_recovery_cycle_timer = beerocks::net::FileDescriptor::invalid_descriptor;
+-            recovery_cycle_stage4_powersave_disable();
+-            return true;
+-        });
++    LOG(INFO) << "Backhaul recovery cycle: requesting 6 GHz powersave-enable";
++    send_6g_powersave_request(true);
++    schedule_endpoint_enable();
+ }
+ 
+ void BackhaulManager::recovery_cycle_stage4_powersave_disable()
+ {
+-    LOG(INFO) << "Backhaul recovery cycle: requesting 6G powersave-disable on all radios";
+-    for (auto &radio_info : m_radios_info) {
+-        auto request = message_com::create_vs_message<
+-            beerocks_message::cACTION_BACKHAUL_RADIO_POWERSAVE_DISABLE_REQUEST>(cmdu_tx);
+-        if (!request) {
+-            LOG(ERROR) << "Failed building cACTION_BACKHAUL_RADIO_POWERSAVE_DISABLE_REQUEST for "
+-                       << radio_info->hostap_iface;
+-            continue;
+-        }
+-        request->set_iface(radio_info->hostap_iface);
+-        send_cmdu(m_agent_fd, cmdu_tx);
+-        LOG(DEBUG) << "Backhaul recovery cycle: sent powersave-disable request for "
+-                  << radio_info->hostap_iface;
++    auto schedule_endpoint_enable = [this]() {
++        m_timer_manager->remove_timer(m_recovery_cycle_timer);
++        m_recovery_cycle_timer = m_timer_manager->add_timer(
++            "Backhaul Recovery Cycle Stage 5", powersave_disable_endpoint_settle_time,
++            std::chrono::milliseconds::zero(), [this](int fd, beerocks::EventLoop &loop) {
++                m_timer_manager->remove_timer(fd);
++                m_recovery_cycle_timer = beerocks::net::FileDescriptor::invalid_descriptor;
++                recovery_cycle_stage1_enable_endpoints();
++                return true;
++            });
++    };
++
++    if (is_wifi8_platform()) {
++        LOG(INFO) << "Backhaul recovery cycle: requesting 5 GHz powersave-disable; scheduling "
++                     "6 GHz powersave-disable after 10 seconds";
++        send_5g_powersave_request(false);
++        arm_powersave_disable_endpoint_settle(
++            powersave_radio_spacing_time + powersave_disable_endpoint_settle_time);
++
++        m_timer_manager->remove_timer(m_recovery_cycle_timer);
++        m_recovery_cycle_timer = m_timer_manager->add_timer(
++            "Backhaul Recovery Cycle 6 GHz PowerSave Disable", powersave_radio_spacing_time,
++            std::chrono::milliseconds::zero(), [this, schedule_endpoint_enable](
++                                                    int fd, beerocks::EventLoop &loop) {
++                m_timer_manager->remove_timer(fd);
++                m_recovery_cycle_timer = beerocks::net::FileDescriptor::invalid_descriptor;
++                send_6g_powersave_request(false);
++                schedule_endpoint_enable();
++                return true;
++            });
++        return;
+     }
+ 
+-    m_timer_manager->remove_timer(m_recovery_cycle_timer);
+-    m_recovery_cycle_timer = m_timer_manager->add_timer(
+-        "Backhaul Recovery Cycle Stage 5", std::chrono::seconds(10),
+-        std::chrono::milliseconds::zero(), [this](int fd, beerocks::EventLoop &loop) {
+-            m_timer_manager->remove_timer(fd);
+-            m_recovery_cycle_timer = beerocks::net::FileDescriptor::invalid_descriptor;
+-            recovery_cycle_stage5_loop_or_stop();
+-            return true;
+-        });
++    LOG(INFO) << "Backhaul recovery cycle: requesting 6 GHz powersave-disable";
++    send_6g_powersave_request(false);
++    arm_powersave_disable_endpoint_settle(powersave_disable_endpoint_settle_time);
++    schedule_endpoint_enable();
+ }
+ 
+ void BackhaulManager::recovery_cycle_stage5_loop_or_stop()
+@@ -4823,6 +5289,16 @@ void BackhaulManager::recovery_cycle_stop()
+         FSM_MOVE_STATE(CONNECTED);
+     }
+ 
++    for (auto &radio_info : m_radios_info) {
++        if (radio_info->powersave_disable_endpoint_wait_timer !=
++            beerocks::net::FileDescriptor::invalid_descriptor) {
++            m_timer_manager->remove_timer(radio_info->powersave_disable_endpoint_wait_timer);
++            radio_info->powersave_disable_endpoint_wait_timer =
++                beerocks::net::FileDescriptor::invalid_descriptor;
++        }
++        radio_info->powersave_disable_endpoint_wait_until = {};
++    }
++
+     m_backhaul_recovery_cycle_active = false;
+ 
+     LOG(INFO) << "Backhaul recovery cycle: connectivity restored - triggering re-onboarding "
+@@ -4844,6 +5320,17 @@ void BackhaulManager::start_backhaul_reconnect_watchdog(std::shared_ptr<sRadioIn
+         return;
+     }
+ 
++#ifdef USE_PRPLMESH_WHM
++    // WHM uses the backend-generic five-stage recovery cycle for a disabled-radio
++    // backhaul loss. Do not arm the legacy per-radio reconnect watchdog here: it
++    // performs only a disconnect/reconnect attempt and then waits five minutes,
++    // preventing the EP/powersave recovery sequence from running.
++    LOG(DEBUG) << "WHM radio-disable recovery deferred to the five-stage cycle for "
++               << radio_info->sta_iface;
++    maybe_start_backhaul_recovery_cycle();
++    return;
++#endif
++
+     auto db = AgentDB::get();
+     if (db->device_conf.local_gw) {
+         LOG(DEBUG) << "local_gw is set - not registering reconnect watchdog timer for "
+@@ -5066,6 +5553,50 @@ void BackhaulManager::handle_backhaul_radio_enabled(std::shared_ptr<sRadioInfo>
+         return;
+     }
+ 
++#ifdef USE_PRPLMESH_WHM
++    if (m_backhaul_recovery_cycle_active) {
++        LOG(DEBUG) << "Ignoring direct radio-enable reconnect for " << radio_info->sta_iface
++                   << " while the backhaul recovery cycle owns endpoint re-enable";
++        return;
++    }
++
++    const auto now = std::chrono::steady_clock::now();
++    if (radio_info->powersave_disable_endpoint_wait_until > now) {
++        const auto wait = radio_info->powersave_disable_endpoint_wait_until - now;
++        auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(wait);
++        // Round up sub-millisecond remainders so the timer cannot fire before the full
++        // powersave-disable settle interval has elapsed.
++        if (std::chrono::duration_cast<std::chrono::steady_clock::duration>(wait_ms) < wait) {
++            wait_ms += std::chrono::milliseconds(1);
++        }
++        if (radio_info->powersave_disable_endpoint_wait_timer ==
++            beerocks::net::FileDescriptor::invalid_descriptor) {
++            LOG(INFO) << "Deferring Endpoint enable/reconnect for " << radio_info->sta_iface
++                      << " until 15 seconds after powersave-disable";
++            radio_info->powersave_disable_endpoint_wait_timer = m_timer_manager->add_timer(
++                "Powersave Disable Endpoint Settle " + radio_info->sta_iface, wait_ms,
++                std::chrono::milliseconds::zero(), [this, radio_info](int fd,
++                                                                        beerocks::EventLoop &loop) {
++                    m_timer_manager->remove_timer(fd);
++                    radio_info->powersave_disable_endpoint_wait_timer =
++                        beerocks::net::FileDescriptor::invalid_descriptor;
++                    radio_info->powersave_disable_endpoint_wait_until = {};
++
++                    if (radio_info->radio_disabled) {
++                        LOG(DEBUG) << "Skipping deferred Endpoint enable/reconnect for "
++                                   << radio_info->sta_iface << " because the radio was disabled again";
++                        return true;
++                    }
++
++                    handle_backhaul_radio_enabled(radio_info);
++                    return true;
++                });
++        }
++        return;
++    }
++    radio_info->powersave_disable_endpoint_wait_until = {};
++#endif
++
+     LOG(INFO) << "Handling backhaul radio_enable for " << radio_info->sta_iface;
+ 
+     if (radio_info->watchdog_owns_recovery) {
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+index 8f3e6cffe..dad6e214f 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+@@ -270,10 +270,10 @@ private:
+     void cancel_backhaul_steering_operation();
+ 
+     /**
+-     * @brief Starts (if not already running) the periodic 5-minute reconnect watchdog timer
+-     * for a radio whose radio_disabled flag was just set. On each firing, reconnects the bSTA
+-     * if it isn't connected, then re-checks 30 seconds later and forces a disconnect if the
+-     * radio is still disabled and still not connected.
++     * @brief Starts the legacy periodic reconnect watchdog for a disabled radio.
++     *
++     * Under WHM, this entry point instead hands recovery to the backend-generic five-stage
++     * recovery cycle below; the legacy per-radio watchdog is retained for other backends.
+      */
+     void start_backhaul_reconnect_watchdog(std::shared_ptr<sRadioInfo> radio_info);
+ 
+@@ -285,7 +285,7 @@ private:
+ 
+ #ifdef USE_PRPLMESH_WHM
+     /**
+-     * @brief Backend-generic backhaul-loss recovery cycle (EP toggle + 6G powersave).
++     * @brief Backend-generic backhaul-loss recovery cycle (EP toggle + radio powersave).
+      *
+      * Entry point, called periodically from the OPERATIONAL-state poll loop. If there is no
+      * backhaul connectivity at all (wireless nor wired) and every radio is currently
+@@ -293,7 +293,8 @@ private:
+      * m_backhaul_recovery_cycle_active, which pauses backhaul_fsm_main() until the cycle exits.
+      * No-op if the cycle is already running or a precondition isn't met.
+      */
+-    void maybe_start_backhaul_recovery_cycle();
++    void maybe_start_backhaul_recovery_cycle(bool require_teardown_confirmation = true);
++    void maybe_start_backhaul_recovery_cycle_if_ready();
+ #endif
+ 
+ #if defined(USE_PRPLMESH_NLHAL) || defined(USE_PRPLMESH_WHM)
+@@ -305,23 +306,34 @@ private:
+ 
+     /** @brief true if m_radios_info is non-empty and every radio's radio_disabled flag is set. */
+     bool all_radios_disabled();
+-
+-    /** @brief Stage 1: re-enable the EP on every radio with a sta_wlan_hal, then wait 60s. */
++    bool all_radios_teardown_confirmed();
++    bool is_wifi8_platform();
++    void send_powersave_request(eFreqType freq, bool enable);
++    /** @brief Send powersave request for the selected radio band. */
++    void send_5g_powersave_request(bool enable);
++    void send_6g_powersave_request(bool enable);
++    void schedule_wired_teardown_powersave_enable();
++    void arm_powersave_disable_endpoint_settle(std::chrono::seconds settle_time);
++
++    /** @brief Start a recovery round: wait 15s, then send powersave-enable(true). */
+     void recovery_cycle_stage1_enable_ep();
++    void recovery_cycle_stage1_wake_powersave();
++    void recovery_cycle_schedule_powersave_dwell();
++    void recovery_cycle_stage1_enable_endpoints();
+ 
+-    /** @brief Stage 2 (fires 60s after stage 1): re-check connectivity; if still down, disable
+-     * the EP again and move directly into stage 3. */
++    /** @brief Stage 2 (fires 60s after endpoint re-enable): if still down, start another round. */
+     void recovery_cycle_stage2_recheck();
+ 
+-    /** @brief Stage 3: request 6G powersave-enable on all radios, then wait 4 minutes. */
++    /** @brief Four minutes after powersave-enable(true), send powersave-disable(false), then
++     * wait 15s after the final radio request before re-enabling endpoints. */
+     void recovery_cycle_stage3_powersave_enable();
+ 
+-    /** @brief Stage 4 (fires 4 minutes after stage 3): request 6G powersave-disable on all
+-     * radios, then wait 10 seconds. */
++    /** @brief Stage 4 (fires 4 minutes after powersave-enable): request radio powersave-disable,
++     * then wait 15 seconds after the final radio request before enabling endpoints. */
+     void recovery_cycle_stage4_powersave_disable();
+ 
+-    /** @brief Stage 5 (fires 10s after stage 4): re-check connectivity; if still down, loop back
+-     * to stage 1, otherwise stop the cycle. */
++    /** @brief Re-check connectivity after endpoint re-enable; if still down, loop back to stage 1,
++     * otherwise stop the cycle. */
+     void recovery_cycle_stage5_loop_or_stop();
+ 
+     /**
+@@ -771,7 +783,7 @@ private:
+ #endif
+ 
+ #ifdef USE_PRPLMESH_WHM
+-    /**< Set while the backend-generic backhaul-loss recovery cycle (EP toggle + 6G powersave)
++    /**< Set while the backend-generic backhaul-loss recovery cycle (EP toggle + radio powersave)
+      * is running; while true, backhaul_fsm_main() early-returns and skips normal FSM
+      * processing, exactly like the reconnect watchdog does for NLHAL. */
+     bool m_backhaul_recovery_cycle_active = false;
+@@ -779,6 +791,8 @@ private:
+     /**< fd of the current recovery-cycle stage's one-shot timer; invalid_descriptor when no
+      * stage is pending. */
+     int m_recovery_cycle_timer = beerocks::net::FileDescriptor::invalid_descriptor;
++    int m_wired_teardown_powersave_timer = beerocks::net::FileDescriptor::invalid_descriptor;
++    bool m_wired_teardown_powersave_enabled = false;
+ #endif
+ 
+     enum class backhaul_connection { Invalid = -1, Wireless, Wired};
+@@ -860,6 +874,12 @@ public:
+          * received for this radio - drives the reconnect watchdog timer below. */
+         bool radio_disabled = false;
+ 
++#ifdef USE_PRPLMESH_WHM
++        // True only after AP manager confirms that this radio's VAPs have actually
++        // completed teardown. radio_disabled represents the disable intent only.
++        bool vaps_teardown_confirmed = false;
++#endif
++
+         /**< fd of the periodic "Backhaul Reconnect Watchdog" timer running while
+          * radio_disabled is true; invalid_descriptor when not running. */
+         int reconnect_watchdog_timer = beerocks::net::FileDescriptor::invalid_descriptor;
+@@ -879,6 +899,14 @@ public:
+          * own reconnection while a radio is disabled. */
+         bool watchdog_owns_recovery = false;
+ 
++#ifdef USE_PRPLMESH_WHM
++        /**< Deadline and timer used to keep Endpoint enable/reconnect at least 15 seconds
++         * after PowerSaveEnable is set to false. */
++        std::chrono::steady_clock::time_point powersave_disable_endpoint_wait_until{};
++        int powersave_disable_endpoint_wait_timer =
++            beerocks::net::FileDescriptor::invalid_descriptor;
++#endif
++
+         /**< Earliest time start_backhaul_reconnect_watchdog() is allowed to (re-)arm the timer
+          * for this radio; set to now+5min when a cycle concludes with a successful reconnect, so
+          * the OPERATIONAL-state poll loop's repeated calls don't restart the cycle early. */
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 1ab457abc..ed8231437 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -4493,6 +4493,27 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+         send_cmdu_to_controller(fronthaul_iface, cmdu_tx);
+         break;
+     }
++#ifdef USE_PRPLMESH_WHM
++    case beerocks_message::ACTION_APMANAGER_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION: {
++        auto notification_in = beerocks_header->addClass<
++            beerocks_message::cACTION_APMANAGER_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION>();
++        if (!notification_in) {
++            LOG(ERROR) << "Failed parsing RADIO_TEARDOWN_CONFIRMED_NOTIFICATION from AP manager";
++            return false;
++        }
++
++        auto notification_out = message_com::create_vs_message<
++            beerocks_message::cACTION_BACKHAUL_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION>(cmdu_tx);
++        if (!notification_out) {
++            LOG(ERROR) << "Failed building RADIO_TEARDOWN_CONFIRMED_NOTIFICATION for backhaul";
++            return false;
++        }
++        notification_out->radio_mac()     = notification_in->radio_mac();
++        notification_out->radio_disable() = notification_in->radio_disable();
++        m_backhaul_manager_client->send_cmdu(cmdu_tx);
++        break;
++    }
++#endif
+     case beerocks_message::ACTION_APMANAGER_HOSTAP_AP_DISABLED_NOTIFICATION: {
+         auto notification_in =
+             beerocks_header
+diff --git a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+index 7de3a0e4d..ee9dfdba6 100644
+--- a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+@@ -127,20 +127,24 @@ public:
+     virtual bool disable() = 0;
+ 
+     /**
+-     * @brief Put the radio into powersave mode (currently only meaningful for 6GHz radios on
+-     * the WHM backend). Default no-op so other backends need no changes.
++     * @brief Put the radio into powersave mode.
++     *
++     * The WHM backend keeps non-6GHz calls as no-ops unless allow_non_6g is true. This lets
++     * explicit Wi-Fi 8 powersave sequencing target 5 GHz without changing legacy calls.
+      *
+      * @return true on success or false on error.
+      */
+-    virtual bool powersave_enable() { return true; }
++    virtual bool powersave_enable(bool allow_non_6g = false) { return true; }
+ 
+     /**
+-     * @brief Take the radio out of powersave mode. Default no-op so other backends need no
+-     * changes.
++     * @brief Take the radio out of powersave mode.
++     *
++     * The WHM backend keeps non-6GHz calls as no-ops unless allow_non_6g is true. This lets
++     * explicit Wi-Fi 8 powersave sequencing target 5 GHz without changing legacy calls.
+      *
+      * @return true on success or false on error.
+      */
+-    virtual bool powersave_disable() { return true; }
++    virtual bool powersave_disable(bool allow_non_6g = false) { return true; }
+ 
+     /**
+      * @brief Back up the current on-disk hostapd radio-level ("head") config for this radio
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index 31f2039be..14919c93a 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -379,11 +379,11 @@ bool ap_wlan_hal_whm::set_channel(int chan, beerocks::eWiFiBandwidth bw, int cen
+     return true;
+ }
+ 
+-bool ap_wlan_hal_whm::powersave_enable()
++bool ap_wlan_hal_whm::powersave_enable(bool allow_non_6g)
+ {
+     LOG(DEBUG) << "ap_wlan_hal_whm::powersave_enable() called for radio iface="
+                << m_radio_info.iface_name << " path=" << m_radio_path;
+-    if (m_radio_info.frequency_band != beerocks::eFreqType::FREQ_6G) {
++    if (!allow_non_6g && m_radio_info.frequency_band != beerocks::eFreqType::FREQ_6G) {
+         LOG(DEBUG) << "powersave_enable() no-op for non-6G radio iface="
+                    << m_radio_info.iface_name;
+         return true; // no-op for non-6G radios
+@@ -399,11 +399,11 @@ bool ap_wlan_hal_whm::powersave_enable()
+     return true;
+ }
+ 
+-bool ap_wlan_hal_whm::powersave_disable()
++bool ap_wlan_hal_whm::powersave_disable(bool allow_non_6g)
+ {
+     LOG(DEBUG) << "ap_wlan_hal_whm::powersave_disable() called for radio iface="
+                << m_radio_info.iface_name << " path=" << m_radio_path;
+-    if (m_radio_info.frequency_band != beerocks::eFreqType::FREQ_6G) {
++    if (!allow_non_6g && m_radio_info.frequency_band != beerocks::eFreqType::FREQ_6G) {
+         LOG(DEBUG) << "powersave_disable() no-op for non-6G radio iface="
+                    << m_radio_info.iface_name;
+         return true; // no-op for non-6G radios
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
+index d00ae7093..0a6e1f77c 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
+@@ -40,8 +40,8 @@ public:
+     virtual HALState attach(bool block = false) override;
+     virtual bool enable() override;
+     virtual bool disable() override;
+-    virtual bool powersave_enable() override;
+-    virtual bool powersave_disable() override;
++    virtual bool powersave_enable(bool allow_non_6g = false) override;
++    virtual bool powersave_disable(bool allow_non_6g = false) override;
+     virtual bool
+     set_channel(int chan, beerocks::eWiFiBandwidth bw = beerocks::eWiFiBandwidth::BANDWIDTH_UNKNOWN,
+                 int center_channel = 0) override;
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
+index 27a86f2e3..17abebd3e 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
+@@ -173,8 +173,9 @@ eActionOp_BACKHAUL:
+   ACTION_BACKHAUL_RADIO_POWERSAVE_ENABLE_REQUEST: 97
+   ACTION_BACKHAUL_RADIO_POWERSAVE_DISABLE_REQUEST: 98
+   ACTION_BACKHAUL_AUTOCONFIG_RENEW_REQUEST: 99
++  ACTION_BACKHAUL_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION: 100
+ 
+-  ACTION_BACKHAUL_ENUM_END: 100
++  ACTION_BACKHAUL_ENUM_END: 101
+ 
+ ####################################################
+ ####################################################
+@@ -315,7 +316,8 @@ eActionOp_APMANAGER:
+   ACTION_APMANAGER_COTDMA_E2E_CONFIG_REQUEST: 99
+   ACTION_APMANAGER_MAPC_NEGOTIATION_STATUS_NOTIFICATION: 100
+   ACTION_APMANAGER_MAPC_DISCOVERY_REPORT_NOTIFICATION: 101
+-  ACTION_APMANAGER_ENUM_END: 102
++  ACTION_APMANAGER_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION: 102
++  ACTION_APMANAGER_ENUM_END: 103
+ 
+ ####################################################
+ ####################################################
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+index 6292799dd..bd77cb70e 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+@@ -379,6 +379,13 @@ cACTION_APMANAGER_RADIO_POWERSAVE_ENABLE_REQUEST:
+ cACTION_APMANAGER_RADIO_POWERSAVE_DISABLE_REQUEST:
+   _type: class
+ 
++cACTION_APMANAGER_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION:
++  _type: class
++  radio_mac:
++    _type: sMacAddr
++  radio_disable:
++    _type: uint8_t
++
+ cACTION_APMANAGER_RADIO_MODE_CONFIG_REQUEST:
+   _type: class
+   operating_standards: airties::tlvAirtiesRadioCapability::sStandards
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
+index cd5921a9f..213deb313 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
+@@ -215,6 +215,13 @@ cACTION_BACKHAUL_RADIO_STATE_NOTIFICATION:
+   radio_disable:
+     _type: uint8_t
+ 
++cACTION_BACKHAUL_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION:
++  _type: class
++  radio_mac:
++    _type: sMacAddr
++  radio_disable:
++    _type: uint8_t
++
+ cACTION_BACKHAUL_WIFI_ENABLE_DISABLE_ENDPOINT:
+   _type: class
+   radio_mac:
+diff --git a/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.cpp b/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.cpp
+index 4667c631d..e7ca4be05 100644
+--- a/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.cpp
++++ b/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.cpp
+@@ -26,7 +26,10 @@ void ap_config_renew_sequencer_task::work()
+     switch (state) {
+     case SEND_NEXT_UNICAST: {
+         if (next_agent_idx >= agents.size()) {
+-            state = SEND_MULTICAST;
++            // Keep the same inter-stage gap after the final unicast Renew as the gap
++            // currently used between multicast Renew and the local-agent Renew.
++            state = WAIT_BEFORE_MULTICAST;
++            wait_for(RENEW_STAGE_GAP_MS);
+             break;
+         }
+ 
+@@ -44,6 +47,10 @@ void ap_config_renew_sequencer_task::work()
+         set_events_timeout(AGENT_M2_TIMEOUT_MS);
+         break;
+     }
++    case WAIT_BEFORE_MULTICAST: {
++        state = SEND_MULTICAST;
++        break;
++    }
+     case WAIT_FOR_AGENT: {
+         // Should not be reached directly - handle_event()/handle_events_timeout() move the
+         // state forward and re-arm wait_for_event() as needed.
+@@ -59,7 +66,7 @@ void ap_config_renew_sequencer_task::work()
+                                       ieee1905_1::eMessageType::AP_AUTOCONFIGURATION_RENEW_MESSAGE));
+ 
+         state = WAIT_AFTER_MULTICAST;
+-        wait_for(AFTER_MULTICAST_WAIT_MS);
++        wait_for(RENEW_STAGE_GAP_MS);
+         break;
+     }
+     case WAIT_AFTER_MULTICAST: {
+diff --git a/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.h b/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.h
+index cbcd3e8f3..42f3b6f52 100644
+--- a/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.h
++++ b/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.h
+@@ -18,8 +18,8 @@ namespace son {
+  *        AP-Configuration Renew to remote agents one at a time, farthest-from-controller
+  *        first, giving each up to AGENT_M2_TIMEOUT_MS to complete its M1/M2 exchange before
+  *        moving to the next-nearest agent. Once every remote agent has been unicast to, it
+- *        sends the multicast Renew as a reliability backstop, waits
+- *        AFTER_MULTICAST_WAIT_MS, and only then unicasts the Renew to the local/co-located
++ *        waits RENEW_STAGE_GAP_MS, sends the multicast Renew as a reliability backstop, waits
++ *        the same RENEW_STAGE_GAP_MS, and only then unicasts the Renew to the local/co-located
+  *        agent (database.get_local_bridge_mac()) - deliberately last, so the local agent
+  *        reconfigures only after every other agent in the topology already has.
+  */
+@@ -41,12 +41,13 @@ protected:
+     virtual void handle_task_end() override;
+ 
+ private:
+-    const int AGENT_M2_TIMEOUT_MS     = 4000;
+-    const int AFTER_MULTICAST_WAIT_MS = 4000;
++    const int AGENT_M2_TIMEOUT_MS = 4000;
++    const int RENEW_STAGE_GAP_MS  = 4000;
+ 
+     enum states {
+         SEND_NEXT_UNICAST = 0,
+         WAIT_FOR_AGENT,
++        WAIT_BEFORE_MULTICAST,
+         SEND_MULTICAST,
+         WAIT_AFTER_MULTICAST,
+         SEND_LOCAL,
+diff --git a/framework/platform/wbapi/wbapi_utils.cpp b/framework/platform/wbapi/wbapi_utils.cpp
+index 87c61c785..d4cafc538 100644
+--- a/framework/platform/wbapi/wbapi_utils.cpp
++++ b/framework/platform/wbapi/wbapi_utils.cpp
+@@ -254,7 +254,12 @@ WSC::eWscEncr wbapi_utils::encryption_type_from_auth(WSC::eWscAuth auth)
+ 
+ eVapType wbapi_utils::vap_type_from_custom_alias(const std::string &custom_alias)
+ {
+-#ifndef USE_PRPLMESH_WHM
++#ifdef USE_PRPLMESH_WHM
++    std::string alias_lc = custom_alias;
++    std::transform(alias_lc.begin(), alias_lc.end(), alias_lc.begin(),
++                   [](unsigned char c) { return std::tolower(c); });
++    return son::wireless_utils::string_to_vap_type(alias_lc);
++#else
+     if (custom_alias.find("home") != std::string::npos)
+         return eVapType::HOME;
+     else if (custom_alias.find("guest") != std::string::npos)
+@@ -272,13 +277,6 @@ eVapType wbapi_utils::vap_type_from_custom_alias(const std::string &custom_alias
+     else
+         return eVapType::OTHER;
+ #endif
+-
+-#ifdef USE_PRPLMESH_NLHAL
+-    std::string alias_lc = custom_alias;
+-    std::transform(alias_lc.begin(), alias_lc.end(), alias_lc.begin(),
+-                   [](unsigned char c) { return std::tolower(c); });
+-    return son::wireless_utils::string_to_vap_type(alias_lc);
+-#endif
+ }
+ 
+ int wbapi_utils::get_object_id(const std::string &object_path)
+-- 
+2.34.1
+
