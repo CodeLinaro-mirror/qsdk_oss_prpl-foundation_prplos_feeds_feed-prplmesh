@@ -1,0 +1,261 @@
+From 16a948ac623985ecdc840ca3c95ae1ec580acf86 Mon Sep 17 00:00:00 2001
+From: Arockiasathish S <arocs@qti.qualcomm.com>
+Date: Fri, 11 Sep 2026 13:40:42 +0530
+Subject: [PATCH] onewifi_hal_map.cpp_and_.h
+
+Signed-off-by: Arockiasathish S <arocs@qti.qualcomm.com>
+---
+ .../bwl/include/bwl/onewifi_hal_map.h         |  89 +++++++++++
+ .../beerocks/bwl/onewifi/onewifi_hal_map.cpp  | 144 ++++++++++++++++++
+ 2 files changed, 233 insertions(+)
+ create mode 100644 common/beerocks/bwl/include/bwl/onewifi_hal_map.h
+ create mode 100644 common/beerocks/bwl/onewifi/onewifi_hal_map.cpp
+
+diff --git a/common/beerocks/bwl/include/bwl/onewifi_hal_map.h b/common/beerocks/bwl/include/bwl/onewifi_hal_map.h
+new file mode 100644
+index 000000000..06c754338
+--- /dev/null
++++ b/common/beerocks/bwl/include/bwl/onewifi_hal_map.h
+@@ -0,0 +1,89 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#ifndef _BWL_ONEWIFI_HAL_MAP_H_
++#define _BWL_ONEWIFI_HAL_MAP_H_
++
++#ifdef BEEROCKS_RDKB
++
++#include "em_base.h"
++
++#include <functional>
++#include <string>
++
++namespace bwl {
++
++// ─────────────────────────────────────────────────────────────────────────────
++// Runtime map: /nvram/StaticVapMAP.json  →  haul-type → (vapType, vapLabel)
++//
++// haulType values match em_haul_type_t from em_base.h:
++//   0=fronthaul  1=backhaul  2=iot  3=configurator  4=hotspot
++//
++// vapType must be one of: home guest video backhaul hotspot staff isolated other
++// vapLabel is the string used for VAP matching in the mesh agent.
++//
++// Placeholders — add entries to the JSON once new em_haul_type_t values appear in em_base.h:
++//   { "haulType": <N>, "vapType": "home",  "vapLabel": "fronthaul1" }
++//   { "haulType": <N>, "vapType": "home",  "vapLabel": "fronthaul2" }
++//   { "haulType": <N>, "vapType": "home",  "vapLabel": "fronthaul3" }
++//   { "haulType": <N>, "vapType": "guest", "vapLabel": "guest"      }
++//   { "haulType": <N>, "vapType": "guest", "vapLabel": "guest1"     }
++//   { "haulType": <N>, "vapType": "guest", "vapLabel": "guest2"     }
++// ─────────────────────────────────────────────────────────────────────────────
++
++#ifndef HAUL_TYPE_MAP_JSON
++#define HAUL_TYPE_MAP_JSON "/nvram/StaticVapMAP.json"
++#endif
++
++#ifndef INTERFACE_MAP_JSON
++#define INTERFACE_MAP_JSON "/nvram/StaticInterfaceMap.json"
++#endif
++
++struct sHaulTypeLabel {
++    std::string vap_type;
++    std::string vap_label;
++};
++
++/**
++ * Forward lookup: haul type value → (vap_type, vap_label).
++ *
++ * Loaded from HAUL_TYPE_MAP_JSON once (on first call), cached in a single
++ * process-wide map owned by onewifi_hal_map.cpp.
++ * Returns false when the haul value is absent from the JSON.
++ */
++bool get_haul_type_label(uint8_t haul, std::string &vap_type, std::string &vap_label);
++
++/** Sentinel returned by get_haul_type_from_label() when the label is absent from the JSON. */
++static constexpr em_haul_type_t EM_HAUL_TYPE_INVALID = static_cast<em_haul_type_t>(0xff);
++
++/**
++ * Reverse lookup: vap_label → em_haul_type_t value.
++ *
++ * Returns EM_HAUL_TYPE_INVALID (0xff) when the label is absent from the JSON.
++ */
++em_haul_type_t get_haul_type_from_label(const std::string &label);
++
++// ─────────────────────────────────────────────────────────────────────────────
++// Interface map: /nvram/StaticInterfaceMap.json  →  VapName → MLD/Interface name
++//
++// JSON structure: PhyList → RadioList → InterfaceList
++// Both InterfaceName (ifname) and MldName (mld_ifname) are passed independently to on_entry.
++// MldName may be empty for SLO interfaces.
++//
++// on_entry: called once per resolved entry.
++//           arg1 = vapName, arg2 = InterfaceName (ifname, may be empty), arg3 = MldName (mld_ifname, may be empty)
++//
++// Returns: > 0  number of entries parsed (success)
++//            0  file absent
++//           -1  file present but unreadable or JSON parse failed
++// ─────────────────────────────────────────────────────────────────────────────
++int load_interface_map(const std::function<void(const std::string &,
++                                                const std::string &,
++                                                const std::string &)> &on_entry);
++
++} // namespace bwl
++
++#endif // BEEROCKS_RDKB
++
++#endif // _BWL_ONEWIFI_HAL_MAP_H_
+diff --git a/common/beerocks/bwl/onewifi/onewifi_hal_map.cpp b/common/beerocks/bwl/onewifi/onewifi_hal_map.cpp
+new file mode 100644
+index 000000000..5db70ce7d
+--- /dev/null
++++ b/common/beerocks/bwl/onewifi/onewifi_hal_map.cpp
+@@ -0,0 +1,144 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#include <bwl/onewifi_hal_map.h>
++
++#ifdef BEEROCKS_RDKB
++
++#include <cjson/cJSON.h>
++#include <cstdio>
++#include <cstring>
++#include <functional>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++
++namespace bwl {
++
++// Process-wide haul-type cache — lives in this TU, shared across all callers
++// that link against bwl-onewifi.
++static std::mutex                                  s_mtx;
++static std::unordered_map<uint8_t, sHaulTypeLabel> s_map;
++static std::once_flag                              s_once;
++
++static void load_haul_map()
++{
++    FILE *fp = fopen(HAUL_TYPE_MAP_JSON, "r");
++    if (fp == nullptr) return;
++
++    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return; }
++    long sz = ftell(fp);
++    rewind(fp);
++    if (sz <= 0) { fclose(fp); return; }
++
++    std::string buf(static_cast<size_t>(sz), '\0');
++    size_t got = fread(&buf[0], 1, static_cast<size_t>(sz), fp);
++    fclose(fp);
++    if (got != static_cast<size_t>(sz)) return;
++
++    cJSON *root = cJSON_Parse(buf.c_str());
++    if (root == nullptr) return;
++
++    std::unordered_map<uint8_t, sHaulTypeLabel> tmp;
++    cJSON *arr = cJSON_GetObjectItemCaseSensitive(root, "HaulTypeMap");
++    cJSON *e   = nullptr;
++    cJSON_ArrayForEach(e, arr) {
++        cJSON *ht = cJSON_GetObjectItemCaseSensitive(e, "haulType");
++        cJSON *vt = cJSON_GetObjectItemCaseSensitive(e, "vapType");
++        cJSON *vl = cJSON_GetObjectItemCaseSensitive(e, "vapLabel");
++        if (cJSON_IsNumber(ht) == 0) continue;
++        if (cJSON_IsString(vt) == 0 || vt->valuestring == nullptr) continue;
++        if (cJSON_IsString(vl) == 0 || vl->valuestring == nullptr) continue;
++        auto key = static_cast<uint8_t>(static_cast<int>(ht->valuedouble));
++        tmp[key] = {vt->valuestring, vl->valuestring};
++    }
++    cJSON_Delete(root);
++
++    // call_once guarantees visibility to all waiters — no lock needed here
++    s_map = std::move(tmp);
++}
++
++static void ensure_loaded()
++{
++    std::call_once(s_once, load_haul_map);
++}
++
++bool get_haul_type_label(uint8_t haul, std::string &vap_type, std::string &vap_label)
++{
++    ensure_loaded();
++    std::lock_guard<std::mutex> lk(s_mtx);
++    auto it = s_map.find(haul);
++    if (it == s_map.end()) return false;
++    vap_type  = it->second.vap_type;
++    vap_label = it->second.vap_label;
++    return true;
++}
++
++em_haul_type_t get_haul_type_from_label(const std::string &label)
++{
++    ensure_loaded();
++    std::lock_guard<std::mutex> lk(s_mtx);
++    for (const auto &kv : s_map) {
++        if (kv.second.vap_label == label) {
++            return static_cast<em_haul_type_t>(kv.first);
++        }
++    }
++    return EM_HAUL_TYPE_INVALID;
++}
++
++int load_interface_map(const std::function<void(const std::string &,
++                                                const std::string &,
++                                                const std::string &)> &on_entry)
++{
++    FILE *fp = fopen(INTERFACE_MAP_JSON, "r");
++    if (fp == nullptr) return 0;
++
++    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return -1; }
++    long sz = ftell(fp);
++    rewind(fp);
++    if (sz <= 0) { fclose(fp); return -1; }
++
++    std::string buf(static_cast<size_t>(sz), '\0');
++    size_t got = fread(&buf[0], 1, static_cast<size_t>(sz), fp);
++    fclose(fp);
++    if (got != static_cast<size_t>(sz)) return -1;
++
++    cJSON *root = cJSON_Parse(buf.c_str());
++    if (root == nullptr) return -1;
++
++    int count = 0;
++    cJSON *phy = nullptr;
++    cJSON_ArrayForEach(phy, cJSON_GetObjectItemCaseSensitive(root, "PhyList")) {
++        cJSON *radio = nullptr;
++        cJSON_ArrayForEach(radio, cJSON_GetObjectItemCaseSensitive(phy, "RadioList")) {
++            cJSON *iface = nullptr;
++            cJSON_ArrayForEach(iface, cJSON_GetObjectItemCaseSensitive(radio, "InterfaceList")) {
++                cJSON *vap_j   = cJSON_GetObjectItemCaseSensitive(iface, "VapName");
++                cJSON *mld_j   = cJSON_GetObjectItemCaseSensitive(iface, "MldName");
++                cJSON *iface_j = cJSON_GetObjectItemCaseSensitive(iface, "InterfaceName");
++                if (cJSON_IsString(vap_j) == 0 || vap_j->valuestring == nullptr) continue;
++                std::string ifname;
++                std::string mld_ifname;
++                if (cJSON_IsString(iface_j) != 0 && iface_j->valuestring != nullptr &&
++                    strlen(iface_j->valuestring) > 0) {
++                    ifname = iface_j->valuestring;
++                }
++                if (cJSON_IsString(mld_j) != 0 && mld_j->valuestring != nullptr &&
++                    strlen(mld_j->valuestring) > 0) {
++                    mld_ifname = mld_j->valuestring;
++                }
++                if (!ifname.empty() || !mld_ifname.empty()) {
++                    on_entry(std::string(vap_j->valuestring), ifname, mld_ifname);
++                    ++count;
++                }
++            }
++        }
++    }
++    cJSON_Delete(root);
++    return count;
++}
++
++} // namespace bwl
++
++#endif // BEEROCKS_RDKB
+-- 
+2.34.1
+
