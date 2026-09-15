@@ -1,0 +1,101 @@
+From 8d6b625ffb482cbc81bfdb2d539e680b7c5123f9 Mon Sep 17 00:00:00 2001
+From: Manoj Sekar <sekar@qti.qualcomm.com>
+Date: Tue, 22 Sep 2026 21:44:03 +0530
+Subject: [PATCH] nl80211: Parse BSS Load IE to fix Channel Scan Report
+ Utilization Present
+
+translate_nl_data_to_bwl_results() parses NL80211_BSS_INFORMATION_ELEMENTS
+from the kernel's scan-cache entry to populate sChannelScanResults for the
+1905 Channel Scan Report, but its IE-parsing switch only handled SSID (0),
+HT Operation (61), and VHT Operation (192). The BSS Load Information
+Element (ID 11, 802.11-2020 9.4.2.28) -- the element that actually carries
+per-neighbor Station Count and Channel Utilization -- was never parsed.
+
+As a result, sChannelScanResults::load_bss_ie_present stayed at its
+zero-initialized default for every neighbor, so
+channel_scan_task.cpp::set_neighbor_in_scan_results_tlv() always took the
+"FIELD_NOT_PRESENT" branch when filling wfa_map::cNeighbors, and
+channel_utilization / station_count were never written to the wire. In
+Wireshark this showed up as "Neighbor Flags: 0x00, Utilization Present:
+False" for every neighbor in the Channel Scan Report, even when the
+scanned AP was advertising real BSS Load data in its beacons -- confirmed
+against a working reference capture that showed
+"Neighbor Flags: 0x80, Utilization Present: True" with a non-zero
+Channel Utilization for the same scenario.
+
+Add a case for BSS Load IE (11) to the IE-parsing loop:
+  - Station Count               : 2 bytes, little-endian
+  - Channel Utilization         : 1 byte
+  - Available Admission Capacity: 2 bytes, little-endian (unused)
+
+and set load_bss_ie_present = 1, channel_utilization and station_count
+from it, so set_neighbor_in_scan_results_tlv() now takes the
+FIELD_PRESENT branch and reports the real driver-observed values.
+
+This is a follow-up fix on top of the nl80211 Channel Scan HAL support
+introduced in 0386-Channel-Scan-nl80211-Support.patch and
+0387-Channel-Scan-fixes-for-parallel-scan.patch, where neighbor discovery
+(BSSID/SSID/signal/channel/bandwidth) was validated but the BSS Load
+(utilization/station-count) IE parsing was missed since it lives in the
+same function but is an independent parsing branch.
+
+Additionally, 802.11 BSS Load IE reports Channel Utilization as a raw byte
+on a 0-255 scale (255 = 100% busy), as confirmed by matching
+`iw scan dump` output on-device (e.g. "channel utilisation: 197/255").
+
+The EasyMesh Multi-AP Channel Scan Result TLV expects this field
+as a genuine percentage (0-100). Without scaling, values like 197-246
+were being forwarded as-is, producing out-of-range utilization
+percentages (e.g. 200%) in the 1905 Channel Scan Report seen on the
+Controller/Wireshark side.
+
+Fix: scale the raw byte by (raw * 100) / 255 before storing it in
+sChannelScanResults::channel_utilization, and extend the debug log
+to print both the converted percentage and the original raw byte.
+
+Signed-off-by: Manoj Sekar <sekar@qti.qualcomm.com>
+---
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 27 +++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 99961e7..a566681 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -252,6 +252,33 @@ static bool translate_nl_data_to_bwl_results(sChannelScanResults &results,
+                 }
+             }
+             break;
++        case 11: // BSS Load (802.11-2020 9.4.2.28)
++            // [CHAN-SCAN] This is the element that feeds the per-neighbor "Channel
++            // Utilization" / "Station Count" / "Utilization Present" fields of the
++            // EasyMesh Channel Scan Report Neighbor structure (wfa_map::cNeighbors).
++            // Without parsing it here, sChannelScanResults::load_bss_ie_present stays at
++            // its zero-initialized default, so channel_scan_task.cpp's
++            // set_neighbor_in_scan_results_tlv() always takes the "FIELD_NOT_PRESENT"
++            // branch and Wireshark shows "Neighbor Flags: 0x00, Utilization Present: False"
++            // for every neighbor, even though the driver/AP is advertising real BSS Load
++            // data in its beacons.
++            //   Station Count               : 2 bytes, little-endian
++            //   Channel Utilization         : 1 byte
++            //   Available Admission Capacity: 2 bytes, little-endian (not used here)
++            if (len >= 5) {
++                results.station_count =
++                    static_cast<uint16_t>(data[0] | (static_cast<uint16_t>(data[1]) << 8));
++                results.channel_utilization = (static_cast<uint32_t>(data[2]) * 100) / 255;
++                results.load_bss_ie_present = 1;
++                LOG(DEBUG) << "[CHAN-SCAN] BSS Load IE parsed for " << results.bssid
++                           << ": station_count=" << results.station_count
++                           << " channel_utilization=" << int(results.channel_utilization)
++                           << "% (raw=" << int(data[2]) << ")";
++            } else {
++                LOG(DEBUG) << "[CHAN-SCAN] BSS Load IE present but too short (len=" << len
++                           << ") for " << results.bssid << " - ignoring";
++            }
++            break;
+         default:
+             break;
+         }
+-- 
+2.34.1
+
