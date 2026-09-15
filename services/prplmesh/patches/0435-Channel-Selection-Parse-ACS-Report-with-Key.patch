@@ -1,0 +1,351 @@
+From 7aff67f007bad83f6c914eaf8905078ed5120e3d Mon Sep 17 00:00:00 2001
+From: Manoj Sekar <sekar@qti.qualcomm.com>
+Date: Tue, 15 Sep 2026 21:10:09 +0530
+Subject: [PATCH] Channel Selection: parse ACS show_report columns by name
+ instead of position
+
+read_acs_ranks() parsed the "ACS show_report" table by assuming the
+Rank column was always the last whitespace-separated token on each
+data row. The QCA driver has since started appending two additional
+trailing columns, MaxRSSI and MinRSSI, after Rank:
+
+Fix the parser to build a column-name -> index map from the table's
+own header row (the line immediately preceding the "----" separator),
+then look up "Rank" by name instead of by a hardcoded position. This
+makes the parser resilient to any future QSDK/hostapd table format
+change that adds, removes, or reorders columns.
+
+Also add defensive handling: abort the parse with an ERROR log if the
+header can't be parsed or "Rank" is missing from it, skip individual
+rows whose column count doesn't match the header, and log the
+discovered header/column map once per call so any future format
+drift is immediately visible in field logs.
+
+No functional change to callers: sAcsChannelRank's (channel,
+center_chan, rank) contract, read_acs_report(), and the backhaul-side
+channel_selection_task.cpp consumer are unaffected.
+
+Signed-off-by: Manoj Sekar <sekar@qti.qualcomm.com>
+---
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 113 ++++++++++++++++--
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   | 110 +++++++++++++++--
+ 2 files changed, 204 insertions(+), 19 deletions(-)
+
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index fad2e3c..4e033e3 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -23,6 +23,7 @@
+ #include <iomanip>
+ #include <sstream>
+ #include <thread>
++#include <unordered_map>
+ #include <easylogging++.h>
+ #include <linux/nl80211.h>
+ #include <netlink/genl/ctrl.h>
+@@ -6648,6 +6649,16 @@ bool ap_wlan_hal_nl80211::read_acs_ranks(std::vector<sAcsChannelRank> &out_ranks
+     std::stringstream ss(report);
+     std::string line;
+     bool past_separator = false;
++    bool header_parsed  = false;
++
++    // Column-name -> index map for everything AFTER the "Freq(chan)" column (i.e. for the
++    // tokens found on line.substr(rparen+1) on each data row). Populated once from the
++    // header row, immediately before the "----" separator, so a future QSDK/hostapd format
++    // change (reordered/added/removed columns, e.g. the "MaxRSSI"/"MinRSSI" columns added
++    // after "Rank") cannot silently shift which token is read as the rank - the column is
++    // always looked up BY NAME, never by a hardcoded position.
++    std::unordered_map<std::string, int> col_index;
++    std::string header_line; // retained for diagnostics/logging only
+ 
+     auto is_summary_line = [](const std::string &s) {
+         return s.find("ACS_SUCCESS") != std::string::npos ||
+@@ -6659,10 +6670,52 @@ bool ap_wlan_hal_nl80211::read_acs_ranks(std::vector<sAcsChannelRank> &out_ranks
+     };
+ 
+     while (std::getline(ss, line)) {
+-        // The "----" divider marks the start of the data rows.
++        // The "----" divider marks the start of the data rows. The line immediately
++        // preceding it is the column header row - parse it to build col_index before
++        // flipping past_separator.
+         if (!past_separator) {
+             if (line.find("---") != std::string::npos) {
+                 past_separator = true;
++                if (!header_parsed) {
++                    LOG(ERROR) << "[CBS] read_acs_ranks: reached '----' separator without a "
++                                  "parsed header row (empty/blank header?) - cannot map "
++                                  "columns by name, aborting parse";
++                    return false;
++                }
++                continue;
++            }
++            // Any non-blank line before the separator is treated as (part of) the header.
++            // The real hostapd table header is a single line, so simply remember the most
++            // recent non-blank line seen - this naturally becomes the header line right
++            // before the "----" row.
++            auto first = line.find_first_not_of(" \t\r\n");
++            if (first != std::string::npos) {
++                header_line = line;
++
++                // Build the name->index map from this candidate header line. The first
++                // header token is "Freq(chan)" (with an embedded space split across two
++                // tokens by naive whitespace tokenization: "Freq(chan)" has no internal
++                // space, so it IS one token) - it corresponds to the special paren-parsed
++                // chan/center fields and is intentionally NOT added to col_index (there is
++                // nothing after the header's own first token to align against on a data
++                // row's paren-derived prefix). All remaining header tokens map 1:1, in
++                // order, to the whitespace-separated tokens found after the closing paren
++                // on each data row.
++                col_index.clear();
++                std::stringstream hss(line);
++                std::string htok;
++                bool skipped_freq_col = false;
++                int idx               = 0;
++                while (hss >> htok) {
++                    if (!skipped_freq_col) {
++                        // First header token is "Freq(chan)" (or similar) - skip it, it is
++                        // handled separately via the "(...)" parsing below.
++                        skipped_freq_col = true;
++                        continue;
++                    }
++                    col_index[htok] = idx++;
++                }
++                header_parsed = !col_index.empty();
+             }
+             continue;
+         }
+@@ -6694,19 +6747,46 @@ bool ap_wlan_hal_nl80211::read_acs_ranks(std::vector<sAcsChannelRank> &out_ranks
+         }
+         pss >> center; // optional; remains 0 if absent
+ 
+-        // The rank is the last whitespace-separated integer token on the line
+-        // (after the closing paren).
+-        int32_t rank = -1;
++        // Tokenize everything after the closing paren, then look up "Rank" BY NAME using
++        // col_index (built from the header above) rather than assuming any fixed position
++        // (e.g. "last token"). This is what makes the parser resilient to columns being
++        // added/reordered/removed by a QSDK/hostapd update (e.g. the MaxRSSI/MinRSSI
++        // columns newly appended after Rank).
++        std::vector<std::string> tokens;
+         {
+             std::stringstream tss(line.substr(rparen + 1));
+             std::string tok;
+             while (tss >> tok) {
+-                // parse trailing integer tokens; keep the last valid one
+-                char *endp = nullptr;
+-                long v     = std::strtol(tok.c_str(), &endp, 10);
+-                if (endp != tok.c_str() && *endp == '\0') {
+-                    rank = static_cast<int32_t>(v);
+-                }
++                tokens.push_back(tok);
++            }
++        }
++
++        auto rank_it = col_index.find("Rank");
++        if (rank_it == col_index.end()) {
++            LOG(ERROR) << "[CBS] read_acs_ranks: 'Rank' column not found in parsed header ('"
++                       << header_line << "') - aborting parse";
++            return false;
++        }
++
++        if (static_cast<size_t>(rank_it->second) >= tokens.size()) {
++            LOG(WARNING) << "[CBS] read_acs_ranks: data row has " << tokens.size()
++                        << " column(s) after Freq(chan), but Rank is expected at index "
++                        << rank_it->second << " (header column count mismatch) - skipping row: '"
++                        << line << "'";
++            continue;
++        }
++
++        int32_t rank = -1;
++        {
++            const std::string &rank_tok = tokens[rank_it->second];
++            char *endp                  = nullptr;
++            long v                      = std::strtol(rank_tok.c_str(), &endp, 10);
++            if (endp != rank_tok.c_str() && *endp == '\0') {
++                rank = static_cast<int32_t>(v);
++            } else {
++                LOG(WARNING) << "[CBS] read_acs_ranks: non-numeric Rank token '" << rank_tok
++                            << "' on row: '" << line << "' - skipping row";
++                continue;
+             }
+         }
+ 
+@@ -6717,6 +6797,19 @@ bool ap_wlan_hal_nl80211::read_acs_ranks(std::vector<sAcsChannelRank> &out_ranks
+         out_ranks.push_back(entry);
+     }
+ 
++    // One-time diagnostic: surface the discovered header->index mapping so any future
++    // QSDK/hostapd format drift (columns added/removed/reordered) is immediately visible
++    // in field logs without needing to reproduce the issue from scratch.
++    if (header_parsed) {
++        std::stringstream col_log;
++        col_log << "[CBS] read_acs_ranks: header='" << header_line << "' column_map={ ";
++        for (const auto &kv : col_index) {
++            col_log << kv.first << "=" << kv.second << " ";
++        }
++        col_log << "}";
++        LOG(INFO) << col_log.str();
++    }
++
+     // Log the parsed table for verification.
+     {
+         std::stringstream log_ss;
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index 14919c9..8076bea 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -23,6 +23,7 @@
+ #include <numeric>
+ #include <sstream>
+ #include <thread>
++#include <unordered_map>
+ #include <tlvf/tlvftypes.h>
+ #include <vector>
+ using namespace beerocks;
+@@ -1620,6 +1621,17 @@ bool parse_acs_report_table(const std::string &report, std::vector<sAcsChannelRa
+     std::stringstream ss(report);
+     std::string line;
+     bool past_separator = false;
++    bool header_parsed  = false;
++
++    // Column-name -> index map for everything AFTER the "Freq(chan)" column (i.e. for the
++    // tokens found on line.substr(rparen+1) on each data row). Populated once from the
++    // header row, immediately before the "----" separator, so a future QSDK/hostapd format
++    // change (reordered/added/removed columns, e.g. the "MaxRSSI"/"MinRSSI" columns added
++    // after "Rank") cannot silently shift which token is read as the rank - the column is
++    // always looked up BY NAME, never by a hardcoded position. Mirrors the fix applied to
++    // ap_wlan_hal_nl80211::read_acs_ranks() for the OpenWrt/nl80211 backend.
++    std::unordered_map<std::string, int> col_index;
++    std::string header_line; // retained for diagnostics/logging only
+ 
+     auto is_summary_line = [](const std::string &s) {
+         return s.find("ACS_SUCCESS") != std::string::npos ||
+@@ -1631,10 +1643,48 @@ bool parse_acs_report_table(const std::string &report, std::vector<sAcsChannelRa
+     };
+ 
+     while (std::getline(ss, line)) {
+-        // The "----" divider marks the start of the data rows.
++        // The "----" divider marks the start of the data rows. The line immediately
++        // preceding it is the column header row - parse it to build col_index before
++        // flipping past_separator.
+         if (!past_separator) {
+             if (line.find("---") != std::string::npos) {
+                 past_separator = true;
++                if (!header_parsed) {
++                    LOG(ERROR) << "[CBS] parse_acs_report_table: reached '----' separator "
++                                  "without a parsed header row (empty/blank header?) - cannot "
++                                  "map columns by name, aborting parse";
++                    return false;
++                }
++                continue;
++            }
++            // Any non-blank line before the separator is treated as (part of) the header.
++            // The real hostapd table header is a single line, so simply remember the most
++            // recent non-blank line seen - this naturally becomes the header line right
++            // before the "----" row.
++            auto first = line.find_first_not_of(" \t\r\n");
++            if (first != std::string::npos) {
++                header_line = line;
++
++                // Build the name->index map from this candidate header line. The first
++                // header token is "Freq(chan)" (or similar) - it corresponds to the special
++                // paren-parsed chan/center fields and is intentionally NOT added to
++                // col_index (there is nothing after the header's own first token to align
++                // against on a data row's paren-derived prefix). All remaining header
++                // tokens map 1:1, in order, to the whitespace-separated tokens found after
++                // the closing paren on each data row.
++                col_index.clear();
++                std::stringstream hss(line);
++                std::string htok;
++                bool skipped_freq_col = false;
++                int idx               = 0;
++                while (hss >> htok) {
++                    if (!skipped_freq_col) {
++                        skipped_freq_col = true;
++                        continue;
++                    }
++                    col_index[htok] = idx++;
++                }
++                header_parsed = !col_index.empty();
+             }
+             continue;
+         }
+@@ -1666,18 +1716,47 @@ bool parse_acs_report_table(const std::string &report, std::vector<sAcsChannelRa
+         }
+         pss >> center; // optional; remains 0 if absent
+ 
+-        // The rank is the last whitespace-separated integer token on the line
+-        // (after the closing paren).
+-        int32_t rank = -1;
++        // Tokenize everything after the closing paren, then look up "Rank" BY NAME using
++        // col_index (built from the header above) rather than assuming any fixed position
++        // (e.g. "last token"). This is what makes the parser resilient to columns being
++        // added/reordered/removed by a QSDK/hostapd update (e.g. the MaxRSSI/MinRSSI
++        // columns newly appended after Rank, as observed on this pWHM build).
++        std::vector<std::string> tokens;
+         {
+             std::stringstream tss(line.substr(rparen + 1));
+             std::string tok;
+             while (tss >> tok) {
+-                char *endp = nullptr;
+-                long v     = std::strtol(tok.c_str(), &endp, 10);
+-                if (endp != tok.c_str() && *endp == '\0') {
+-                    rank = static_cast<int32_t>(v);
+-                }
++                tokens.push_back(tok);
++            }
++        }
++
++        auto rank_it = col_index.find("Rank");
++        if (rank_it == col_index.end()) {
++            LOG(ERROR) << "[CBS] parse_acs_report_table: 'Rank' column not found in parsed "
++                          "header ('"
++                       << header_line << "') - aborting parse";
++            return false;
++        }
++
++        if (static_cast<size_t>(rank_it->second) >= tokens.size()) {
++            LOG(WARNING) << "[CBS] parse_acs_report_table: data row has " << tokens.size()
++                        << " column(s) after Freq(chan), but Rank is expected at index "
++                        << rank_it->second << " (header column count mismatch) - skipping row: '"
++                        << line << "'";
++            continue;
++        }
++
++        int32_t rank = -1;
++        {
++            const std::string &rank_tok = tokens[rank_it->second];
++            char *endp                  = nullptr;
++            long v                      = std::strtol(rank_tok.c_str(), &endp, 10);
++            if (endp != rank_tok.c_str() && *endp == '\0') {
++                rank = static_cast<int32_t>(v);
++            } else {
++                LOG(WARNING) << "[CBS] parse_acs_report_table: non-numeric Rank token '"
++                            << rank_tok << "' on row: '" << line << "' - skipping row";
++                continue;
+             }
+         }
+ 
+@@ -1688,6 +1767,19 @@ bool parse_acs_report_table(const std::string &report, std::vector<sAcsChannelRa
+         out_ranks.push_back(entry);
+     }
+ 
++    // One-time diagnostic: surface the discovered header->index mapping so any future
++    // QSDK/hostapd format drift (columns added/removed/reordered) is immediately visible
++    // in field logs without needing to reproduce the issue from scratch.
++    if (header_parsed) {
++        std::stringstream col_log;
++        col_log << "[CBS] parse_acs_report_table: header='" << header_line << "' column_map={ ";
++        for (const auto &kv : col_index) {
++            col_log << kv.first << "=" << kv.second << " ";
++        }
++        col_log << "}";
++        LOG(INFO) << col_log.str();
++    }
++
+     if (out_ranks.empty()) {
+         LOG(WARNING) << "[CBS] parse_acs_report_table: parsed 0 rows (report empty or format "
+                          "changed)";
+-- 
+2.34.1
+
