@@ -1,0 +1,818 @@
+From ba31e70527f861b2811576e37b2010f1c4957e67 Mon Sep 17 00:00:00 2001
+From: Parimalarengan Gururajan <gururaja@qti.qualcomm.com>
+Date: Wed, 16 Sep 2026 18:01:36 +0530
+Subject: [PATCH] split EPPKE from MRSNO - DPP SecurityIEs - Airties DPP relay
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Split eppke (802.11bi EPPKE) out of additional_auth into its own flag
+so it and MRSNO/RSN Overriding are tracked independently through
+agent<->ap_manager IPC, WSC, UCI, and the nl80211 HAL.
+
+Extend DPP onboarding with MRSNO support, mirroring the WSC M2 path:
+Controller emits "SecurityIEs" as a root-level sibling of "cred" in
+the Configuration Object (cred.akm left empty when used), only to
+agents that advertised RSN Overriding in their AP Capability TLV
+(agent->rsn_overriding_supported); eppke and SecurityIEs stay mutually
+exclusive for now. Agent decodes SecurityIEs back through the existing
+UCI/hostapd path. Also fixes a TLVF field-ordering bug where
+security_ies must be allocated before enabled_ecp_groups/
+security_profiles/rsnxe_capab_mask on cEncryptedSettingsPayload.
+
+Per EasyMesh §17.1.54, the agent now also handles the optional Default
+802.1Q Settings TLV and Traffic Separation Policy TLV on the BSS
+Configuration Response, ahead of sending the BSS Configuration Result.
+
+Add em_ap_controller_found: propagated from the M2 Supported Service
+TLV through ap_manager to sBssInfoConf, so a BSS onboarded by a
+non-standard controller (e.g. Airties, which never sets WSC_AUTH_DPP
+in its M2 AKM) still gets the local DPP-over-TCP relay config written
+into UCI/hostapd.
+
+Signed-off-by: Parimalarengan Gururajan <gururaja@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 |   7 +
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  90 ++++++++---
+ .../slave/tasks/ap_autoconfiguration_task.h   |   1 +
+ .../bcl/include/bcl/son/son_wireless_utils.h  |  15 +-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       |  52 +++++--
+ .../tlvf/beerocks_message_apmanager.yaml      |   1 +
+ .../master/tasks/dpp_configurator_task.cpp    | 141 +++++++++++++-----
+ .../master/tasks/dpp_configurator_task.h      |  10 +-
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     |  35 ++---
+ .../tlvf/yaml/tlvf/WSC/WSC_Attributes.yaml    |   3 +
+ 10 files changed, 256 insertions(+), 99 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 799077c55..8048e60d3 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -2385,6 +2385,11 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+         std::list<son::wireless_utils::sBssInfoConf> bss_info_conf_list;
+         auto wifi_credentials_size = request->wifi_credentials_size();
+ 
++        // Forwarded from the slave process's AgentDB (this process has its own, separate
++        // AgentDB copy that never gets this flag populated - see the M2 Supported Service
++        // TLV handling in ApAutoConfigurationTask).
++        const bool em_ap_controller_found = request->em_ap_controller_found();
++
+         // Read SMD policy list from the request
+         auto smd_policy_list_size = request->smd_policy_list_size();
+         LOG(DEBUG) << "Received " << int(smd_policy_list_size) << " SMD policies";
+@@ -2467,6 +2472,7 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+             auto &config_data = std::get<1>(config_data_tuple);
+ 
+             bss_info_conf.bssid = config_data.bssid_attr().data;
++            bss_info_conf.em_ap_controller_found = em_ap_controller_found;
+ 
+             // If a Multi-AP Agent receives an AP-Autoconfiguration WSC message containing an M2
+             // with a Multi-AP Extension subelement with bit 4 (Tear Down bit) of the subelement
+@@ -2520,6 +2526,7 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+ 
+             bss_info_conf.additional_auth =
+                 static_cast<son::wireless_utils::eAdditionalAuth>(config_data.additional_auth());
++            bss_info_conf.eppke            = config_data.eppke() != 0;
+             bss_info_conf.vap_type         = config_data.vap_type();
+             bss_info_conf.vap_label        = config_data.vap_label_str();
+             bss_info_conf.wifi_compat_mode = config_data.wifi_compat_mode();
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 10361ca8a..ce59eafd6 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -18,6 +18,7 @@
+ #include "../tlvf_utils.h"
+ #include "multi_vendor.h"
+ #include <bcl/beerocks_config_file.h>
++#include <bcl/beerocks_string_utils.h>
+ 
+ #include <bcl/beerocks_utils.h>
+ #include <bcl/beerocks_version.h>
+@@ -2260,6 +2261,8 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+         std::string enabled_ecp_groups; // from "enabledECPGroups" (802.11bi ECP group numbers)
+         std::string security_profiles;  // from "security_profiles" (Table 9-bb22 profile numbers)
+         std::string rsnxe_capab_mask;    // from "extendedRSNCapabilitiesMask" (RSNXE capabilities mask hex string)
++        std::string security_ies_hex;    // from "SecurityIEs" (root-level sibling of "cred", hex-encoded
++                                          // RSNE+RSNOE+RSNO2E+RSNXOE blob per EasyMesh v6.1 Figure 12)
+         uint8_t     map_bss_type  = 0;  // 0x40=backhaul BSS, 0x20=fronthaul BSS
+         bool        hidden_ssid   = false;  // from "SSIDAdvertisement": false → hidden
+         bool        ssid_advert_present = false; // true when field was found in JSON
+@@ -2384,6 +2387,11 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+             cfg.security_profiles  = extract_quoted_field("security_profiles");
+             cfg.rsnxe_capab_mask   = extract_quoted_field("extendedRSNCapabilitiesMask");
+ 
++            // SecurityIEs is a root-level sibling of "cred" (spec Figure 12), not nested
++            // inside it — extract_quoted_field searches the whole sub-TLV JSON string, so
++            // this finds it regardless of nesting level.
++            cfg.security_ies_hex = extract_quoted_field("SecurityIEs");
++
+             if (!cfg.ssid.empty()) {
+                 LOG(INFO) << "DPP BSS Config: ssid=" << cfg.ssid
+                           << " akm=" << cfg.akm
+@@ -2401,7 +2409,9 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+                           << " security_profiles="
+                           << (cfg.security_profiles.empty() ? "(none)" : cfg.security_profiles)
+                           << " extendedRSNCapabilitiesMask="
+-                          << (cfg.rsnxe_capab_mask.empty() ? "(none)" : cfg.rsnxe_capab_mask);
++                          << (cfg.rsnxe_capab_mask.empty() ? "(none)" : cfg.rsnxe_capab_mask)
++                          << " SecurityIEs="
++                          << (cfg.security_ies_hex.empty() ? "(none)" : "(set)");
+                 dpp_configs.push_back(std::move(cfg));
+             } else {
+                 LOG(DEBUG) << "DPP: skipping sub-TLV with no SSID (1905-layer object)";
+@@ -2553,9 +2563,13 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+                     base_auth_type                = WSC::eWscAuth::WSC_AUTH_WPA2PSK;
+                     info.payload_config.encr_type = WSC::eWscEncr::WSC_ENCR_AES;
+                 } else {
+-                    // No recognised auth token (e.g. DPP-only but with passphrase, or empty)
+-                    LOG(WARNING) << "DPP: no auth type resolved from AKM '"
+-                                 << dpp_cfg.akm << "' — defaulting to WPA2-PSK";
++                    // No recognised auth token (e.g. DPP-only but with passphrase, or empty).
++                    // akm is intentionally "" when SecurityIEs carries the AKMs instead
++                    // (spec Figure 12) — skip the warning in that case.
++                    if (dpp_cfg.security_ies_hex.empty()) {
++                        LOG(WARNING) << "DPP: no auth type resolved from AKM '"
++                                     << dpp_cfg.akm << "' — defaulting to WPA2-PSK";
++                    }
+                     base_auth_type                = WSC::eWscAuth::WSC_AUTH_WPA2PSK;
+                     info.payload_config.encr_type = WSC::eWscEncr::WSC_ENCR_AES;
+                 }
+@@ -2619,19 +2633,26 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+             // bss_index: not present in DPP config objects — leave 0 (unset)
+             info.m2_config.bss_index   = 0;
+             // additional_auth: DPP connectors handle network access; no MRSNO/RSN override
+-            // here, except EPPKE (802.11bi), detected from the "000FAC29[...]" AKM token
+-            // above and preserved rather than overwritten.
+-            // (DPP itself is now signalled via WSC_AUTH_DPP in auth_type above, not here.)
+-            if (has_eppk) {
+-                info.additional_auth = son::wireless_utils::eAdditionalAuth::EPPKE;
+-            } else {
+-                info.additional_auth = son::wireless_utils::eAdditionalAuth::NONE;
+-            }
++            // here. EPPKE (802.11bi) is independent of additional_auth, detected from the
++            // "000FAC29[...]" AKM token above.
++            info.eppke            = has_eppk;
++            info.additional_auth  = son::wireless_utils::eAdditionalAuth::NONE;
+             // enabledECPGroups / security_profiles: opaque pass-through, re-emitted
+             // verbatim into hostapd config by the HAL regardless of EPPKE.
+             info.enabled_ecp_groups = dpp_cfg.enabled_ecp_groups;
+             info.security_profiles  = dpp_cfg.security_profiles;
+             info.rsnxe_capab_mask    = dpp_cfg.rsnxe_capab_mask;
++            // MRSNO (RSN Overriding) and EPPKE are mutually exclusive for now (TODO:
++            // redefine once eppk+MRSNO co-existence is spec'd) — ignore a received
++            // SecurityIEs blob when this BSS also has EPPKE enabled.
++            if (!has_eppk && !dpp_cfg.security_ies_hex.empty()) {
++                info.security_ies = beerocks::string_utils::hex_to_bytes<std::vector<uint8_t>>(
++                    dpp_cfg.security_ies_hex);
++            } else if (has_eppk && !dpp_cfg.security_ies_hex.empty()) {
++                LOG(WARNING) << "DPP: SecurityIEs present but EPPKE also enabled for ssid="
++                             << dpp_cfg.ssid << " — MRSNO/eppk are mutually exclusive for now "
++                             << "(TODO: redefine); ignoring SecurityIEs.";
++            }
+ 
+             bss_infos.push_back(std::move(info));
+         }
+@@ -2727,6 +2748,19 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+         }
+     }
+ 
++    // Per EasyMesh §17.1.54: Default 802.1Q Settings TLV (optional) and Traffic
++    // Separation Policy TLV (optional) may be received on this message.
++    if (!handle_profile2_default_802dotq_settings_tlv(cmdu_rx)) {
++        LOG(ERROR) << "handle_profile2_default_802dotq_settings_tlv has failed!";
++    }
++
++    std::unordered_set<std::string> misconfigured_ssids;
++    if (!cmdu_rx.getClass<wfa_map::tlvProfile2TrafficSeparationPolicy>()) {
++        LOG(INFO) << "tlvProfile2TrafficSeparationPolicy not found in BSS Configuration Response";
++    } else if (!handle_profile2_traffic_separation_policy_tlv(cmdu_rx, misconfigured_ssids)) {
++        LOG(ERROR) << "handle_profile2_traffic_separation_policy_tlv has failed!";
++    }
++
+     // Per EasyMesh §17.1.55: send BSS Configuration Result with required TLVs.
+     auto cmdu_header = m_cmdu_tx.create(
+         0, ieee1905_1::eMessageType::BSS_CONFIGURATION_RESULT_MESSAGE);
+@@ -6441,6 +6475,7 @@ bool ApAutoConfigurationTask::handle_bss_reconfiguration(
+                 iter->m2_config.vap_type         = remaining_bss.m2_config.vap_type;
+                 iter->m2_config.vap_label        = remaining_bss.m2_config.vap_label;
+                 iter->additional_auth            = remaining_bss.additional_auth;
++                iter->eppke                      = remaining_bss.eppke;
+                 iter->mld_id                     = remaining_bss.mld_id;
+ 
+                 continue;
+@@ -6597,6 +6632,10 @@ bool ApAutoConfigurationTask::send_ap_bss_configuration_message(
+ 
+     auto db = AgentDB::get();
+     request->set_bridge_ifname(db->bridge.iface_name);
++    // ap_manager runs in a separate process with its own AgentDB copy that never gets this
++    // flag populated, so forward it over IPC rather than having ap_manager read AgentDB
++    // directly (see EM_AP_CONTROLLER handling below).
++    request->em_ap_controller_found() = db->em_ap_controller_found;
+ 
+     std::stringstream ss;
+     for (const auto &info : infos) {
+@@ -6628,7 +6667,8 @@ bool ApAutoConfigurationTask::send_ap_bss_configuration_message(
+            << "- Auth: " << std::hex << int(info.payload_config.auth_type) << std::endl
+            << "- Encr: " << std::hex << int(info.payload_config.encr_type) << std::endl
+            << "- Hidden_SSID: " << info.m2_config.hidden_ssid << std::endl
+-           << "- additional_auth: " << int(info.additional_auth) << std::endl;
++           << "- additional_auth: " << int(info.additional_auth) << std::endl
++           << "- eppke: " << info.eppke << std::endl;
+ 
+         c->set_ssid(info.payload_config.ssid);
+         c->set_network_key(info.payload_config.network_key);
+@@ -6639,24 +6679,26 @@ bool ApAutoConfigurationTask::send_ap_bss_configuration_message(
+         c->bss_index()                     = info.m2_config.bss_index;
+         c->additional_auth() =
+             static_cast<son::wireless_utils::eAdditionalAuth>(info.additional_auth);
++        c->eppke() = info.eppke ? 1 : 0;
+         c->vap_type() = info.m2_config.vap_type;
+         c->set_vap_label(info.m2_config.vap_label);
+         c->smd_mac()  = info.smd_mac;
+         c->wifi_compat_mode() = info.wifi_compat_mode;
+ 
+-        // 802.11bi: opaque pass-through strings, echoed verbatim into hostapd by
+-        // ap_wlan_hal_nl80211 (sae_groups=/pasn_groups= and security_profiles=).
+-        c->set_enabled_ecp_groups(info.enabled_ecp_groups);
+-        c->set_security_profiles(info.security_profiles);
+-        c->set_rsnxe_capab_mask(info.rsnxe_capab_mask);
+-
+         // Forward the raw RSN Security IEs blob captured earlier by
+-        // handle_rsn_parameters_configuration_tlv(). These bytes travel end-to-end down
+-        // to ap_wlan_hal_nl80211::apply_rsn_from_security_ies() via
++        // handle_rsn_parameters_configuration_tlv() (or, for DPP onboarding, decoded from
++        // the Configuration Object's root-level "SecurityIEs" field). These bytes travel
++        // end-to-end down to ap_wlan_hal_nl80211::apply_rsn_from_security_ies() via
+         // sBssInfoConf::security_ies, so hostapd can be programmed with arbitrary
+         // Controller-supplied RSN parameters (not only the canned WPA3-PCM enums).
+         // Skip the allocate/copy entirely when the sBssConfig has no IEs to preserve
+         // the wire size for BSSes the Controller did not target with an RSN TLV.
++        //
++        // Must be allocated before enabled_ecp_groups/security_profiles/rsnxe_capab_mask
++        // below: TLVF enforces variable-length fields on cEncryptedSettingsPayload be
++        // allocated in struct declaration order (WSC_Attributes.yaml has security_ies
++        // declared first), and allocating out of order aborts with "Out of order
++        // allocation for variable length list security_ies, abort!".
+         if (!info.security_ies.empty()) {
+             if (!c->alloc_security_ies(info.security_ies.size())) {
+                 LOG(ERROR) << "Failed to allocate security_ies (" << info.security_ies.size()
+@@ -6671,6 +6713,12 @@ bool ApAutoConfigurationTask::send_ap_bss_configuration_message(
+                        << info.payload_config.bssid;
+         }
+ 
++        // 802.11bi: opaque pass-through strings, echoed verbatim into hostapd by
++        // ap_wlan_hal_nl80211 (sae_groups=/pasn_groups= and security_profiles=).
++        c->set_enabled_ecp_groups(info.enabled_ecp_groups);
++        c->set_security_profiles(info.security_profiles);
++        c->set_rsnxe_capab_mask(info.rsnxe_capab_mask);
++
+         request->add_wifi_credentials(c);
+     }
+ 
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+index 15fba0ce1..84df397c8 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+@@ -151,6 +151,7 @@ private:
+         int8_t mld_id = DISABLED_MLDUNIT;
+         son::wireless_utils::eAdditionalAuth additional_auth =
+             son::wireless_utils::eAdditionalAuth::NONE;
++        bool eppke = false;
+         sMacAddr smd_mac = beerocks::net::network_utils::ZERO_MAC;
+         /**
+          * @brief Raw RSN Security IEs (RSNE + RSNOE + RSNO2E + RSNXOE) copied from
+diff --git a/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h b/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
+index 4d718f720..18db7bd50 100644
+--- a/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
++++ b/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
+@@ -320,10 +320,6 @@ public:
+         AIRTIES_WPA3_COMPATIBILITY_AKM8 = 2,
+         AIRTIES_WPA3_COMPATIBILITY_AKM24 = 3,
+         AIRTIES_WPA3_COMPATIBILITY_AKM8_AKM24 = 4,
+-        // 802.11bi EPPKE (Enhanced/Extended PASN Privacy Key Exchange): the BSS's AKM
+-        // includes the 000FAC29[000FAC24] bracket suite. Orthogonal to the WPA3-PCM/
+-        // Airties values above (only one eAdditionalAuth value is active per BSS).
+-        EPPKE = 5,
+     };
+ 
+     enum eEstimationStatus {
+@@ -381,6 +377,7 @@ public:
+         bool wps_pushbutton                               = false;
+         uint8_t bss_index               = 0;
+         eAdditionalAuth additional_auth = eAdditionalAuth::NONE;
++        bool eppke                      = false; ///< 802.11bi EPPKE; independent of MRSNO.
+         bool ssid_advertisement         = true; ///< BSS Advanced Configuration: SSID advertisement (0=disabled, 1=enabled)
+ 
+         /**
+@@ -469,6 +466,16 @@ public:
+         uint8_t smd_ptk_mode              = 0;
+         uint8_t smd_type                  = 0;
+         uint8_t smd_default_dl_drain_time = 0;
++
++        /**
++         * @brief Set when the discovered EasyMesh controller advertised
++         *        EM_AP_CONTROLLER in its Supported Service TLV (e.g. an Airties
++         *        controller onboarding this agent via a proprietary mechanism
++         *        rather than standard DPP). This BSS's M2 AKM will therefore never
++         *        carry WSC_AUTH_DPP, so this flag lets the HAL/UCI layers still
++         *        enable the local DPP-over-TCP relay config for it.
++         */
++        bool em_ap_controller_found = false;
+     } sBssInfoConf;
+ 
+     typedef struct sMldInfoConf {
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 4752c1edd..48c257c87 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -1145,6 +1145,15 @@ static bool apply_rsn_from_security_ies(prplmesh::hostapd::Configuration &conf,
+               << group_mgmt_cipher << "' ieee80211w=" << mfp
+               << " ovr1=" << have_ovr1 << " ovr2=" << have_ovr2 << " ovrx=" << have_ovrx;
+ 
++    if (bss.eppke && wpa_key_mgmt.find("EPPKE") == std::string::npos) {
++        if (!wpa_key_mgmt.empty()) {
++            wpa_key_mgmt += " ";
++        }
++        wpa_key_mgmt += "EPPKE";
++        conf.set_create_value(vap_id, "assoc_frame_encryption", "1");
++        conf.set_create_value(vap_id, "pmksa_caching_privacy", "1");
++    }
++
+     // Primary RSNE -> hostapd keys.
+     conf.set_create_value(vap_id, "wpa", 2);
+     conf.set_create_value(vap_id, "wpa_key_mgmt", wpa_key_mgmt);
+@@ -1439,12 +1448,15 @@ static void preload_mrsno_from_uci(son::wireless_utils::sBssInfoConf &bss,
+         // avoid cross-band leaks when the same ifname is shared across bands).
+         found = beerocks::bpl::bpl_cfg_get_wifi_credentials(iface_hint, uci_bss);
+     }
+-    if (!found ||
+-        uci_bss.additional_auth == son::wireless_utils::eAdditionalAuth::NONE) {
++    if (!found || (uci_bss.additional_auth == son::wireless_utils::eAdditionalAuth::NONE &&
++                   !uci_bss.eppke)) {
+         return;
+     }
+ 
+-    bss.additional_auth = uci_bss.additional_auth;
++    if (uci_bss.additional_auth != son::wireless_utils::eAdditionalAuth::NONE) {
++        bss.additional_auth = uci_bss.additional_auth;
++    }
++    bss.eppke = bss.eppke || uci_bss.eppke;
+ 
+     // Copy the SecurityIEs blob built from UCI rsn_override_* options so
+     // assign_auth_encr_parameters() takes the apply_rsn_from_security_ies() path
+@@ -1470,6 +1482,7 @@ static void preload_mrsno_from_uci(son::wireless_utils::sBssInfoConf &bss,
+     LOG(INFO) << "preload_mrsno_from_uci: iface='" << iface_hint
+               << "' ssid='" << bss.ssid
+               << "' -> additional_auth=" << int(bss.additional_auth)
++              << " eppke=" << bss.eppke
+               << " authentication_type: 0x" << std::hex << old_auth
+               << " -> 0x" << new_auth << std::dec
+               << " security_ies_len=" << bss.security_ies.size();
+@@ -2016,9 +2029,8 @@ static bool assign_auth_encr_parameters(prplmesh::hostapd::Configuration &conf,
+ 
+     // 802.11bi EPPKE (Enhanced/Extended PASN Privacy Key Exchange): appended to
+     // wpa_key_mgmt plus its two dependent hostapd options, whenever this VAP's
+-    // additional_auth is EPPKE (set from either the local UCI "option eppk '1'" or
+-    // parsed back out of a received DPP Configuration Object's "akm").
+-    if (bss.additional_auth == son::wireless_utils::eAdditionalAuth::EPPKE) {
++    // eppke is set from either local UCI or a received DPP Configuration Object.
++    if (bss.eppke) {
+         if (!wpa_key_mgmt.empty()) {
+             wpa_key_mgmt.append(" EPPKE");
+         }
+@@ -5036,8 +5048,14 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+     // this radio can forward an over-the-air DPP Auth Request to the local DPP TCP listener
+     // (DppAgentTask, 127.0.0.1:8908) — needed for downstream/cascaded enrollee relay. Written
+     // under this radio's own interface= section (base_interface), not the head, and once per
+-    // radio (every radio gets its own interface= section here).
+-    if (beerocks::bpl::cfg_get_onboarding_type() == "DPP") {
++    // radio (every radio gets its own interface= section here). Also enabled when the
++    // discovered controller advertised EM_AP_CONTROLLER (e.g. Airties, onboarding via its
++    // own proprietary mechanism rather than "DPP") - no per-VAP AKM is available yet at this
++    // point, so check the whole list for the flag instead.
++    bool any_em_ap_controller = std::any_of(
++        bss_info_conf_list.begin(), bss_info_conf_list.end(),
++        [](const son::wireless_utils::sBssInfoConf &b) { return b.em_ap_controller_found; });
++    if (beerocks::bpl::cfg_get_onboarding_type() == "DPP" || any_em_ap_controller) {
+         // pkhash is all-zeros for now — hostapd only relays a DPP Auth Request whose
+         // R-Bootstrap-Key-Hash attribute matches this value exactly. Real matching requires
+         // the actual bootstrap key hash (see cfg_get_dpp_bootstrap_pubkey_hash()) — follow-up.
+@@ -5645,9 +5663,12 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                 // hostapd's native DPP-over-TCP relay for this VAP — needed in both gateway
+                 // and extender roles, since a DPP Auth Request may arrive on any DPP-AKM BSS
+                 // and must be relayed to the local DPP TCP listener (DppAgentTask,
+-                // 127.0.0.1:8908). Non-DPP VAPs on the same radio are left untouched.
+-                if (beerocks::bpl::cfg_get_onboarding_type() == "DPP" &&
+-                    (bss_it.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP)) {
++                // 127.0.0.1:8908). Non-DPP VAPs on the same radio are left untouched. Also
++                // enabled unconditionally for a VAP flagged em_ap_controller_found (e.g.
++                // Airties) — its M2 AKM will never carry WSC_AUTH_DPP.
++                if ((beerocks::bpl::cfg_get_onboarding_type() == "DPP" &&
++                     (bss_it.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP)) ||
++                    bss_it.em_ap_controller_found) {
+                     static const std::string zero_pkhash(64, '0');
+                     conf.set_create_vap_value(vap_id, "dpp_controller",
+                                               "ipaddr=127.0.0.1 pkhash=" + zero_pkhash);
+@@ -9794,9 +9815,12 @@ bool ap_wlan_hal_nl80211::create_new_hostapd_conf_file(std::string &ifname, son:
+     // native DPP-over-TCP relay for this VAP (see update_vap_credentials() for the
+     // equivalent per-VAP write on existing radios). Without this, a VAP created here (via
+     // add_bss()/add_mld_link(), each with its own conf file) never advertises the DPP CCE
+-    // IE and never relays DPP Auth Request frames to DppAgentTask (127.0.0.1:8908).
+-    if (beerocks::bpl::cfg_get_onboarding_type() == "DPP" &&
+-        (bss_conf.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP)) {
++    // IE and never relays DPP Auth Request frames to DppAgentTask (127.0.0.1:8908). Also
++    // enabled unconditionally when em_ap_controller_found is set (e.g. Airties) — its M2
++    // AKM will never carry WSC_AUTH_DPP.
++    if ((beerocks::bpl::cfg_get_onboarding_type() == "DPP" &&
++         (bss_conf.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP)) ||
++        bss_conf.em_ap_controller_found) {
+         static const std::string zero_pkhash(64, '0');
+         conf.set_create_vap_value(vap_id, "dpp_controller",
+                                   "ipaddr=127.0.0.1 pkhash=" + zero_pkhash);
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+index bd77cb70e..f39e359dd 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+@@ -354,6 +354,7 @@ cACTION_APMANAGER_WIFI_CREDENTIALS_UPDATE_REQUEST:
+   dpp_netaccesskey:
+     _type: uint8_t
+     _length: [dpp_netaccesskey_length]
++  em_ap_controller_found: uint8_t #bool
+ 
+ cACTION_APMANAGER_WIFI_CREDENTIALS_UPDATE_RESPONSE:
+   _type: class
+diff --git a/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp b/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp
+index 6713f5269..599740ef7 100644
+--- a/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp
++++ b/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp
+@@ -902,26 +902,8 @@ bool DppConfiguratorTask::handle_1905_decryption_failure(const sMacAddr &src_mac
+ //   000FAC08 = SAE      (AKM suite 8)
+ //   000FAC24 = SAE-EXT-KEY (AKM suite 24, WPA3-PCM)
+ //   506F9A02 = DPP      (Wi-Fi Alliance OUI, type 2)
+-static std::string
+-wsc_auth_to_fh_akm(WSC::eWscAuth auth,
+-                   son::wireless_utils::eAdditionalAuth additional_auth =
+-                       son::wireless_utils::eAdditionalAuth::NONE)
++static std::string wsc_auth_to_base_akm(WSC::eWscAuth auth)
+ {
+-    // WSC_AUTH_DPP may be OR'd into auth alongside a standard AKM (a BSS can be both
+-    // DPP-onboarded and use a standard AKM for its primary RSNE); mask it out here so the
+-    // switch/bitfield checks below match on the base AKM only. The DPP OUI is prepended by
+-    // the caller when that bit is set.
+-    auth = static_cast<WSC::eWscAuth>(auth & ~WSC::eWscAuth::WSC_AUTH_DPP);
+-
+-    // 802.11bi EPPKE: the AKM becomes (optional base AKM)+000FAC29[000FAC24]. AKM24, if
+-    // present in the base AKM, is folded into the bracket rather than listed twice.
+-    if (additional_auth == son::wireless_utils::eAdditionalAuth::EPPKE) {
+-        auth = static_cast<WSC::eWscAuth>(auth & ~WSC::eWscAuth::WSC_AUTH_SAE_AKM24);
+-        std::string prefix =
+-            (auth == WSC::eWscAuth::WSC_AUTH_OPEN) ? "" : wsc_auth_to_fh_akm(auth) + "+";
+-        return prefix + "000FAC29[000FAC24]";
+-    }
+-
+     switch (auth) {
+     case WSC::eWscAuth::WSC_AUTH_WPA2PSK:
+         return "000FAC02";
+@@ -942,14 +924,39 @@ wsc_auth_to_fh_akm(WSC::eWscAuth auth,
+     }
+ }
+ 
++static std::string
++wsc_auth_to_fh_akm(WSC::eWscAuth auth,
++                   son::wireless_utils::eAdditionalAuth additional_auth =
++                       son::wireless_utils::eAdditionalAuth::NONE,
++                   bool eppke = false)
++{
++    // WSC_AUTH_DPP may be OR'd into auth alongside a standard AKM (a BSS can be both
++    // DPP-onboarded and use a standard AKM for its primary RSNE); mask it out here so the
++    // switch/bitfield checks below match on the base AKM only. The DPP OUI is prepended by
++    // the caller when that bit is set.
++    auth = static_cast<WSC::eWscAuth>(auth & ~WSC::eWscAuth::WSC_AUTH_DPP);
++
++    // 802.11bi EPPKE: the AKM becomes (optional base AKM)+000FAC29[000FAC24]. AKM24, if
++    // present in the base AKM, is folded into the bracket rather than listed twice.
++    if (eppke) {
++        auth = static_cast<WSC::eWscAuth>(auth & ~WSC::eWscAuth::WSC_AUTH_SAE_AKM24);
++        std::string prefix =
++            (auth == WSC::eWscAuth::WSC_AUTH_OPEN) ? "" : wsc_auth_to_base_akm(auth) + "+";
++        return prefix + "000FAC29[000FAC24]";
++    }
++
++    return wsc_auth_to_base_akm(auth);
++}
++
+ static std::string
+ wsc_auth_to_bh_akm(WSC::eWscAuth auth,
+                     son::wireless_utils::eAdditionalAuth additional_auth =
+-                        son::wireless_utils::eAdditionalAuth::NONE)
++                        son::wireless_utils::eAdditionalAuth::NONE,
++                    bool eppke = false)
+ {
+     // Testing hook: wpa_supplicant has a bug parsing "dpp+psk+sae" in the Config Object's
+     // cred.akm — drop the 506F9A02 (DPP) AKM token so it sees "psk+sae" instead.
+-    return wsc_auth_to_fh_akm(auth, additional_auth);
++    return wsc_auth_to_fh_akm(auth, additional_auth, eppke);
+ }
+ 
+ bool DppConfiguratorTask::add_bss_config_response_tlvs(const sMacAddr &agent_mac,
+@@ -1057,6 +1064,12 @@ bool DppConfiguratorTask::add_bss_config_response_tlvs(const sMacAddr &agent_mac
+     // BH and FH configs — one entry per radio
+     std::set<std::string> seen_bh, seen_fh;
+     auto agent_entry = m_database.m_agents.get(agent_mac);
++    // Mirror the WSC/M2 legacy path (controller.cpp:2752/6636), which only builds/sends
++    // the RSN Parameters Configuration TLV when the agent advertised RSN Overriding
++    // support in its AP Capability TLV. A SecurityIEs blob is meaningless to an agent
++    // whose hostapd doesn't support rsn_override_*, so don't emit one for it here either.
++    const bool agent_supports_rsn_overriding = agent_entry && agent_entry->rsn_overriding_supported;
++    const std::vector<uint8_t> kEmptySecurityIes;
+     for (size_t ri = 0; ri < radio_ruids.size(); ri++) {
+         const std::string &ruid = radio_ruids[ri];
+ 
+@@ -1141,12 +1154,20 @@ bool DppConfiguratorTask::add_bss_config_response_tlvs(const sMacAddr &agent_mac
+                 continue;
+             }
+             std::string akm = wsc_auth_to_bh_akm(adjust_auth(bss.authentication_type),
+-                                                 bss.additional_auth);
++                                                 bss.additional_auth, bss.eppke);
+             std::string custom_alias = son::wireless_utils::vap_type_to_string(bss.vap_type);
+             bool dpp_enabled = (bss.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP) != 0;
++            if (!bss.security_ies.empty() && !agent_supports_rsn_overriding) {
++                LOG(WARNING) << "DPP: agent " << agent_mac
++                             << " did not advertise RSN Overriding support — omitting"
++                                " SecurityIEs for backhaul ssid=" << bss.ssid;
++            }
++            const std::vector<uint8_t> &security_ies_for_agent =
++                agent_supports_rsn_overriding ? bss.security_ies : kEmptySecurityIes;
+             std::string cfg = generate_backhaul_bss_config(*session, ruid, bss.ssid,
+                                                             bss.network_key, akm, custom_alias,
+-                                                            dpp_enabled);
++                                                            dpp_enabled, security_ies_for_agent,
++                                                            bss.eppke, bss.ssid_advertisement);
+             if (!cfg.empty()) configs.push_back(cfg);
+         }
+         for (const auto &bss : bss_info) {
+@@ -1160,13 +1181,20 @@ bool DppConfiguratorTask::add_bss_config_response_tlvs(const sMacAddr &agent_mac
+             // Testing hook: wpa_supplicant has a bug parsing "dpp+..." in the Config
+             // Object's cred.akm — drop the 506F9A02 (DPP) AKM token here too.
+             std::string akm = wsc_auth_to_fh_akm(adjust_auth(bss.authentication_type),
+-                                                 bss.additional_auth);
++                                                 bss.additional_auth, bss.eppke);
+             std::string custom_alias = son::wireless_utils::vap_type_to_string(bss.vap_type);
+             bool dpp_enabled = (bss.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP) != 0;
++            if (!bss.security_ies.empty() && !agent_supports_rsn_overriding) {
++                LOG(WARNING) << "DPP: agent " << agent_mac
++                             << " did not advertise RSN Overriding support — omitting"
++                                " SecurityIEs for fronthaul ssid=" << bss.ssid;
++            }
++            const std::vector<uint8_t> &security_ies_for_agent_fh =
++                agent_supports_rsn_overriding ? bss.security_ies : kEmptySecurityIes;
+             std::string cfg = generate_fronthaul_bss_config(
+                 *session, ruid, bss.ssid, bss.network_key, akm, custom_alias,
+                 bss.enabled_ecp_groups, bss.security_profiles, bss.rsnxe_capab_mask,
+-                dpp_enabled);
++                dpp_enabled, security_ies_for_agent_fh, bss.eppke, bss.ssid_advertisement);
+             if (!cfg.empty()) configs.push_back(cfg);
+         }
+     }
+@@ -1802,7 +1830,8 @@ bool DppConfiguratorTask::send_config_response(sDppSession &session)
+         if (bss.backhaul) {
+             bh_ssid       = bss.ssid;
+             bh_passphrase = bss.network_key;
+-            bh_akm        = wsc_auth_to_bh_akm(bss.authentication_type, bss.additional_auth);
++            bh_akm =
++                wsc_auth_to_bh_akm(bss.authentication_type, bss.additional_auth, bss.eppke);
+             config_bsta   = is_infra_request
+                                ? generate_backhaul_sta_config(session, bh_ssid, bh_passphrase,
+                                                                bh_akm, "sta", "*")
+@@ -2056,17 +2085,21 @@ std::string DppConfiguratorTask::generate_backhaul_sta_config(const sDppSession
+     return config;
+ }
+ 
+-std::string DppConfiguratorTask::generate_backhaul_bss_config(const sDppSession &session,
+-                                                                const std::string &ruid,
+-                                                                const std::string &ssid,
+-                                                                const std::string &passphrase,
+-                                                                const std::string &akm,
+-                                                                const std::string &custom_alias,
+-                                                                bool dpp_enabled) const
++std::string DppConfiguratorTask::generate_backhaul_bss_config(
++    const sDppSession &session, const std::string &ruid, const std::string &ssid,
++    const std::string &passphrase, const std::string &akm, const std::string &custom_alias,
++    bool dpp_enabled, const std::vector<uint8_t> &security_ies, bool eppke,
++    bool ssid_advertisement) const
+ {
+     if (ssid.empty()) return {};
+ 
+-    std::string cred = "\"akm\":\"" + akm + "\","
++    // MRSNO (RSN Overriding) and EPPKE are mutually exclusive for now (TODO: redefine once
++    // eppk+MRSNO co-existence is spec'd) — a VAP with eppke enabled never gets SecurityIEs.
++    bool use_security_ies = !eppke && !security_ies.empty();
++
++    // Per EasyMesh v6.1 §5.3.2 Figure 12: when SecurityIEs is used, cred.akm is set to "" and
++    // the RSN parameters instead come entirely from the SecurityIEs blob.
++    std::string cred = "\"akm\":\"" + (use_security_ies ? std::string() : akm) + "\","
+                        "\"pass\":\"" + passphrase + "\"";
+     if (dpp_enabled) {
+         if (!session.enrollee_protocol_key) return {};
+@@ -2085,6 +2118,18 @@ std::string DppConfiguratorTask::generate_backhaul_bss_config(const sDppSession
+     if (!custom_alias.empty()) {
+         config += ",\"customAlias\":\"" + custom_alias + "\"";
+     }
++    // SecurityIEs: root-level sibling of "cred" (spec Figure 12), not nested inside it.
++    if (use_security_ies) {
++        config += ",\"SecurityIEs\":\"" +
++                  DppCryptoHelper::to_hex(security_ies.data(), security_ies.size()) + "\"";
++    }
++    // SSIDAdvertisement: root-level sibling of "cred", mirroring the BSS Advanced
++    // Configuration TLV's ssid_advertisement used on the WSC/M2 path. Only emitted when
++    // the SSID is hidden (false) — absent means advertised, matching the default the
++    // agent-side parser already assumes (see handle_bss_configuration_response()).
++    if (!ssid_advertisement) {
++        config += ",\"SSIDAdvertisement\":false";
++    }
+     config += "}";
+     return config;
+ }
+@@ -2094,11 +2139,18 @@ std::string DppConfiguratorTask::generate_fronthaul_bss_config(
+     const std::string &passphrase, const std::string &akm,
+     const std::string &custom_alias, const std::string &enabled_ecp_groups,
+     const std::string &security_profiles, const std::string &rsnxe_capab_mask,
+-    bool dpp_enabled) const
++    bool dpp_enabled, const std::vector<uint8_t> &security_ies, bool eppke,
++    bool ssid_advertisement) const
+ {
+     if (ssid.empty()) return {};
+ 
+-    std::string cred = "\"akm\":\"" + akm + "\","
++    // MRSNO (RSN Overriding) and EPPKE are mutually exclusive for now (TODO: redefine once
++    // eppk+MRSNO co-existence is spec'd) — a VAP with eppke enabled never gets SecurityIEs.
++    bool use_security_ies = !eppke && !security_ies.empty();
++
++    // Per EasyMesh v6.1 §5.3.2 Figure 12: when SecurityIEs is used, cred.akm is set to "" and
++    // the RSN parameters instead come entirely from the SecurityIEs blob.
++    std::string cred = "\"akm\":\"" + (use_security_ies ? std::string() : akm) + "\","
+                        "\"pass\":\"" + passphrase + "\"";
+     if (dpp_enabled) {
+         if (!session.enrollee_protocol_key) return {};
+@@ -2126,6 +2178,18 @@ std::string DppConfiguratorTask::generate_fronthaul_bss_config(
+     if (!rsnxe_capab_mask.empty()) {
+         config += ",\"extendedRSNCapabilitiesMask\":\"" + rsnxe_capab_mask + "\"";
+     }
++    // SecurityIEs: root-level sibling of "cred" (spec Figure 12), not nested inside it.
++    if (use_security_ies) {
++        config += ",\"SecurityIEs\":\"" +
++                  DppCryptoHelper::to_hex(security_ies.data(), security_ies.size()) + "\"";
++    }
++    // SSIDAdvertisement: root-level sibling of "cred", mirroring the BSS Advanced
++    // Configuration TLV's ssid_advertisement used on the WSC/M2 path. Only emitted when
++    // the SSID is hidden (false) — absent means advertised, matching the default the
++    // agent-side parser already assumes (see handle_bss_configuration_response()).
++    if (!ssid_advertisement) {
++        config += ",\"SSIDAdvertisement\":false";
++    }
+     config += "}";
+     LOG(DEBUG) << "DPP: fronthaul BSS config ssid=" << ssid << " akm=" << akm
+                << " enabledECPGroups="
+@@ -2133,7 +2197,10 @@ std::string DppConfiguratorTask::generate_fronthaul_bss_config(
+                << " security_profiles="
+                << (security_profiles.empty() ? "(none)" : security_profiles)
+                << " extendedRSNCapabilitiesMask="
+-               << (rsnxe_capab_mask.empty() ? "(none)" : rsnxe_capab_mask);
++               << (rsnxe_capab_mask.empty() ? "(none)" : rsnxe_capab_mask)
++               << " SecurityIEs=" << (use_security_ies ? "(set)" : "(none)")
++               << " ssid_advertisement=" << ssid_advertisement
++               << " eppke=" << eppke;
+     return config;
+ }
+ 
+diff --git a/controller/src/beerocks/master/tasks/dpp_configurator_task.h b/controller/src/beerocks/master/tasks/dpp_configurator_task.h
+index 879f6d32a..72a5697d2 100644
+--- a/controller/src/beerocks/master/tasks/dpp_configurator_task.h
++++ b/controller/src/beerocks/master/tasks/dpp_configurator_task.h
+@@ -318,7 +318,10 @@ private:
+                                               const std::string &passphrase,
+                                               const std::string &akm,
+                                               const std::string &custom_alias = {},
+-                                              bool dpp_enabled = true) const;
++                                              bool dpp_enabled = true,
++                                              const std::vector<uint8_t> &security_ies = {},
++                                              bool eppke = false,
++                                              bool ssid_advertisement = true) const;
+     std::string generate_fronthaul_bss_config(const sDppSession &session, const std::string &ruid,
+                                                const std::string &ssid,
+                                                const std::string &passphrase,
+@@ -327,7 +330,10 @@ private:
+                                                const std::string &enabled_ecp_groups = {},
+                                                const std::string &security_profiles = {},
+                                                const std::string &rsnxe_capab_mask = {},
+-                                               bool dpp_enabled = true) const;
++                                               bool dpp_enabled = true,
++                                               const std::vector<uint8_t> &security_ies = {},
++                                               bool eppke = false,
++                                               bool ssid_advertisement = true) const;
+ 
+     // -------------------------------------------------------------------------
+     // 1905-layer security
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index f5f737145..3a4618bf0 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -522,15 +522,8 @@ static bool bpl_cfg_get_bss_configuration(const std::string &section_name,
+         }
+     }
+ 
+-    // option eppk '1' — 802.11bi Enhanced/Extended PASN Privacy Key Exchange (EPPKE)
+-    // for this VAP. Folds into the akm bracket suite 000FAC29[000FAC24] in the DPP
+-    // Configuration Object, and wpa_key_mgmt += EPPKE / assoc_frame_encryption=1 /
+-    // pmksa_caching_privacy=1 in hostapd config. Must be applied after the RSN
+-    // Override read above, which unconditionally sets additional_auth to either
+-    // WPA3_PERSONAL_COMPATIBILITY or NONE and would otherwise clobber this.
+-    if (options["eppk"] == "1") {
+-        configuration.additional_auth = son::wireless_utils::eAdditionalAuth::EPPKE;
+-    }
++    // EPPKE is orthogonal to RSN Overriding and may be enabled on the same BSS.
++    configuration.eppke = (options["eppk"] == "1");
+ 
+     // option sae_groups / pasn_groups — space-separated ECP group numbers. Whichever
+     // is present (non-empty) is copied verbatim into "enabledECPGroups" in the DPP
+@@ -1320,7 +1313,10 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+ 	    // written directly into hostapd.conf by ap_wlan_hal_nl80211). pkhash is left
+ 	    // all-zero: cfg_get_dpp_bootstrap_pubkey_hash() reads the Controller's own
+ 	    // bootstrapping key from /etc/prplmesh/dpp_uri and is not applicable on an Agent.
+-	    if (configuration.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP) {
++	    // Also persisted when em_ap_controller_found is set (e.g. Airties) — its M2 AKM
++	    // will never carry WSC_AUTH_DPP.
++	    if ((configuration.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP) ||
++	        configuration.em_ap_controller_found) {
+ 		    static const std::string zero_pkhash(64, '0');
+ 		    options["dpp"] = "1";
+ 		    options["dpp_controller"] = "ipaddr=127.0.0.1 pkhash=" + zero_pkhash;
+@@ -1357,10 +1353,7 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+ 	    // security_profiles=, sae_groups=/pasn_groups= directives written directly
+ 	    // into hostapd.conf by ap_wlan_hal_nl80211, and survives a UCI-driven
+ 	    // hostapd.conf regeneration / reboot.
+-	    options["eppk"] = (configuration.additional_auth ==
+-	                        son::wireless_utils::eAdditionalAuth::EPPKE)
+-	                           ? "1"
+-	                           : "";
++	    options["eppk"] = configuration.eppke ? "1" : "";
+ 	    // assoc_frame_encryption/pmksa_caching_privacy are not independent JSON
+ 	    // fields — ap_wlan_hal_nl80211 always writes them as "1" alongside EPPKE,
+ 	    // so mirror that 1:1 dependency on the eppk bit here rather than adding
+@@ -1841,7 +1834,10 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+             // written directly into hostapd.conf by ap_wlan_hal_nl80211). pkhash is left
+             // all-zero: cfg_get_dpp_bootstrap_pubkey_hash() reads the Controller's own
+             // bootstrapping key from /etc/prplmesh/dpp_uri and is not applicable on an Agent.
+-            if (config.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP) {
++            // Also persisted when em_ap_controller_found is set (e.g. Airties) — its M2 AKM
++            // will never carry WSC_AUTH_DPP.
++            if ((config.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP) ||
++                config.em_ap_controller_found) {
+                 static const std::string zero_pkhash(64, '0');
+                 options["dpp"] = "1";
+                 options["dpp_controller"] = "ipaddr=127.0.0.1 pkhash=" + zero_pkhash;
+@@ -1878,10 +1874,7 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+             // security_profiles=, sae_groups=/pasn_groups= directives written directly
+             // into hostapd.conf by ap_wlan_hal_nl80211, and survives a UCI-driven
+             // hostapd.conf regeneration / reboot.
+-            options["eppk"] = (config.additional_auth ==
+-                                son::wireless_utils::eAdditionalAuth::EPPKE)
+-                                   ? "1"
+-                                   : "";
++            options["eppk"] = config.eppke ? "1" : "";
+             // assoc_frame_encryption/pmksa_caching_privacy are not independent JSON
+             // fields — ap_wlan_hal_nl80211 always writes them as "1" alongside EPPKE,
+             // so mirror that 1:1 dependency on the eppk bit here rather than adding
+@@ -2120,7 +2113,7 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+         // established at the MLD, not per-link — mirror them into the wifi-mld
+         // section here in addition to the per-link wifi-iface section (`options`)
+         // set via build_map_options() above.
+-        if (configuration.additional_auth == son::wireless_utils::eAdditionalAuth::EPPKE) {
++        if (configuration.eppke) {
+             mldOptions["assoc_frame_encryption"] = "1";
+             mldOptions["pmksa_caching_privacy"] = "1";
+         } else {
+@@ -4638,4 +4631,4 @@ std::string cfg_get_dpp_bootstrap_pubkey_hash()
+ }
+ 
+ } // namespace bpl
+-} // namespace beerocks
+\ No newline at end of file
++} // namespace beerocks
+diff --git a/framework/tlvf/yaml/tlvf/WSC/WSC_Attributes.yaml b/framework/tlvf/yaml/tlvf/WSC/WSC_Attributes.yaml
+index dce91adb7..1fd9b525e 100644
+--- a/framework/tlvf/yaml/tlvf/WSC/WSC_Attributes.yaml
++++ b/framework/tlvf/yaml/tlvf/WSC/WSC_Attributes.yaml
+@@ -174,6 +174,9 @@ cEncryptedSettingsPayload:
+     _value: eWscWifiCompatMode::WIFI_COMPAT_MODE_UNSET
+   smd_mac:
+     _type: sMacAddr
++  eppke:
++    _type: uint8_t
++    _value: 0
+   security_ies_length:
+     _type: uint16_t
+     _length_var: True
+-- 
+2.34.1
+
