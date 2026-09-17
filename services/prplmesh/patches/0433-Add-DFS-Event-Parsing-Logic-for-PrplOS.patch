@@ -1,0 +1,131 @@
+From 23dde03b12d96b18c4250cad6c5adaddef6cec06 Mon Sep 17 00:00:00 2001
+From: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+Date: Wed, 16 Sep 2026 00:19:48 +0530
+Subject: [PATCH] Add DFS Event Parsing Logic for PrplOS
+
+Signed-off-by: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+---
+ common/beerocks/bwl/common/base_wlan_hal.cpp  | 21 +++++++++++
+ .../beerocks/bwl/include/bwl/base_wlan_hal.h  | 11 ++++++
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   | 37 +++++++++++++++++++
+ 3 files changed, 69 insertions(+)
+
+diff --git a/common/beerocks/bwl/common/base_wlan_hal.cpp b/common/beerocks/bwl/common/base_wlan_hal.cpp
+index 6090c6c1b..0fcf524d6 100644
+--- a/common/beerocks/bwl/common/base_wlan_hal.cpp
++++ b/common/beerocks/bwl/common/base_wlan_hal.cpp
+@@ -14,6 +14,7 @@
+ #include <errno.h>
+ #include <sys/eventfd.h>
+ #include <unistd.h>
++#include <unordered_set>
+ 
+ #include <easylogging++.h>
+ 
+@@ -303,6 +304,26 @@ void base_wlan_hal::apply_bitmask_to_csv(const std::string &in_csv, uint64_t bit
+     }
+ }
+ 
++uint64_t base_wlan_hal::bitmask_from_csv_subset(const std::string &full_csv,
++                                                const std::string &subset_csv)
++{
++    auto full_elems   = beerocks::string_utils::str_split(full_csv, ',');
++    auto subset_elems = beerocks::string_utils::str_split(subset_csv, ',');
++    std::unordered_set<std::string> subset_set(subset_elems.begin(), subset_elems.end());
++
++    LOG_IF((full_elems.size() > 64), DEBUG)
++        << "implicitly filtering elements outside of bitmask range";
++    auto max_i = std::min(int(full_elems.size()), 64);
++
++    uint64_t bitmask = 0;
++    for (auto i = 0; i < max_i; ++i) {
++        if (subset_set.find(full_elems[i]) != subset_set.end()) {
++            bitmask |= (uint64_t(1) << i);
++        }
++    }
++    return bitmask;
++}
++
+ void base_wlan_hal::extractLinkBaseInterface(const std::string &interface_name, std::string &base_interface) {
+     size_t pos = interface_name.find("_link");
+     if (pos != std::string::npos) {
+diff --git a/common/beerocks/bwl/include/bwl/base_wlan_hal.h b/common/beerocks/bwl/include/bwl/base_wlan_hal.h
+index 2f5f29966..ed9432fdc 100644
+--- a/common/beerocks/bwl/include/bwl/base_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/base_wlan_hal.h
+@@ -354,6 +354,17 @@ public:
+     static void apply_bitmask_to_csv(const std::string &in_csv, uint64_t bitmask,
+                                      std::string &out_csv);
+ 
++    /**
++     * @brief Inverse of apply_bitmask_to_csv(): compute a bitmask over @param full_csv
++     * (maximum 64 elements) whose set bits are exactly the elements also present in
++     * @param subset_csv.
++     * @param[in] full_csv csv string containing the full ordered set of values
++     * @param[in] subset_csv csv string containing the subset of @param full_csv to flag
++     * @return bitmask with bit i set if the i-th element of @param full_csv appears in @param subset_csv
++     */
++    static uint64_t bitmask_from_csv_subset(const std::string &full_csv,
++                                            const std::string &subset_csv);
++
+     // Protected methods
+ protected:
+     /*!
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index 1b96197f8..4fc0392f2 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -2401,6 +2401,15 @@ bool ap_wlan_hal_whm::process_radio_channel_change_event(const AmbiorixVariant *
+             LOG(INFO) << "Channel change event received due to AWGN";
+             m_radio_info.last_csa_sw_reason = ChanSwReason::Unknown;
+         }
++        // Handle INITIAL (driver-autonomous channel selection, including the reason reported
++        // for some driver-computed radar/puncturing recoveries). Previously this fell through
++        // to the ERROR branch below, which returned false before event_queue_push() -
++        // silently dropping the CSA notification (and any puncturing bitmap update).
++        else if (chan_change_reason == "INITIAL") {
++            LOG(INFO) << "Channel change event received due to INITIAL (driver-autonomous) "
++                      << "channel selection";
++            m_radio_info.last_csa_sw_reason = ChanSwReason::Unknown;
++        }
+         else {
+             LOG(ERROR) << "Unsupported channel change reason: " << chan_change_reason;
+             return false;
+@@ -2409,6 +2418,34 @@ bool ap_wlan_hal_whm::process_radio_channel_change_event(const AmbiorixVariant *
+         m_radio_info.last_csa_sw_reason = ChanSwReason::Unknown;
+     }
+ 
++    // Re-sync m_radio_info.puncturing_bitmap with the driver's actual current puncturing state
++    // for this event. set_disabled_subchannels() only updates puncturing_bitmap when beerocks
++    // itself commands a pattern; it never fires for driver-autonomous/radar-triggered
++    // puncturing (e.g. reason INITIAL/DFS above), so without this read-back fill_cs_params()
++    // would keep reporting a stale bitmap in the resulting CSA notification.
++    if (m_radio_path.empty()) {
++        m_ambiorix_cl.resolve_path(wbapi_utils::search_path_radio_by_iface(m_radio_info.iface_name),
++                                   m_radio_path);
++    }
++
++    std::string channels_in_use;
++    std::string disabled_subchannels;
++    if (m_ambiorix_cl.get_param(channels_in_use, m_radio_path, "ChannelsInUse") &&
++        m_ambiorix_cl.get_param(disabled_subchannels, m_radio_path + "StaticPuncturing.",
++                                "DisabledSubChannels")) {
++        uint16_t new_bitmap = static_cast<uint16_t>(
++            bwl::base_wlan_hal::bitmask_from_csv_subset(channels_in_use, disabled_subchannels));
++        if (new_bitmap != m_radio_info.puncturing_bitmap) {
++            LOG(DEBUG) << "Radio " << m_radio_path << " puncturing_bitmap 0x" << std::hex
++                       << m_radio_info.puncturing_bitmap << " -> 0x" << new_bitmap << std::dec
++                       << " (DisabledSubChannels=" << disabled_subchannels << ")";
++            m_radio_info.puncturing_bitmap = new_bitmap;
++        }
++    } else {
++        LOG(DEBUG) << "Could not read back StaticPuncturing.DisabledSubChannels for "
++                   << m_radio_path << ", keeping cached puncturing_bitmap";
++    }
++
+     event_queue_push(Event::CSA_Finished);
+     return true;
+ }
+-- 
+2.34.1
+
