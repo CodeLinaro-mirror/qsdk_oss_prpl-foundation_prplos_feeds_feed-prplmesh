@@ -14,6 +14,7 @@
             object '{{Itf.Alias}}' {
                 parameter ReconnectInterval = 60;
                 parameter ReconnectDelay = 60;
+                parameter ToggleBssOnReconnect = 1;
             }
 {% endif; endfor; %}
         }
