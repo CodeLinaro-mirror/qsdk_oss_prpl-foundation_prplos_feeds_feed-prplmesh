@@ -1,0 +1,174 @@
+From 5cf95d8601a70ec390a4312bf5f939f4c6a94516 Mon Sep 17 00:00:00 2001
+From: Aryan Khare <aryakhar@qti.qualcomm.com>
+Date: Wed, 19 Aug 2026 11:56:52 +0530
+Subject: [PATCH] fix BW selection and operating channel reporting for Airties
+ DV
+
+Honor explicitly requested operating classes for channel/BW selection
+and send Operating Channel Report on CSA failure.
+
+Signed-off-by: Aryan Khare <aryakhar@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 |  4 +
+ .../slave/tasks/channel_selection_task.cpp    | 98 +++++++++++++++++--
+ 2 files changed, 95 insertions(+), 7 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 059a92cee..7c077f633 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -1664,6 +1664,10 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+             return;
+         }
+ 
++        // Refresh radio info to ensure m_radio_info.eht_supported reflects the
++        // current HAL/hostapd state before building the CHAN_SWITCH PHY flags.
++        ap_wlan_hal->refresh_radio_info();
++
+         // Set AP channel
+         // punct_bitmap_valid/disabled_subchannel_bitmap are passed explicitly on every call so
+         // that this switch only ever applies a puncturing pattern that was requested alongside
+diff --git a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+index 73e8af8b9..400546245 100644
+--- a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+@@ -2019,9 +2019,54 @@ void ChannelSelectionTask::handle_channel_selection_request(ieee1905_1::CmduMess
+                  * support the current width at all (e.g. 160MHz on a 5GHz channel limited to
+                  * 80MHz). Without this, get_vht_central_frequency() returns 0 and the HAL fails
+                  * with "No valid PHY mode found" / "Failed to set AP channel!".
++                 *
++                 * Bandwidth selection: prefer the bandwidth from the controller's explicitly
++                 * preferred operating class (the one that contains only_ch with preference > 0).
++                 * This ensures that when the MQTT command specifies "bw":"40", the controller's
++                 * tlvChannelPreference (e.g. op-class 84 = 40MHz) is respected end-to-end rather
++                 * than silently upgrading to the current (wider) operating bandwidth.
++                 * Fall back to cur_bw if no matching explicit preference is found.
+                  */
++                beerocks::eWiFiBandwidth desired_bw = cur_bw;
++                {
++                    uint8_t best_pref_for_bw = 0;
++                    for (const auto &pref : radio_request.controller_preferences) {
++                        if (pref.first.flags.preference == 0) {
++                            continue; // non-operable, skip
++                        }
++                        // Check if this op-class contains only_ch (or has an empty channel list
++                        // meaning all channels of the op-class are preferred).
++                        const bool channel_matches =
++                            pref.second.empty() || (pref.second.find(only_ch) != pref.second.end());
++                        if (!channel_matches) {
++                            continue;
++                        }
++                        if (pref.first.flags.preference > best_pref_for_bw) {
++                            auto oc_it = son::wireless_utils::operating_classes_list.find(
++                                pref.first.operating_class);
++                            if (oc_it != son::wireless_utils::operating_classes_list.end()) {
++                                desired_bw       = oc_it->second.band;
++                                best_pref_for_bw = pref.first.flags.preference;
++                                LOG(DEBUG) << "[CHANSEL_RULES] Rule 1: extracted desired BW "
++                                           << beerocks::utils::convert_bandwidth_to_string(
++                                                  desired_bw)
++                                           << " from op-class "
++                                           << int(pref.first.operating_class)
++                                           << " (pref=" << int(pref.first.flags.preference)
++                                           << ") for channel " << int(only_ch);
++                            }
++                        }
++                    }
++                    if (best_pref_for_bw == 0) {
++                        LOG(DEBUG) << "[CHANSEL_RULES] Rule 1: no explicit op-class preference "
++                                      "found for channel "
++                                   << int(only_ch) << " -> using current BW "
++                                   << beerocks::utils::convert_bandwidth_to_string(cur_bw);
++                    }
++                }
++
+                 const auto target_bw =
+-                    resolve_usable_bandwidth(rules_radio, only_ch, cur_bw, "Rule 1");
++                    resolve_usable_bandwidth(rules_radio, only_ch, desired_bw, "Rule 1");
+ 
+                 LOG(DEBUG) << "[CHANSEL_RULES] Rule 1: single preferred channel " << int(only_ch)
+                            << " -> switch directly at bandwidth "
+@@ -2608,8 +2653,14 @@ void ChannelSelectionTask::handle_vs_csa_error_notification(
+                << sender_iface_name;
+ 
+     is_waiting_for_csa_notification(radio->front.iface_mac);
+-    // contrary to CSA_NOTIFICATION,
+-    // do not check retval and do not send unsolicited OPERATING_CHANNEL_REPORT
++
++    // EasyMesh v6.1 §8.2: OCR is mandatory irrespective of whether the channel
++    // switch succeeded or failed — report the current (unchanged) channel.
++    if (!send_operating_channel_report(radio->front.iface_mac)) {
++        LOG(ERROR) << "Failed to send Operating Channel Report after CSA error on "
++                   << sender_iface_name;
++    }
++
+ 
+     // send inner task message
+     auto switch_channel_notification = std::make_shared<sSwitchChannelNotification>();
+@@ -3873,6 +3924,20 @@ ChannelSelectionTask::sSelectedChannel ChannelSelectionTask::select_next_channel
+     const auto &radio_request        = m_pending_selection.requests[radio_mac];
+     const auto &received_preferences = radio_request.controller_preferences;
+ 
++    // Helper: returns true if the operating class is explicitly listed in the
++    // controller's Channel Preference TLV with preference > 0.
++    // Used by the tie-breaker below to prefer the bandwidth the controller
++    // explicitly requested over wider bandwidths that are only implicitly
++    // preferred (not in the TLV at all, so treated as BEST by default).
++    const auto is_explicitly_preferred_by_controller = [&](uint8_t op_class) -> bool {
++        for (const auto &pref : received_preferences) {
++            if (pref.first.operating_class == op_class && pref.first.flags.preference > 0) {
++                return true;
++            }
++        }
++        return false;
++    };
++
+     sSelectedChannel best_channel = {};
+ 
+     for (const auto &channel_iter : radio->channels_list) {
+@@ -3960,11 +4025,28 @@ ChannelSelectionTask::sSelectedChannel ChannelSelectionTask::select_next_channel
+                 // Found preference is lower then best, skip.
+                 continue;
+             } else if (primary_preference == best_channel.preference_score) {
+-                // On a same preference, prefer a higher bandwidth.
+-                if (bandwidth <= best_channel.bw) {
+-                    // Found bandwidth is lower or equal to the best, skip.
++                // Tie-break: prefer the bandwidth whose operating class is explicitly
++                // listed in the controller's Channel Preference TLV (preference > 0)
++                // over one that is only implicitly preferred (not in the TLV, treated
++                // as BEST by default). This ensures that when the controller requests
++                // a specific bandwidth via MQTT (e.g. "bw":"40" → op-class 84), the
++                // agent does not silently upgrade to a wider bandwidth (e.g. 80MHz via
++                // op-class 128) that the controller never explicitly preferred.
++                const bool cur_explicit  = is_explicitly_preferred_by_controller(operating_class);
++                const bool best_explicit =
++                    is_explicitly_preferred_by_controller(best_channel.operating_class);
++                if (!cur_explicit && best_explicit) {
++                    // Best is explicitly preferred; current is only implicitly preferred.
+                     continue;
+                 }
++                if (cur_explicit == best_explicit) {
++                    // Both explicitly preferred or both implicitly preferred:
++                    // fall back to the original wider-bandwidth tie-breaker.
++                    if (bandwidth <= best_channel.bw) {
++                        continue;
++                    }
++                }
++                // else: cur_explicit && !best_explicit → current wins; fall through.
+             }
+ 
+             LOG(INFO) << "[" << channel << "-" << operating_class << "("
+@@ -4084,7 +4166,9 @@ bool ChannelSelectionTask::send_channel_switch_request(
+                    << beerocks::utils::convert_bandwidth_to_string(switch_bw) << " band="
+                    << beerocks::utils::convert_frequency_type_to_string(
+                           request.outgoing_request.freq_type)
+-                   << " -> the driver switch will fail (radio " << radio_mac << ")";
++                   << " -> aborting channel switch to prevent HAL failure (radio " << radio_mac
++                   << ")";
++        return false;
+     }
+ 
+     request_msg->tx_limit()       = request.outgoing_request.tx_limit;
+-- 
+2.34.1
+
