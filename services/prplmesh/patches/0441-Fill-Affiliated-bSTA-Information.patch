@@ -1,0 +1,431 @@
+From f1ea717119cdc7b5c2005017feb3544f8c1da001 Mon Sep 17 00:00:00 2001
+From: Jain Roy <jambi@qti.qualcomm.com>
+Date: Wed, 16 Sep 2026 22:06:01 +0530
+Subject: [PATCH] Fill Affiliated bSTA Information
+
+Signed-off-by: Jain Roy <jambi@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/agent_db.h           |   4 +
+ .../backhaul_manager/backhaul_manager.cpp     |  47 ++++++-
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  10 +-
+ .../bwl/include/bwl/base_wlan_hal_types.h     |  10 ++
+ .../beerocks/bwl/include/bwl/nl80211_client.h |  33 +++++
+ .../bwl/nl80211/sta_wlan_hal_nl80211.cpp      | 129 ++++++++++++++++++
+ .../bwl/nl80211/sta_wlan_hal_nl80211.h        |  34 +++++
+ .../bwl/shared/nl80211_client_impl.cpp        |  19 +++
+ 8 files changed, 283 insertions(+), 3 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index d2f7e56d0..2183cdccd 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -445,6 +445,10 @@ public:
+         sMacAddr observed_ap_mld_mac   = net::network_utils::ZERO_MAC;
+         sMacAddr observed_bsta_mld_mac = net::network_utils::ZERO_MAC;
+ 
++        // Per-RUID affiliated-link-local MAC observed at backhaul-connect time (from
++        // Event::Affiliated_Link_Connected), keyed by RUID.
++        std::unordered_map<sMacAddr, sMacAddr> observed_affiliated_bsta_mac;
++
+         // MLO: interface reporting a non-zero multi_ap_primary_vlanid on the connected event.
+         // Empty in SLO mode or before it has been identified.
+         std::string mlo_primary_bsta_iface;
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 403bed741..8bc92d690 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -3796,6 +3796,39 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+         auto msg = static_cast<bwl::sACTION_BACKHAUL_UPDATE_MLD_MAC_NOTIFICATION *>(data);
+         auto db  = AgentDB::get();
+ 
++        // msg->ruid is only ever valid on platforms with one HAL instance per radio (e.g.
++        // WHM), which set it unconditionally - including on disconnect. On platforms with a
++        // single HAL instance covering the whole (possibly multi-link) bSTA MLO connection
++        // (e.g. nl80211), msg->ruid always stays ZERO_MAC; resolve it here from the link's
++        // operating frequency against this agent's own radio list instead (which the HAL
++        // layer has no access to). A frequency is only meaningful together with a connected
++        // link's MAC, so this fallback only applies when affiliated_mac_address is non-zero -
++        // on an nl80211 disconnect there is no way to know which specific link went down (a
++        // single event covers the whole interface), so ruid legitimately stays ZERO_MAC there.
++        sMacAddr ruid = msg ? msg->ruid : net::network_utils::ZERO_MAC;
++        if (msg && ruid == net::network_utils::ZERO_MAC &&
++            msg->affiliated_mac_address != net::network_utils::ZERO_MAC) {
++            // Match on the radio's own primary-channel frequency, not its (potentially
++            // wider, bandwidth-dependent) center frequency - msg->affiliated_link_frequency
++            // is NL80211_ATTR_WIPHY_FREQ, the link's primary/operating frequency, which for
++            // a bonded (40/80/160MHz) channel differs from wifi_channel's center frequency.
++            for (const auto radio : db->get_radios_list()) {
++                const auto &wifi_channel    = radio->wifi_channel;
++                const uint16_t primary_freq = son::wireless_utils::channel_to_freq(
++                    wifi_channel.get_channel(), wifi_channel.get_freq_type());
++                if (primary_freq != 0 && primary_freq == msg->affiliated_link_frequency) {
++                    ruid = radio->front.iface_mac;
++                    break;
++                }
++            }
++            if (ruid == net::network_utils::ZERO_MAC) {
++                LOG(WARNING) << "Affiliated_Link_Connected: no local radio matches link "
++                                "frequency "
++                             << msg->affiliated_link_frequency << " - can't resolve RUID for "
++                             << "affiliated mac " << msg->affiliated_mac_address;
++            }
++        }
++
+         // Always update the observed-MAC cache so a late-arriving
+         // BSTA_MLD_CONFIGURATION_REQUEST can be backfilled with the correct MLD MACs.
+         // This covers the race where Affiliated_Link_Connected fires before
+@@ -3809,6 +3842,10 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+             if (msg->bsta_mld_mac_address != net::network_utils::ZERO_MAC) {
+                 db->backhaul.observed_bsta_mld_mac = msg->bsta_mld_mac_address;
+             }
++            if (msg->affiliated_mac_address != net::network_utils::ZERO_MAC &&
++                ruid != net::network_utils::ZERO_MAC) {
++                db->backhaul.observed_affiliated_bsta_mac[ruid] = msg->affiliated_mac_address;
++            }
+         }
+ 
+         if (msg && db->bsta_mld_configuration) {
+@@ -3827,9 +3864,15 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+                 db->bsta_mld_configuration->mld_config.mld_mac = msg->bsta_mld_mac_address;
+             }
+ 
+-            auto it = db->bsta_mld_configuration->affiliated_bstas.find(msg->ruid);
++            if (ruid == net::network_utils::ZERO_MAC) {
++                // nl80211 disconnect (or a connect event whose link frequency didn't
++                // resolve to a local radio) - no specific RUID entry to update.
++                break;
++            }
++
++            auto it = db->bsta_mld_configuration->affiliated_bstas.find(ruid);
+             if (it == db->bsta_mld_configuration->affiliated_bstas.end()) {
+-                LOG(ERROR) << "RUID: " << msg->ruid << "not found in bSTA MLD Config";
++                LOG(ERROR) << "RUID: " << ruid << "not found in bSTA MLD Config";
+                 return false;
+             }
+             it->second.mac_addr = msg->affiliated_mac_address;
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 10361ca8a..319332cfd 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -5052,7 +5052,15 @@ bool ApAutoConfigurationTask::handle_bsta_mld_configuration_tlv(ieee1905_1::Cmdu
+         if (valid) {
+             affiliated_entry.mac_addr = in_affiliated_bsta_mac;
+         } else if (affiliated_entry.mac_addr == net::network_utils::ZERO_MAC) {
+-            affiliated_entry.mac_addr = in_affiliated_bsta_mac;
++            // Backfill from the per-RUID MAC observed at backhaul-connect time, in case
++            // Event::Affiliated_Link_Connected already fired for this RUID before this
++            // affiliated_bstas entry existed.
++            auto observed_it = db->backhaul.observed_affiliated_bsta_mac.find(in_ruid);
++            if (observed_it != db->backhaul.observed_affiliated_bsta_mac.end()) {
++                affiliated_entry.mac_addr = observed_it->second;
++            } else {
++                affiliated_entry.mac_addr = in_affiliated_bsta_mac;
++            }
+         }
+ 
+         affiliated_entry.bssid = net::network_utils::ZERO_MAC;
+diff --git a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+index ad7d9eb7e..f038a007d 100644
+--- a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
++++ b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+@@ -350,7 +350,17 @@ typedef struct {
+     sMacAddr ap_mld_mac_address;
+     sMacAddr bsta_mld_mac_address;
+     sMacAddr affiliated_mac_address;
++    // On platforms with one HAL instance per radio (e.g. WHM), the HAL knows its own radio's
++    // RUID directly and sets it here. On platforms with a single HAL instance covering the
++    // whole (possibly multi-link) bSTA MLO connection (e.g. nl80211), the HAL has no way to
++    // know which local radio a given link belongs to, so this stays ZERO_MAC and
++    // affiliated_link_frequency is set instead, letting the receiver (BackhaulManager, which
++    // has AgentDB access) resolve the owning radio's RUID from its own radio list.
+     sMacAddr ruid;
++    // Operating frequency (MHz) of the link that affiliated_mac_address belongs to. Only
++    // meaningful when ruid above is ZERO_MAC; 0 otherwise (e.g. on disconnect, when ruid is
++    // already known, or when no MLO link could be resolved).
++    uint32_t affiliated_link_frequency;
+ } sACTION_BACKHAUL_UPDATE_MLD_MAC_NOTIFICATION;
+ 
+ /**
+diff --git a/common/beerocks/bwl/include/bwl/nl80211_client.h b/common/beerocks/bwl/include/bwl/nl80211_client.h
+index 54982bf3b..a6986bab8 100644
+--- a/common/beerocks/bwl/include/bwl/nl80211_client.h
++++ b/common/beerocks/bwl/include/bwl/nl80211_client.h
+@@ -142,6 +142,39 @@ public:
+          * Obtained from NL80211_ATTR_CENTER_FREQ2
+          */
+         uint32_t frequency_center2 = 0;
++
++        /**
++         * @brief Per-link information for a multi-link (MLO) interface.
++         *
++         * One entry per nested NL80211_ATTR_MLO_LINKS attribute, unfiltered (i.e. not
++         * limited to any particular link index) so callers can pick the link relevant
++         * to them, e.g. by matching frequency against their own operating channel.
++         */
++        struct mlo_link_info {
++            /**
++             * MLO link ID.
++             * Obtained from NL80211_ATTR_MLO_LINK_ID
++             */
++            uint8_t link_id = 0;
++
++            /**
++             * MAC address of this link (local side).
++             * Obtained from NL80211_ATTR_MAC
++             */
++            sMacAddr addr;
++
++            /**
++             * Frequency of this link's operating channel, in MHz.
++             * Obtained from NL80211_ATTR_WIPHY_FREQ
++             */
++            uint32_t frequency = 0;
++        };
++
++        /**
++         * All parsed NL80211_ATTR_MLO_LINKS entries for this interface.
++         * Empty for a non-MLO interface.
++         */
++        std::vector<mlo_link_info> mlo_links;
+     };
+ 
+     /**
+diff --git a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
+index 9b5f24f9e..d296b836e 100644
+--- a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
+@@ -389,6 +389,117 @@ sMacAddr sta_wlan_hal_nl80211::get_ap_mld_mac()
+     return tlvf::mac_from_string(it->second);
+ }
+ 
++bool sta_wlan_hal_nl80211::get_mlo_links(std::vector<nl80211_client::interface_info::mlo_link_info> &out_links)
++{
++    out_links.clear();
++
++    // Query nl80211 NL80211_CMD_GET_INTERFACE for the full set of MLO links reported for
++    // this interface. Not every connection is MLO - an empty mlo_links list means "not
++    // MLO / not available" rather than a hard error.
++    nl80211_client::interface_info if_info;
++    if (!m_nl80211_client->get_interface_info(get_iface_name(), if_info)) {
++        LOG(DEBUG) << "get_mlo_links: get_interface_info failed for " << get_iface_name();
++        return false;
++    }
++
++    if (if_info.mlo_links.empty()) {
++        LOG(DEBUG) << "get_mlo_links: no MLO links reported for " << get_iface_name()
++                   << " (non-MLO backhaul)";
++        return true;
++    }
++
++    out_links = if_info.mlo_links;
++    return true;
++}
++
++void sta_wlan_hal_nl80211::emit_affiliated_link_status(bool connected)
++{
++    if (!connected) {
++        auto msg_buff = ALLOC_SMART_BUFFER(sizeof(sACTION_BACKHAUL_UPDATE_MLD_MAC_NOTIFICATION));
++        auto *msg =
++            reinterpret_cast<sACTION_BACKHAUL_UPDATE_MLD_MAC_NOTIFICATION *>(msg_buff.get());
++        LOG_IF(!msg, FATAL) << "alloc failed";
++        memset(msg_buff.get(), 0, sizeof(*msg));
++
++        LOG(DEBUG) << "emit_affiliated_link_status: disconnected, clearing " << get_iface_name();
++        event_queue_push(Event::Affiliated_Link_Connected, msg_buff);
++        return;
++    }
++
++    // Always resolve the AP/bSTA MLD MACs independently of the per-link MAC lookup below -
++    // these are read directly from wpa_supplicant STATUS and are needed by backhaul_manager's
++    // observed_ap_mld_mac/observed_bsta_mld_mac backfill cache even when no per-link MAC below
++    // can be resolved.
++    sMacAddr ap_mld_mac   = get_ap_mld_mac();
++    sMacAddr bsta_mld_mac = get_bsta_mld_mac();
++
++    // A single sta_wlan_hal_nl80211 instance (this one) represents the entire (possibly
++    // multi-link) bSTA MLO connection on this platform - there is one interface for all
++    // links, not one HAL instance per radio/link. So every reported link is emitted as its
++    // own event; the receiver (BackhaulManager) resolves each link's frequency to the owning
++    // radio's RUID using its own radio list, which this HAL layer has no access to.
++    std::vector<nl80211_client::interface_info::mlo_link_info> mlo_links;
++    get_mlo_links(mlo_links);
++
++    if (mlo_links.empty()) {
++        // Nothing to push if neither MLD MAC is known - a genuinely non-MLO connection,
++        // where there's no cache to feed and nothing for backhaul_manager to act on.
++        if (ap_mld_mac == beerocks::net::network_utils::ZERO_MAC &&
++            bsta_mld_mac == beerocks::net::network_utils::ZERO_MAC) {
++            LOG(DEBUG) << "emit_affiliated_link_status: no MLO links and no MLD MACs for "
++                       << get_iface_name() << " (non-MLO connection), skipping";
++            return;
++        }
++
++        // MLO connection where STATUS already reports the MLD MACs but the per-link
++        // NL80211_ATTR_MLO_LINKS data hasn't landed yet - push the MLD MACs now so
++        // backhaul_manager's observed_ap_mld_mac/observed_bsta_mld_mac cache isn't left
++        // empty while waiting for the per-link data.
++        auto msg_buff = ALLOC_SMART_BUFFER(sizeof(sACTION_BACKHAUL_UPDATE_MLD_MAC_NOTIFICATION));
++        auto *msg =
++            reinterpret_cast<sACTION_BACKHAUL_UPDATE_MLD_MAC_NOTIFICATION *>(msg_buff.get());
++        LOG_IF(!msg, FATAL) << "alloc failed";
++        memset(msg_buff.get(), 0, sizeof(*msg));
++
++        msg->ap_mld_mac_address   = ap_mld_mac;
++        msg->bsta_mld_mac_address = bsta_mld_mac;
++
++        LOG(DEBUG) << "emit_affiliated_link_status: MLD MACs available but no MLO links yet for "
++                   << get_iface_name() << " ap_mld_mac=" << msg->ap_mld_mac_address
++                   << " bsta_mld_mac=" << msg->bsta_mld_mac_address;
++
++        event_queue_push(Event::Affiliated_Link_Connected, msg_buff);
++        return;
++    }
++
++    for (const auto &mlo_link : mlo_links) {
++        if (mlo_link.addr == beerocks::net::network_utils::ZERO_MAC) {
++            LOG(DEBUG) << "emit_affiliated_link_status: link id=" << int(mlo_link.link_id)
++                       << " (freq=" << mlo_link.frequency << ") has zero MAC, skipping";
++            continue;
++        }
++
++        auto msg_buff = ALLOC_SMART_BUFFER(sizeof(sACTION_BACKHAUL_UPDATE_MLD_MAC_NOTIFICATION));
++        auto *msg =
++            reinterpret_cast<sACTION_BACKHAUL_UPDATE_MLD_MAC_NOTIFICATION *>(msg_buff.get());
++        LOG_IF(!msg, FATAL) << "alloc failed";
++        memset(msg_buff.get(), 0, sizeof(*msg));
++
++        msg->ap_mld_mac_address        = ap_mld_mac;
++        msg->bsta_mld_mac_address      = bsta_mld_mac;
++        msg->affiliated_mac_address    = mlo_link.addr;
++        msg->affiliated_link_frequency = mlo_link.frequency;
++
++        LOG(DEBUG) << "emit_affiliated_link_status: link id=" << int(mlo_link.link_id)
++                   << " freq=" << msg->affiliated_link_frequency
++                   << " affiliated_mac=" << msg->affiliated_mac_address
++                   << " ap_mld_mac=" << msg->ap_mld_mac_address
++                   << " bsta_mld_mac=" << msg->bsta_mld_mac_address;
++
++        event_queue_push(Event::Affiliated_Link_Connected, msg_buff);
++    }
++}
++
+ bool sta_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+ {
+     auto opcode = parsed_obj["_opcode"];
+@@ -490,6 +601,14 @@ bool sta_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+         // Forward the event
+         event_queue_push(event, msg_buff);
+ 
++        // MLO: attempt to resolve and emit this bSTA's own affiliated-link MAC address
++        // (per-radio link MAC, distinct from the AP/bSTA MLD MACs above). This feeds
++        // AgentDB::sBStaMLDConfiguration::affiliated_bstas[ruid].mac_addr on the agent
++        // side (via BackhaulManager's Event::Affiliated_Link_Connected handler), which
++        // in turn is what the controller-facing AffiliatedbSTAList is built from.
++        // No-op (silently returns without pushing anything) for non-MLO connections.
++        emit_affiliated_link_status(true);
++
+     } break;
+ 
+     // Client disconnected
+@@ -510,6 +629,11 @@ bool sta_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+         // Forward the event
+         event_queue_push(event, msg_buff);
+ 
++        // MLO: clear the affiliated-link MAC entry for this radio's RUID on disconnect,
++        // mirroring the WHM HAL's behavior. The backhaul manager guards against
++        // overwriting an already-valid MAC with zero on a stale/duplicate notification.
++        emit_affiliated_link_status(false);
++
+     } break;
+ 
+     case Event::Terminating:
+@@ -582,6 +706,11 @@ bool sta_wlan_hal_nl80211::reassociate()
+             msg->multi_ap_primary_vlan_id = connection_status.multi_ap_primary_vlanid;
+             event_queue_push(Event::Connected, msg_buff);
+ 
++            // MLO: also (re-)emit the affiliated-link MAC on the reassociate path, since
++            // this path also represents a confirmed connected state (mirrors the
++            // process_nl80211_event Event::Connected handling above).
++            emit_affiliated_link_status(true);
++
+             return true;
+         }
+     }
+diff --git a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h
+index 48e91da4d..c4b757887 100644
+--- a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h
+@@ -280,6 +280,40 @@ private:
+      */
+     bool is_connected(const std::string &wpa_state);
+ 
++    /**
++     * @brief Reads the full set of MLO links reported for this bSTA's interface.
++     *
++     * Calls nl80211_client::get_interface_info() to fetch the NL80211_CMD_GET_INTERFACE
++     * per-link list (NL80211_ATTR_MLO_LINKS: link id, local MAC, frequency), unfiltered.
++     * A single sta_wlan_hal_nl80211 instance represents the entire (possibly multi-link)
++     * bSTA MLO connection on this platform - there is one interface (e.g. wlan0) for all
++     * links, not one HAL instance per radio/link - so every reported link must be read,
++     * not just the one matching this instance's own STATUS frequency.
++     *
++     * @param[out] out_links All parsed MLO links for this interface. Empty for a non-MLO
++     *             connection.
++     * @return True if get_interface_info() succeeded (out_links may still be empty for a
++     *         non-MLO connection), false on a query failure.
++     */
++    bool get_mlo_links(std::vector<nl80211_client::interface_info::mlo_link_info> &out_links);
++
++    /**
++     * @brief Emits one Affiliated_Link_Connected event per MLO link (or a single cleared
++     *        event on disconnect), so that the backhaul manager can resolve each link's
++     *        owning radio (RUID) and populate the per-RUID affiliated-bSTA MAC address used
++     *        to build the controller-facing AffiliatedbSTAList.
++     *
++     * On connect: resolves the AP/bSTA MLD MACs once, then reads all MLO links via
++     * get_mlo_links() and pushes one Event::Affiliated_Link_Connected per link, each
++     * carrying that link's local MAC and operating frequency. The HAL layer has no AgentDB
++     * access and so cannot resolve a link's frequency to a RUID itself - that resolution is
++     * left to the receiver (BackhaulManager).
++     * On disconnect: pushes a single event with all fields zeroed.
++     *
++     * @param connected True if this call is for a (re)connection, false for a disconnection.
++     */
++    void emit_affiliated_link_status(bool connected);
++
+     // Active network parameters
+     std::string m_active_ssid;
+     std::string m_active_bssid;
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.cpp b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+index 641c909ac..534da7441 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -438,6 +438,25 @@ bool nl80211_client_impl::get_interface_info(const std::string &interface_name,
+                 struct nlattr *attrs, *link[NL80211_ATTR_MAX + 1];
+                 nla_for_each_nested(attrs, tb[NL80211_ATTR_MLO_LINKS], ret) {
+                 nla_parse_nested(link, NL80211_ATTR_MAX, attrs, NULL);
++
++                // Record every link unfiltered, regardless of link_idx, so callers that
++                // are not identifiable via extractLinkId() (e.g. a STA interface name
++                // with no "_link<N>" suffix) can still inspect all links themselves
++                // (e.g. by matching on frequency against their own operating channel).
++                if (link[NL80211_ATTR_MLO_LINK_ID]) {
++                    interface_info::mlo_link_info mlo_link;
++                    mlo_link.link_id = nla_get_u8(link[NL80211_ATTR_MLO_LINK_ID]);
++                    if (link[NL80211_ATTR_MAC]) {
++                        const uint8_t *mlo_link_addr =
++                            static_cast<const uint8_t *>(nla_data(link[NL80211_ATTR_MAC]));
++                        tlvf::mac_from_array(mlo_link_addr, mlo_link.addr);
++                    }
++                    if (link[NL80211_ATTR_WIPHY_FREQ]) {
++                        mlo_link.frequency = nla_get_u32(link[NL80211_ATTR_WIPHY_FREQ]);
++                    }
++                    interface_info.mlo_links.push_back(mlo_link);
++                }
++
+                 if (link[NL80211_ATTR_MLO_LINK_ID] && (nla_get_u8(link[NL80211_ATTR_MLO_LINK_ID]) == link_idx)) {
+ 
+                                if (link[NL80211_ATTR_MAC]) {
+-- 
+2.34.1
+
