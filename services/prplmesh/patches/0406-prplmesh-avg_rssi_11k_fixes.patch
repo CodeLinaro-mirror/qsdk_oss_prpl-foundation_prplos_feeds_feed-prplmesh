@@ -1,0 +1,244 @@
+From c347c986372838d782f9f14e54936d9ad409b994 Mon Sep 17 00:00:00 2001
+From: Sureshkumar <suresure@qti.qualcomm.com>
+Date: Wed, 16 Sep 2026 07:20:35 +0530
+Subject: [PATCH] [prplmesh] Assoc sta link metrics MLO/SLO/Legacy sta SIG_AVG
+ usage            11k request AT dv fix
+
+Signed-off-by: Sureshkumar <suresure@qti.qualcomm.com>
+---
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 181 ++++++++++++++----
+ 1 file changed, 144 insertions(+), 37 deletions(-)
+
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 27988385a..99961e7a6 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -494,6 +494,7 @@ bool mon_wlan_hal_nl80211::update_stations_stats(const std::string &vap_iface_na
+     stats_policy[NL80211_STA_INFO_RX_PACKETS]  = {NLA_U32, 0, 0};
+     stats_policy[NL80211_STA_INFO_TX_PACKETS]  = {NLA_U32, 0, 0};
+     stats_policy[NL80211_STA_INFO_SIGNAL]      = {NLA_U8, 0, 0};
++    stats_policy[NL80211_STA_INFO_SIGNAL_AVG]  = {NLA_U8, 0, 0};
+     stats_policy[NL80211_STA_INFO_T_OFFSET]    = {NLA_U64, 0, 0};
+     stats_policy[NL80211_STA_INFO_TX_BITRATE]  = {NLA_NESTED, 0, 0};
+     stats_policy[NL80211_STA_INFO_RX_BITRATE]  = {NLA_NESTED, 0, 0};
+@@ -551,24 +552,115 @@ bool mon_wlan_hal_nl80211::update_stations_stats(const std::string &vap_iface_na
+                 return false;
+             }
+ 
+-            // RX RSSI: prefer SIGNAL_AVG over SIGNAL for MLO STAs.
+-            // For MLO STAs, NL80211_STA_INFO_SIGNAL is 0 dBm (aggregate not measured),
+-            // but NL80211_STA_INFO_SIGNAL_AVG contains the actual average signal.
++            // RX RSSI resolution — single NL80211_CMD_GET_STATION response, no extra queries.
++            //
++            // MLO STA (NL80211_ATTR_MLO_LINKS present in response):
++            //   P1: per-link SIGNAL_AVG from NL80211_ATTR_MLO_LINKS — pick strongest valid link
++            //       (signal < 0); skip idle links (signal >= 0).
++            //   P2: top-level SIGNAL_AVG fallback (if all per-link values are 0/invalid)
++            //   P3: top-level SIGNAL last resort
++            //
++            // SLO/regular STA (NL80211_ATTR_MLO_LINKS absent):
++            //   P1: top-level SIGNAL_AVG (kernel EWMA — preferred, more stable)
++            //   P2: top-level SIGNAL fallback (when EWMA not yet seeded after association)
++            //
++            // Grep tag: [RSSI-DBG] — use "grep RSSI-DBG" to trace the full RSSI resolution.
+             {
+                 int8_t signal = 0;
+                 bool signal_valid = false;
+-                if (sinfo[NL80211_STA_INFO_SIGNAL]) {
+-                    signal = int8_t(nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL]));
+-                    signal_valid = (signal < 0);
+-                }
+-                // Fallback to SIGNAL_AVG if SIGNAL is 0 dBm (MLO aggregate not measured)
+-                if (!signal_valid && sinfo[NL80211_STA_INFO_SIGNAL_AVG]) {
+-                    signal = int8_t(nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL_AVG]));
+-                    signal_valid = (signal < 0);
++
++                if (tb[NL80211_ATTR_MLO_LINKS]) {
++                    // MLO STA: scan per-link SIGNAL_AVG, pick strongest valid link.
++                    LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                               << " MLO path: scanning per-link SIGNAL_AVG from NL80211_ATTR_MLO_LINKS";
++                    struct nlattr *link_attr;
++                    int rem_links;
++                    nla_for_each_nested(link_attr, tb[NL80211_ATTR_MLO_LINKS], rem_links) {
++                        struct nlattr *link_tb[NL80211_ATTR_MAX + 1];
++                        if (nla_parse(link_tb, NL80211_ATTR_MAX,
++                                      static_cast<struct nlattr *>(nla_data(link_attr)),
++                                      nla_len(link_attr), NULL) != 0) {
++                            continue;
++                        }
++                        if (!link_tb[NL80211_ATTR_STA_INFO]) { continue; }
++                        struct nlattr *link_sinfo[NL80211_STA_INFO_MAX + 1];
++                        if (nla_parse_nested(link_sinfo, NL80211_STA_INFO_MAX,
++                                             link_tb[NL80211_ATTR_STA_INFO],
++                                             stats_policy) != 0) {
++                            continue;
++                        }
++                        if (!link_sinfo[NL80211_STA_INFO_SIGNAL_AVG]) {
++                            LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                                       << " MLO link: SIGNAL_AVG attr absent, skipping";
++                            continue;
++                        }
++                        int8_t link_sig = int8_t(nla_get_u8(link_sinfo[NL80211_STA_INFO_SIGNAL_AVG]));
++                        LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                                   << " MLO link SIGNAL_AVG=" << int(link_sig) << " dBm"
++                                   << (link_sig < 0 ? " (active)" : " (idle/invalid, skipped)");
++                        if (link_sig < 0 && (!signal_valid || link_sig > signal)) {
++                            signal = link_sig;
++                            signal_valid = true;
++                        }
++                    }
++                    if (signal_valid) {
++                        LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                                   << " MLO P1 resolved: strongest per-link SIGNAL_AVG="
++                                   << int(signal) << " dBm";
++                    } else {
++                        LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                                   << " MLO P1 failed: all per-link SIGNAL_AVG are 0/invalid"
++                                   << " -> trying P2 top-level SIGNAL_AVG";
++                    }
++                    // Fallback: top-level SIGNAL_AVG if all per-link values were 0/invalid.
++                    if (!signal_valid && sinfo[NL80211_STA_INFO_SIGNAL_AVG]) {
++                        int8_t sig = int8_t(nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL_AVG]));
++                        LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                                   << " MLO P2 top-level SIGNAL_AVG=" << int(sig) << " dBm"
++                                   << (sig < 0 ? " -> VALID" : " -> 0/invalid");
++                        if (sig < 0) { signal = sig; signal_valid = true; }
++                    }
++                    // Last resort: top-level SIGNAL.
++                    if (!signal_valid && sinfo[NL80211_STA_INFO_SIGNAL]) {
++                        int8_t sig = int8_t(nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL]));
++                        LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                                   << " MLO P3 top-level SIGNAL=" << int(sig) << " dBm"
++                                   << (sig < 0 ? " -> VALID" : " -> 0/invalid");
++                        if (sig < 0) { signal = sig; signal_valid = true; }
++                    }
++                } else {
++                    // SLO/regular STA: top-level SIGNAL_AVG preferred, SIGNAL fallback.
++                    LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                               << " SLO path: trying top-level SIGNAL_AVG";
++                    if (sinfo[NL80211_STA_INFO_SIGNAL_AVG]) {
++                        int8_t sig = int8_t(nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL_AVG]));
++                        LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                                   << " SLO P1 SIGNAL_AVG=" << int(sig) << " dBm"
++                                   << (sig < 0 ? " -> VALID" : " -> 0/invalid, trying P2 SIGNAL");
++                        if (sig < 0) { signal = sig; signal_valid = true; }
++                    } else {
++                        LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                                   << " SLO P1 SIGNAL_AVG attr absent -> trying P2 SIGNAL";
++                    }
++                    if (!signal_valid && sinfo[NL80211_STA_INFO_SIGNAL]) {
++                        int8_t sig = int8_t(nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL]));
++                        LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                                   << " SLO P2 SIGNAL=" << int(sig) << " dBm"
++                                   << (sig < 0 ? " -> VALID" : " -> 0/invalid");
++                        if (sig < 0) { signal = sig; signal_valid = true; }
++                    }
+                 }
++
+                 if (signal_valid) {
++                    LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                               << " FINAL signal=" << int(signal) << " dBm"
++                               << " -> rx_rssi_watt updated";
+                     sta_stats.rx_rssi_watt += pow(10, (signal / 10.0));
+                     sta_stats.rx_rssi_watt_samples_cnt++;
++                } else {
++                    LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                               << " no valid RSSI from any source"
++                               << " -> rx_rssi_watt NOT updated (RCPI may saturate)";
+                 }
+             }
+ 
+@@ -801,21 +893,6 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+         }
+     }
+ 
+-    // Select measurement duration based on mode (from agent config, overrides req.duration).
+-    // Matches Prop: BcnrptActiveDuration / BcnrptPassiveDuration / BcnrptBcnTableDuration.
+-    uint16_t measurement_duration;
+-    switch (measurement_mode) {
+-        case BEACON_MEASUREMENT_MODE_ACTIVE:
+-            measurement_duration = g_beacon_11k_active_measurement_duration;
+-            break;
+-        case BEACON_MEASUREMENT_MODE_PASSIVE:
+-            measurement_duration = g_beacon_11k_passive_measurement_duration;
+-            break;
+-        default: // TABLE and any other mode
+-            measurement_duration = g_beacon_11k_table_measurement_duration;
+-            break;
+-    }
+-
+     // Resolve which registered link interface the STA is actually using, by
+     // probing each one with get_sta_info() (nl80211 GET_STATION, the same
+     // query "iw dev <iface> station dump" uses). Non-MLD clients associate on
+@@ -966,6 +1043,24 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+         }
+     }
+ 
++    // Select measurement duration based on the final (possibly downgraded) mode above
++    // (from agent config, overrides req.duration).
++    // Matches Prop: BcnrptActiveDuration / BcnrptPassiveDuration / BcnrptBcnTableDuration.
++    uint16_t measurement_duration;
++    switch (measurement_mode) {
++        case BEACON_MEASUREMENT_MODE_ACTIVE:
++            measurement_duration = g_beacon_11k_active_measurement_duration;
++            break;
++        case BEACON_MEASUREMENT_MODE_PASSIVE:
++            measurement_duration = g_beacon_11k_passive_measurement_duration;
++            break;
++        default: // TABLE and any other mode
++            measurement_duration = g_beacon_11k_table_measurement_duration;
++            break;
++    }
++    LOG(DEBUG) << "FIX_VALIDATE_4634256: final measurement_mode=" << int(measurement_mode)
++               << " measurement_duration=" << measurement_duration;
++
+     // REQ_BEACON 02:14:5f:b8:ae:9f req_mode=01 510B000011110004f021318193
+     // op_class (2), channel (2), randomization_interval (4), measurement duration (4), measurement mode (2), bssid (12)
+ 
+@@ -987,20 +1082,32 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+                       beerocks::string_utils::int_to_hex_string(req.bssid.oct[5], 2);
+ 
+     // Add SSID subelement (ID=0) - mandated by 802.11 spec for beacon requests.
+-    // Always add SSID by looking up from VAP info, regardless of req.use_optional_ssid.
+-    // Required for strict clients like iPhones that refuse beacon requests without
+-    // an SSID subelement (causes "Invalid 11k report length!" on response parsing).
++    // Trust the SSID already resolved upstream (req.ssid) when the caller supplied one -
++    // it reflects the SSID actually requested in the 1905 Beacon Metrics Query TLV.
++    // Only fall back to looking it up from VAP info (first VAP on this base interface with
++    // a non-empty SSID) when the caller didn't supply one, so a beacon request is still sent
++    // with a best-effort SSID subelement for strict clients like iPhones that refuse beacon
++    // requests without one (causes "Invalid 11k report length!" on response parsing).
+     std::string ssid_for_request;
+-    std::string base_target_iface;
+-    extractBase1Interface(vap_iface_name, base_target_iface);
+-    for (const auto &vap : m_radio_info.available_vaps) {
+-        std::string base_vap_iface_check;
+-        extractBase1Interface(vap.second.bss, base_vap_iface_check);
+-        if (base_vap_iface_check == base_target_iface && !vap.second.ssid.empty()) {
+-            ssid_for_request = vap.second.ssid;
+-            break;
++    if (req.use_optional_ssid && req.ssid[0] != '\0') {
++        ssid_for_request = std::string(reinterpret_cast<const char *>(req.ssid),
++                                       strnlen(reinterpret_cast<const char *>(req.ssid),
++                                               sizeof(req.ssid)));
++    } else {
++        std::string base_target_iface;
++        extractBase1Interface(vap_iface_name, base_target_iface);
++        for (const auto &vap : m_radio_info.available_vaps) {
++            std::string base_vap_iface_check;
++            extractBase1Interface(vap.second.bss, base_vap_iface_check);
++            if (base_vap_iface_check == base_target_iface && !vap.second.ssid.empty()) {
++                ssid_for_request = vap.second.ssid;
++                break;
++            }
+         }
+     }
++    LOG(DEBUG) << "FIX_VALIDATE_4634256: ssid_source="
++               << ((req.use_optional_ssid && req.ssid[0] != '\0') ? "caller" : "vap_lookup")
++               << " ssid_for_request=" << ssid_for_request;
+     if (!ssid_for_request.empty()) {
+         // subelement ID = 0 (SSID)
+         cmd += beerocks::string_utils::int_to_hex_string(0, 2);
+-- 
+2.34.1
+
