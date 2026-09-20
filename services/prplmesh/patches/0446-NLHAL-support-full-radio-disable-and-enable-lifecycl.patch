@@ -1,0 +1,2699 @@
+From 2204996751d031794080d8a1a2b3a709dd734a52 Mon Sep 17 00:00:00 2001
+From: Girija P <gpandiya@qti.qualcomm.com>
+Date: Sun, 20 Sep 2026 16:13:40 +0530
+Subject: [PATCH] NLHAL: support full radio disable and enable lifecycle
+
+Add complete NLHAL radio teardown/re-enable handling, including VAP teardown
+confirmation, radio_disable state synchronization, no-VAP control-socket
+support, WSI powersave handling, and cached wiphy recovery across interface
+removal.
+
+Signed-off-by: Girija P <gpandiya@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 | 273 +++++++++++++++---
+ .../fronthaul_manager/ap_manager/ap_manager.h |  14 +-
+ .../fronthaul_manager/monitor/monitor.cpp     |  21 +-
+ .../backhaul_manager/backhaul_manager.cpp     | 138 ++++++---
+ .../slave/backhaul_manager/backhaul_manager.h |  28 +-
+ agent/src/beerocks/slave/son_slave_thread.cpp |  55 +++-
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  77 +++--
+ .../slave/tasks/ap_autoconfiguration_task.h   |   2 -
+ .../bwl/dummy/nl80211_client_dummy.cpp        |   4 +
+ common/beerocks/bwl/include/bwl/ap_wlan_hal.h |  24 +-
+ .../beerocks/bwl/include/bwl/nl80211_client.h |  10 +
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 153 +++++++++-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.h         |   7 +
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     | 143 +++++++--
+ .../bwl/nl80211/base_wlan_hal_nl80211.h       |  13 +-
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      |  80 ++---
+ .../bwl/shared/nl80211_client_impl.cpp        |   8 +
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   |  16 +-
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.h     |   7 +-
+ .../tlvf/beerocks_message_action.yaml         |   6 +-
+ .../tlvf/beerocks_message_apmanager.yaml      |   2 +
+ .../tlvf/beerocks_message_backhaul.yaml       |   7 +
+ .../beerocks/tlvf/beerocks_message_cli.yaml   |   7 +
+ .../src/beerocks/cli/beerocks_cli_socket.cpp  |  42 ++-
+ .../src/beerocks/cli/beerocks_cli_socket.h    |   8 +-
+ controller/src/beerocks/master/controller.cpp |  13 +-
+ controller/src/beerocks/master/db/db.cpp      |  57 +++-
+ controller/src/beerocks/master/db/db.h        |  25 +-
+ .../src/beerocks/master/son_actions.cpp       |   2 -
+ controller/src/beerocks/master/son_actions.h  |   2 -
+ .../src/beerocks/master/son_management.cpp    |  48 ++-
+ .../tasks/ap_config_renew_sequencer_task.cpp  |   2 -
+ .../tasks/ap_config_renew_sequencer_task.h    |   2 -
+ .../master/tasks/health_monitoring_task.cpp   |   2 +-
+ 34 files changed, 1041 insertions(+), 257 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index da7282a9d..3b4ddcd0e 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -430,6 +430,28 @@ void ApManager::resolve_iface_from_hostapd_conf()
+ */
+ }
+ 
++std::string ApManager::get_radio_uid_for_notification()
++{
++#ifdef USE_PRPLMESH_NLHAL
++    if (!m_radio_iface_mac.empty()) {
++        return m_radio_iface_mac;
++    }
++
++    // AgentDB stores the MAC from AP_MANAGER_JOINED_NOTIFICATION as front.iface_mac.
++    // Do not derive this from a later Linux/MLO link interface: subordinate MLO links can
++    // expose a different 02:03:... link MAC after hostapd has grouped the radios.
++#endif
++    auto radio_mac = ap_wlan_hal ? ap_wlan_hal->get_radio_mac()
++                                 : beerocks::net::network_utils::ZERO_MAC_STRING;
++#ifdef USE_PRPLMESH_NLHAL
++    if (!radio_mac.empty() && radio_mac != beerocks::net::network_utils::ZERO_MAC_STRING) {
++        m_radio_iface_mac = radio_mac;
++        LOG(DEBUG) << "Captured canonical radio MAC for notifications: " << m_radio_iface_mac;
++    }
++#endif
++    return radio_mac;
++}
++
+ bool ApManager::create_ap_wlan_hal()
+ {
+     using namespace std::placeholders; // for `_1`
+@@ -2374,7 +2396,7 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+ 
+         std::string bridge_name = request->bridge_ifname_str();
+ 
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+         auto powersave_wait = m_powersave_disable_wait_until - std::chrono::steady_clock::now();
+         if (powersave_wait > std::chrono::steady_clock::duration::zero()) {
+             auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(powersave_wait);
+@@ -2640,6 +2662,35 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+         }
+ #endif
+ 
++        // The teardown bit applies to the complete radio, not only to the BSSID carried by
++        // each entry. It is used for the early all-teardown confirmation and for WHM, where
++        // disabled VAP objects remain in available_vaps. NLHAL uses the actual post-update
++        // available_vaps result below, because a failed VAP recreation is not a teardown request.
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
++        const bool all_vaps_disabled =
++            !bss_info_conf_list.empty() &&
++            std::all_of(bss_info_conf_list.begin(), bss_info_conf_list.end(),
++                        [](const son::wireless_utils::sBssInfoConf &bss_info) {
++                            return bss_info.teardown;
++                        });
++        bool teardown_confirmation_sent = false;
++        auto send_teardown_confirmation = [&](bool radio_disable) {
++            auto teardown_confirmation = message_com::create_vs_message<
++                beerocks_message::cACTION_APMANAGER_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION>(
++                cmdu_tx);
++            if (!teardown_confirmation) {
++                LOG(ERROR) << "Failed building RADIO_TEARDOWN_CONFIRMED_NOTIFICATION";
++                return;
++            }
++            teardown_confirmation->radio_mac() =
++                tlvf::mac_from_string(get_radio_uid_for_notification());
++            teardown_confirmation->radio_disable() = radio_disable ? 1 : 0;
++            send_cmdu(cmdu_tx);
++            m_vaps_teardown_confirmed = radio_disable;
++            teardown_confirmation_sent = true;
++        };
++#endif
++
+         // Enabling VAPs and MLDs takes time to apply to the driver
+         if (perform_update && !bss_info_conf_list.empty()) {
+             // An M2 with the Tear Down bit set tears down all currently operating BSS(es) on
+@@ -2663,6 +2714,22 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+             if (!credentials_update_ok) {
+                 LOG(ERROR) << "VAP credentials update failed for " << m_iface
+                            << "; not waiting for VAP/MLD completion";
++#ifdef USE_PRPLMESH_NLHAL
++                // A failed re-enable with no remaining VAPs is still a disabled
++                // radio. Preserve that fact across a fronthaul respawn; otherwise
++                // the next phy-based launch enters no-VAP mode with radio_disable=0
++                // and fails while querying STATUS on an empty interface name.
++                if (ap_wlan_hal->get_iface_name().empty() &&
++                    ap_wlan_hal->get_radio_info().available_vaps.empty()) {
++                    m_radio_disable = true;
++                    if (!beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_iface, true)) {
++                        LOG(ERROR) << "Failed to set radio_disable in UCI for phy=" << m_iface;
++                    }
++                    if (!teardown_confirmation_sent) {
++                        send_teardown_confirmation(true);
++                    }
++                }
++#endif
+                 auto response = message_com::create_vs_message<
+                     beerocks_message::cACTION_APMANAGER_WIFI_CREDENTIALS_UPDATE_RESPONSE>(cmdu_tx);
+                 if (response) {
+@@ -2672,6 +2739,16 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+                 return;
+             }
+ 
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
++            // update_vap_credentials() performs the synchronous teardown operation.  Notify
++            // immediately for an all-teardown M2 so the confirmation is not lost when NLHAL has
++            // already removed every BSS and its subsequent STATUS refresh has no interface to
++            // query.
++            if (all_vaps_disabled) {
++                send_teardown_confirmation(true);
++            }
++#endif
++
+             // The HAL already removed the interface (and its whole MLD-link/base-name
+             // family) for any torn-down BSS, but it has no knowledge of ApManager's
+             // m_dynamic_bss_ext_events_fds / event-loop registrations. This path bypasses
+@@ -2781,20 +2858,23 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+             response->number_of_bss_available() = radio_vaps.size();
+             send_cmdu(cmdu_tx);
+ 
+-#ifdef USE_PRPLMESH_WHM
+-            // Report the platform-confirmed VAP teardown state.  The radio-disable
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
++            // WHM keeps disabled VAP objects in available_vaps, while NLHAL's
++            // empty container is the authoritative result of a failed/empty
++            // VAP recreation. Use the platform's actual result for NLHAL rather
++            // than the request's teardown flags.
++#ifdef USE_PRPLMESH_NLHAL
++            const bool radio_disabled_after_update = radio_vaps.empty();
++#else
++            const bool radio_disabled_after_update = all_vaps_disabled;
++#endif
++            // Report the platform-confirmed VAP teardown state. The radio-disable
+             // notification is an intent; this notification is sent only after the
+-            // credentials update has refreshed the actual VAP list.
+-            auto teardown_confirmation = message_com::create_vs_message<
+-                beerocks_message::cACTION_APMANAGER_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION>(
+-                cmdu_tx);
+-            if (!teardown_confirmation) {
+-                LOG(ERROR) << "Failed building RADIO_TEARDOWN_CONFIRMED_NOTIFICATION";
+-            } else {
+-                teardown_confirmation->radio_mac() =
+-                    tlvf::mac_from_string(ap_wlan_hal->get_radio_mac());
+-                teardown_confirmation->radio_disable() = radio_vaps.empty() ? 1 : 0;
+-                send_cmdu(cmdu_tx);
++            // credentials update has completed. WHM uses the M2 teardown bit because
++            // disabled VAP objects remain in available_vaps; NLHAL uses the actual
++            // post-update VAP list.
++            if (!teardown_confirmation_sent) {
++                send_teardown_confirmation(radio_disabled_after_update);
+             }
+ #endif
+ 
+@@ -2805,13 +2885,13 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+             // never send a Service-Status TLV, so a teardown-only M2 (zero remaining VAPs) or a
+             // real M2 (VAPs actually created) is the only signal we get that the radio has
+             // implicitly become disabled/enabled.
+-            if (radio_vaps.empty()) {
++            if (radio_disabled_after_update) {
+                 if (!m_radio_disable) {
+                     m_radio_disable = true;
+                     if (!beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_iface, true)) {
+                         LOG(ERROR) << "Failed to set radio_disable in UCI for phy=" << m_iface;
+                     }
+-                    LOG(INFO) << "No VAPs remain on " << m_iface
++                    LOG(INFO) << "All VAPs were disabled on " << m_iface
+                               << " after credentials update - setting radio_disable";
+                 }
+             } else if (m_radio_disable) {
+@@ -2825,6 +2905,32 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+ #endif
+ 
+         } else {
++            // A teardown-only update can contain no BSS entries after the controller has
++            // already removed the VAP credentials.  The radio-disable request leaves the
++            // AP manager locked, which is the local confirmation that this empty update is
++            // the completion of a full radio teardown.  Do not emit a positive confirmation
++            // for an unrelated empty credentials update while the radio is enabled.
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
++            if (bss_info_conf_list.empty() &&
++                (radio_state_lock || m_radio_disable ||
++                 ap_wlan_hal->get_radio_info().radio_state == bwl::eRadioState::DISABLED)) {
++                if (!m_vaps_teardown_confirmed) {
++                    auto teardown_confirmation = message_com::create_vs_message<
++                        beerocks_message::cACTION_APMANAGER_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION>(
++                        cmdu_tx);
++                    if (!teardown_confirmation) {
++                        LOG(ERROR) << "Failed building RADIO_TEARDOWN_CONFIRMED_NOTIFICATION";
++                    } else {
++                        teardown_confirmation->radio_mac() =
++                            tlvf::mac_from_string(get_radio_uid_for_notification());
++                        teardown_confirmation->radio_disable() = 1;
++                        send_cmdu(cmdu_tx);
++                        m_vaps_teardown_confirmed = true;
++                        LOG(INFO) << "Confirmed empty full-radio teardown for " << m_iface;
++                    }
++                }
++            }
++#endif
+ #ifdef USE_PRPLMESH_NLHAL
+             LOG(ERROR) << "discard new configuration because configuration is empty";
+ #else
+@@ -2873,6 +2979,9 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+         if (ap_wlan_hal->get_radio_info().radio_state == bwl::eRadioState::DISABLED) {
+             return;
+         }
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
++        m_vaps_teardown_confirmed = false;
++#endif
+ 
+ #ifdef USE_PRPLMESH_NLHAL
+         // Set radio_disable proactively, before tearing down the interface, rather than
+@@ -2905,6 +3014,33 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+         }
+         LOG(DEBUG) << "ap_wlan_hal->disable() returned success for iface: "
+                    << ap_wlan_hal->get_iface_name();
++
++        // A teardown-only M2 with no local VAP does not send a credentials-update
++        // request.  NLHAL disable() is only a bookkeeping operation, so no
++        // AP-DISABLED event is generated either.  In that case the direct radio
++        // disable request is the complete teardown transaction and must notify
++        // backhaul_manager, otherwise all_radios_teardown_confirmed() remains
++        // false and the wired powersave-enable sequence never starts.
++        const auto &radio_info = ap_wlan_hal->get_radio_info();
++        const bool no_active_vaps = ap_wlan_hal->get_iface_name().empty() &&
++                                    radio_info.available_vaps.empty() &&
++                                    radio_info.active_BSSs.empty();
++        if (no_active_vaps && !m_vaps_teardown_confirmed) {
++            auto teardown_confirmation = message_com::create_vs_message<
++                beerocks_message::cACTION_APMANAGER_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION>(
++                cmdu_tx);
++            if (!teardown_confirmation) {
++                LOG(ERROR) << "Failed building RADIO_TEARDOWN_CONFIRMED_NOTIFICATION";
++            } else {
++                teardown_confirmation->radio_mac() =
++                    tlvf::mac_from_string(get_radio_uid_for_notification());
++                teardown_confirmation->radio_disable() = 1;
++                send_cmdu(cmdu_tx);
++                m_vaps_teardown_confirmed = true;
++                LOG(INFO) << "Confirmed full-radio teardown after direct radio disable for "
++                          << m_iface;
++            }
++        }
+ #else
+         // Disable the radio interface
+         LOG(DEBUG) << "Dispatching ap_wlan_hal->disable() (direct path, non-NLHAL build) for "
+@@ -2922,20 +3058,25 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+     }
+     case beerocks_message::ACTION_APMANAGER_RADIO_ENABLE_REQUEST: {
+         LOG(DEBUG) << "Got ACTION_APMANAGER_RADIO_ENABLE_REQUEST";
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
++        m_vaps_teardown_confirmed = false;
++#endif
+         if (ap_wlan_hal->get_radio_info().radio_state == bwl::eRadioState::ENABLED) {
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+             // Already enabled (e.g. on WHM, where enable()/disable() only toggle
+             // AccessPoint.Enable and never Radio.Enable, so radio_state never actually left
+             // ENABLED across a VAP-level disable/enable cycle) - still release the lock set by
+             // RADIO_DISABLE_REQUEST, otherwise it stays stuck true forever and permanently blocks
+             // the WIFI_CREDENTIALS_UPDATE_REQUEST handler's radio_state_lock check below.
+             radio_state_lock = false;
+-            if (!ap_wlan_hal->powersave_disable()) {
+-                LOG(ERROR) << "Failed disabling powersave while processing radio enable for iface: "
+-                           << ap_wlan_hal->get_iface_name();
++            if (ap_wlan_hal->is_powersave_enabled()) {
++                if (!ap_wlan_hal->powersave_disable()) {
++                    LOG(ERROR) << "Failed disabling powersave while processing radio enable for iface: "
++                               << ap_wlan_hal->get_iface_name();
++                }
++                m_powersave_disable_wait_until =
++                    std::chrono::steady_clock::now() + std::chrono::seconds(15);
+             }
+-            m_powersave_disable_wait_until =
+-                std::chrono::steady_clock::now() + std::chrono::seconds(15);
+ #endif
+             return;
+         }
+@@ -2950,13 +3091,15 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+         LOG(DEBUG) << "ap_wlan_hal->enable() returned success for iface: "
+                    << ap_wlan_hal->get_iface_name();
+         radio_state_lock = false;
+-#ifdef USE_PRPLMESH_WHM
+-        if (!ap_wlan_hal->powersave_disable()) {
+-            LOG(ERROR) << "Failed disabling powersave while processing radio enable for iface: "
+-                       << ap_wlan_hal->get_iface_name();
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
++        if (ap_wlan_hal->is_powersave_enabled()) {
++            if (!ap_wlan_hal->powersave_disable()) {
++                LOG(ERROR) << "Failed disabling powersave while processing radio enable for iface: "
++                           << ap_wlan_hal->get_iface_name();
++            }
++            m_powersave_disable_wait_until =
++                std::chrono::steady_clock::now() + std::chrono::seconds(15);
+         }
+-        m_powersave_disable_wait_until =
+-            std::chrono::steady_clock::now() + std::chrono::seconds(15);
+ #endif
+         auto timeout     = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+         while (std::chrono::steady_clock::now() < timeout) {
+@@ -2969,10 +3112,18 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+         }
+         break;
+     }
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+     case beerocks_message::ACTION_APMANAGER_RADIO_POWERSAVE_ENABLE_REQUEST: {
+         LOG(DEBUG) << "Got ACTION_APMANAGER_RADIO_POWERSAVE_ENABLE_REQUEST";
+-        if (!ap_wlan_hal->powersave_enable(true)) {
++        auto request = beerocks_header->addClass<
++            beerocks_message::cACTION_APMANAGER_RADIO_POWERSAVE_ENABLE_REQUEST>();
++        if (!request) {
++            LOG(ERROR) << "addClass cACTION_APMANAGER_RADIO_POWERSAVE_ENABLE_REQUEST failed";
++            return;
++        }
++        const bool force = request->force();
++        LOG(DEBUG) << "Powersave enable request force=" << force;
++        if (!ap_wlan_hal->powersave_enable(true, force)) {
+             LOG(ERROR) << "Failed enabling powersave on iface: "
+                        << ap_wlan_hal->get_iface_name();
+         }
+@@ -2980,10 +3131,25 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+     }
+     case beerocks_message::ACTION_APMANAGER_RADIO_POWERSAVE_DISABLE_REQUEST: {
+         LOG(DEBUG) << "Got ACTION_APMANAGER_RADIO_POWERSAVE_DISABLE_REQUEST";
+-        if (!ap_wlan_hal->powersave_disable(true)) {
+-            LOG(ERROR) << "Failed disabling powersave on iface: "
+-                       << ap_wlan_hal->get_iface_name();
++        auto request = beerocks_header->addClass<
++            beerocks_message::cACTION_APMANAGER_RADIO_POWERSAVE_DISABLE_REQUEST>();
++        if (!request) {
++            LOG(ERROR) << "addClass cACTION_APMANAGER_RADIO_POWERSAVE_DISABLE_REQUEST failed";
++            return;
+         }
++        const bool force = request->force();
++        LOG(DEBUG) << "Powersave disable request force=" << force;
++        if (force || ap_wlan_hal->is_powersave_enabled()) {
++            if (!ap_wlan_hal->powersave_disable(true, force)) {
++                LOG(ERROR) << "Failed disabling powersave on iface: "
++                           << ap_wlan_hal->get_iface_name();
++            }
++        }
++        m_powersave_disable_wait_until =
++            std::chrono::steady_clock::now() + std::chrono::seconds(15);
++        LOG(INFO) << "Delaying first VAP credential/create operation for 15 seconds after "
++                     "powersave-disable on iface: "
++                  << ap_wlan_hal->get_iface_name();
+         break;
+     }
+ #endif
+@@ -4416,6 +4582,29 @@ bool ApManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+ 
+         send_cmdu(cmdu_tx);
+ 
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
++        // A radio-level AP-DISABLED event is the asynchronous platform confirmation that
++        // the complete radio teardown finished.  This is needed when the disable operation
++        // does not arrive through a credentials update containing explicit TEARDOWN BSS
++        // entries (for example, an empty teardown update or a direct radio-disable request).
++        if (msg->vap_id == beerocks::IFACE_RADIO_ID && !m_vaps_teardown_confirmed) {
++            auto teardown_confirmation = message_com::create_vs_message<
++                beerocks_message::cACTION_APMANAGER_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION>(
++                cmdu_tx);
++            if (!teardown_confirmation) {
++                LOG(ERROR) << "Failed building RADIO_TEARDOWN_CONFIRMED_NOTIFICATION";
++            } else {
++                teardown_confirmation->radio_mac() =
++                    tlvf::mac_from_string(get_radio_uid_for_notification());
++                teardown_confirmation->radio_disable() = 1;
++                send_cmdu(cmdu_tx);
++                m_vaps_teardown_confirmed = true;
++                LOG(INFO) << "Radio-level AP-DISABLED confirmed full VAP teardown for "
++                          << m_iface;
++            }
++        }
++#endif
++
+         // If this radio now has zero enabled VAPs left (last VAP torn down, or the M2 tore
+         // everything down), mark it disabled - even though no explicit
+         // ACTION_APMANAGER_RADIO_DISABLE_REQUEST was ever sent (non-AT controllers never send
+@@ -5125,6 +5314,16 @@ void ApManager::handle_hostapd_attached()
+ {
+     LOG(DEBUG) << "handling enabled hostapd";
+ 
++    // AP_Attached can be delivered before all radio information (in particular the
++    // frequency band and current channel of an MLO link) has been populated.  Refresh
++    // it before creating ACTION_APMANAGER_JOINED_NOTIFICATION; the agent uses this
++    // notification to initialize AgentDB::sRadio::wifi_channel and AP autoconfiguration
++    // cannot build a WSC M1 without a valid frequency band.
++    if (!ap_wlan_hal->refresh_radio_info()) {
++        LOG(ERROR) << "Failed to refresh radio information before JOINED_NOTIFICATION";
++        return;
++    }
++
+     if (acs_enabled) {
+         LOG(DEBUG) << "retrieving ACS report";
+         int read_acs_attempt = 0;
+@@ -5154,7 +5353,11 @@ void ApManager::handle_hostapd_attached()
+                               ap_wlan_hal->get_iface_name().c_str(), message::IFACE_NAME_LENGTH);
+ 
+     notification->params().iface_type = uint8_t(ap_wlan_hal->get_iface_type());
+-    notification->params().iface_mac  = tlvf::mac_from_string(ap_wlan_hal->get_radio_mac());
++    // Capture the same canonical identity that AgentDB will store in front.iface_mac.  This
++    // must happen before MLO teardown/reconfiguration can make get_radio_mac() expose a
++    // subordinate link MAC.
++    const auto radio_uid = get_radio_uid_for_notification();
++    notification->params().iface_mac = tlvf::mac_from_string(radio_uid);
+     notification->params().ant_num    = ap_wlan_hal->get_radio_info().ant_num;
+     notification->params().tx_power   = ap_wlan_hal->get_radio_info().tx_power;
+ 
+@@ -5260,7 +5463,7 @@ void ApManager::handle_hostapd_attached()
+ 
+     LOG(INFO) << "send ACTION_APMANAGER_JOINED_NOTIFICATION";
+     LOG(INFO) << " iface = " << ap_wlan_hal->get_iface_name();
+-    LOG(INFO) << " mac = " << ap_wlan_hal->get_radio_mac();
++    LOG(INFO) << " mac = " << radio_uid;
+     LOG(INFO) << " ant_num = " << ap_wlan_hal->get_radio_info().ant_num;
+     LOG(INFO) << " tx_power = " << ap_wlan_hal->get_radio_info().tx_power;
+     LOG(INFO) << " current channel = " << ap_wlan_hal->get_radio_info().channel;
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
+index c3e4478bb..d9183c02e 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
+@@ -243,6 +243,12 @@ private:
+ 
+     std::string m_iface;
+ 
++    /**
++     * Canonical radio MAC captured from the AP_MANAGER_JOINED_NOTIFICATION identity. It is
++     * retained across teardown so later MLO link MAC changes cannot alter notification lookup.
++     */
++    std::string m_radio_iface_mac;
++
+     /**
+      * Resolved Linux interface name for this PHY.
+      * Populated at startup by reading "interface=" from /var/run/hostapd-<phy_id>.conf.
+@@ -257,6 +263,11 @@ private:
+      */
+     void resolve_iface_from_hostapd_conf();
+ 
++    /**
++     * @brief Returns the radio interface MAC used as AgentDB::sRadio::front.iface_mac.
++     */
++    std::string get_radio_uid_for_notification();
++
+     beerocks::logging &m_logger;
+     bool acs_enabled;
+     bool m_ap_support_zwdfs;
+@@ -397,7 +408,8 @@ private:
+     // process in cACTION_APMANAGER_CONFIGURE (beerocks_agent.conf).
+     bool chansel_preference_report_refresh_enable = false;
+     bool radio_state_lock   = false;
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
++    bool m_vaps_teardown_confirmed = false;
+     std::chrono::steady_clock::time_point m_powersave_disable_wait_until{};
+ #endif
+     uint8_t multi_ap_profile =
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+index 46ec09436..996f2d79a 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+@@ -1351,7 +1351,17 @@ bool Monitor::update_ap_stats()
+             if (!mon_wlan_hal->get_hostapd_conf_iface_name(updated_iface)) {
+                 LOG(ERROR) << "No interface found in hostapd conf file for this radio - "
+                           << "treating as no-VAP mode and marking radio_disable";
+-                mon_wlan_hal->set_radio_disable(true);
++                // Keep both the Monitor FSM and the HAL in no-VAP mode. Updating only the HAL
++                // leaves m_radio_disable false, so the next polling cycle still runs AP/VAP
++                // statistics and hostapd recovery against sockets that were just torn down.
++                set_radio_disable(true);
++                // No VAP remains on this radio - clear the stale iface_name (both the HAL's
++                // own copy and the base-class copy) so that once VAPs are recreated (e.g. on
++                // radio re-enable), the first one is correctly treated as the primary/global
++                // BSS instead of being matched against this leftover name.
++                std::string empty_iface;
++                mon_wlan_hal->set_base_radio_iface_name(empty_iface);
++                mon_wlan_hal->set_iface_name(empty_iface);
+                 // This is the expected, transient state while VAPs are being torn down (e.g.
+                 // during a radio disable), not a fatal error - do not kill the Monitor's event
+                 // loop over it; the FSM will simply skip stats polling while radio_disable is set.
+@@ -2121,7 +2131,14 @@ void Monitor::handle_cmdu_vs_message(ieee1905_1::CmduMessageRx &cmdu_rx)
+         if (!mon_wlan_hal->get_hostapd_conf_iface_name(hostapd_iface)) {
+             LOG(ERROR) << "No interface found in hostapd conf file for this radio - "
+                       << "treating as no-VAP mode and marking radio_disable";
+-            mon_wlan_hal->set_radio_disable(true);
++            set_radio_disable(true);
++            // No VAP remains on this radio - clear the stale iface_name (both the HAL's
++            // own copy and the base-class copy) so that once VAPs are recreated (e.g. on
++            // radio re-enable), the first one is correctly treated as the primary/global
++            // BSS instead of being matched against this leftover name.
++            std::string empty_iface;
++            mon_wlan_hal->set_base_radio_iface_name(empty_iface);
++            mon_wlan_hal->set_iface_name(empty_iface);
+             return;
+         }
+ 
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 8bc92d690..9d704465f 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -77,7 +77,7 @@ constexpr auto tasks_timer_period = std::chrono::milliseconds(90);
+  */
+ constexpr auto fsm_timer_period = std::chrono::milliseconds(500);
+ 
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+ constexpr auto powersave_disable_endpoint_settle_time = std::chrono::seconds(15);
+ constexpr auto powersave_radio_spacing_time              = std::chrono::seconds(10);
+ #endif
+@@ -182,7 +182,7 @@ BackhaulManager::BackhaulManager(const config_file::sConfigSlave &config,
+ 
+ BackhaulManager::~BackhaulManager()
+ {
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+     if (m_timer_manager &&
+         m_wired_teardown_powersave_timer != beerocks::net::FileDescriptor::invalid_descriptor) {
+         m_timer_manager->remove_timer(m_wired_teardown_powersave_timer);
+@@ -839,7 +839,7 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+ {
+     skip_select = false;
+ 
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+     // Backend-generic backhaul-loss recovery cycle owns reconnection while it's running -
+     // skip normal FSM processing until it exits (see recovery_cycle_stop()).
+     if (m_backhaul_recovery_cycle_active) {
+@@ -1265,7 +1265,7 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+                 }
+             }
+ 
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+             if (m_eth_link_up) {
+                 schedule_wired_teardown_powersave_enable();
+             }
+@@ -2186,6 +2186,7 @@ bool BackhaulManager::backhaul_fsm_wireless(bool &skip_select)
+         break;
+     }
+     case EState::WIRELESS_WAIT_FOR_RECONNECT: {
++#if !defined(USE_PRPLMESH_WHM) && !defined(USE_PRPLMESH_NLHAL)
+         {
+             auto db         = AgentDB::get();
+             auto radio_info = get_radio_info_by_iface(db->backhaul.selected_iface_name);
+@@ -2195,6 +2196,7 @@ bool BackhaulManager::backhaul_fsm_wireless(bool &skip_select)
+                 break;
+             }
+         }
++#endif
+ 
+         auto now = std::chrono::steady_clock::now();
+         if (now > state_time_stamp_timeout) {
+@@ -2434,7 +2436,7 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+             }
+ 
+             radio_info->radio_mac = radio->front.iface_mac;
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+             // radio_disable is persisted in AgentDB/UCI and may have been set before the
+             // backhaul FSM restarted.  Rehydrate it when rebuilding m_radios_info; otherwise
+             // a disabled bSTA is treated as enabled after RESTART and the normal reconnect FSM
+@@ -2747,15 +2749,16 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+             }
+             matched                    = true;
+             radio_info->radio_disabled = disable;
+-#ifdef USE_PRPLMESH_WHM
+-            if (!disable) {
+-                radio_info->vaps_teardown_confirmed = false;
+-            }
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
++            // Every new disable intent starts a fresh teardown transaction.  Do not reuse a
++            // confirmation from a previous disable/enable cycle, otherwise all-radios-ready
++            // can become true before AP Manager confirms this teardown.
++            radio_info->vaps_teardown_confirmed = false;
+ #endif
+             LOG(INFO) << "backhaul_manager radio_disabled=" << disable << " for radio "
+                       << radio_mac << " (sta_iface=" << radio_info->sta_iface << ")";
+             if (disable) {
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+                 if (radio_info->powersave_disable_endpoint_wait_timer !=
+                     beerocks::net::FileDescriptor::invalid_descriptor) {
+                     m_timer_manager->remove_timer(radio_info->powersave_disable_endpoint_wait_timer);
+@@ -2766,7 +2769,7 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+ #endif
+                 start_backhaul_reconnect_watchdog(radio_info);
+             } else {
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+                 if (m_wired_teardown_powersave_enabled) {
+                     LOG(INFO) << "Radio enable received - disabling wired teardown powersave";
+                     if (m_wired_teardown_powersave_timer !=
+@@ -2814,7 +2817,7 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+     }
+ #endif
+ 
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+     case beerocks_message::ACTION_BACKHAUL_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION: {
+         auto request = beerocks_header->addClass<
+             beerocks_message::cACTION_BACKHAUL_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION>();
+@@ -2828,11 +2831,13 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+         LOG(INFO) << "Received RADIO_TEARDOWN_CONFIRMED_NOTIFICATION for radio_mac="
+                   << radio_mac << ", disable=" << disable;
+ 
++        bool matched = false;
+         for (auto &radio_info : m_radios_info) {
+             if (radio_info->radio_mac != radio_mac) {
+                 continue;
+             }
+ 
++            matched = true;
+             // A confirmed teardown also establishes the disabled state when the
+             // original radio-disable intent notification was lost during startup.
+             radio_info->radio_disabled          = disable;
+@@ -2840,14 +2845,16 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+             LOG(INFO) << "backhaul_manager vaps_teardown_confirmed=" << disable
+                       << " for radio " << radio_mac;
+ 
+-#ifdef USE_PRPLMESH_WHM
+             if (disable && m_eth_link_up) {
+                 schedule_wired_teardown_powersave_enable();
+             }
+             maybe_start_backhaul_recovery_cycle_if_ready();
+-#endif
+             break;
+         }
++        if (!matched) {
++            LOG(WARNING) << "Ignoring RADIO_TEARDOWN_CONFIRMED_NOTIFICATION for unknown radio_mac="
++                         << radio_mac;
++        }
+         break;
+     }
+ #endif
+@@ -2958,16 +2965,31 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+         }
+ 
+         const sMacAddr &radio_mac = request->radio_mac();
++        const bool enable = static_cast<bool>(request->enable());
+ 
+         LOG(DEBUG) << "handle ACTION_BACKHAUL_WIFI_ENABLE_DISABLE_ENDPOINT for bsta on radio "
+                    << radio_mac;
++
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
++        if (!enable) {
++            if (!all_radios_disabled()) {
++                LOG(INFO) << "Deferring bSTA endpoint disable for radio " << radio_mac
++                          << " - at least one radio is still enabled";
++            } else {
++                LOG(INFO) << "Deferring bSTA endpoint disable for radio " << radio_mac
++                          << " until the coordinated powersave-enable sequence";
++            }
++            break;
++        }
++#endif
++
+         auto sta_wlan_hal = get_wireless_hal(radio_mac);
+         if (!sta_wlan_hal) {
+             LOG(ERROR) << "Failed to get wireless hal for radio " << radio_mac;
+             return false;
+         }
+ 
+-        sta_wlan_hal->enable_disable_ep(static_cast<bool>(request->enable()));
++        sta_wlan_hal->enable_disable_ep(enable);
+ 
+         break;
+     }
+@@ -3475,7 +3497,7 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+             return true;
+         }
+         auto db = AgentDB::get();
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+         bool recovery_cycle_owns_disconnect = false;
+         // A disabled bSTA must not enter the ordinary WIRELESS_WAIT_FOR_RECONNECT ->
+         // INITIATE_SCAN -> RESTART path.  The radio is intentionally down, so scanning it
+@@ -3540,7 +3562,7 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+                     LOG(ERROR) << "Failed sending ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION";
+                 }
+             }
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+             if (recovery_cycle_owns_disconnect) {
+                 LOG(DEBUG) << "Recovery cycle owns disabled bSTA disconnect for " << iface
+                            << " - suppressing routine wireless reconnect FSM";
+@@ -3561,18 +3583,6 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+                     reset_1905_security_for_connection_switch(false);
+                 }
+ 
+-#ifdef USE_PRPLMESH_NLHAL
+-                // If our own reconnect-watchdog is driving disconnect/reconnect for this iface,
+-                // suppress the automatic FSM recovery path entirely - the watchdog's own timers
+-                // own reconnection until its cycle concludes.
+-                auto radio_info = get_radio_info_by_iface(iface);
+-                if (radio_info && radio_info->watchdog_owns_recovery) {
+-                    LOG(DEBUG) << "Watchdog owns recovery for " << iface
+-                               << " - suppressing automatic FSM disconnect handling";
+-                    return true;
+-                }
+-#endif
+-
+                 // Re-assert the BSSID pin (defensively, in case it was not already set or
+                 // was cleared) so that the bSTA keeps retrying this same node while we wait
+                 // for reconnection below, instead of roaming away immediately.
+@@ -3664,6 +3674,7 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+ 
+     case Event::Terminating: {
+ 
++#if !defined(USE_PRPLMESH_WHM) && !defined(USE_PRPLMESH_NLHAL)
+         {
+             auto db         = AgentDB::get();
+             auto radio_info = get_radio_info_by_iface(db->backhaul.selected_iface_name);
+@@ -3673,6 +3684,7 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+                 return true;
+             }
+         }
++#endif
+ 
+         LOG(DEBUG) << "wpa_supplicant terminated, restarting";
+         platform_notify_error(bpl::eErrorCode::BH_WPA_SUPPLICANT_TERMINATED,
+@@ -4846,7 +4858,7 @@ bool BackhaulManager::is_backhaul_fully_disconnected()
+ 
+ #endif
+ 
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+ bool BackhaulManager::all_radios_disabled()
+ {
+     if (m_radios_info.empty()) {
+@@ -4958,9 +4970,32 @@ void BackhaulManager::send_6g_powersave_request(bool enable)
+     send_powersave_request(eFreqType::FREQ_6G, enable);
+ }
+ 
++void BackhaulManager::disable_backhaul_endpoints_if_all_radios_disabled()
++{
++    if (!all_radios_disabled()) {
++        LOG(INFO) << "Skipping bSTA endpoint disable - at least one radio is still enabled";
++        return;
++    }
++
++    LOG(INFO) << "All radios are disabled - disabling bSTA endpoints before powersave-enable";
++    for (auto &radio_info : m_radios_info) {
++        if (!radio_info->sta_wlan_hal) {
++            continue;
++        }
++
++        if (!radio_info->sta_wlan_hal->enable_disable_ep(false)) {
++            LOG(WARNING) << "Failed to disable bSTA endpoint on " << radio_info->sta_iface;
++        }
++    }
++}
++
+ void BackhaulManager::schedule_wired_teardown_powersave_enable()
+ {
+-    if (!m_eth_link_up || !all_radios_disabled() || !all_radios_teardown_confirmed()) {
++    // Act on the disable intent directly (all_radios_disabled()) rather than waiting for
++    // AP Manager's per-radio teardown confirmation. A teardown-flagged credentials update
++    // can be discarded when the radio-disable request arrives first, so the teardown
++    // confirmation is not guaranteed to arrive.
++    if (!m_eth_link_up || !all_radios_disabled()) {
+         return;
+     }
+ 
+@@ -4976,10 +5011,12 @@ void BackhaulManager::schedule_wired_teardown_powersave_enable()
+         std::chrono::milliseconds::zero(), [this](int fd, beerocks::EventLoop &loop) {
+             m_timer_manager->remove_timer(fd);
+             m_wired_teardown_powersave_timer = beerocks::net::FileDescriptor::invalid_descriptor;
+-            if (!m_eth_link_up || !all_radios_disabled() || !all_radios_teardown_confirmed()) {
++            if (!m_eth_link_up || !all_radios_disabled()) {
+                 LOG(INFO) << "Wired teardown powersave-enable cancelled because conditions changed";
+                 return true;
+             }
++
++            disable_backhaul_endpoints_if_all_radios_disabled();
+             m_wired_teardown_powersave_enabled = true;
+ 
+             if (is_wifi8_platform()) {
+@@ -4993,8 +5030,7 @@ void BackhaulManager::schedule_wired_teardown_powersave_enable()
+                         m_timer_manager->remove_timer(secondary_fd);
+                         m_wired_teardown_powersave_timer =
+                             beerocks::net::FileDescriptor::invalid_descriptor;
+-                        if (!m_eth_link_up || !all_radios_disabled() ||
+-                            !all_radios_teardown_confirmed()) {
++                        if (!m_eth_link_up || !all_radios_disabled()) {
+                             m_wired_teardown_powersave_enabled = false;
+                             LOG(INFO) << "Wired teardown 6 GHz powersave-enable cancelled because "
+                                          "conditions changed";
+@@ -5080,6 +5116,15 @@ void BackhaulManager::recovery_cycle_stage1_wake_powersave()
+         return;
+     }
+ 
++    if (!all_radios_disabled()) {
++        LOG(INFO) << "Backhaul connectivity recovery stopped before powersave wake because "
++                     "at least one radio is enabled";
++        recovery_cycle_stop();
++        return;
++    }
++
++    disable_backhaul_endpoints_if_all_radios_disabled();
++
+     // Teardown gating leaves the endpoint unavailable. On Wi-Fi 8, wake 5 GHz first and
+     // 6 GHz ten seconds later; Wi-Fi 7 keeps the existing 6 GHz-only behavior.
+     if (is_wifi8_platform()) {
+@@ -5203,17 +5248,8 @@ void BackhaulManager::recovery_cycle_stage1_enable_endpoints()
+ void BackhaulManager::recovery_cycle_stage2_recheck()
+ {
+     if (is_backhaul_fully_disconnected()) {
+-        LOG(INFO) << "Backhaul recovery cycle stage 2: still no connectivity - disabling EP "
+-                     "again and moving to powersave stage";
+-        for (auto &radio_info : m_radios_info) {
+-            if (radio_info->sta_wlan_hal) {
+-                if (!radio_info->sta_wlan_hal->enable_disable_ep(false)) {
+-                    LOG(WARNING) << "Backhaul recovery cycle: enable_disable_ep(false) failed on "
+-                                    "iface "
+-                                 << radio_info->sta_iface;
+-                }
+-            }
+-        }
++        LOG(INFO) << "Backhaul recovery cycle stage 2: still no connectivity - moving to "
++                     "powersave stage; endpoint disable will be tied to powersave-enable";
+         // Start a fresh round. It will wait 15 seconds before sending powersave-enable(true),
+         // then wait four minutes before sending powersave-disable(false).
+         recovery_cycle_stage1_enable_ep();
+@@ -5363,8 +5399,8 @@ void BackhaulManager::start_backhaul_reconnect_watchdog(std::shared_ptr<sRadioIn
+         return;
+     }
+ 
+-#ifdef USE_PRPLMESH_WHM
+-    // WHM uses the backend-generic five-stage recovery cycle for a disabled-radio
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
++    // WHM and NLHAL use the backend-generic five-stage recovery cycle for a disabled-radio
+     // backhaul loss. Do not arm the legacy per-radio reconnect watchdog here: it
+     // performs only a disconnect/reconnect attempt and then waits five minutes,
+     // preventing the EP/powersave recovery sequence from running.
+@@ -5374,6 +5410,7 @@ void BackhaulManager::start_backhaul_reconnect_watchdog(std::shared_ptr<sRadioIn
+     return;
+ #endif
+ 
++#if !defined(USE_PRPLMESH_WHM) && !defined(USE_PRPLMESH_NLHAL)
+     auto db = AgentDB::get();
+     if (db->device_conf.local_gw) {
+         LOG(DEBUG) << "local_gw is set - not registering reconnect watchdog timer for "
+@@ -5586,6 +5623,7 @@ void BackhaulManager::start_backhaul_reconnect_watchdog(std::shared_ptr<sRadioIn
+     if (radio_info->reconnect_watchdog_timer == beerocks::net::FileDescriptor::invalid_descriptor) {
+         LOG(ERROR) << "Failed to create backhaul reconnect watchdog timer for " << sta_iface;
+     }
++#endif
+ }
+ 
+ 
+@@ -5596,7 +5634,7 @@ void BackhaulManager::handle_backhaul_radio_enabled(std::shared_ptr<sRadioInfo>
+         return;
+     }
+ 
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+     if (m_backhaul_recovery_cycle_active) {
+         LOG(DEBUG) << "Ignoring direct radio-enable reconnect for " << radio_info->sta_iface
+                    << " while the backhaul recovery cycle owns endpoint re-enable";
+@@ -5642,11 +5680,13 @@ void BackhaulManager::handle_backhaul_radio_enabled(std::shared_ptr<sRadioInfo>
+ 
+     LOG(INFO) << "Handling backhaul radio_enable for " << radio_info->sta_iface;
+ 
++#if !defined(USE_PRPLMESH_WHM) && !defined(USE_PRPLMESH_NLHAL)
+     if (radio_info->watchdog_owns_recovery) {
+         LOG(DEBUG) << "Releasing watchdog ownership of recovery for " << radio_info->sta_iface
+                    << " - radio_enable arrived mid-cycle";
+         radio_info->watchdog_owns_recovery = false;
+     }
++#endif
+ 
+     bool is_connected = radio_info->sta_wlan_hal && radio_info->sta_wlan_hal->is_connected();
+     if (!is_connected) {
+@@ -5676,6 +5716,7 @@ void BackhaulManager::handle_backhaul_radio_enabled(std::shared_ptr<sRadioInfo>
+         LOG(DEBUG) << "bSTA " << radio_info->sta_iface << " already connected on radio_enable";
+     }
+ 
++#if !defined(USE_PRPLMESH_WHM) && !defined(USE_PRPLMESH_NLHAL)
+     if (radio_info->reconnect_watchdog_timer != beerocks::net::FileDescriptor::invalid_descriptor) {
+         LOG(INFO) << "Removing backhaul reconnect watchdog timer for " << radio_info->sta_iface;
+         m_timer_manager->remove_timer(radio_info->reconnect_watchdog_timer);
+@@ -5695,6 +5736,7 @@ void BackhaulManager::handle_backhaul_radio_enabled(std::shared_ptr<sRadioInfo>
+     }
+ 
+     radio_info->next_watchdog_start_allowed = std::chrono::steady_clock::time_point::min();
++#endif
+ }
+ 
+ std::string BackhaulManager::freq_to_radio_mac(eFreqType freq) const
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+index dad6e214f..acedb9871 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+@@ -270,20 +270,21 @@ private:
+     void cancel_backhaul_steering_operation();
+ 
+     /**
+-     * @brief Starts the legacy periodic reconnect watchdog for a disabled radio.
++     * @brief Starts recovery for a disabled radio.
+      *
+-     * Under WHM, this entry point instead hands recovery to the backend-generic five-stage
+-     * recovery cycle below; the legacy per-radio watchdog is retained for other backends.
++     * WHM and NLHAL use the backend-generic five-stage recovery cycle below. Other backends
++     * retain the legacy per-radio reconnect watchdog.
+      */
+     void start_backhaul_reconnect_watchdog(std::shared_ptr<sRadioInfo> radio_info);
+ 
+     /**
+      * @brief Handles a radio_enable notification for a radio: reconnects/enables the bSTA if
+-     * needed and stops the reconnect watchdog timer started by start_backhaul_reconnect_watchdog().
++     * needed; legacy backends also stop the watchdog timer started by
++     * start_backhaul_reconnect_watchdog().
+      */
+     void handle_backhaul_radio_enabled(std::shared_ptr<sRadioInfo> radio_info);
+ 
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+     /**
+      * @brief Backend-generic backhaul-loss recovery cycle (EP toggle + radio powersave).
+      *
+@@ -302,7 +303,7 @@ private:
+     bool is_backhaul_fully_disconnected();
+ #endif
+ 
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+ 
+     /** @brief true if m_radios_info is non-empty and every radio's radio_disabled flag is set. */
+     bool all_radios_disabled();
+@@ -312,6 +313,7 @@ private:
+     /** @brief Send powersave request for the selected radio band. */
+     void send_5g_powersave_request(bool enable);
+     void send_6g_powersave_request(bool enable);
++    void disable_backhaul_endpoints_if_all_radios_disabled();
+     void schedule_wired_teardown_powersave_enable();
+     void arm_powersave_disable_endpoint_settle(std::chrono::seconds settle_time);
+ 
+@@ -782,10 +784,10 @@ private:
+     std::shared_ptr<beerocks::net::BridgeStateManager> m_bridge_state_manager;
+ #endif
+ 
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+     /**< Set while the backend-generic backhaul-loss recovery cycle (EP toggle + radio powersave)
+      * is running; while true, backhaul_fsm_main() early-returns and skips normal FSM
+-     * processing, exactly like the reconnect watchdog does for NLHAL. */
++     * processing so the recovery cycle exclusively owns endpoint reconnection. */
+     bool m_backhaul_recovery_cycle_active = false;
+ 
+     /**< fd of the current recovery-cycle stage's one-shot timer; invalid_descriptor when no
+@@ -871,15 +873,16 @@ public:
+                                                           to the backhaul BSS, so chirping stops */
+ 
+         /**< Flag: Set when a ACTION_BACKHAUL_RADIO_STATE_NOTIFICATION with disable=true was
+-         * received for this radio - drives the reconnect watchdog timer below. */
++         * received for this radio. */
+         bool radio_disabled = false;
+ 
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+         // True only after AP manager confirms that this radio's VAPs have actually
+         // completed teardown. radio_disabled represents the disable intent only.
+         bool vaps_teardown_confirmed = false;
+ #endif
+ 
++#if !defined(USE_PRPLMESH_WHM) && !defined(USE_PRPLMESH_NLHAL)
+         /**< fd of the periodic "Backhaul Reconnect Watchdog" timer running while
+          * radio_disabled is true; invalid_descriptor when not running. */
+         int reconnect_watchdog_timer = beerocks::net::FileDescriptor::invalid_descriptor;
+@@ -898,8 +901,9 @@ public:
+          * radio's iface, so the watchdog's own timers - not the FSM's automatic recovery path -
+          * own reconnection while a radio is disabled. */
+         bool watchdog_owns_recovery = false;
++#endif
+ 
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+         /**< Deadline and timer used to keep Endpoint enable/reconnect at least 15 seconds
+          * after PowerSaveEnable is set to false. */
+         std::chrono::steady_clock::time_point powersave_disable_endpoint_wait_until{};
+@@ -907,11 +911,13 @@ public:
+             beerocks::net::FileDescriptor::invalid_descriptor;
+ #endif
+ 
++#if !defined(USE_PRPLMESH_WHM) && !defined(USE_PRPLMESH_NLHAL)
+         /**< Earliest time start_backhaul_reconnect_watchdog() is allowed to (re-)arm the timer
+          * for this radio; set to now+5min when a cycle concludes with a successful reconnect, so
+          * the OPERATIONAL-state poll loop's repeated calls don't restart the cycle early. */
+         std::chrono::steady_clock::time_point next_watchdog_start_allowed =
+             std::chrono::steady_clock::time_point::min();
++#endif
+     };
+ 
+ private:
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 7e48c56fe..d591514d1 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -2981,7 +2981,7 @@ bool slave_thread::handle_cmdu_backhaul_manager_message(
+         send_cmdu(radio_manager.ap_manager_fd, cmdu_tx);
+         break;
+     }
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+     case beerocks_message::ACTION_BACKHAUL_RADIO_POWERSAVE_ENABLE_REQUEST: {
+         auto request_in = beerocks_header->addClass<
+             beerocks_message::cACTION_BACKHAUL_RADIO_POWERSAVE_ENABLE_REQUEST>();
+@@ -3001,6 +3001,7 @@ bool slave_thread::handle_cmdu_backhaul_manager_message(
+                 << "Failed building message cACTION_APMANAGER_RADIO_POWERSAVE_ENABLE_REQUEST!";
+             return false;
+         }
++        request_out->force() = 0;
+         send_cmdu(m_radio_managers[iface].ap_manager_fd, cmdu_tx);
+         break;
+     }
+@@ -3023,9 +3024,57 @@ bool slave_thread::handle_cmdu_backhaul_manager_message(
+                 << "Failed building message cACTION_APMANAGER_RADIO_POWERSAVE_DISABLE_REQUEST!";
+             return false;
+         }
+-        send_cmdu(m_radio_managers[iface].ap_manager_fd, cmdu_tx);
++        request_out->force() = 0;
++        // A powersave-disable transition must settle before any radio starts rebuilding VAPs.
++        // Fan the notification out so every AP Manager arms its VAP settle window. Each AP
++        // Manager still invokes the HAL disable only when its own radio was powersave-enabled.
++        for (const auto &radio_manager_element : m_radio_managers.get()) {
++            const auto &radio_manager = radio_manager_element.second;
++            send_cmdu(radio_manager.ap_manager_fd, cmdu_tx);
++        }
++        break;
++    }
++#if defined(USE_PRPLMESH_NLHAL) && !defined(USE_PRPLMESH_WHM)
++    case beerocks_message::ACTION_BACKHAUL_CLI_RADIO_POWERSAVE_REQUEST: {
++        auto request_in = beerocks_header->addClass<
++            beerocks_message::cACTION_BACKHAUL_CLI_RADIO_POWERSAVE_REQUEST>();
++        if (!request_in) {
++            LOG(ERROR) << "addClass cACTION_BACKHAUL_CLI_RADIO_POWERSAVE_REQUEST failed";
++            return false;
++        }
++        const std::string phy_name = request_in->phy_name();
++        auto &radio_managers   = m_radio_managers.get();
++        auto radio_manager_it   = radio_managers.find(phy_name);
++        if (radio_manager_it == radio_managers.end()) {
++            // The controller sends PHY-keyed requests to all agents because it does not
++            // depend on a VAP/interface mapping. Non-owning agents simply ignore them.
++            LOG(DEBUG) << "Ignoring radio powersave request for non-local PHY " << phy_name;
++            break;
++        }
++
++        LOG(INFO) << "CLI requesting direct radio powersave-"
++                  << (request_in->enable() ? "enable" : "disable") << " for PHY " << phy_name;
++        if (request_in->enable()) {
++            auto request_out = message_com::create_vs_message<
++                beerocks_message::cACTION_APMANAGER_RADIO_POWERSAVE_ENABLE_REQUEST>(cmdu_tx);
++            if (!request_out) {
++                LOG(ERROR) << "Failed building cACTION_APMANAGER_RADIO_POWERSAVE_ENABLE_REQUEST";
++                return false;
++            }
++            request_out->force() = 1;
++        } else {
++            auto request_out = message_com::create_vs_message<
++                beerocks_message::cACTION_APMANAGER_RADIO_POWERSAVE_DISABLE_REQUEST>(cmdu_tx);
++            if (!request_out) {
++                LOG(ERROR) << "Failed building cACTION_APMANAGER_RADIO_POWERSAVE_DISABLE_REQUEST";
++                return false;
++            }
++            request_out->force() = 1;
++        }
++        send_cmdu(radio_manager_it->second.ap_manager_fd, cmdu_tx);
+         break;
+     }
++#endif
+     case beerocks_message::ACTION_BACKHAUL_AUTOCONFIG_RENEW_REQUEST: {
+         LOG(DEBUG) << "ACTION_BACKHAUL_AUTOCONFIG_RENEW_REQUEST";
+         m_task_pool.send_event(eTaskType::AP_AUTOCONFIGURATION,
+@@ -4493,7 +4542,7 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+         send_cmdu_to_controller(fronthaul_iface, cmdu_tx);
+         break;
+     }
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+     case beerocks_message::ACTION_APMANAGER_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION: {
+         auto notification_in = beerocks_header->addClass<
+             beerocks_message::cACTION_APMANAGER_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION>();
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index f222b0d4d..2cb45a345 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -415,6 +415,17 @@ void ApAutoConfigurationTask::work()
+                 continue;
+             }
+ 
++            // The JOINED notification normally initializes wifi_channel, but radio
++            // information can arrive asynchronously during MLO startup.  Do not send
++            // an autoconfiguration search while the radio band is still unknown.
++            // Keep the radio in this state; work() will retry once the channel metadata
++            // has been populated.
++            if (radio->wifi_channel.is_empty()) {
++                LOG(DEBUG) << "Waiting for valid channel information before AP"
++                           << " autoconfiguration discovery on " << radio_iface;
++                break;
++            }
++
+             // If another radio with same band already finished the discovery phase, we can skip
+             // directly to next phase (AP_CONFIGURATION).
+             if (m_discovery_status[radio->wifi_channel.get_freq_type()].completed) {
+@@ -519,6 +530,19 @@ void ApAutoConfigurationTask::work()
+         }
+         case eState::SEND_AP_AUTOCONFIGURATION_WSC_M1: {
+             auto db = AgentDB::get();
++            auto radio = db->radio(radio_iface);
++            if (!radio) {
++                break;
++            }
++
++            // WSC M1 contains the radio band.  Holding here prevents an invalid M1
++            // from being built while AP-manager/HAL channel information is pending.
++            if (radio->wifi_channel.is_empty()) {
++                LOG(DEBUG) << "Waiting for valid channel information before sending WSC M1 on "
++                           << radio_iface;
++                break;
++            }
++
+             // If TS is active but the initial VLAN interface has not yet been created,
+             // hold M1 here. The early AP capability report must reach the controller
+             // before M1 so it can include MLO configuration in M2; gating M1 on
+@@ -1212,8 +1236,10 @@ void ApAutoConfigurationTask::configuration_complete_wait_action(const std::stri
+         }
+ 
+         // Backhaul-only BSSes are not bridged (controller<->agent traffic only).
+-        // Including them in the bridge check permanently stalls the 5G FSM in
+-        // WAIT_AP_CONFIGURATION_COMPLETE, silently dropping all subsequent Renews.
++        // Including them in the bridge check can stall the FSM in
++        // WAIT_AP_CONFIGURATION_COMPLETE; Renew handling re-arms that state for
++        // a subsequent M1/M2 exchange, but the completion check should still not
++        // wait for a backhaul-only interface to appear in the bridge.
+         if (bssid.backhaul_bss && !bssid.fronthaul_bss) {
+             LOG(DEBUG) << "skip backhaul-only bss " << bssid.iface_name
+                        << " from bridge membership check";
+@@ -3061,18 +3087,12 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_wsc(ieee1905_1::CmduMe
+ #endif
+     };
+ 
+-#if USE_PRPLMESH_WHM
+-    // WHM-only: mirror send_radio_disable_request_if_no_real_bss() for the opposite direction.
+-    // On WHM, ap_manager's WIFI_CREDENTIALS_UPDATE_REQUEST handler blocks waiting for
+-    // ap_wlan_hal->get_radio_info().radio_state == ENABLED before applying the update (see
+-    // "discard new configuration because radio not enabled" in ap_manager.cpp) - if that wait
+-    // is still pending when RADIO_ENABLE_REQUEST is sent, the credentials update is discarded
+-    // and the M2's real BSS entries never get applied. Sending RADIO_ENABLE_REQUEST here, before
+-    // handle_bss_reconfiguration()/send_ap_bss_configuration_message() below, guarantees
+-    // ap_manager processes it first. NLHAL is unaffected: its WIFI_CREDENTIALS_UPDATE_REQUEST
+-    // handler applies configuration unconditionally regardless of radio_state, so this ordering
+-    // doesn't matter there and the existing trailing enable-request send (below) still handles
+-    // it for NLHAL.
++#if defined(USE_PRPLMESH_NLHAL) || defined(USE_PRPLMESH_WHM)
++    // If the M2 carries real BSS entries for a radio previously marked disabled, propagate the
++    // enable before dispatching the credentials update. WHM needs this ordering because its
++    // WIFI_CREDENTIALS_UPDATE_REQUEST path waits for the radio to become enabled. NLHAL applies
++    // the update without that radio-state gate, but the early notification is still required so
++    // backhaul_manager disables wired-teardown powersave before update_vap_credentials() runs.
+     auto send_radio_enable_request_if_real_bss = [&]() {
+         LOG(DEBUG) << "send_radio_enable_request_if_real_bss() invoked: has_real_bss="
+                    << has_real_bss << " radio->radio_disable=" << radio->radio_disable
+@@ -3092,7 +3112,7 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_wsc(ieee1905_1::CmduMe
+         radio->radio_disable = false;
+         LOG(INFO) << "M2 carried real BSS entries - propagated radio_disable=false to "
+                      "ap_manager for "
+-                  << radio->front.iface_name << " (WHM early-enable path)";
++                  << radio->front.iface_name << " (early-enable path)";
+         notify_backhaul_manager_radio_state(radio->front.iface_mac, false);
+     };
+ #endif
+@@ -3118,7 +3138,7 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_wsc(ieee1905_1::CmduMe
+         }
+ 
+         send_radio_disable_request_if_no_real_bss();
+-#if USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_NLHAL) || defined(USE_PRPLMESH_WHM)
+         send_radio_enable_request_if_real_bss();
+ #endif
+ 
+@@ -3219,7 +3239,7 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_wsc(ieee1905_1::CmduMe
+                                            WSC::eWscVendorExtSubelementBssType::TEARDOWN);
+             });
+         send_radio_disable_request_if_no_real_bss();
+-#if USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_NLHAL) || defined(USE_PRPLMESH_WHM)
+         send_radio_enable_request_if_real_bss();
+ #endif
+     }
+@@ -3336,9 +3356,9 @@ void ApAutoConfigurationTask::handle_ap_autoconfiguration_wsc(ieee1905_1::CmduMe
+     // this M2 is itself the signal that the radio is being implicitly re-enabled - mirror the
+     // change_radio_state() enable branch below and proactively tell ap_manager/HAL, instead of
+     // waiting on the reactive AP_Enabled-notification-driven clears elsewhere in this file.
+-    // On WHM, send_radio_enable_request_if_real_bss() above already sent this request earlier
+-    // (before the credentials update) and cleared radio->radio_disable, so this is effectively
+-    // the NLHAL-only path now; it still runs unconditionally as a harmless no-op fallback.
++    // The early-enable helper above normally clears radio->radio_disable before the credentials
++    // update on both WHM and NLHAL. Keep this trailing path as a fallback if the early request
++    // could not be built or the helper was not reached.
+     if (radio->radio_disable) {
+         auto request = message_com::create_vs_message<
+             beerocks_message::cACTION_APMANAGER_RADIO_ENABLE_REQUEST>(m_cmdu_tx);
+@@ -3437,8 +3457,7 @@ void ApAutoConfigurationTask::restart_autoconfiguration_for_all_radios()
+         auto &radio_conf_params = m_radios_conf_params[radio->front.iface_name];
+         const bool renew_already_in_progress =
+             (radio_conf_params.state == eState::SEND_AP_AUTOCONFIGURATION_WSC_M1) ||
+-            (radio_conf_params.state == eState::WAIT_AP_AUTOCONFIGURATION_WSC_M2) ||
+-            (radio_conf_params.state == eState::WAIT_AP_CONFIGURATION_COMPLETE);
++            (radio_conf_params.state == eState::WAIT_AP_AUTOCONFIGURATION_WSC_M2);
+         if (renew_already_in_progress) {
+             LOG(DEBUG) << "Ignore duplicate renew on " << radio->front.iface_name
+                        << " while state is " << fsm_state_to_string(radio_conf_params.state);
+@@ -3447,6 +3466,20 @@ void ApAutoConfigurationTask::restart_autoconfiguration_for_all_radios()
+ 
+         m_task_is_active = true;
+ 
++        // Clear completion data from the previous M2/AP-manager cycle. The
++        // new M2 may contain only teardown entries, in which case no fresh
++        // AP-manager response or enabled BSSID will arrive to overwrite these
++        // fields before the radio is moved to CONFIGURED.
++        radio_conf_params.num_of_bss_available     = 0;
++        radio_conf_params.enabled_bssids.clear();
++        radio_conf_params.sent_vaps_list_update     = false;
++        radio_conf_params.received_vaps_list_update = false;
++
++        if (radio_conf_params.state == eState::WAIT_AP_CONFIGURATION_COMPLETE) {
++            LOG(INFO) << "Rearming completed radio " << radio->front.iface_name
++                      << " for AP-Autoconfiguration Renew and WSC M1";
++        }
++
+         // Refresh VAP info to ensure accurate BSS configuration matching
+         if (!send_ap_bss_info_update_request(radio->front.iface_name)) {
+             LOG(WARNING) << "send_ap_bss_info_update_request has failed for "
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+index 84df397c8..4689f4580 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+@@ -61,9 +61,7 @@ public:
+          * backhaul-loss recovery cycle). Invokes the same reset+resend logic as a real
+          * AP-Autoconfiguration Renew message, without needing one.
+          */
+-#ifdef USE_PRPLMESH_WHM
+         RESTART_AUTOCONFIG_ALL_RADIOS,
+-#endif
+     };
+ 
+     /**
+diff --git a/common/beerocks/bwl/dummy/nl80211_client_dummy.cpp b/common/beerocks/bwl/dummy/nl80211_client_dummy.cpp
+index da196634d..51d8b52b3 100644
+--- a/common/beerocks/bwl/dummy/nl80211_client_dummy.cpp
++++ b/common/beerocks/bwl/dummy/nl80211_client_dummy.cpp
+@@ -40,6 +40,10 @@ bool nl80211_client_dummy::get_radio_info(const std::string &interface_name, rad
+     // Suppress "unused parameter" warning
+     (void)interface_name;
+ 
++    // Keep the dummy client's radio-scoped WSI path equivalent to get_interface_info().
++    radio_info.wiphy       = 2;
++    radio_info.wiphy_valid = true;
++
+     band_info band{};
+ 
+     // 5GHz simulated report
+diff --git a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+index ee9dfdba6..ab05669c4 100644
+--- a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+@@ -128,23 +128,43 @@ public:
+ 
+     /**
+      * @brief Put the radio into powersave mode.
++     * @param force Issue the operation even when the local HAL state is unchanged.
+      *
+      * The WHM backend keeps non-6GHz calls as no-ops unless allow_non_6g is true. This lets
+      * explicit Wi-Fi 8 powersave sequencing target 5 GHz without changing legacy calls.
+      *
+      * @return true on success or false on error.
+      */
+-    virtual bool powersave_enable(bool allow_non_6g = false) { return true; }
++    virtual bool powersave_enable(bool allow_non_6g = false, bool force = false)
++    {
++        (void)allow_non_6g;
++        (void)force;
++        return true;
++    }
+ 
+     /**
+      * @brief Take the radio out of powersave mode.
++     * @param force Issue the operation even when the local HAL state says it is disabled.
+      *
+      * The WHM backend keeps non-6GHz calls as no-ops unless allow_non_6g is true. This lets
+      * explicit Wi-Fi 8 powersave sequencing target 5 GHz without changing legacy calls.
+      *
+      * @return true on success or false on error.
+      */
+-    virtual bool powersave_disable(bool allow_non_6g = false) { return true; }
++    virtual bool powersave_disable(bool allow_non_6g = false, bool force = false)
++    {
++        (void)allow_non_6g;
++        (void)force;
++        return true;
++    }
++
++    /**
++     * @brief Check whether powersave was successfully enabled for this radio.
++     *
++     * The default is false because most HAL backends do not implement the
++     * powersave operation.
++     */
++    virtual bool is_powersave_enabled() const { return false; }
+ 
+     /**
+      * @brief Back up the current on-disk hostapd radio-level ("head") config for this radio
+diff --git a/common/beerocks/bwl/include/bwl/nl80211_client.h b/common/beerocks/bwl/include/bwl/nl80211_client.h
+index a6986bab8..ecfcd2b09 100644
+--- a/common/beerocks/bwl/include/bwl/nl80211_client.h
++++ b/common/beerocks/bwl/include/bwl/nl80211_client.h
+@@ -408,6 +408,16 @@ public:
+          * Bands included in this radio (obtained from NL80211_ATTR_WIPHY_BANDS)
+          */
+         std::vector<band_info> bands;
++
++        /**
++         * Kernel wiphy index (obtained from NL80211_ATTR_WIPHY).
++         *
++         * This is intentionally kept separate from an interface index: a wiphy remains
++         * addressable for radio-scoped vendor commands after all VAP netdevs are removed.
++         */
++        uint32_t wiphy = 0;
++        bool wiphy_valid = false;
++
+ 	struct eht_info eht_cfg;
+         struct smd_info smd_cfg;
+         int8_t num_of_bands;
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index c94fb9b7c..438485e03 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -26,6 +26,7 @@
+ #include <unordered_map>
+ #include <easylogging++.h>
+ #include <linux/nl80211.h>
++#include <netlink/attr.h>
+ #include <netlink/genl/ctrl.h>
+ #include <netlink/genl/family.h>
+ #include <netlink/genl/genl.h>
+@@ -56,6 +57,18 @@ static constexpr auto LINK_REMOVE_LOCK_POLL_INTERVAL = std::chrono::milliseconds
+ static constexpr int  LINK_REMOVE_CMD_MAX_ATTEMPTS = 3;
+ static constexpr auto LINK_REMOVE_CMD_RETRY_DELAY  = std::chrono::milliseconds(300);
+ 
++// Qualcomm WSI bypass vendor command used by prplOS PowerSaveEnable.
++static constexpr uint32_t WSI_QCA_VENDOR_ID       = 0x001374u;
++static constexpr uint32_t WSI_BYPASS_SUBCMD       = 505u;
++static constexpr int WSI_ATTR_RADIO_IDX           = 150;
++static constexpr int WSI_ATTR_DPARAM0             = 17;
++static constexpr int WSI_ATTR_DPARAM1             = 18;
++static constexpr int WSI_ATTR_VALUE0              = 19;
++static constexpr uint32_t WSI_DPARAM0_WIFI_PARAMS = 200u;
++static constexpr uint32_t WSI_DPARAM1_WSI_BYPASS  = 80u;
++static constexpr uint32_t WSI_VALUE0_BYPASS       = 1u;
++static constexpr uint32_t WSI_VALUE0_READD        = 2u;
++
+ // Stub override for nl_event_handle
+ bool ap_wlan_hal_nl80211::nl_event_handle(struct nl_msg *msg, void *arg)
+ {
+@@ -2164,6 +2177,16 @@ bool ap_wlan_hal_nl80211::refresh_radio_info()
+         return false;
+     }
+ 
++    // get_radio_info() uses an interface-independent GET_WIPHY dump. Cache the kernel wiphy
++    // even when this AP manager is running in no-VAP mode, so WSI bypass can still target the
++    // radio after the last VAP/netdev has been torn down.
++    if (radio_info.wiphy_valid) {
++        m_cached_wiphy       = radio_info.wiphy;
++        m_cached_wiphy_valid = true;
++        LOG(DEBUG) << "Cached wiphy=" << m_cached_wiphy << " for radio phy="
++                   << m_hal_conf.phy_name;
++    }
++
+     if (radio_info.bands.empty()) {
+         LOG(ERROR) << "Unable to read any band in radio for interface " << m_radio_info.iface_name;
+         return false;
+@@ -2543,6 +2566,109 @@ bool ap_wlan_hal_nl80211::disable()
+     return true;
+ }
+ 
++bool ap_wlan_hal_nl80211::set_wsi_bypass_device(bool enable)
++{
++    int radio_idx = 0;
++    if (!get_this_radio_idx(radio_idx)) {
++        LOG(ERROR) << "Unable to determine radio index for WSI bypass on iface "
++                   << get_iface_name();
++        return false;
++    }
++
++    // The WSI command uses one 5 GHz bucket. prplMesh distinguishes 5 GHz high
++    // from the regular 5 GHz bucket internally, but prplOS does not.
++    if (radio_idx == RADIOIDX_5GH) {
++        radio_idx = RADIOIDX_5G;
++    }
++
++    uint32_t wiphy = 0;
++    if (m_cached_wiphy_valid) {
++        wiphy = m_cached_wiphy;
++    } else {
++        // Bootstrap from the interface-independent GET_WIPHY dump. Do not use
++        // get_interface_info() here: all VAP netdevs may already be gone when powersave is
++        // enabled, while the wiphy and its radio index remain valid.
++        nl80211_client::radio_info radio_info;
++        if (!m_nl80211_client || !m_nl80211_client->get_radio_info({}, radio_info) ||
++            !radio_info.wiphy_valid) {
++            LOG(ERROR) << "Unable to obtain wiphy for WSI bypass from GET_WIPHY for phy "
++                       << m_hal_conf.phy_name;
++            return false;
++        }
++        wiphy               = radio_info.wiphy;
++        m_cached_wiphy       = wiphy;
++        m_cached_wiphy_valid = true;
++    }
++
++    const uint32_t bypass_value = enable ? WSI_VALUE0_BYPASS : WSI_VALUE0_READD;
++    LOG(INFO) << "Setting WSI bypass for phy=" << m_hal_conf.phy_name
++              << " wiphy=" << wiphy << " radio_idx=" << radio_idx
++              << " enable=" << enable << " bypass_value=" << bypass_value;
++
++    const auto msg_create = [=](struct nl_msg *msg) {
++        if (nla_put_u32(msg, NL80211_ATTR_VENDOR_ID, WSI_QCA_VENDOR_ID) < 0 ||
++            nla_put_u32(msg, NL80211_ATTR_VENDOR_SUBCMD, WSI_BYPASS_SUBCMD) < 0 ||
++            nla_put_u32(msg, NL80211_ATTR_WIPHY, wiphy) < 0) {
++            return false;
++        }
++
++        auto *vendor_data = nla_nest_start(msg, NL80211_ATTR_VENDOR_DATA);
++        if (!vendor_data) {
++            return false;
++        }
++
++        if (nla_put_u8(msg, WSI_ATTR_RADIO_IDX, static_cast<uint8_t>(radio_idx)) < 0 ||
++            nla_put_u32(msg, WSI_ATTR_DPARAM0, WSI_DPARAM0_WIFI_PARAMS) < 0 ||
++            nla_put_u32(msg, WSI_ATTR_DPARAM1, WSI_DPARAM1_WSI_BYPASS) < 0 ||
++            nla_put_u32(msg, WSI_ATTR_VALUE0, bypass_value) < 0) {
++            return false;
++        }
++
++        nla_nest_end(msg, vendor_data);
++        return true;
++    };
++
++    const bool success = send_nl80211_msg(
++        NL80211_CMD_VENDOR, 0, msg_create, [](struct nl_msg *) { return true; }, {}, false);
++    if (!success) {
++        LOG(ERROR) << "WSI bypass command failed for phy " << m_hal_conf.phy_name
++                   << " enable=" << enable;
++    }
++    return success;
++}
++
++bool ap_wlan_hal_nl80211::powersave_enable(bool allow_non_6g, bool force)
++{
++    (void)allow_non_6g;
++    LOG(DEBUG) << "ap_wlan_hal_nl80211::powersave_enable() called for radio iface="
++               << get_iface_name() << " force=" << force;
++    if (!set_wsi_bypass_device(true)) {
++        return false;
++    }
++
++    m_powersave_enabled = true;
++    return true;
++}
++
++bool ap_wlan_hal_nl80211::powersave_disable(bool allow_non_6g, bool force)
++{
++    (void)allow_non_6g;
++    LOG(DEBUG) << "ap_wlan_hal_nl80211::powersave_disable() called for radio iface="
++               << get_iface_name() << " force=" << force;
++    if (!force && !m_powersave_enabled) {
++        LOG(DEBUG) << "powersave_disable() skipped because powersave was not enabled for iface="
++                   << get_iface_name();
++        return true;
++    }
++
++    if (!set_wsi_bypass_device(false)) {
++        return false;
++    }
++
++    m_powersave_enabled = false;
++    return true;
++}
++
+ bool ap_wlan_hal_nl80211::backup_reference_hostapd_config()
+ {
+     prplmesh::hostapd::Configuration base_conf = load_hostapd_config(m_radio_info.iface_name, "");
+@@ -8983,6 +9109,14 @@ bool ap_wlan_hal_nl80211::remove_bss(std::string &ifname, std::vector<std::strin
+         m_radio_info.available_vaps.erase(vap_id);
+     }
+ 
++    // If this was the last VAP on the radio, clear iface_name so the next VAP added
++    // (e.g. on radio re-enable after a full teardown) is correctly recognized as the
++    // primary/global-path BSS rather than being routed down the stale secondary-BSS path.
++    if (m_radio_info.available_vaps.empty()) {
++        set_iface_name(std::string());
++        m_radio_info.iface_name.clear();
++    }
++
+     // Remove the fd for this BSS and every family sibling (base netdev + "_link<N>"
+     // interfaces) currently registered.
+     auto family = get_interface_family(ifname);
+@@ -9025,6 +9159,14 @@ bool ap_wlan_hal_nl80211::remove_bss(std::string &iface_name, sMacAddr &iface_ma
+         m_radio_info.available_vaps.erase(vap_id);
+     }
+ 
++    // If this was the last VAP on the radio, clear iface_name so the next VAP added
++    // (e.g. on radio re-enable after a full teardown) is correctly recognized as the
++    // primary/global-path BSS rather than being routed down the stale secondary-BSS path.
++    if (m_radio_info.available_vaps.empty()) {
++        set_iface_name(std::string());
++        m_radio_info.iface_name.clear();
++    }
++
+     // Delete interface
+     if (!m_nl80211_client->remove_vap_interface(iface_name)) {
+         LOG(ERROR) << "Failed to remove vap iface: " << iface_name;
+@@ -9486,9 +9628,8 @@ void ap_wlan_hal_nl80211::generate_bssid_pool()
+         // No existing VAP/BSS control socket to query (e.g. re-enabling the radio from
+         // zero VAPs) - fall back to the radio's own MAC (live if the phy interface
+         // exists, otherwise the UCI-persisted one) as the base BSS mac, the same source
+-        // get_radio_mac() already falls back to for the no-Linux-interface case. Unlike
+-        // the STATUS-derived base mac above, this address isn't already in use by an
+-        // existing BSS, so mark it available rather than taken.
++        // get_radio_mac() already falls back to for the no-Linux-interface case. This
++        // becomes the primary BSS's actual BSSID (see below), so it must be marked taken.
+         std::string radio_mac = get_radio_mac();
+         if (radio_mac.empty()) {
+             LOG(ERROR) << __func__ << " STATUS Failed, and no radio mac available to fall back to";
+@@ -9497,6 +9638,10 @@ void ap_wlan_hal_nl80211::generate_bssid_pool()
+ 
+         LOG(WARNING) << __func__ << " STATUS Failed - falling back to radio mac " << radio_mac
+                      << " as base BSS mac";
++        // This synthesized address becomes the primary BSS's actual BSSID once the first
++        // VAP is (re)created below - it must be marked taken, not available, or the pool
++        // allocator hands this same address to the next VAP as its BSSID and hostapd
++        // rejects it ("may not have BSSID set to the MAC address of the radio").
+ 
+         base_mac = tlvf::mac_from_string(radio_mac);
+         // Every non-primary BSSID generated below (the "b5" branch) has the
+@@ -9508,7 +9653,7 @@ void ap_wlan_hal_nl80211::generate_bssid_pool()
+         // on that bit and hostapd rejects every secondary with "doesn't satisfy
+         // prefix requirement for the MBSSID groups".
+         base_mac.oct[0] |= 2;
+-        m_radio_info.bssid_pool[tlvf::mac_to_string(base_mac)] = false;
++        m_radio_info.bssid_pool[tlvf::mac_to_string(base_mac)] = true;
+     }
+ 
+ 
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+index 3b47097c1..c683fbfbd 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+@@ -39,6 +39,9 @@ public:
+     bool refresh_radio_info() override;
+     virtual bool enable() override;
+     virtual bool disable() override;
++    virtual bool powersave_enable(bool allow_non_6g = false, bool force = false) override;
++    virtual bool powersave_disable(bool allow_non_6g = false, bool force = false) override;
++    virtual bool is_powersave_enabled() const override { return m_powersave_enabled; }
+     virtual bool backup_reference_hostapd_config() override;
+     virtual bool set_channel(int chan, beerocks::eWiFiBandwidth bw, int center_channel) override;
+     virtual bool sta_allow(const sMacAddr &mac, const sMacAddr &bssid) override;
+@@ -258,6 +261,10 @@ protected:
+     }
+ 
+ private:
++    bool set_wsi_bypass_device(bool enable);
++
++    bool m_powersave_enabled = false;
++
+     // Unassociated measurement state variables
+     std::chrono::steady_clock::time_point m_unassoc_measure_start;
+     int m_unassoc_measure_window_size = 0;
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index 22a9e51ed..deb9631e8 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -956,7 +956,16 @@ bool base_wlan_hal_nl80211::refresh_radio_info()
+     // down) only the global control socket is connected; STATUS is a per-interface command
+     // that the global socket does not support, and no socket is even registered under the
+     // empty iface_name key. Treat it like radio_disable - skip the per-interface query.
+-    const bool no_vap_mode = get_iface_name().empty();
++    // Both names must describe a real hostapd interface before issuing per-interface
++    // commands. During a full radio teardown either member can still contain a stale value
++    // while the other one has already been cleared.
++    const bool no_vap_mode = get_iface_name().empty() || m_radio_info.iface_name.empty();
++
++    // Keep the UCI lookup keyed by the phy even when this refresh is entered before the
++    // normal hostapd STATUS path has had a chance to populate radio_info.
++    if (m_radio_info.phy_name.empty()) {
++        m_radio_info.phy_name = m_hal_conf.phy_name;
++    }
+ 
+     if (!m_hal_conf.radio_disable && !no_vap_mode) {
+         if (!wpa_ctrl_send_msg("STATUS", reply)) {
+@@ -1021,6 +1030,9 @@ bool base_wlan_hal_nl80211::refresh_radio_info()
+         // Always try nl80211 as fallback/verification to get accurate bandwidth
+         // This handles cases where STATUS doesn't provide complete info
+         if (m_nl80211_client->get_interface_info(get_iface_name(), if_info)) {
++            m_cached_wiphy       = if_info.wiphy;
++            m_cached_wiphy_valid = true;
++
+             // 320MHz (EHT, 6GHz) has no vht_oper_chwidth representation, so it must be
+             // taken directly from nl80211 instead of going through the VHT-style mapping below.
+             if (if_info.bandwidth == 320) {
+@@ -1204,7 +1216,11 @@ bool base_wlan_hal_nl80211::refresh_radio_info()
+                 m_radio_info.channel, m_radio_info.frequency_band, m_radio_info.bandwidth,
+                 m_radio_info.channel_ext_above);
+         }
+-        if (!m_hal_conf.radio_disable) {
++        // In no-VAP mode only the global hostapd socket is connected. There is no
++        // per-interface STATUS command to query until the first VAP is created.
++        // Keep the HAL attachable so the AP manager can receive the credentials
++        // update that creates that first VAP.
++        if (!m_hal_conf.radio_disable && !no_vap_mode) {
+             // Keep available_vaps in sync with the platform on every refresh, not just when it
+             // is empty, so stale/removed BSSs are detected promptly.
+             if (!refresh_vaps_info(beerocks::IFACE_RADIO_ID)) {
+@@ -1346,6 +1362,17 @@ bool base_wlan_hal_nl80211::refresh_vaps_info(int id)
+     int vap_id = 0;
+     int bss_count = 0;
+ 
++    // A disabled radio or a radio with no local hostapd interface has no
++    // per-interface control socket. In particular, do not send STATUS with an
++    // empty interface name: the global socket is not registered under that key
++    // and the failed query would make HAL attach fail before credentials can
++    // recreate the first VAP.
++    if (m_hal_conf.radio_disable || get_iface_name().empty() ||
++        m_radio_info.iface_name.empty()) {
++        m_radio_info.available_vaps.clear();
++        return true;
++    }
++
+     // hostapd may still be bringing up multiple newly-added BSS/MLO-link interfaces when
+     // STATUS is queried here, which can return a transiently incomplete snapshot (bss_count
+     // == 0, or a bss[N] entry with no matching bssid[N] yet). Retry a bounded number of times
+@@ -1707,23 +1734,24 @@ void base_wlan_hal_nl80211::send_ctrl_iface_cmd(std::string cmd)
+ bool base_wlan_hal_nl80211::send_nl80211_msg(uint8_t command, int flags,
+                                              std::function<bool(struct nl_msg *msg)> msg_create,
+                                              std::function<bool(struct nl_msg *msg)> msg_handle,
+-                                             const std::string &ifName)
++                                             const std::string &ifName, bool include_ifindex)
+ {
++    int iface_index = 0;
++    if (include_ifindex) {
++        std::string iface_name = ifName;
++        if (ifName.empty()) {
++            iface_name = get_iface_name();
++        }
+ 
+-    std::string iface_name = ifName;
+-    if (ifName.empty()) {
+-        iface_name = get_iface_name();
+-    }
+-
+-    std::string base_iface_name;
+-    extractLinkBaseInterface(iface_name, base_iface_name);
++        std::string base_iface_name;
++        extractLinkBaseInterface(iface_name, base_iface_name);
+ 
+-    int iface_index;
+-    if ((m_iface_index.find(base_iface_name) == m_iface_index.end()) ||
+-        ((iface_index = m_iface_index.at(base_iface_name)) <= 0)) {
+-        LOG(ERROR) << "Failed getting the index of interface " << base_iface_name;
++        if ((m_iface_index.find(base_iface_name) == m_iface_index.end()) ||
++            ((iface_index = m_iface_index.at(base_iface_name)) <= 0)) {
++            LOG(ERROR) << "Failed getting the index of interface " << base_iface_name;
+ 
+-        return false;
++            return false;
++        }
+     }
+ 
+     // Netlink Message
+@@ -1777,7 +1805,8 @@ bool base_wlan_hal_nl80211::send_nl80211_msg(uint8_t command, int flags,
+ 
+     // Initialize the netlink message
+     if (!genlmsg_put(nl_message.get(), 0, 0, m_nl80211_id, 0, flags, command, 0) ||
+-        nla_put_u32(nl_message.get(), NL80211_ATTR_IFINDEX, iface_index) != 0) {
++        (include_ifindex &&
++         nla_put_u32(nl_message.get(), NL80211_ATTR_IFINDEX, iface_index) != 0)) {
+         LOG(ERROR) << "Failed initializing the netlink message!";
+         return false;
+     }
+@@ -1809,7 +1838,7 @@ bool base_wlan_hal_nl80211::send_nl80211_msg(uint8_t command, int flags,
+         nl_recvmsgs(m_nl80211_sock.get(), nl_callback.get());
+     }
+ 
+-    return true;
++    return err == 0;
+ }
+ 
+ bool base_wlan_hal_nl80211::get_channel_utilization(uint8_t &channel_utilization)
+@@ -1912,14 +1941,23 @@ bool base_wlan_hal_nl80211::register_wpa_ctrl_interface(const std::string &inter
+         LOG(ERROR) << "Unsupported interface type " << int(get_type());
+         return false;
+     }
+-    if (m_wpa_ctrl_client.has_interface(interface)) {
+-        return true;
+-    }
+-
+     auto wpa_ctrl_path = m_hal_conf.wpa_ctrl_path;
+ 
+-    // Build wpa_ctrl path for secondary BSSs.
+-    if (interface.compare(get_iface_name()) != 0) {
++    // Build the dedicated per-BSS wpa_ctrl path whenever its socket file exists on
++    // disk - including for the radio's primary VAP (interface == get_iface_name()),
++    // so it can be upgraded off the "global" socket once hostapd creates its own
++    // control socket for it. Without this, the primary VAP would be stuck using
++    // "global" forever, and STATUS queries against it (e.g. from get_vap_status())
++    // would keep failing even though hostapd is actually up and serving a dedicated
++    // socket for it, same as it does for every secondary BSS.
++    //
++    // An empty get_iface_name() means no VAP exists yet on this radio (e.g.
++    // re-enabling from a full teardown) - the interface being registered is about to
++    // become the primary, so use the global socket path directly (matching how the
++    // "ADD bss_config=..." command itself is dispatched over the global control
++    // interface) instead of requiring its own dedicated socket file to already exist.
++    if (!get_iface_name().empty()) {
++        bool is_secondary_bss = (interface.compare(get_iface_name()) != 0);
+ 
+         // Get wpa_ctrl socket directory:
+         // including all socket files.
+@@ -1927,25 +1965,62 @@ bool base_wlan_hal_nl80211::register_wpa_ctrl_interface(const std::string &inter
+         if (pos != std::string::npos) {
+             pos += 1;
+         }
++        auto dedicated_path = wpa_ctrl_path.substr(0, pos) + interface;
+ 
+-        int retry_count = 6; //count intialized to retry for 500 milliseconds max
++        // Secondary BSSs must have their own dedicated socket, so retry for up to
++        // 500 milliseconds as before. The primary VAP is allowed to fall back to
++        // "global" for this attempt if its dedicated socket isn't there yet (e.g.
++        // right after the zero-VAP ADD) - a later re-registration attempt (e.g. from
++        // get_vap_status()'s failure-recovery path) will pick up the dedicated socket
++        // once hostapd creates it.
++        int retry_count = is_secondary_bss ? 6 : 1; //count intialized to retry for 500 milliseconds max
+ 
+         do {
+             retry_count--;
+-            wpa_ctrl_path = wpa_ctrl_path.substr(0, pos) + interface;
+-            if (beerocks::os_utils::wpa_ctrl_skt_exists(wpa_ctrl_path)) {
++            if (beerocks::os_utils::wpa_ctrl_skt_exists(dedicated_path)) {
++                wpa_ctrl_path = dedicated_path;
+                 LOG(DEBUG) << " wpa_ctrl_path for interface " << interface << " exists in " << wpa_ctrl_path;
+                 break;
+             } else {
+-                LOG(ERROR) << " wpa_ctrl_path for interface " << interface << " not exists in " << wpa_ctrl_path;
+-                LOG(ERROR) << " Try one more time after 100 millosecond";
+-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
++                LOG(DEBUG) << " wpa_ctrl_path for interface " << interface << " not exists in " << dedicated_path;
+                 if (retry_count <= 0) {
+-                    return false;
++                    if (is_secondary_bss) {
++                        return false;
++                    }
++                    break;
+                 }
++                LOG(DEBUG) << " Try one more time after 100 millosecond";
++                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+             }
+         }while(retry_count > 0);
+     }
++
++    // A radio that started with zero VAPs initially registers its first BSS against
++    // the global socket so that ADD bss_config can complete before hostapd creates
++    // /var/run/hostapd/<interface>. Once that dedicated socket appears, the existing
++    // logical interface entry must be rebound from global to the per-interface path.
++    // Otherwise STATUS is sent through /var/run/hostapd/global, which returns FAIL
++    // even though the kernel netdev and the hostapd per-interface socket exist.
++    if (m_wpa_ctrl_client.has_interface(interface)) {
++        auto existing_cmd = m_wpa_ctrl_client.get_socket_cmd(interface);
++        if (existing_cmd && existing_cmd->path() == wpa_ctrl_path) {
++            return true;
++        }
++
++        const std::string existing_path =
++            existing_cmd ? existing_cmd->path() : std::string("<unknown>");
++        LOG(INFO) << "Rebinding WPA ctrl interface " << interface << " from " << existing_path
++                  << " to " << wpa_ctrl_path;
++        // Erasing the entry closes both command/event sockets and removes the old
++        // event fd from m_fds_ext_events via wpa_ctrl_socket_event::close(). Keep
++        // active_BSSs intact; the interface is still logically active, only its
++        // control-socket endpoint is changing.
++        if (!m_wpa_ctrl_client.del_interface(interface)) {
++            LOG(ERROR) << "Failed to remove stale WPA ctrl mapping for " << interface;
++            return false;
++        }
++    }
++
+     LOG(DEBUG) << "Built wpa_ctrl_path " << wpa_ctrl_path << " for interface " << interface;
+     if (!m_wpa_ctrl_client.add_interface(interface, wpa_ctrl_path, m_fds_ext_events)) {
+         return false;
+@@ -2382,6 +2457,14 @@ bool base_wlan_hal_nl80211::remove_interface(const std::string &interface)
+        LOG(ERROR) << interface << " not found in active_BSSs";
+    }
+ 
++   // Drop the cached ifindex for this interface's base name too. add_interface() only
++   // resolves/stores an ifindex when the key is absent, so leaving a stale entry here
++   // makes a later add_interface() for a recreated netdev (which gets a new kernel
++   // ifindex) silently reuse the old, now-dead ifindex for outgoing netlink messages.
++   std::string base_iface_name;
++   extractLinkBaseInterface(interface, base_iface_name);
++   m_iface_index.erase(base_iface_name);
++
+    return true;
+ }
+ 
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
+index 730aca8a4..16a0003fd 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
+@@ -254,10 +254,11 @@ protected:
+ 
+     // Send NL80211 message to vap interface
+     // (default: Empty ifname will send msg to radio/MainBSS interface)
++    // Set include_ifindex=false for radio-scoped commands addressed by WIPHY.
+     bool send_nl80211_msg(uint8_t command, int flags,
+                           std::function<bool(struct nl_msg *msg)> msg_create,
+                           std::function<bool(struct nl_msg *msg)> msg_handle,
+-                          const std::string &ifName = {});
++                          const std::string &ifName = {}, bool include_ifindex = true);
+ 
+     /**
+      * @brief Register a new interface and immediately connect to it
+@@ -278,7 +279,9 @@ protected:
+      * wpa_ctrl sockets and resolve its NL80211 ifindex via add_interface() - so the string value
+      * and its backing socket/fd state cannot silently drift apart.
+      *
+-     * A no-op registration if the interface is already registered (is_wpa_ctrl_interface_registered()).
++     * A no-op registration if the interface is already registered with the same socket path.
++     * If the path changed (for example global -> per-interface after first VAP creation),
++     * the old mapping is replaced.
+      *
+      * @param[in] new_iface_name New value for m_radio_info.iface_name.
+      */
+@@ -286,6 +289,12 @@ protected:
+ 
+     std::unique_ptr<nl80211_client> m_nl80211_client;
+ 
++    // Wiphy identity survives MLO link/VAP teardown. Keep it separately from the
++    // transient interface name so radio-scoped vendor commands can still be sent
++    // after the link interface has disappeared.
++    uint32_t m_cached_wiphy = 0;
++    bool m_cached_wiphy_valid = false;
++
+     // Private data-members:
+ private:
+     bool fsm_setup();
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 99961e7a6..8867c982c 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -30,7 +30,6 @@
+ #include <vector>
+ 
+ #include <cstring>
+-#include <dirent.h>
+ 
+ extern "C" {
+ #include <wpa_ctrl.h>
+@@ -2601,62 +2600,39 @@ const std::string mon_wlan_hal_nl80211::get_iface_from_fd(int fd)
+ 
+ bool mon_wlan_hal_nl80211::get_hostapd_conf_iface_name(std::string &iface_name)
+ {
+-    std::vector<std::string> hostapd_cfg_names;
+-    std::string path = "/var/run/";
+-
+-    auto hasExtension = [](const std::string &filename, const std::string &extension) {
+-        if (filename.length() >= extension.length()) {
+-            return filename.compare(filename.length() - extension.length(), extension.length(),
+-                                    extension) == 0;
+-        }
+-        return false;
+-    };
+-
+-    DIR *dir = opendir(path.c_str());
+-    if (!dir) {
+-        LOG(ERROR) << "can't open the directory";
++    iface_name.clear();
++
++    // The unsuffixed file is the authoritative radio-level snapshot.  The suffixed files
++    // (hostapd-<phy>.<vap>.conf) are per-BSS working files and can survive a teardown after
++    // the corresponding BSS has already been removed.  Scanning them as a fallback can make
++    // a disabled/no-VAP radio appear active and makes the monitor reconnect to a stale VAP.
++    const std::string conf_path =
++        std::string(bwl::nl80211::base_ctrl_path) + "hostapd-" + m_radio_info.phy_name + ".conf";
++    LOG(DEBUG) << "Trying to load authoritative hostapd config " << conf_path;
++
++    prplmesh::hostapd::Configuration hostapd_conf(conf_path);
++    if (!hostapd_conf.load("interface=", "bss=")) {
++        LOG(DEBUG) << "Failed to load authoritative hostapd config " << conf_path
++                   << " - treating radio as no-VAP mode";
+         return false;
+     }
+ 
+-    struct dirent *entry;
+-    std::string hostapd_phy = "hostapd-" + m_radio_info.phy_name;
+-    LOG(DEBUG) << "Looking for hostapd conf files starting with " << hostapd_phy;
+-    while ((entry = readdir(dir)) != nullptr) {
+-        if (entry->d_type == DT_REG &&
+-            (strncmp(entry->d_name, hostapd_phy.c_str(), hostapd_phy.length()) == 0) &&
+-            hasExtension(entry->d_name, ".conf")) {
+-            hostapd_cfg_names.push_back(path + entry->d_name);
+-        }
+-    }
+-    closedir(dir);
+-
+-    std::sort(hostapd_cfg_names.begin(), hostapd_cfg_names.end());
+-
+-    for (const auto &try_fname : hostapd_cfg_names) {
+-        LOG(DEBUG) << "Trying to load " << try_fname << "...";
+-
+-        prplmesh::hostapd::Configuration hostapd_conf(try_fname);
+-        if (!hostapd_conf.load("interface=", "bss=")) {
+-            LOG(ERROR) << "Failed to load hostapd config file: " << try_fname;
+-            continue;
+-        }
+-
+-        auto vaps = hostapd_conf.get_hostapd_bss_config();
+-        if (vaps.empty()) {
+-            continue;
+-        }
+-
+-        // first configured vap's name is the real interface name for this radio
+-        iface_name = vaps.front().first;
+-        if (!iface_name.empty()) {
+-            LOG(DEBUG) << "Found interface " << iface_name << " in " << try_fname;
+-            return true;
+-        }
++    const auto vaps = hostapd_conf.get_hostapd_bss_config();
++    const auto interface_vap = std::find_if(
++        vaps.begin(), vaps.end(), [](const auto &vap) {
++            return std::any_of(vap.second.begin(), vap.second.end(), [](const auto &line) {
++                return line.rfind("interface=", 0) == 0;
++            });
++        });
++    if (interface_vap == vaps.end() || interface_vap->first.empty()) {
++        LOG(DEBUG) << "No interface found in authoritative hostapd config " << conf_path
++                   << " - treating radio as no-VAP mode";
++        return false;
+     }
+ 
+-    LOG(DEBUG) << "No interface found in any hostapd conf file for " << hostapd_phy
+-              << " - treating radio as no-VAP mode";
+-    return false;
++    iface_name = interface_vap->first;
++    LOG(DEBUG) << "Found interface " << iface_name << " in " << conf_path;
++    return true;
+ }
+ 
+ } // namespace nl80211
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.cpp b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+index 534da7441..57e1759b9 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -549,6 +549,14 @@ bool nl80211_client_impl::get_radio_info(const std::string &interface_name, radi
+                 return;
+             }
+ 
++            // GET_WIPHY is interface-independent. Preserve the kernel wiphy index from the
++            // dump so callers can still issue radio-scoped vendor commands after all VAP
++            // interfaces have been removed.
++            if (!radio_info.wiphy_valid && tb[NL80211_ATTR_WIPHY]) {
++                radio_info.wiphy       = nla_get_u32(tb[NL80211_ATTR_WIPHY]);
++                radio_info.wiphy_valid = true;
++            }
++
+ #if LINUX_VERSION_CODE > KERNEL_VERSION(4, 19, 1)
+             /**
+ 	     * Multiple BSSID capability is set in the 6th bit of 3rd byte of the
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index 87944ff3d..218e4c62b 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -380,10 +380,10 @@ bool ap_wlan_hal_whm::set_channel(int chan, beerocks::eWiFiBandwidth bw, int cen
+     return true;
+ }
+ 
+-bool ap_wlan_hal_whm::powersave_enable(bool allow_non_6g)
++bool ap_wlan_hal_whm::powersave_enable(bool allow_non_6g, bool force)
+ {
+     LOG(DEBUG) << "ap_wlan_hal_whm::powersave_enable() called for radio iface="
+-               << m_radio_info.iface_name << " path=" << m_radio_path;
++               << m_radio_info.iface_name << " path=" << m_radio_path << " force=" << force;
+     if (!allow_non_6g && m_radio_info.frequency_band != beerocks::eFreqType::FREQ_6G) {
+         LOG(DEBUG) << "powersave_enable() no-op for non-6G radio iface="
+                    << m_radio_info.iface_name;
+@@ -396,26 +396,34 @@ bool ap_wlan_hal_whm::powersave_enable(bool allow_non_6g)
+         LOG(ERROR) << "powersave_enable() failed on radio " << m_radio_path;
+         return false;
+     }
++    m_powersave_enabled = true;
+     LOG(DEBUG) << "powersave_enable() set PowerSaveEnable=1 on radio " << m_radio_path;
+     return true;
+ }
+ 
+-bool ap_wlan_hal_whm::powersave_disable(bool allow_non_6g)
++bool ap_wlan_hal_whm::powersave_disable(bool allow_non_6g, bool force)
+ {
+     LOG(DEBUG) << "ap_wlan_hal_whm::powersave_disable() called for radio iface="
+-               << m_radio_info.iface_name << " path=" << m_radio_path;
++               << m_radio_info.iface_name << " path=" << m_radio_path << " force=" << force;
+     if (!allow_non_6g && m_radio_info.frequency_band != beerocks::eFreqType::FREQ_6G) {
+         LOG(DEBUG) << "powersave_disable() no-op for non-6G radio iface="
+                    << m_radio_info.iface_name;
+         return true; // no-op for non-6G radios
+     }
+ 
++    if (!force && !m_powersave_enabled) {
++        LOG(DEBUG) << "powersave_disable() skipped because powersave was not enabled for iface="
++                   << m_radio_info.iface_name;
++        return true;
++    }
++
+     AmbiorixVariant new_obj(AMXC_VAR_ID_HTABLE);
+     new_obj.add_child("PowerSaveEnable", false);
+     if (!m_ambiorix_cl.update_object(m_radio_path, new_obj)) {
+         LOG(ERROR) << "powersave_disable() failed on radio " << m_radio_path;
+         return false;
+     }
++    m_powersave_enabled = false;
+     LOG(DEBUG) << "powersave_disable() set PowerSaveEnable=0 on radio " << m_radio_path;
+     return true;
+ }
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
+index 0a6e1f77c..8bf7dddf6 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
+@@ -40,8 +40,9 @@ public:
+     virtual HALState attach(bool block = false) override;
+     virtual bool enable() override;
+     virtual bool disable() override;
+-    virtual bool powersave_enable(bool allow_non_6g = false) override;
+-    virtual bool powersave_disable(bool allow_non_6g = false) override;
++    virtual bool powersave_enable(bool allow_non_6g = false, bool force = false) override;
++    virtual bool powersave_disable(bool allow_non_6g = false, bool force = false) override;
++    virtual bool is_powersave_enabled() const override { return m_powersave_enabled; }
+     virtual bool
+     set_channel(int chan, beerocks::eWiFiBandwidth bw = beerocks::eWiFiBandwidth::BANDWIDTH_UNKNOWN,
+                 int center_channel = 0) override;
+@@ -252,6 +253,8 @@ protected:
+     virtual bool set(const std::string &param, const std::string &value, int vap_id) override;
+ 
+ private:
++    bool m_powersave_enabled = false;
++
+     /**
+      * @brief Pending unassociated STA measurement entry.
+      * Populated by send_unassoc_sta_link_metric_query(),
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
+index 17abebd3e..9d93c12b8 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
+@@ -174,8 +174,9 @@ eActionOp_BACKHAUL:
+   ACTION_BACKHAUL_RADIO_POWERSAVE_DISABLE_REQUEST: 98
+   ACTION_BACKHAUL_AUTOCONFIG_RENEW_REQUEST: 99
+   ACTION_BACKHAUL_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION: 100
++  ACTION_BACKHAUL_CLI_RADIO_POWERSAVE_REQUEST: 101
+ 
+-  ACTION_BACKHAUL_ENUM_END: 101
++  ACTION_BACKHAUL_ENUM_END: 102
+ 
+ ####################################################
+ ####################################################
+@@ -415,8 +416,9 @@ eActionOp_CLI:
+   ACTION_CLI_SET_BSS_STATE_RESPONSE: 130
+   ACTION_CLI_TRIGGER_AP_CONFIG_RENEW_REQUEST: 131
+   ACTION_CLI_TRIGGER_AP_CONFIG_RENEW_RESPONSE: 132
++  ACTION_CLI_RADIO_POWERSAVE_REQUEST: 133
+ 
+-  ACTION_CLI_ENUM_END: 133
++  ACTION_CLI_ENUM_END: 134
+ 
+ ####################################################
+ ####################################################
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+index f39e359dd..8ab7144e1 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+@@ -376,9 +376,11 @@ cACTION_APMANAGER_RADIO_ENABLE_REQUEST:
+ 
+ cACTION_APMANAGER_RADIO_POWERSAVE_ENABLE_REQUEST:
+   _type: class
++  force: uint8_t #bool
+ 
+ cACTION_APMANAGER_RADIO_POWERSAVE_DISABLE_REQUEST:
+   _type: class
++  force: uint8_t #bool
+ 
+ cACTION_APMANAGER_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION:
+   _type: class
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
+index 213deb313..0b7ec27d3 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
+@@ -185,6 +185,13 @@ cACTION_BACKHAUL_RADIO_POWERSAVE_DISABLE_REQUEST:
+     _type: char
+     _length: ["beerocks::message::IFACE_NAME_LENGTH"]
+ 
++cACTION_BACKHAUL_CLI_RADIO_POWERSAVE_REQUEST:
++  _type: class
++  phy_name:
++    _type: char
++    _length: ["beerocks::message::IFACE_NAME_LENGTH"]
++  enable: uint8_t #bool
++
+ cACTION_BACKHAUL_AUTOCONFIG_RENEW_REQUEST:
+   _type: class
+ 
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_cli.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_cli.yaml
+index e9409d162..3c5f54611 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_cli.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_cli.yaml
+@@ -170,6 +170,13 @@ cACTION_CLI_SET_BSS_STATE_RESPONSE:
+ cACTION_CLI_TRIGGER_AP_CONFIG_RENEW_REQUEST:
+   _type: class
+ 
++cACTION_CLI_RADIO_POWERSAVE_REQUEST:
++  _type: class
++  phy_name:
++    _type: char
++    _length: ["beerocks::message::IFACE_NAME_LENGTH"]
++  enable: uint8_t #bool
++
+ cACTION_CLI_TRIGGER_AP_CONFIG_RENEW_RESPONSE:
+   _type: class
+   error_code: uint32_t
+diff --git a/controller/src/beerocks/cli/beerocks_cli_socket.cpp b/controller/src/beerocks/cli/beerocks_cli_socket.cpp
+index 86908f977..70a49f8d1 100644
+--- a/controller/src/beerocks/cli/beerocks_cli_socket.cpp
++++ b/controller/src/beerocks/cli/beerocks_cli_socket.cpp
+@@ -177,20 +177,25 @@ void cli_socket::setFunctionsMapAndArray()
+                        "remove 'bssid' from  11k neighbor list of 'hostap_mac' 'vap_id'",
+                        static_cast<pFunction>(&cli_socket::rm_neighbor_11k_caller), 3, 3,
+                        STRING_ARG, STRING_ARG);
+-#ifdef USE_PRPLMESH_WHM
+     insertCommandToMap("get_bss_list", "<ruid>",
+                        "List the VAPs/BSSes configured in the controller for the given radio.",
+                        static_cast<pFunction>(&cli_socket::get_bss_list_caller), 1, 1, STRING_ARG);
+     insertCommandToMap(
+         "set_bss_state", "<ruid> <vap_label> <enable 0/1>",
+-        "Enable/disable a configured VAP/BSS on the given radio. Does NOT trigger a renew - "
+-        "call trigger_ap_config_renew once after setting all desired states.",
++        "Enable/disable a configured VAP/BSS on the frequency band selected by ruid. "
++        "The state applies to all radios in that band. Does NOT trigger a renew - call "
++        "trigger_ap_config_renew once after setting all desired states.",
+         static_cast<pFunction>(&cli_socket::set_bss_state_caller), 3, 3, STRING_ARG, STRING_ARG,
+         STRING_ARG);
+     insertCommandToMap(
+         "trigger_ap_config_renew", "",
+         "Trigger an Autoconfig Renew to propagate pending set_bss_state changes to agents.",
+         static_cast<pFunction>(&cli_socket::trigger_ap_config_renew_caller), 0, 0);
++#if defined(USE_PRPLMESH_NLHAL) && !defined(USE_PRPLMESH_WHM)
++    insertCommandToMap(
++        "radio_powersave", "<phy_name> <enable 0/1>",
++        "Directly enable or disable the nl80211 radio WSI powersave command for one PHY.",
++        static_cast<pFunction>(&cli_socket::radio_powersave_caller), 2, 2, STRING_ARG, INT_ARG);
+ #endif
+ }
+ 
+@@ -263,7 +268,6 @@ bool cli_socket::handle_cmdu(Socket *sd, ieee1905_1::CmduMessageRx &cmdu_rx)
+         wait_response = false;
+         break;
+     }
+-#ifdef USE_PRPLMESH_WHM
+     case beerocks_message::ACTION_CLI_GET_BSS_LIST_RESPONSE: {
+         auto response =
+             beerocks_header->addClass<beerocks_message::cACTION_CLI_GET_BSS_LIST_RESPONSE>();
+@@ -330,7 +334,6 @@ bool cli_socket::handle_cmdu(Socket *sd, ieee1905_1::CmduMessageRx &cmdu_rx)
+         wait_response = false;
+         break;
+     }
+-#endif
+     default: {
+         LOG(ERROR) << "ACTION_CLI, action_op " << int(beerocks_header->action_op())
+                    << " not supported.";
+@@ -523,7 +526,6 @@ int cli_socket::rm_neighbor_11k_caller(int numOfArgs)
+     return -1;
+ }
+ 
+-#ifdef USE_PRPLMESH_WHM
+ int cli_socket::get_bss_list_caller(int numOfArgs)
+ {
+     if (numOfArgs != 1)
+@@ -545,6 +547,16 @@ int cli_socket::trigger_ap_config_renew_caller(int numOfArgs)
+         return -1;
+     return trigger_ap_config_renew();
+ }
++
++#if defined(USE_PRPLMESH_NLHAL) && !defined(USE_PRPLMESH_WHM)
++int cli_socket::radio_powersave_caller(int numOfArgs)
++{
++    if (numOfArgs != 2 || (args.intArgs[1] != 0 && args.intArgs[1] != 1)) {
++        std::cout << "Usage: radio_powersave <phy_name> <enable 0/1>" << std::endl;
++        return -1;
++    }
++    return radio_powersave(args.stringArgs[0], args.intArgs[1]);
++}
+ #endif
+ 
+ //
+@@ -876,7 +888,6 @@ int cli_socket::rm_neighbor_11k(std::string ap_mac, std::string bssid, int8_t va
+     return 0;
+ }
+ 
+-#ifdef USE_PRPLMESH_WHM
+ int cli_socket::get_bss_list(std::string ruid)
+ {
+     auto request =
+@@ -924,6 +935,23 @@ int cli_socket::trigger_ap_config_renew()
+     waitResponseReady();
+     return 0;
+ }
++
++#if defined(USE_PRPLMESH_NLHAL) && !defined(USE_PRPLMESH_WHM)
++int cli_socket::radio_powersave(const std::string &phy_name, int enable)
++{
++    auto request = message_com::create_vs_message<
++        beerocks_message::cACTION_CLI_RADIO_POWERSAVE_REQUEST>(cmdu_tx);
++    if (request == nullptr) {
++        LOG(ERROR) << "Failed building cACTION_CLI_RADIO_POWERSAVE_REQUEST message!";
++        return -1;
++    }
++    request->set_phy_name(phy_name);
++    request->enable() = enable ? 1 : 0;
++    wait_response     = true;
++    message_com::send_cmdu(master_socket, cmdu_tx);
++    waitResponseReady();
++    return 0;
++}
+ #endif
+ 
+ } // namespace beerocks
+diff --git a/controller/src/beerocks/cli/beerocks_cli_socket.h b/controller/src/beerocks/cli/beerocks_cli_socket.h
+index 13b0794bc..2b265a4a7 100644
+--- a/controller/src/beerocks/cli/beerocks_cli_socket.h
++++ b/controller/src/beerocks/cli/beerocks_cli_socket.h
+@@ -79,12 +79,14 @@ private:
+ 
+     int client_beacon_11k_req_caller(int numOfArgs);
+ 
+-#ifdef USE_PRPLMESH_WHM
+     int get_bss_list_caller(int numOfArgs);
+ 
+     int set_bss_state_caller(int numOfArgs);
+ 
+     int trigger_ap_config_renew_caller(int numOfArgs);
++
++#if defined(USE_PRPLMESH_NLHAL) && !defined(USE_PRPLMESH_WHM)
++    int radio_powersave_caller(int numOfArgs);
+ #endif
+ 
+     // Functions
+@@ -129,12 +131,14 @@ private:
+                               std::string ssid, uint16_t duration, uint16_t rand_ival,
+                               uint16_t repeats, int16_t op_class, const std::string &mode);
+ 
+-#ifdef USE_PRPLMESH_WHM
+     int get_bss_list(std::string ruid);
+ 
+     int set_bss_state(std::string ruid, std::string vap_label, int enable);
+ 
+     int trigger_ap_config_renew();
++
++#if defined(USE_PRPLMESH_NLHAL) && !defined(USE_PRPLMESH_WHM)
++    int radio_powersave(const std::string &phy_name, int enable);
+ #endif
+ 
+     // Variables
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 0dae46a6e..f59f9c54f 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -12,9 +12,7 @@
+ #include "son_actions.h"
+ #include "son_management.h"
+ #include "tasks/agent_monitoring_task.h"
+-#ifdef USE_PRPLMESH_WHM
+ #include "tasks/ap_config_renew_sequencer_task.h"
+-#endif
+ #include "tasks/bml_task.h"
+ #include "tasks/btm_request_task.h"
+ #include "tasks/client_association_task.h"
+@@ -2579,13 +2577,20 @@ bool Controller::handle_cmdu_1905_autoconfiguration_WSC(const sMacAddr &src_mac,
+             LOG(INFO) << "Skipping " << bss_info_conf.ssid << " due to operclass mismatch";
+             continue;
+         }
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+         if (bss_info_conf.teardown) {
+             LOG(INFO) << "Skipping " << bss_info_conf.ssid
+-                      << " - administratively disabled via set_bss_state";
++                      << " (vap_label=" << bss_info_conf.vap_label << ", ruid=" << ruid
++                      << ") - administratively disabled via set_bss_state";
+             continue;
+         }
+ #endif
++        if (!database.get_bss_state(ruid, bss_info_conf.vap_label)) {
++            LOG(INFO) << "Skipping " << bss_info_conf.ssid << " (vap_label="
++                      << bss_info_conf.vap_label << ", ruid=" << ruid
++                      << ") - administratively disabled via set_bss_state";
++            continue;
++        }
+         if ((m1->auth_type_flags() & bss_info_conf.authentication_type) !=
+             bss_info_conf.authentication_type) {
+             LOG(INFO) << std::hex << "Auth mismatch for " << bss_info_conf.ssid << ": get 0x"
+diff --git a/controller/src/beerocks/master/db/db.cpp b/controller/src/beerocks/master/db/db.cpp
+index 74b1277a1..e92818e73 100644
+--- a/controller/src/beerocks/master/db/db.cpp
++++ b/controller/src/beerocks/master/db/db.cpp
+@@ -6336,7 +6336,6 @@ bool db::assign_bml_task_id(int new_task_id)
+ 
+ int db::get_bml_task_id() { return bml_task_id; }
+ 
+-#ifdef USE_PRPLMESH_WHM
+ bool db::assign_ap_config_renew_sequencer_task_id(int new_task_id)
+ {
+     ap_config_renew_sequencer_task_id = new_task_id;
+@@ -6344,7 +6343,6 @@ bool db::assign_ap_config_renew_sequencer_task_id(int new_task_id)
+ }
+ 
+ int db::get_ap_config_renew_sequencer_task_id() { return ap_config_renew_sequencer_task_id; }
+-#endif
+ 
+ bool db::assign_pre_association_steering_task_id(int new_task_id)
+ {
+@@ -6518,12 +6516,67 @@ void db::clear_bss_info_configuration()
+ {
+     bss_infos.clear();
+     bss_infos_global.clear();
++    bss_states.clear();
+ }
+ 
+ void db::clear_mld_info_configuration() { mld_infos_global.clear(); }
+ 
+ void db::clear_bss_info_configuration(const sMacAddr &al_mac) { bss_infos[al_mac].clear(); }
+ 
++bool db::set_bss_state(const sMacAddr &ruid, const std::string &vap_label, bool enable)
++{
++    auto radio = get_radio_by_uid(ruid);
++    if (!radio) {
++        LOG(ERROR) << "Cannot set BSS state: radio " << ruid << " was not found";
++        return false;
++    }
++
++    auto band = radio->band;
++    if (band == beerocks::FREQ_UNKNOWN || band == beerocks::FREQ_DISABLED) {
++        band = radio->wifi_channel.get_freq_type();
++    }
++    if (band == beerocks::FREQ_UNKNOWN || band == beerocks::FREQ_DISABLED) {
++        LOG(ERROR) << "Cannot set BSS state: frequency band is unknown for radio " << ruid;
++        return false;
++    }
++
++    bss_states[static_cast<uint8_t>(band)][vap_label] = enable;
++    LOG(INFO) << "Set band-wide BSS state: band=" << int(band)
++              << " vap_label=" << vap_label << " enable=" << enable
++              << " (source ruid=" << ruid << ")";
++    return true;
++}
++
++bool db::get_bss_state(const sMacAddr &ruid, const std::string &vap_label) const
++{
++    beerocks::eFreqType band = beerocks::FREQ_UNKNOWN;
++    for (const auto &agent_entry : m_agents) {
++        const auto &radios = agent_entry.second->radios;
++        auto radio_it       = radios.find(ruid);
++        if (radio_it == radios.end() || !radio_it->second) {
++            continue;
++        }
++
++        band = radio_it->second->band;
++        if (band == beerocks::FREQ_UNKNOWN || band == beerocks::FREQ_DISABLED) {
++            band = radio_it->second->wifi_channel.get_freq_type();
++        }
++        break;
++    }
++
++    if (band == beerocks::FREQ_UNKNOWN || band == beerocks::FREQ_DISABLED) {
++        return true;
++    }
++
++    auto band_state = bss_states.find(static_cast<uint8_t>(band));
++    if (band_state == bss_states.end()) {
++        return true;
++    }
++
++    auto bss_state = band_state->second.find(vap_label);
++    return bss_state == band_state->second.end() ? true : bss_state->second;
++}
++
+ void db::clear_configured_bss_info(const sMacAddr &ruid)
+ {
+     LOG(DEBUG) << "clear configuration for radio " << tlvf::mac_to_string(ruid);
+diff --git a/controller/src/beerocks/master/db/db.h b/controller/src/beerocks/master/db/db.h
+index 66ea8f383..3850053ee 100644
+--- a/controller/src/beerocks/master/db/db.h
++++ b/controller/src/beerocks/master/db/db.h
+@@ -2352,6 +2352,22 @@ public:
+     void clear_bss_info_configuration();
+     void clear_bss_info_configuration(const sMacAddr &al_mac);
+ 
++    /**
++     * @brief Set the administrative state of a BSS for the radio's frequency band.
++     *
++     * The RUID identifies the source radio and is used to resolve its band. The
++     * resulting state is applied to every radio in the network with that band.
++     */
++    bool set_bss_state(const sMacAddr &ruid, const std::string &vap_label, bool enable);
++
++    /**
++     * @brief Get the effective administrative state of a BSS for a radio.
++     *
++     * The radio's band is resolved from its RUID and the band-wide state is
++     * returned. BSSes without an explicit runtime state are enabled by default.
++     */
++    bool get_bss_state(const sMacAddr &ruid, const std::string &vap_label) const;
++
+     /**
+      * @brief Clear the list of BSSs configured on a given radio.
+      */
+@@ -3585,10 +3601,8 @@ public:
+     bool assign_bml_task_id(int new_task_id);
+     int get_bml_task_id();
+ 
+-#ifdef USE_PRPLMESH_WHM
+     bool assign_ap_config_renew_sequencer_task_id(int new_task_id);
+     int get_ap_config_renew_sequencer_task_id();
+-#endif
+ 
+     bool assign_pre_association_steering_task_id(int new_task_id);
+     int get_pre_association_steering_task_id();
+@@ -4043,9 +4057,7 @@ private:
+     int channel_selection_task_id              = -1;
+     int dynamic_channel_selection_r2_task_id   = -1;
+     int bml_task_id                            = -1;
+-#ifdef USE_PRPLMESH_WHM
+     int ap_config_renew_sequencer_task_id      = -1;
+-#endif
+     int pre_association_steering_task_id       = -1;
+     int config_update_task_id                  = -1;
+     int persistent_db_aging_operation_id       = -1;
+@@ -4104,6 +4116,11 @@ private:
+     std::unordered_map<sMacAddr, std::list<wireless_utils::sBssInfoConf>> bss_infos; // key=al_mac
+     std::list<wireless_utils::sBssInfoConf> bss_infos_global;
+ 
++    // Runtime BSS state, keyed by radio frequency band and VAP label. The RUID
++    // supplied to set_bss_state() is only used to resolve the source band's
++    // frequency; the resulting policy applies to all radios in that band.
++    std::unordered_map<uint8_t, std::unordered_map<std::string, bool>> bss_states;
++
+     /**
+      * @brief This map holds MLD configurations for each MLD indentifier.
+      */
+diff --git a/controller/src/beerocks/master/son_actions.cpp b/controller/src/beerocks/master/son_actions.cpp
+index cd26f1412..335df4965 100644
+--- a/controller/src/beerocks/master/son_actions.cpp
++++ b/controller/src/beerocks/master/son_actions.cpp
+@@ -587,7 +587,6 @@ bool son_actions::send_ap_config_renew_msg(ieee1905_1::CmduMessageTx &cmdu_tx, d
+     return ret;
+ }
+ 
+-#ifdef USE_PRPLMESH_WHM
+ unsigned son_actions::get_agent_hop_count(db &database, const sMacAddr &al_mac)
+ {
+     unsigned hops           = 0;
+@@ -760,7 +759,6 @@ bool son_actions::send_ap_config_renew_msg_farthest_first(ieee1905_1::CmduMessag
+ 
+     return ret;
+ }
+-#endif
+ 
+ bool son_actions::send_reconfiguration_trigger_msg(const sMacAddr &agent_mac,
+                                                     ieee1905_1::CmduMessageTx &cmdu_tx, db &database)
+diff --git a/controller/src/beerocks/master/son_actions.h b/controller/src/beerocks/master/son_actions.h
+index 6a58dfa56..e0dfc3968 100644
+--- a/controller/src/beerocks/master/son_actions.h
++++ b/controller/src/beerocks/master/son_actions.h
+@@ -62,7 +62,6 @@ public:
+     static bool send_cmdu_to_agent(const sMacAddr &dest_mac, ieee1905_1::CmduMessageTx &cmdu_tx,
+                                    db &database, const std::string &radio_mac = std::string());
+     static bool send_ap_config_renew_msg(ieee1905_1::CmduMessageTx &cmdu_tx, db &database);
+-#ifdef USE_PRPLMESH_WHM
+     // CLI "trigger_ap_config_renew"-only variant: unicasts farthest-agent-first, nearest-last,
+     // then sends the multicast renew last as a backstop. See son_actions.cpp for rationale.
+     static bool send_ap_config_renew_msg_farthest_first(ieee1905_1::CmduMessageTx &cmdu_tx,
+@@ -81,7 +80,6 @@ public:
+     // ignored). Used by ap_config_renew_sequencer_task to pace out individual sends.
+     static bool send_single_ap_config_renew_msg(ieee1905_1::CmduMessageTx &cmdu_tx, db &database,
+                                                 const sMacAddr &dest_mac, bool multicast);
+-#endif
+     static bool send_reconfiguration_trigger_msg(const sMacAddr &agent_mac,
+                                                  ieee1905_1::CmduMessageTx &cmdu_tx, db &database);
+     static bool send_topology_query_msg(const sMacAddr &dest_mac,
+diff --git a/controller/src/beerocks/master/son_management.cpp b/controller/src/beerocks/master/son_management.cpp
+index 7f0e7d0fa..94a8d7978 100644
+--- a/controller/src/beerocks/master/son_management.cpp
++++ b/controller/src/beerocks/master/son_management.cpp
+@@ -8,9 +8,7 @@
+ 
+ #include "son_management.h"
+ #include "son_actions.h"
+-#ifdef USE_PRPLMESH_WHM
+ #include "tasks/ap_config_renew_sequencer_task.h"
+-#endif
+ #include "tasks/bml_task.h"
+ #ifdef FEATURE_PRE_ASSOCIATION_STEERING
+ #include "tasks/pre_association_steering/pre_association_steering_task.h"
+@@ -26,6 +24,7 @@
+ #include "tasks/statistics_polling_task.h"
+ 
+ #include <beerocks/tlvf/beerocks_message_1905_vs.h>
++#include <beerocks/tlvf/beerocks_message_backhaul.h>
+ #include <beerocks/tlvf/beerocks_message_bml.h>
+ #include <beerocks/tlvf/beerocks_message_cli.h>
+ #include <bml_defs.h>
+@@ -712,7 +711,6 @@ void son_management::handle_cli_message(int sd, std::shared_ptr<beerocks_header>
+ 
+         break;
+     }
+-#ifdef USE_PRPLMESH_WHM
+     case beerocks_message::ACTION_CLI_GET_BSS_LIST_REQUEST: {
+         LOG(TRACE) << "ACTION_CLI_GET_BSS_LIST_REQUEST";
+ 
+@@ -777,7 +775,9 @@ void son_management::handle_cli_message(int sd, std::shared_ptr<beerocks_header>
+                         beerocks::string_utils::copy_string(bss_elements[i].ssid,
+                                                              conf.ssid.c_str(),
+                                                              beerocks::message::WIFI_SSID_MAX_LENGTH);
+-                        bss_elements[i].enabled     = conf.teardown ? 0 : 1;
++                        const bool bss_enabled =
++                            !conf.teardown && database.get_bss_state(ruid, conf.vap_label);
++                        bss_elements[i].enabled = bss_enabled ? 1 : 0;
+                         bss_elements[i].fronthaul   = conf.fronthaul ? 1 : 0;
+                         bss_elements[i].backhaul    = conf.backhaul ? 1 : 0;
+                         bss_elements[i].hidden_ssid =
+@@ -817,9 +817,10 @@ void son_management::handle_cli_message(int sd, std::shared_ptr<beerocks_header>
+             bool found            = false;
+             for (auto &bss_info_conf : bss_info_confs) {
+                 if (bss_info_conf.vap_label == vap_label) {
+-                    bss_info_conf.teardown = !enable;
+-                    found                  = true;
+-                    error_code             = 0;
++                    if (database.set_bss_state(ruid, vap_label, enable)) {
++                        found      = true;
++                        error_code = 0;
++                    }
+                     break;
+                 }
+             }
+@@ -888,6 +889,39 @@ void son_management::handle_cli_message(int sd, std::shared_ptr<beerocks_header>
+         }
+         break;
+     }
++#if defined(USE_PRPLMESH_NLHAL) && !defined(USE_PRPLMESH_WHM)
++    case beerocks_message::ACTION_CLI_RADIO_POWERSAVE_REQUEST: {
++        LOG(TRACE) << "ACTION_CLI_RADIO_POWERSAVE_REQUEST";
++
++        auto request =
++            beerocks_header->addClass<beerocks_message::cACTION_CLI_RADIO_POWERSAVE_REQUEST>();
++        if (request == nullptr) {
++            LOG(ERROR) << "addClass cACTION_CLI_RADIO_POWERSAVE_REQUEST failed";
++            isOK = false;
++            break;
++        }
++
++        const std::string phy_name = request->phy_name_str();
++        bool sent_to_agent        = false;
++        for (const auto &agent : database.get_all_connected_agents()) {
++            auto request_out = message_com::create_vs_message<
++                beerocks_message::cACTION_BACKHAUL_CLI_RADIO_POWERSAVE_REQUEST>(cmdu_tx);
++            if (request_out == nullptr) {
++                LOG(ERROR) << "Failed building cACTION_BACKHAUL_CLI_RADIO_POWERSAVE_REQUEST!";
++                isOK = false;
++                break;
++            }
++            request_out->set_phy_name(phy_name);
++            request_out->enable() = request->enable() ? 1 : 0;
++            sent_to_agent |=
++                son_actions::send_cmdu_to_agent(agent->al_mac, cmdu_tx, database);
++        }
++        if (!sent_to_agent) {
++            LOG(ERROR) << "Failed sending radio powersave request for PHY " << phy_name;
++            isOK = false;
++        }
++        break;
++    }
+ #endif
+     default: {
+         LOG(ERROR) << "Unsupported CLI action_op:" << int(beerocks_header->action_op());
+diff --git a/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.cpp b/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.cpp
+index e7ca4be05..3ba62fb0d 100644
+--- a/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.cpp
++++ b/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.cpp
+@@ -9,7 +9,6 @@
+ 
+ using namespace beerocks;
+ using namespace net;
+-#ifdef USE_PRPLMESH_WHM
+ using namespace son;
+ 
+ ap_config_renew_sequencer_task::ap_config_renew_sequencer_task(db &database_,
+@@ -125,4 +124,3 @@ void ap_config_renew_sequencer_task::handle_task_end()
+         database.assign_ap_config_renew_sequencer_task_id(-1);
+     }
+ }
+-#endif
+diff --git a/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.h b/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.h
+index 42f3b6f52..83fd6f472 100644
+--- a/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.h
++++ b/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.h
+@@ -10,7 +10,6 @@
+ 
+ #include <vector>
+ 
+-#ifdef USE_PRPLMESH_WHM
+ namespace son {
+ 
+ /**
+@@ -66,6 +65,5 @@ private:
+ };
+ 
+ } // namespace son
+-#endif
+ 
+ #endif
+diff --git a/controller/src/beerocks/master/tasks/health_monitoring_task.cpp b/controller/src/beerocks/master/tasks/health_monitoring_task.cpp
+index 25a0903a1..108df2f06 100644
+--- a/controller/src/beerocks/master/tasks/health_monitoring_task.cpp
++++ b/controller/src/beerocks/master/tasks/health_monitoring_task.cpp
+@@ -694,7 +694,7 @@ HealthMonitoringTask::compute_expected_ssids_for_agent(const std::shared_ptr<Age
+ 
+         std::multiset<std::string> expected_ssids;
+         for (const auto &bss_conf : bss_info_confs) {
+-            if (bss_conf.teardown) {
++            if (bss_conf.teardown || !m_database.get_bss_state(ruid, bss_conf.vap_label)) {
+                 continue;
+             }
+ 
+-- 
+2.34.1
+
