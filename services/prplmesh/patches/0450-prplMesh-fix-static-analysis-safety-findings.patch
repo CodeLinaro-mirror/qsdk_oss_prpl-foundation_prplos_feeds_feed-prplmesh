@@ -1,0 +1,1249 @@
+From 77c823708facca63364475b084dc316f2ddc7337 Mon Sep 17 00:00:00 2001
+From: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+Date: Tue, 22 Sep 2026 15:25:50 +0530
+Subject: [PATCH] prplMesh: fix static analysis safety findings
+
+Problem:
+- Several runtime paths lacked pointer and payload validation.
+- Arithmetic and TLVF length handling could overflow or underflow.
+- Generated variable-length allocation code modified state before
+  validation and used unsafe overlapping copies.
+- Some generated fields had incorrect or unsafe initialization.
+- Enum string fallback storage was not thread-safe.
+
+RCA:
+- Input validation and allocation failure handling were incomplete.
+- TLVF generator templates did not consistently validate lengths before
+  modifying buffers and object state.
+- Optional fields were initialized before being allocated.
+- Generated defaults and protocol identifiers were incorrect in several
+  definitions.
+
+Fix:
+- Add null, HAL-result, divisor, and event-payload validation.
+- Reset failed ARP registration state.
+- Add serialized-length overflow and TLV-length underflow checks.
+- Reserve buffer capacity before updating indexes, counters, and pointers.
+- Replace overlapping std::copy_n operations with checked std::memmove.
+- Initialize optional structures only after successful allocation.
+- Correct QoS element ID and optional-field defaults.
+- Make enum fallback strings thread-local.
+- Update TLVF generators and YAML definitions so regeneration preserves
+  the fixes.
+
+Signed-off-by: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+---
+ .../fronthaul_manager/monitor/monitor.cpp     |  48 ++++++-
+ .../tlvf/beerocks_message_apmanager.cpp       |  90 ++++++++-----
+ .../master/tasks/client_association_task.cpp  |   4 +
+ .../master/tasks/client_steering_task.cpp     |   6 +-
+ .../master/tasks/load_balancer_task.cpp       |   4 +
+ .../master/tasks/optimal_path_task.cpp        |   4 +
+ .../external/enumAutoPrint/enum_auto_print.py |   4 +-
+ .../tlvf/association_frame/eExtElementID.h    |   3 +-
+ .../tlvf/association_frame/cQosCapability.cpp |   2 +-
+ .../association_frame/cStaHeCapability.cpp    |   7 +-
+ .../tlvBackhaulStaRadioCapabilities.cpp       |  24 ++--
+ .../tlvDppBootstrappingUriNotification.cpp    |   7 +-
+ .../src/tlvf/wfa_map/tlvSteeringBTMReport.cpp |  35 ++++--
+ .../src/tlvf/wfa_map/tlvSteeringPolicy.cpp    |  76 +++++++----
+ .../src/tlvf/wfa_map/tlvSteeringRequest.cpp   |  52 +++++---
+ .../AssociationRequestFrame/AssocReqFrame.h   |   3 +-
+ framework/tlvf/tlvf.py                        | 119 +++++++++++++-----
+ .../association_frame/cQosCapability.yaml     |   2 +-
+ .../tlvBackhaulStaRadioCapabilities.yaml      |   1 +
+ .../tlvf/wfa_map/tlvSteeringBTMReport.yaml    |   5 +-
+ 20 files changed, 369 insertions(+), 127 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+index 46ec09436..399b5696b 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+@@ -754,6 +754,7 @@ bool Monitor::monitor_fsm()
+                 if (!m_event_loop->register_handlers(m_arp_fd, arp_events_handlers)) {
+                     LOG(WARNING) << "Unable to register handlers for arp monitor, ignore and "
+                                     "continue without it";
++                    m_arp_fd = beerocks::net::FileDescriptor::invalid_descriptor;
+                     mon_rssi.stop();
+                 }
+             }
+@@ -1188,6 +1189,11 @@ bool Monitor::update_sta_qos_ctrl_params()
+         auto vap_node             = mon_db.vap_get_by_id(sta_node->get_vap_id());
+         auto &sta_qos_ctrl_params = sta_node->get_qos_ctrl_params();
+ 
++        if (!vap_node) {
++            LOG(ERROR) << "Invalid VAP for STA = " << sta_mac;
++            return false;
++        }
++
+         // Update the stats
+         if (!mon_wlan_hal->update_station_qos_control_params(vap_node->get_iface(), sta_mac,
+                                                              sta_qos_ctrl_params)) {
+@@ -1229,6 +1235,11 @@ bool Monitor::update_sta_stats(const std::chrono::steady_clock::time_point &time
+         auto &sta_stats      = sta_node->get_stats();
+         bool is_read_unicast = false;
+ 
++        if (!vap_node) {
++            LOG(WARNING) << "Invalid VAP for STA = " << sta_mac;
++            continue;
++        }
++
+         // Skip stations that were already updated in the current cycle
+         if (sta_stats.last_update_time > m_sta_stats_polling_start_timestamp) {
+             continue;
+@@ -1900,7 +1911,7 @@ void Monitor::handle_cmdu_vs_message(ieee1905_1::CmduMessageRx &cmdu_rx)
+             vap_iface = vap_node->get_iface();
+         }
+ 
+-        int dialog_token;
++        int dialog_token = 0;
+ 
+         // TODO: TEMPORARY CONVERSION!
+         bwl::SBeaconRequest11k bwl_request;
+@@ -1934,7 +1945,10 @@ void Monitor::handle_cmdu_vs_message(ieee1905_1::CmduMessageRx &cmdu_rx)
+         bwl_request.new_ch_center_freq_seg_1 = request->params().new_ch_center_freq_seg_1;
+         bwl_request.reporting_detail         = request->params().reporting_detail;
+ 
+-        mon_wlan_hal->sta_beacon_11k_request(vap_iface, bwl_request, dialog_token);
++        if (!mon_wlan_hal->sta_beacon_11k_request(vap_iface, bwl_request, dialog_token)) {
++            LOG(ERROR) << "sta_beacon_11k_request failed for STA " << sta_mac;
++            return;
++        }
+ 
+         sEvent11k event_11k = {tlvf::mac_to_string(request->params().sta_mac),
+                                tlvf::mac_to_string(request->params().bssid), dialog_token,
+@@ -2362,6 +2376,11 @@ bool Monitor::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+ 
+     case Event::RRM_Channel_Load_Response: {
+ 
++        if (!data) {
++            LOG(ERROR) << "RRM_Channel_Load_Response without data";
++            return false;
++        }
++
+         auto hal_data = static_cast<bwl::SStaChannelLoadResponse11k *>(data);
+ 
+         auto response = message_com::create_vs_message<
+@@ -2396,6 +2415,11 @@ bool Monitor::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+ 
+     case Event::RRM_Beacon_Request_Status: {
+ 
++        if (!data) {
++            LOG(ERROR) << "RRM_Beacon_Request_Status without data";
++            return false;
++        }
++
+         auto hal_data = static_cast<bwl::SBeaconRequestStatus11k *>(data);
+         auto sta_mac  = tlvf::mac_to_string((sMacAddr &)hal_data->sta_mac);
+ 
+@@ -2604,6 +2628,10 @@ bool Monitor::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+ 
+         // If event == Channel_Scan_New_Results_Ready do nothing since is_dump's default is 0
+         if (event == Event::Channel_Scan_Dump_Result) {
++            if (!data) {
++                LOG(ERROR) << "Channel_Scan_Dump_Result without data";
++                return false;
++            }
+             auto msg = static_cast<bwl::sCHANNEL_SCAN_RESULTS_NOTIFICATION *>(data);
+ 
+             auto &in_result  = msg->channel_scan_results;
+@@ -2692,6 +2720,10 @@ bool Monitor::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+     } break;
+     case Event::STA_Connected: {
+         LOG(TRACE) << "Received STA_Connected event";
++        if (!data) {
++            LOG(ERROR) << "STA_Connected without data";
++            return false;
++        }
+         auto msg = static_cast<bwl::sACTION_MONITOR_CLIENT_ASSOCIATED_NOTIFICATION *>(data);
+ 
+         auto sta_mac = tlvf::mac_to_string(msg->mac);
+@@ -2759,6 +2791,10 @@ bool Monitor::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+     }
+     case Event::STA_Disconnected: {
+         LOG(TRACE) << "Received STA_Disconnected event";
++        if (!data) {
++            LOG(ERROR) << "STA_Disconnected without data";
++            return false;
++        }
+         auto msg = static_cast<bwl::sACTION_MONITOR_CLIENT_DISCONNECTED_NOTIFICATION *>(data);
+         auto mac = tlvf::mac_to_string(msg->mac);
+ 
+@@ -2770,6 +2806,10 @@ bool Monitor::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+ 
+     case Event::Unassociation_Stations_Stats: {
+         LOG(DEBUG) << " received an internal event of type Event::Unassociation_Stations_Stats";
++        if (!data) {
++            LOG(ERROR) << "Unassociation_Stations_Stats without data";
++            return false;
++        }
+         auto msg = static_cast<bwl::sUnassociatedStationsStats *>(data);
+ 
+         auto response = message_com::create_vs_message<
+@@ -2937,6 +2977,10 @@ void Monitor::send_heartbeat()
+ 
+ void Monitor::update_vaps_in_db()
+ {
++    if (!mon_wlan_hal) {
++        LOG(ERROR) << "HAL is not initialized";
++        return;
++    }
+     if (!mon_wlan_hal->refresh_vaps_info()) {
+         LOG(ERROR) << "Failed to refresh vaps info!";
+         return;
+diff --git a/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_apmanager.cpp b/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_apmanager.cpp
+index 819af1f74..0e7fccc01 100644
+--- a/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_apmanager.cpp
++++ b/common/beerocks/tlvf/AutoGenerated/src/beerocks/tlvf/beerocks_message_apmanager.cpp
+@@ -12,6 +12,8 @@
+ 
+ #include <beerocks/tlvf/beerocks_message_apmanager.h>
+ #include <tlvf/tlvflogging.h>
++#include <cstring>
++#include <limits>
+ 
+ using namespace beerocks_message;
+ 
+@@ -2554,18 +2556,23 @@ std::shared_ptr<cAffiliatedSta> cACTION_APMANAGER_CLIENT_ASSOCIATED_NOTIFICATION
+         TLVF_LOG(ERROR) << "Not enough available space on buffer";
+         return nullptr;
+     }
+-    m_lock_order_counter__ = 0;
+-    m_lock_allocation__ = true;
+     uint8_t *src = (uint8_t *)m_affiliated_sta;
+     if (m_affiliated_sta_idx__ > 0) {
+         src = (uint8_t *)m_affiliated_sta_vector[m_affiliated_sta_idx__ - 1]->getBuffPtr();
+     }
+     if (!m_parse__) {
+         uint8_t *dst = src + len;
+-        size_t move_length = getBuffRemainingBytes(src) - len;
+-        std::copy_n(src, move_length, dst);
++        size_t remaining = getBuffRemainingBytes(src);
++        if (remaining < len) {
++            TLVF_LOG(ERROR) << "Not enough available space on buffer - can't shift data";
++            return nullptr;
++        }
++        size_t move_length = remaining - len;
++        std::memmove(dst, src, move_length);
+     }
+     m_association_frame = (uint8_t *)((uint8_t *)(m_association_frame) + len);
++    m_lock_order_counter__ = 0;
++    m_lock_allocation__ = true;
+     return std::make_shared<cAffiliatedSta>(src, getBuffRemainingBytes(src), m_parse__);
+ }
+ 
+@@ -2590,15 +2597,15 @@ bool cACTION_APMANAGER_CLIENT_ASSOCIATED_NOTIFICATION::add_affiliated_sta(std::s
+         TLVF_LOG(ERROR) << "Not enough available space on buffer";
+         return false;
+     }
+-    m_affiliated_sta_idx__++;
+-    if (!m_parse__) { (*m_num_affiliated_sta)++; }
+     size_t len = ptr->getLen();
+-    m_association_frame = (uint8_t *)((uint8_t *)(m_association_frame) + len - ptr->get_initial_size());
+-    m_affiliated_sta_vector.push_back(ptr);
+     if (!buffPtrIncrementSafe(len)) {
+         LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << len << ") Failed!";
+         return false;
+     }
++    m_affiliated_sta_idx__++;
++    if (!m_parse__) { (*m_num_affiliated_sta)++; }
++    m_association_frame = (uint8_t *)((uint8_t *)(m_association_frame) + len - ptr->get_initial_size());
++    m_affiliated_sta_vector.push_back(ptr);
+     m_lock_allocation__ = false;
+     return true;
+ }
+@@ -3438,26 +3445,36 @@ bool cACTION_APMANAGER_CLIENT_ALLOW_REQUEST::alloc_mac(size_t count) {
+         TLVF_LOG(ERROR) << "Out of order allocation for variable length list mac, abort!";
+         return false;
+     }
++    if (count >
++        (static_cast<size_t>(std::numeric_limits<uint8_t>::max()) - *m_mac_list_size)) {
++        TLVF_LOG(ERROR) << "mac_list_size overflow";
++        return false;
++    }
+     size_t len = sizeof(sMacAddr) * count;
+     if(getBuffRemainingBytes() < len )  {
+         TLVF_LOG(ERROR) << "Not enough available space on buffer - can't allocate";
+         return false;
+     }
+-    m_lock_order_counter__ = 0;
+     uint8_t *src = (uint8_t *)&m_mac[*m_mac_list_size];
+     uint8_t *dst = src + len;
+-    if (!m_parse__) {
+-        size_t move_length = getBuffRemainingBytes(src) - len;
+-        std::copy_n(src, move_length, dst);
+-    }
+-    m_bssid = (sMacAddr *)((uint8_t *)(m_bssid) + len);
+-    m_mac_idx__ += count;
+-    *m_mac_list_size += count;
+     if (!buffPtrIncrementSafe(len)) {
+         LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << len << ") Failed!";
+         return false;
+     }
+-    if (!m_parse__) { 
++    if (!m_parse__) {
++        size_t remaining = getBuffRemainingBytes(src);
++        if (remaining < len) {
++            TLVF_LOG(ERROR) << "Not enough available space on buffer - can't shift data";
++            return false;
++        }
++        size_t move_length = remaining - len;
++        std::memmove(dst, src, move_length);
++    }
++    m_bssid = (sMacAddr *)((uint8_t *)(m_bssid) + len);
++    m_lock_order_counter__ = 0;
++    m_mac_idx__ += count;
++    *m_mac_list_size = static_cast<uint8_t>(*m_mac_list_size + count);
++    if (!m_parse__) {
+         for (size_t i = m_mac_idx__ - count; i < m_mac_idx__; i++) { m_mac[i].struct_init(); }
+     }
+     return true;
+@@ -4302,17 +4319,30 @@ bool cACTION_APMANAGER_WIFI_CREDENTIALS_UPDATE_REQUEST::alloc_bridge_ifname(size
+         TLVF_LOG(ERROR) << "Out of order allocation for variable length list bridge_ifname, abort!";
+         return false;
+     }
++    if (count >
++        (static_cast<size_t>(std::numeric_limits<uint8_t>::max()) - *m_bridge_ifname_length)) {
++        TLVF_LOG(ERROR) << "bridge_ifname_length overflow";
++        return false;
++    }
+     size_t len = sizeof(char) * count;
+     if(getBuffRemainingBytes() < len )  {
+         TLVF_LOG(ERROR) << "Not enough available space on buffer - can't allocate";
+         return false;
+     }
+-    m_lock_order_counter__ = 0;
+     uint8_t *src = (uint8_t *)&m_bridge_ifname[*m_bridge_ifname_length];
+     uint8_t *dst = src + len;
++    if (!buffPtrIncrementSafe(len)) {
++        LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << len << ") Failed!";
++        return false;
++    }
+     if (!m_parse__) {
+-        size_t move_length = getBuffRemainingBytes(src) - len;
+-        std::copy_n(src, move_length, dst);
++        size_t remaining = getBuffRemainingBytes(src);
++        if (remaining < len) {
++            TLVF_LOG(ERROR) << "Not enough available space on buffer - can't shift data";
++            return false;
++        }
++        size_t move_length = remaining - len;
++        std::memmove(dst, src, move_length);
+     }
+     m_wifi_credentials_size = (uint8_t *)((uint8_t *)(m_wifi_credentials_size) + len);
+     m_wifi_credentials = (WSC::cEncryptedSettingsPayload *)((uint8_t *)(m_wifi_credentials) + len);
+@@ -4320,12 +4350,9 @@ bool cACTION_APMANAGER_WIFI_CREDENTIALS_UPDATE_REQUEST::alloc_bridge_ifname(size
+     m_dpp_bss_credentials = (cDppBssCredentials *)((uint8_t *)(m_dpp_bss_credentials) + len);
+     m_dpp_netaccesskey_length = (uint16_t *)((uint8_t *)(m_dpp_netaccesskey_length) + len);
+     m_dpp_netaccesskey = (uint8_t *)((uint8_t *)(m_dpp_netaccesskey) + len);
++    m_lock_order_counter__ = 0;
+     m_bridge_ifname_idx__ += count;
+     *m_bridge_ifname_length += count;
+-    if (!buffPtrIncrementSafe(len)) {
+-        LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << len << ") Failed!";
+-        return false;
+-    }
+     return true;
+ }
+ 
+@@ -4356,21 +4383,26 @@ std::shared_ptr<WSC::cEncryptedSettingsPayload> cACTION_APMANAGER_WIFI_CREDENTIA
+         TLVF_LOG(ERROR) << "Not enough available space on buffer";
+         return nullptr;
+     }
+-    m_lock_order_counter__ = 1;
+-    m_lock_allocation__ = true;
+     uint8_t *src = (uint8_t *)m_wifi_credentials;
+     if (m_wifi_credentials_idx__ > 0) {
+         src = (uint8_t *)m_wifi_credentials_vector[m_wifi_credentials_idx__ - 1]->getBuffPtr();
+     }
+     if (!m_parse__) {
+         uint8_t *dst = src + len;
+-        size_t move_length = getBuffRemainingBytes(src) - len;
+-        std::copy_n(src, move_length, dst);
++        size_t remaining = getBuffRemainingBytes(src);
++        if (remaining < len) {
++            TLVF_LOG(ERROR) << "Not enough available space on buffer";
++            return nullptr;
++        }
++        size_t move_length = remaining - len;
++        std::memmove(dst, src, move_length);
+     }
+     m_dpp_bss_credentials_size = (uint8_t *)((uint8_t *)(m_dpp_bss_credentials_size) + len);
+     m_dpp_bss_credentials = (cDppBssCredentials *)((uint8_t *)(m_dpp_bss_credentials) + len);
+     m_dpp_netaccesskey_length = (uint16_t *)((uint8_t *)(m_dpp_netaccesskey_length) + len);
+     m_dpp_netaccesskey = (uint8_t *)((uint8_t *)(m_dpp_netaccesskey) + len);
++    m_lock_order_counter__ = 1;
++    m_lock_allocation__ = true;
+     return std::make_shared<WSC::cEncryptedSettingsPayload>(src, getBuffRemainingBytes(src), m_parse__);
+ }
+ 
+@@ -6049,5 +6081,3 @@ bool cACTION_APMANAGER_BSS_SET_QOS_MANAGEMENT_REQUEST::init()
+     if (m_parse__) { class_swap(); }
+     return true;
+ }
+-
+-
+diff --git a/controller/src/beerocks/master/tasks/client_association_task.cpp b/controller/src/beerocks/master/tasks/client_association_task.cpp
+index 222fe31ed..14271e6f2 100644
+--- a/controller/src/beerocks/master/tasks/client_association_task.cpp
++++ b/controller/src/beerocks/master/tasks/client_association_task.cpp
+@@ -259,6 +259,10 @@ bool client_association_task::dm_add_sta_association_event(const sMacAddr &sta_m
+ {
+     // Add AssociationEventData data model object
+     auto station = m_database.get_station(sta_mac);
++    if (!station) {
++        LOG(ERROR) << "station " << sta_mac << " not found";
++        return false;
++    }
+     station->assoc_event_path =
+         m_database.dm_add_association_event(bssid, sta_mac, station->assoc_timestamp);
+ 
+diff --git a/controller/src/beerocks/master/tasks/client_steering_task.cpp b/controller/src/beerocks/master/tasks/client_steering_task.cpp
+index fb58a8bb5..520e4a741 100644
+--- a/controller/src/beerocks/master/tasks/client_steering_task.cpp
++++ b/controller/src/beerocks/master/tasks/client_steering_task.cpp
+@@ -613,8 +613,12 @@ void client_steering_task::handle_event(int event_type, void *obj)
+             finish();
+         }
+     } else if (event_type == BTM_REPORT_RECEIVED) {
++        if (!obj) {
++            TASK_LOG(ERROR) << "BTM report event payload is null";
++            return;
++        }
+         m_btm_report_received = true;
+-        m_status_code         = *(uint8_t *)obj;
++        m_status_code         = *static_cast<uint8_t *>(obj);
+ 
+         auto bss = m_database.get_bss(tlvf::mac_from_string(m_target_bssid));
+         if (!bss) {
+diff --git a/controller/src/beerocks/master/tasks/load_balancer_task.cpp b/controller/src/beerocks/master/tasks/load_balancer_task.cpp
+index 89958e462..117d17318 100644
+--- a/controller/src/beerocks/master/tasks/load_balancer_task.cpp
++++ b/controller/src/beerocks/master/tasks/load_balancer_task.cpp
+@@ -373,6 +373,10 @@ void load_balancer_task::work()
+                 chosen_client_bytes * hostap_duration_ms / ap_total_duration_ms;
+ 
+             //int predicted_chosen_client_airtime_ms = 1000 * (double(normalized_chosen_client_bytes) / (1e+6*predicted_chosen_client_phy_rate));
++            if (hostap_duration_ms <= 0) {
++                TASK_LOG(ERROR) << "invalid hostap measurement duration for " << hostap;
++                continue;
++            }
+             int predicted_chosen_client_bitrate =
+                 normalized_chosen_client_bytes / hostap_duration_ms;
+ 
+diff --git a/controller/src/beerocks/master/tasks/optimal_path_task.cpp b/controller/src/beerocks/master/tasks/optimal_path_task.cpp
+index b13f69e8f..402f00e03 100644
+--- a/controller/src/beerocks/master/tasks/optimal_path_task.cpp
++++ b/controller/src/beerocks/master/tasks/optimal_path_task.cpp
+@@ -2012,6 +2012,10 @@ bool optimal_path_task::is_delay_match_window(const std::set<std::string> &temp_
+         res = false;
+     }
+ 
++    if (windows_size == 0) {
++        TASK_LOG(ERROR) << "measurement window size is zero";
++        return false;
++    }
+     float actual_max_delay_percent = (float(actual_max_delay) / float(windows_size)) * 100;
+     TASK_LOG(DEBUG) << "actual_max_delay_percent =" << float(actual_max_delay_percent);
+     //calculating the delay for the rest of the ire's
+diff --git a/framework/external/enumAutoPrint/enum_auto_print.py b/framework/external/enumAutoPrint/enum_auto_print.py
+index 9385a9af8..4319907f4 100755
+--- a/framework/external/enumAutoPrint/enum_auto_print.py
++++ b/framework/external/enumAutoPrint/enum_auto_print.py
+@@ -263,8 +263,8 @@ def add_generated_code(enum_metadata: EnumMetadata, base_indentation: int, lines
+             getIndentation(1), getEnumClass(), enum_value, spacesPad(enum_value)))
+ 
+     lines_out.append('{0}}}\n'.format(getIndentation(1)))
+-    lines_out.append('{0}static std::string out_str = std::to_string(int(enum_value));\n'.format(
+-        getIndentation(1)))
++    lines_out.append('{0}static thread_local std::string out_str;\n'.format(getIndentation(1)))
++    lines_out.append('{0}out_str = std::to_string(int(enum_value));\n'.format(getIndentation(1)))
+     lines_out.append('{0}return out_str.c_str();\n{1}}}\n'.format(
+         getIndentation(1), getIndentation(0)))
+     lines_out.append('{0}{1}{2}std::ostream &operator<<(std::ostream &out, {3} value) {{ '
+diff --git a/framework/tlvf/AutoGenerated/include/tlvf/association_frame/eExtElementID.h b/framework/tlvf/AutoGenerated/include/tlvf/association_frame/eExtElementID.h
+index 825e94f2f..829e2823d 100644
+--- a/framework/tlvf/AutoGenerated/include/tlvf/association_frame/eExtElementID.h
++++ b/framework/tlvf/AutoGenerated/include/tlvf/association_frame/eExtElementID.h
+@@ -26,7 +26,8 @@ static const char *eExtElementID_str(eExtElementID enum_value) {
+     switch (enum_value) {
+     case EXTID_HE_CAPABILITIES: return "EXTID_HE_CAPABILITIES";
+     }
+-    static std::string out_str = std::to_string(int(enum_value));
++    static thread_local std::string out_str;
++    out_str = std::to_string(int(enum_value));
+     return out_str.c_str();
+ }
+ inline std::ostream &operator<<(std::ostream &out, eExtElementID value) { return out << eExtElementID_str(value); }
+diff --git a/framework/tlvf/AutoGenerated/src/tlvf/association_frame/cQosCapability.cpp b/framework/tlvf/AutoGenerated/src/tlvf/association_frame/cQosCapability.cpp
+index a57138371..c3ba01812 100644
+--- a/framework/tlvf/AutoGenerated/src/tlvf/association_frame/cQosCapability.cpp
++++ b/framework/tlvf/AutoGenerated/src/tlvf/association_frame/cQosCapability.cpp
+@@ -86,7 +86,7 @@ bool cQosCapability::init()
+         return false;
+     }
+     m_type = reinterpret_cast<eElementID*>(m_buff_ptr__);
+-    if (!m_parse__) *m_type = ID_RSN;
++    if (!m_parse__) *m_type = ID_QOS_CAPABILITY;
+     if (!buffPtrIncrementSafe(sizeof(eElementID))) {
+         LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << sizeof(eElementID) << ") Failed!";
+         return false;
+diff --git a/framework/tlvf/AutoGenerated/src/tlvf/association_frame/cStaHeCapability.cpp b/framework/tlvf/AutoGenerated/src/tlvf/association_frame/cStaHeCapability.cpp
+index ecfd5140e..677289797 100644
+--- a/framework/tlvf/AutoGenerated/src/tlvf/association_frame/cStaHeCapability.cpp
++++ b/framework/tlvf/AutoGenerated/src/tlvf/association_frame/cStaHeCapability.cpp
+@@ -454,7 +454,12 @@ bool cStaHeCapability::init()
+         auto swap_len = *m_length;
+         tlvf_swap((sizeof(swap_len) * 8), reinterpret_cast<uint8_t*>(&swap_len));
+         size_t len = swap_len;
+-        len -= (m_buff_ptr__ - sizeof(*m_type) - sizeof(*m_length) - m_buff__);
++        size_t consumed = m_buff_ptr__ - sizeof(*m_type) - sizeof(*m_length) - m_buff__;
++        if (len < consumed) {
++            LOG(ERROR) << "Invalid HE capability length: shorter than parsed fields";
++            return false;
++        }
++        len -= consumed;
+         m_ppe_thresholds_idx__ = len/sizeof(uint8_t);
+         if (!buffPtrIncrementSafe(len)) {
+             LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << len << ") Failed!";
+diff --git a/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvBackhaulStaRadioCapabilities.cpp b/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvBackhaulStaRadioCapabilities.cpp
+index 0f1d4495a..e1ab7c673 100644
+--- a/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvBackhaulStaRadioCapabilities.cpp
++++ b/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvBackhaulStaRadioCapabilities.cpp
+@@ -12,6 +12,7 @@
+ 
+ #include <tlvf/wfa_map/tlvBackhaulStaRadioCapabilities.h>
+ #include <tlvf/tlvflogging.h>
++#include <cstring>
+ 
+ using namespace wfa_map;
+ 
+@@ -51,16 +52,22 @@ bool tlvBackhaulStaRadioCapabilities::alloc_sta_mac() {
+         TLVF_LOG(ERROR) << "Not enough available space on buffer - can't allocate";
+         return false;
+     }
+-    uint8_t *src = (uint8_t *)m_sta_mac;
+-    uint8_t *dst = src + len;
+-    if (!m_parse__) {
+-        size_t move_length = getBuffRemainingBytes(src) - len;
+-        std::copy_n(src, move_length, dst);
+-    }
+     if (!buffPtrIncrementSafe(len)) {
+         LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << len << ") Failed!";
+         return false;
+     }
++    uint8_t *src = (uint8_t *)m_sta_mac;
++    uint8_t *dst = src + len;
++    if (!m_parse__) {
++        size_t remaining = getBuffRemainingBytes(src);
++        if (remaining < len) {
++            TLVF_LOG(ERROR) << "Not enough available space on buffer - can't shift data";
++            return false;
++        }
++        size_t move_length = remaining - len;
++        std::memmove(dst, src, move_length);
++    }
++    if (!m_parse__) { m_sta_mac->struct_init(); }
+     if(m_length){ (*m_length) += len; }
+     m_sta_mac_allocated = true;
+     return true;
+@@ -156,17 +163,17 @@ bool tlvBackhaulStaRadioCapabilities::init()
+     if(m_length && !m_parse__){ (*m_length) += sizeof(sMacAddr); }
+     if (!m_parse__) { m_ruid->struct_init(); }
+     m_sta_mac_included = reinterpret_cast<eStaMacIncluded*>(m_buff_ptr__);
++    if (!m_parse__) *m_sta_mac_included = FIELD_NOT_PRESENT;
+     if (!buffPtrIncrementSafe(sizeof(eStaMacIncluded))) {
+         LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << sizeof(eStaMacIncluded) << ") Failed!";
+         return false;
+     }
+     if(m_length && !m_parse__){ (*m_length) += sizeof(eStaMacIncluded); }
+     m_sta_mac = reinterpret_cast<sMacAddr*>(m_buff_ptr__);
+-    if ((*m_sta_mac_included == eStaMacIncluded::FIELD_PRESENT) && !buffPtrIncrementSafe(sizeof(sMacAddr))) {
++    if (m_parse__ && (*m_sta_mac_included == eStaMacIncluded::FIELD_PRESENT) && !buffPtrIncrementSafe(sizeof(sMacAddr))) {
+         LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << sizeof(sMacAddr) << ") Failed!";
+         return false;
+     }
+-    if (!m_parse__) { m_sta_mac->struct_init(); }
+     if (m_parse__) { class_swap(); }
+     if (m_parse__) {
+         if (*m_type != eTlvTypeMap::TLV_BACKHAUL_STA_RADIO_CAPABILITIES) {
+@@ -177,4 +184,3 @@ bool tlvBackhaulStaRadioCapabilities::init()
+     return true;
+ }
+ 
+-
+diff --git a/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvDppBootstrappingUriNotification.cpp b/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvDppBootstrappingUriNotification.cpp
+index 23b4865d1..81a59fbbc 100644
+--- a/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvDppBootstrappingUriNotification.cpp
++++ b/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvDppBootstrappingUriNotification.cpp
+@@ -195,7 +195,12 @@ bool tlvDppBootstrappingUriNotification::init()
+         auto swap_len = *m_length;
+         tlvf_swap((sizeof(swap_len) * 8), reinterpret_cast<uint8_t*>(&swap_len));
+         size_t len = swap_len;
+-        len -= (m_buff_ptr__ - sizeof(*m_type) - sizeof(*m_length) - m_buff__);
++        size_t consumed = m_buff_ptr__ - sizeof(*m_type) - sizeof(*m_length) - m_buff__;
++        if (len < consumed) {
++            LOG(ERROR) << "Invalid DPP URI length: shorter than parsed fields";
++            return false;
++        }
++        len -= consumed;
+         m_dpp_uri_idx__ = len/sizeof(char);
+         if (!buffPtrIncrementSafe(len)) {
+             LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << len << ") Failed!";
+diff --git a/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvSteeringBTMReport.cpp b/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvSteeringBTMReport.cpp
+index acd0fdffe..833acff95 100644
+--- a/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvSteeringBTMReport.cpp
++++ b/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvSteeringBTMReport.cpp
+@@ -12,6 +12,7 @@
+ 
+ #include <tlvf/wfa_map/tlvSteeringBTMReport.h>
+ #include <tlvf/tlvflogging.h>
++#include <cstring>
+ 
+ using namespace wfa_map;
+ 
+@@ -55,16 +56,22 @@ bool tlvSteeringBTMReport::alloc_target_bssid() {
+         TLVF_LOG(ERROR) << "Not enough available space on buffer - can't allocate";
+         return false;
+     }
+-    uint8_t *src = (uint8_t *)m_target_bssid;
+-    uint8_t *dst = src + len;
+-    if (!m_parse__) {
+-        size_t move_length = getBuffRemainingBytes(src) - len;
+-        std::copy_n(src, move_length, dst);
+-    }
+     if (!buffPtrIncrementSafe(len)) {
+         LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << len << ") Failed!";
+         return false;
+     }
++    uint8_t *src = (uint8_t *)m_target_bssid;
++    uint8_t *dst = src + len;
++    if (!m_parse__) {
++        size_t remaining = getBuffRemainingBytes(src);
++        if (remaining < len) {
++            TLVF_LOG(ERROR) << "Not enough available space on buffer - can't shift data";
++            return false;
++        }
++        size_t move_length = remaining - len;
++        std::memmove(dst, src, move_length);
++    }
++    if (!m_parse__) { m_target_bssid->struct_init(); }
+     if(m_length){ (*m_length) += len; }
+     m_target_bssid_allocated = true;
+     return true;
+@@ -170,19 +177,30 @@ bool tlvSteeringBTMReport::init()
+     if(m_length && !m_parse__){ (*m_length) += sizeof(sMacAddr); }
+     if (!m_parse__) { m_sta_mac->struct_init(); }
+     m_btm_status_code = reinterpret_cast<eBTMStatusCode*>(m_buff_ptr__);
++    if (!m_parse__) *m_btm_status_code = REJECT_UNSPECIFIED;
+     if (!buffPtrIncrementSafe(sizeof(eBTMStatusCode))) {
+         LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << sizeof(eBTMStatusCode) << ") Failed!";
+         return false;
+     }
+     if(m_length && !m_parse__){ (*m_length) += sizeof(eBTMStatusCode); }
+     m_target_bssid = reinterpret_cast<sMacAddr*>(m_buff_ptr__);
+-    if ((*m_btm_status_code == eBTMStatusCode::ACCEPT) && !buffPtrIncrementSafe(sizeof(sMacAddr))) {
++    if (m_parse__ && (*m_btm_status_code == eBTMStatusCode::ACCEPT) &&
++        !buffPtrIncrementSafe(sizeof(sMacAddr))) {
+         LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << sizeof(sMacAddr) << ") Failed!";
+         return false;
+     }
+-    if (!m_parse__) { m_target_bssid->struct_init(); }
+     if (m_parse__) { class_swap(); }
+     if (m_parse__) {
++        const size_t mandatory_len = get_initial_size() - sizeof(*m_type) - sizeof(*m_length);
++        if (*m_length < mandatory_len) {
++            TLVF_LOG(ERROR) << "TLV length too short";
++            return false;
++        }
++        if (*m_btm_status_code == eBTMStatusCode::ACCEPT &&
++            *m_length < mandatory_len + sizeof(sMacAddr)) {
++            TLVF_LOG(ERROR) << "TLV length too short for target_bssid";
++            return false;
++        }
+         if (*m_type != eTlvTypeMap::TLV_STEERING_BTM_REPORT) {
+             TLVF_LOG(ERROR) << "TLV type mismatch. Expected value: " << int(eTlvTypeMap::TLV_STEERING_BTM_REPORT) << ", received value: " << int(*m_type);
+             return false;
+@@ -191,4 +209,3 @@ bool tlvSteeringBTMReport::init()
+     return true;
+ }
+ 
+-
+diff --git a/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvSteeringPolicy.cpp b/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvSteeringPolicy.cpp
+index 12d7fc4ac..de13910fd 100644
+--- a/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvSteeringPolicy.cpp
++++ b/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvSteeringPolicy.cpp
+@@ -12,6 +12,8 @@
+ 
+ #include <tlvf/wfa_map/tlvSteeringPolicy.h>
+ #include <tlvf/tlvflogging.h>
++#include <cstring>
++#include <limits>
+ 
+ using namespace wfa_map;
+ 
+@@ -51,28 +53,38 @@ bool tlvSteeringPolicy::alloc_local_steering_disallowed_sta_list(size_t count) {
+         TLVF_LOG(ERROR) << "Out of order allocation for variable length list local_steering_disallowed_sta_list, abort!";
+         return false;
+     }
++    if (count > (static_cast<size_t>(std::numeric_limits<uint8_t>::max()) -
++                 *m_local_steering_disallowed_sta_list_length)) {
++        TLVF_LOG(ERROR) << "local_steering_disallowed_sta_list_length overflow";
++        return false;
++    }
+     size_t len = sizeof(sMacAddr) * count;
+     if(getBuffRemainingBytes() < len )  {
+         TLVF_LOG(ERROR) << "Not enough available space on buffer - can't allocate";
+         return false;
+     }
+-    m_lock_order_counter__ = 0;
++    if (!buffPtrIncrementSafe(len)) {
++        LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << len << ") Failed!";
++        return false;
++    }
+     uint8_t *src = (uint8_t *)&m_local_steering_disallowed_sta_list[*m_local_steering_disallowed_sta_list_length];
+     uint8_t *dst = src + len;
+     if (!m_parse__) {
+-        size_t move_length = getBuffRemainingBytes(src) - len;
+-        std::copy_n(src, move_length, dst);
++        size_t remaining = getBuffRemainingBytes(src);
++        if (remaining < len) {
++            TLVF_LOG(ERROR) << "Not enough available space on buffer - can't shift data";
++            return false;
++        }
++        size_t move_length = remaining - len;
++        std::memmove(dst, src, move_length);
+     }
+     m_btm_steering_disallowed_sta_list_length = (uint8_t *)((uint8_t *)(m_btm_steering_disallowed_sta_list_length) + len);
+     m_btm_steering_disallowed_sta_list = (sMacAddr *)((uint8_t *)(m_btm_steering_disallowed_sta_list) + len);
+     m_radio_ap_control_policy_list_length = (uint8_t *)((uint8_t *)(m_radio_ap_control_policy_list_length) + len);
+     m_radio_ap_control_policy_list = (sRadioApControlPolicy *)((uint8_t *)(m_radio_ap_control_policy_list) + len);
++    m_lock_order_counter__ = 0;
+     m_local_steering_disallowed_sta_list_idx__ += count;
+     *m_local_steering_disallowed_sta_list_length += count;
+-    if (!buffPtrIncrementSafe(len)) {
+-        LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << len << ") Failed!";
+-        return false;
+-    }
+     if(m_length){ (*m_length) += len; }
+     if (!m_parse__) { 
+         for (size_t i = m_local_steering_disallowed_sta_list_idx__ - count; i < m_local_steering_disallowed_sta_list_idx__; i++) { m_local_steering_disallowed_sta_list[i].struct_init(); }
+@@ -98,26 +110,36 @@ bool tlvSteeringPolicy::alloc_btm_steering_disallowed_sta_list(size_t count) {
+         TLVF_LOG(ERROR) << "Out of order allocation for variable length list btm_steering_disallowed_sta_list, abort!";
+         return false;
+     }
++    if (count > (static_cast<size_t>(std::numeric_limits<uint8_t>::max()) -
++                 *m_btm_steering_disallowed_sta_list_length)) {
++        TLVF_LOG(ERROR) << "btm_steering_disallowed_sta_list_length overflow";
++        return false;
++    }
+     size_t len = sizeof(sMacAddr) * count;
+     if(getBuffRemainingBytes() < len )  {
+         TLVF_LOG(ERROR) << "Not enough available space on buffer - can't allocate";
+         return false;
+     }
+-    m_lock_order_counter__ = 1;
++    if (!buffPtrIncrementSafe(len)) {
++        LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << len << ") Failed!";
++        return false;
++    }
+     uint8_t *src = (uint8_t *)&m_btm_steering_disallowed_sta_list[*m_btm_steering_disallowed_sta_list_length];
+     uint8_t *dst = src + len;
+     if (!m_parse__) {
+-        size_t move_length = getBuffRemainingBytes(src) - len;
+-        std::copy_n(src, move_length, dst);
++        size_t remaining = getBuffRemainingBytes(src);
++        if (remaining < len) {
++            TLVF_LOG(ERROR) << "Not enough available space on buffer - can't shift data";
++            return false;
++        }
++        size_t move_length = remaining - len;
++        std::memmove(dst, src, move_length);
+     }
+     m_radio_ap_control_policy_list_length = (uint8_t *)((uint8_t *)(m_radio_ap_control_policy_list_length) + len);
+     m_radio_ap_control_policy_list = (sRadioApControlPolicy *)((uint8_t *)(m_radio_ap_control_policy_list) + len);
++    m_lock_order_counter__ = 1;
+     m_btm_steering_disallowed_sta_list_idx__ += count;
+     *m_btm_steering_disallowed_sta_list_length += count;
+-    if (!buffPtrIncrementSafe(len)) {
+-        LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << len << ") Failed!";
+-        return false;
+-    }
+     if(m_length){ (*m_length) += len; }
+     if (!m_parse__) { 
+         for (size_t i = m_btm_steering_disallowed_sta_list_idx__ - count; i < m_btm_steering_disallowed_sta_list_idx__; i++) { m_btm_steering_disallowed_sta_list[i].struct_init(); }
+@@ -143,24 +165,34 @@ bool tlvSteeringPolicy::alloc_radio_ap_control_policy_list(size_t count) {
+         TLVF_LOG(ERROR) << "Out of order allocation for variable length list radio_ap_control_policy_list, abort!";
+         return false;
+     }
++    if (count > (static_cast<size_t>(std::numeric_limits<uint8_t>::max()) -
++                 *m_radio_ap_control_policy_list_length)) {
++        TLVF_LOG(ERROR) << "radio_ap_control_policy_list_length overflow";
++        return false;
++    }
+     size_t len = sizeof(sRadioApControlPolicy) * count;
+     if(getBuffRemainingBytes() < len )  {
+         TLVF_LOG(ERROR) << "Not enough available space on buffer - can't allocate";
+         return false;
+     }
+-    m_lock_order_counter__ = 2;
++    if (!buffPtrIncrementSafe(len)) {
++        LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << len << ") Failed!";
++        return false;
++    }
+     uint8_t *src = (uint8_t *)&m_radio_ap_control_policy_list[*m_radio_ap_control_policy_list_length];
+     uint8_t *dst = src + len;
+     if (!m_parse__) {
+-        size_t move_length = getBuffRemainingBytes(src) - len;
+-        std::copy_n(src, move_length, dst);
++        size_t remaining = getBuffRemainingBytes(src);
++        if (remaining < len) {
++            TLVF_LOG(ERROR) << "Not enough available space on buffer - can't shift data";
++            return false;
++        }
++        size_t move_length = remaining - len;
++        std::memmove(dst, src, move_length);
+     }
++    m_lock_order_counter__ = 2;
+     m_radio_ap_control_policy_list_idx__ += count;
+     *m_radio_ap_control_policy_list_length += count;
+-    if (!buffPtrIncrementSafe(len)) {
+-        LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << len << ") Failed!";
+-        return false;
+-    }
+     if(m_length){ (*m_length) += len; }
+     if (!m_parse__) { 
+         for (size_t i = m_radio_ap_control_policy_list_idx__ - count; i < m_radio_ap_control_policy_list_idx__; i++) { m_radio_ap_control_policy_list[i].struct_init(); }
+@@ -290,5 +322,3 @@ bool tlvSteeringPolicy::init()
+     }
+     return true;
+ }
+-
+-
+diff --git a/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvSteeringRequest.cpp b/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvSteeringRequest.cpp
+index 7d9e6bc8b..92049d279 100644
+--- a/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvSteeringRequest.cpp
++++ b/framework/tlvf/AutoGenerated/src/tlvf/wfa_map/tlvSteeringRequest.cpp
+@@ -12,6 +12,8 @@
+ 
+ #include <tlvf/wfa_map/tlvSteeringRequest.h>
+ #include <tlvf/tlvflogging.h>
++#include <cstring>
++#include <limits>
+ 
+ using namespace wfa_map;
+ 
+@@ -67,26 +69,36 @@ bool tlvSteeringRequest::alloc_sta_list(size_t count) {
+         TLVF_LOG(ERROR) << "Out of order allocation for variable length list sta_list, abort!";
+         return false;
+     }
++    if (count >
++        (static_cast<size_t>(std::numeric_limits<uint8_t>::max()) - *m_sta_list_length)) {
++        TLVF_LOG(ERROR) << "sta_list_length overflow";
++        return false;
++    }
+     size_t len = sizeof(sMacAddr) * count;
+     if(getBuffRemainingBytes() < len )  {
+         TLVF_LOG(ERROR) << "Not enough available space on buffer - can't allocate";
+         return false;
+     }
+-    m_lock_order_counter__ = 0;
++    if (!buffPtrIncrementSafe(len)) {
++        LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << len << ") Failed!";
++        return false;
++    }
+     uint8_t *src = (uint8_t *)&m_sta_list[*m_sta_list_length];
+     uint8_t *dst = src + len;
+     if (!m_parse__) {
+-        size_t move_length = getBuffRemainingBytes(src) - len;
+-        std::copy_n(src, move_length, dst);
++        size_t remaining = getBuffRemainingBytes(src);
++        if (remaining < len) {
++            TLVF_LOG(ERROR) << "Not enough available space on buffer - can't shift data";
++            return false;
++        }
++        size_t move_length = remaining - len;
++        std::memmove(dst, src, move_length);
+     }
+     m_target_bssid_list_length = (uint8_t *)((uint8_t *)(m_target_bssid_list_length) + len);
+     m_target_bssid_list = (sTargetBssidInfo *)((uint8_t *)(m_target_bssid_list) + len);
++    m_lock_order_counter__ = 0;
+     m_sta_list_idx__ += count;
+     *m_sta_list_length += count;
+-    if (!buffPtrIncrementSafe(len)) {
+-        LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << len << ") Failed!";
+-        return false;
+-    }
+     if(m_length){ (*m_length) += len; }
+     if (!m_parse__) { 
+         for (size_t i = m_sta_list_idx__ - count; i < m_sta_list_idx__; i++) { m_sta_list[i].struct_init(); }
+@@ -112,24 +124,34 @@ bool tlvSteeringRequest::alloc_target_bssid_list(size_t count) {
+         TLVF_LOG(ERROR) << "Out of order allocation for variable length list target_bssid_list, abort!";
+         return false;
+     }
++    if (count >
++        (static_cast<size_t>(std::numeric_limits<uint8_t>::max()) - *m_target_bssid_list_length)) {
++        TLVF_LOG(ERROR) << "target_bssid_list_length overflow";
++        return false;
++    }
+     size_t len = sizeof(sTargetBssidInfo) * count;
+     if(getBuffRemainingBytes() < len )  {
+         TLVF_LOG(ERROR) << "Not enough available space on buffer - can't allocate";
+         return false;
+     }
+-    m_lock_order_counter__ = 1;
++    if (!buffPtrIncrementSafe(len)) {
++        LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << len << ") Failed!";
++        return false;
++    }
+     uint8_t *src = (uint8_t *)&m_target_bssid_list[*m_target_bssid_list_length];
+     uint8_t *dst = src + len;
+     if (!m_parse__) {
+-        size_t move_length = getBuffRemainingBytes(src) - len;
+-        std::copy_n(src, move_length, dst);
++        size_t remaining = getBuffRemainingBytes(src);
++        if (remaining < len) {
++            TLVF_LOG(ERROR) << "Not enough available space on buffer - can't shift data";
++            return false;
++        }
++        size_t move_length = remaining - len;
++        std::memmove(dst, src, move_length);
+     }
++    m_lock_order_counter__ = 1;
+     m_target_bssid_list_idx__ += count;
+     *m_target_bssid_list_length += count;
+-    if (!buffPtrIncrementSafe(len)) {
+-        LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << len << ") Failed!";
+-        return false;
+-    }
+     if(m_length){ (*m_length) += len; }
+     if (!m_parse__) { 
+         for (size_t i = m_target_bssid_list_idx__ - count; i < m_target_bssid_list_idx__; i++) { m_target_bssid_list[i].struct_init(); }
+@@ -274,5 +296,3 @@ bool tlvSteeringRequest::init()
+     }
+     return true;
+ }
+-
+-
+diff --git a/framework/tlvf/src/include/tlvf/AssociationRequestFrame/AssocReqFrame.h b/framework/tlvf/src/include/tlvf/AssociationRequestFrame/AssocReqFrame.h
+index 83d0bc670..d50837b69 100644
+--- a/framework/tlvf/src/include/tlvf/AssociationRequestFrame/AssocReqFrame.h
++++ b/framework/tlvf/src/include/tlvf/AssociationRequestFrame/AssocReqFrame.h
+@@ -92,7 +92,8 @@ public:
+         case REASSOCIATION_REQUEST: return "REASSOCIATION_REQUEST";
+         case UNKNOWN:               return "UNKNOWN";
+         }
+-        static std::string out_str = std::to_string(int(enum_value));
++        static thread_local std::string out_str;
++        out_str = std::to_string(int(enum_value));
+         return out_str.c_str();
+     }
+     friend inline std::ostream &operator<<(std::ostream &out, eFrameType value) { return out << eFrameType_str(value); }
+diff --git a/framework/tlvf/tlvf.py b/framework/tlvf/tlvf.py
+index 580dbfc80..b803a60bc 100755
+--- a/framework/tlvf/tlvf.py
++++ b/framework/tlvf/tlvf.py
+@@ -189,6 +189,7 @@ class MetaData:
+     KEY_LENGTH_VAR = "_length_var"
+     KEY_LENGTH_MAX = "_length_max"
+     KEY_CONDITION = "_condition"
++    KEY_VALIDATE_TLV_LENGTH = "_validate_tlv_length"
+     CONDITION_USING_MEMBERS = "_using_members"
+     CONDITION_PHRASE = "_phrase"
+     LENGTH_TYPE_INT = "_int_"
+@@ -231,6 +232,7 @@ class MetaData:
+         self.constractor_cpp_lines = []
+         self.alloc_list = []
+         self.condition = None
++        self.validate_tlv_length = False
+ 
+         self.fillMetaData(dict)
+         self.errorCheck(dict)
+@@ -328,6 +330,8 @@ class MetaData:
+                                       if '.' in e else e for e in cond_parts]
+ 
+                         self.condition[MetaData.CONDITION_PHRASE] = ' '.join(cond_parts)
++                elif key == MetaData.KEY_VALIDATE_TLV_LENGTH:
++                    self.validate_tlv_length = value
+                 else:
+                     self.error = self.errPrefix() + "unknown key: %s, dict: %s" % (key, dict)
+ 
+@@ -882,8 +886,9 @@ class TlvF:
+                 lines_cpp.append("m_%s = reinterpret_cast<%s*>(m_%s__);" %
+                                  (param_name, param_type, self.MEMBER_BUFF_PTR))
+                 lines_cpp.append(
+-                    "%sif ((%s) && !buffPtrIncrementSafe(sizeof(%s))) {" % (
++                    "%sif (m_%s__ && (%s) && !buffPtrIncrementSafe(sizeof(%s))) {" % (
+                         self.getIndentation(0),
++                        self.MEMBER_PARSE,
+                         param_meta.condition[MetaData.CONDITION_PHRASE],
+                         param_type))
+                 lines_cpp.append("%sLOG(ERROR) << \"buffPtrIncrementSafe(\" << std::dec << sizeof(%s) << \") Failed!\";" % (
+@@ -892,12 +897,32 @@ class TlvF:
+                 lines_cpp.append("%sreturn false;" % (self.getIndentation(1)))
+                 lines_cpp.append("%s}" % (self.getIndentation(0)))
+ 
+-                if TypeInfo(param_type).type == TypeInfo.STRUCT:
+-                    lines_cpp.append(
+-                        "if (!m_%s__) { m_%s->struct_init(); }" % (self.MEMBER_PARSE, param_name))
+-
+                 self.insertLineCpp(obj_meta.name, self.CODE_CLASS_INIT_FUNC_INSERT, lines_cpp)
+ 
++                if param_meta.validate_tlv_length:
++                    if not obj_meta.is_tlv_class:
++                        self.abort("%s.yaml --> _validate_tlv_length requires a TLV class" %
++                                   self.yaml_fname)
++                    lines_cpp = ["if (m_%s__) {" % self.MEMBER_PARSE]
++                    lines_cpp.append(
++                        "%sconst size_t mandatory_len = get_initial_size() - sizeof(*m_type) - sizeof(*m_length);" %
++                        self.getIndentation(1))
++                    lines_cpp.append("%sif (*m_length < mandatory_len) {" % self.getIndentation(1))
++                    lines_cpp.append('%sTLVF_LOG(ERROR) << "TLV length too short";' %
++                                     self.getIndentation(2))
++                    lines_cpp.append("%sreturn false;" % self.getIndentation(2))
++                    lines_cpp.append("%s}" % self.getIndentation(1))
++                    lines_cpp.append("%sif ((%s) && *m_length < mandatory_len + sizeof(%s)) {" % (
++                        self.getIndentation(1),
++                        param_meta.condition[MetaData.CONDITION_PHRASE], param_type))
++                    lines_cpp.append('%sTLVF_LOG(ERROR) << "TLV length too short for %s";' % (
++                        self.getIndentation(2), param_name))
++                    lines_cpp.append("%sreturn false;" % self.getIndentation(2))
++                    lines_cpp.append("%s}" % self.getIndentation(1))
++                    lines_cpp.append("}")
++                    self.insertLineCpp(obj_meta.name, self.CODE_CLASS_INIT_FUNC_SWAP_INSERT,
++                                       lines_cpp)
++
+                 lines_h = []
+                 lines_cpp = []
+ 
+@@ -1110,8 +1135,16 @@ class TlvF:
+                     lines_cpp.append("%stlvf_swap((sizeof(swap_len) * 8), reinterpret_cast<uint8_t*>(&swap_len));" %
+                                      (self.getIndentation(1)))
+                     lines_cpp.append("%ssize_t len = swap_len;" % (self.getIndentation(1)))
+-                    lines_cpp.append("%slen -= (m_%s__ - sizeof(*m_type) - sizeof(*m_length) - m_%s__);" %
+-                                     (self.getIndentation(1), self.MEMBER_BUFF_PTR, self.MEMBER_BUFF))
++                    lines_cpp.append(
++                        "%ssize_t consumed = m_%s__ - sizeof(*m_type) - sizeof(*m_length) - m_%s__;" %
++                        (self.getIndentation(1), self.MEMBER_BUFF_PTR, self.MEMBER_BUFF))
++                    lines_cpp.append("%sif (len < consumed) {" % self.getIndentation(1))
++                    lines_cpp.append(
++                        '%sTLVF_LOG(ERROR) << "TLV length is shorter than parsed fields";' %
++                        self.getIndentation(2))
++                    lines_cpp.append("%sreturn false;" % self.getIndentation(2))
++                    lines_cpp.append("%s}" % self.getIndentation(1))
++                    lines_cpp.append("%slen -= consumed;" % self.getIndentation(1))
+                 else:
+                     lines_cpp.append("if (m_%s__) {" % self.MEMBER_PARSE)
+                     lines_cpp.append("%ssize_t len = getBuffRemainingBytes();" % (self.getIndentation(1)))
+@@ -1466,12 +1499,12 @@ class TlvF:
+                 '%sTLVF_LOG(ERROR) << "Not enough available space on buffer";' % self.getIndentation(2))
+             lines_cpp.append("%sreturn nullptr;" % self.getIndentation(2))
+             lines_cpp.append("%s}" % self.getIndentation(1))
++            lines_cpp.extend(self.addAllocationMarkersCreate(obj_meta, param_meta,
++                                                             param_length, True))  # Variable length lists support
+             lines_cpp.append("%sm_%s__ = %s;" % (self.getIndentation(
+                 1), self.MEMBER_LOCK_ORDER_COUNTER, param_meta.list_index))
+             lines_cpp.append("%sm_%s__ = true;" %
+                              (self.getIndentation(1), self.MEMBER_LOCK_ALLOCATION))
+-            lines_cpp.extend(self.addAllocationMarkersCreate(obj_meta, param_meta,
+-                                                             param_length, True))  # Variable length lists support
+             if is_dynamic_len:
+                 lines_cpp.append("%sreturn std::make_shared<%s>(getBuffPtr(), getBuffRemainingBytes(), m_%s__);" % (
+                     self.getIndentation(1), param_type, self.MEMBER_PARSE))
+@@ -1521,6 +1554,12 @@ class TlvF:
+             lines_cpp.append("%sreturn false;" % self.getIndentation(2))
+             lines_cpp.append("%s}" % self.getIndentation(1))
+ 
++            lines_cpp.append("%ssize_t len = ptr->getLen();" % (self.getIndentation(1)))
++            lines_cpp.append("%sif (!buffPtrIncrementSafe(len)) {" % (self.getIndentation(1)))
++            lines_cpp.append("%sLOG(ERROR) << \"buffPtrIncrementSafe(\" << std::dec << len << \") Failed!\";" % (
++                self.getIndentation(2)))
++            lines_cpp.append("%sreturn false;" % (self.getIndentation(2)))
++            lines_cpp.append("%s}" % (self.getIndentation(1)))
+             if param_length or is_dynamic_len:
+                 lines_cpp.append("%sm_%s_idx__++;" % (self.getIndentation(1), param_name))
+                 if is_var_len:
+@@ -1530,7 +1569,6 @@ class TlvF:
+                 # When the user calls the add_member method, the value of the bool variable is set to TRUE.
+                 # For more information, please read overrideIsPostInitSucceeded method documentation
+                 lines_cpp.append("%sm_%s_init = true;" % (self.getIndentation(1), param_meta.name))
+-            lines_cpp.append("%ssize_t len = ptr->getLen();" % (self.getIndentation(1)))
+             lines_cpp.extend(self.addAllocationMarkersAdd(obj_meta, param_meta,
+                                                           param_length, False))  # Variable length lists support
+             if param_length or is_dynamic_len:
+@@ -1538,11 +1576,6 @@ class TlvF:
+                                  (self.getIndentation(1), param_name))
+             else:
+                 lines_cpp.append("%sm_%s_ptr = ptr;" % (self.getIndentation(1), param_name))
+-            lines_cpp.append("%sif (!buffPtrIncrementSafe(len)) {" % (self.getIndentation(1)))
+-            lines_cpp.append("%sLOG(ERROR) << \"buffPtrIncrementSafe(\" << std::dec << len << \") Failed!\";" % (
+-                self.getIndentation(2)))
+-            lines_cpp.append("%sreturn false;" % (self.getIndentation(2)))
+-            lines_cpp.append("%s}" % (self.getIndentation(1)))
+             if obj_meta.is_tlv_class:
+                 lines_cpp.append(
+                     "%sif(!m_parse__ && m_length){ (*m_length) += len; }" % (self.getIndentation(1)))
+@@ -1572,13 +1605,16 @@ class TlvF:
+                 '%sTLVF_LOG(ERROR) << "Not enough available space on buffer - can\'t allocate";' % self.getIndentation(2))
+             lines_cpp.append("%sreturn false;" % self.getIndentation(2))
+             lines_cpp.append("%s}" % self.getIndentation(1))
+-            lines_cpp.extend(self.addAllocationMarkersAlloc(obj_meta, param_meta,
+-                                                            param_length, True))  # Variable length lists support
+             lines_cpp.append("%sif (!buffPtrIncrementSafe(len)) {" % (self.getIndentation(1)))
+             lines_cpp.append("%sLOG(ERROR) << \"buffPtrIncrementSafe(\" << std::dec << len << \") Failed!\";" % (
+                 self.getIndentation(2)))
+             lines_cpp.append("%sreturn false;" % (self.getIndentation(2)))
+             lines_cpp.append("%s}" % (self.getIndentation(1)))
++            lines_cpp.extend(self.addAllocationMarkersAlloc(obj_meta, param_meta,
++                                                            param_length, True))  # Variable length lists support
++            if TypeInfo(param_type).type == TypeInfo.STRUCT:
++                lines_cpp.append("%sif (!m_%s__) { m_%s->struct_init(); }" % (
++                    self.getIndentation(1), self.MEMBER_PARSE, param_name))
+             if obj_meta.is_tlv_class:
+                 lines_cpp.append("%sif(m_length){ (*m_length) += len; }" % (self.getIndentation(1)))
+             # mark it as allocated:
+@@ -1595,6 +1631,17 @@ class TlvF:
+                 self.getIndentation(2), param_name))
+             lines_cpp.append("%sreturn false;" % self.getIndentation(2))
+             lines_cpp.append("%s}" % self.getIndentation(1))
++            if is_var_len:
++                length_type = obj_meta.children_types[param_length]
++                if length_type.type_str.startswith("uint"):
++                    self.include_list.append("<limits>")
++                    lines_cpp.append(
++                        "%sif (count > (static_cast<size_t>(std::numeric_limits<%s>::max()) - *m_%s)) {" % (
++                            self.getIndentation(1), length_type.type_str, param_length))
++                    lines_cpp.append('%sTLVF_LOG(ERROR) << "%s overflow";' % (
++                        self.getIndentation(2), param_length))
++                    lines_cpp.append("%sreturn false;" % self.getIndentation(2))
++                    lines_cpp.append("%s}" % self.getIndentation(1))
+             lines_cpp.append("%ssize_t len = sizeof(%s) * count;" %
+                              (self.getIndentation(1), param_type))
+             lines_cpp.append("%sif(getBuffRemainingBytes() < len )  {" % (self.getIndentation(1)))
+@@ -1610,18 +1657,18 @@ class TlvF:
+                                      self.getIndentation(2), param_meta.length_max, param_name))
+                 lines_cpp.append("%sreturn false;" % self.getIndentation(2))
+                 lines_cpp.append("%s}" % self.getIndentation(1))
+-            lines_cpp.append("%sm_%s__ = %s;" % (self.getIndentation(
+-                1), self.MEMBER_LOCK_ORDER_COUNTER, param_meta.list_index))
+-            lines_cpp.extend(self.addAllocationMarkersAlloc(obj_meta, param_meta,
+-                                                            param_length, True))  # Variable length lists support
+-            lines_cpp.append("%sm_%s_idx__ += count;" % (self.getIndentation(1), param_name))
+-            if is_var_len:
+-                lines_cpp.append("%s*m_%s += count;" % (self.getIndentation(1), param_length))
+             lines_cpp.append("%sif (!buffPtrIncrementSafe(len)) {" % (self.getIndentation(1)))
+             lines_cpp.append("%sLOG(ERROR) << \"buffPtrIncrementSafe(\" << std::dec << len << \") Failed!\";" % (
+                 self.getIndentation(2)))
+             lines_cpp.append("%sreturn false;" % (self.getIndentation(2)))
+             lines_cpp.append("%s}" % (self.getIndentation(1)))
++            lines_cpp.extend(self.addAllocationMarkersAlloc(obj_meta, param_meta,
++                                                            param_length, True))  # Variable length lists support
++            lines_cpp.append("%sm_%s__ = %s;" % (self.getIndentation(
++                1), self.MEMBER_LOCK_ORDER_COUNTER, param_meta.list_index))
++            lines_cpp.append("%sm_%s_idx__ += count;" % (self.getIndentation(1), param_name))
++            if is_var_len:
++                lines_cpp.append("%s*m_%s += count;" % (self.getIndentation(1), param_length))
+             if obj_meta.is_tlv_class:
+                 lines_cpp.append("%sif(m_length){ (*m_length) += len; }" % (self.getIndentation(1)))
+             if TypeInfo(param_type).type == TypeInfo.STRUCT:
+@@ -1655,6 +1702,7 @@ class TlvF:
+         lines_cpp = []
+         if param_meta.length_type == MetaData.LENGTH_TYPE_VAR or param_meta.length_type == MetaData.LENGTH_TYPE_DYNAMIC:
+             if memmove:
++                self.include_list.append("<cstring>")
+                 lines_cpp.append("%suint8_t *src = (uint8_t *)m_%s;" %
+                                  (self.getIndentation(1), param_meta.name))
+                 # Since list of classes does not have length parameter like list of native type,
+@@ -1670,8 +1718,15 @@ class TlvF:
+                 lines_cpp.append("%sif (!m_parse__) {" % self.getIndentation(1))
+                 lines_cpp.append("%suint8_t *dst = src + len;" % (self.getIndentation(2)))
+                 lines_cpp.append(
+-                    "%ssize_t move_length = getBuffRemainingBytes(src) - len;" % self.getIndentation(2))
+-                lines_cpp.append("%sstd::copy_n(src, move_length, dst);" % self.getIndentation(2))
++                    "%ssize_t remaining = getBuffRemainingBytes(src);" % self.getIndentation(2))
++                lines_cpp.append("%sif (remaining < len) {" % self.getIndentation(2))
++                lines_cpp.append(
++                    '%sTLVF_LOG(ERROR) << "Not enough available space on buffer - can\'t shift data";' %
++                    self.getIndentation(3))
++                lines_cpp.append("%sreturn nullptr;" % self.getIndentation(3))
++                lines_cpp.append("%s}" % self.getIndentation(2))
++                lines_cpp.append("%ssize_t move_length = remaining - len;" % self.getIndentation(2))
++                lines_cpp.append("%sstd::memmove(dst, src, move_length);" % self.getIndentation(2))
+                 lines_cpp.append("%s}" % self.getIndentation(1))
+ 
+             marker = "%s_%s_%s_%s" % (self.CODE_CLASS_ALLOC_INSERT,
+@@ -1685,6 +1740,7 @@ class TlvF:
+         lines_cpp = []
+         if param_meta.length_type == MetaData.LENGTH_TYPE_VAR or MetaData.LENGTH_TYPE_DYNAMIC:
+             if memmove:
++                self.include_list.append("<cstring>")
+                 if param_meta.length_type == MetaData.LENGTH_TYPE_VAR:
+                     lines_cpp.append(
+                         "%suint8_t *src = (uint8_t *)&m_%s[*m_%s];" % (self.getIndentation(1), param_meta.name, param_length))
+@@ -1697,8 +1753,15 @@ class TlvF:
+                 lines_cpp.append("%suint8_t *dst = src + len;" % (self.getIndentation(1)))
+                 lines_cpp.append("%sif (!m_parse__) {" % self.getIndentation(1))
+                 lines_cpp.append(
+-                    "%ssize_t move_length = getBuffRemainingBytes(src) - len;" % self.getIndentation(2))
+-                lines_cpp.append("%sstd::copy_n(src, move_length, dst);" % self.getIndentation(2))
++                    "%ssize_t remaining = getBuffRemainingBytes(src);" % self.getIndentation(2))
++                lines_cpp.append("%sif (remaining < len) {" % self.getIndentation(2))
++                lines_cpp.append(
++                    '%sTLVF_LOG(ERROR) << "Not enough available space on buffer - can\'t shift data";' %
++                    self.getIndentation(3))
++                lines_cpp.append("%sreturn false;" % self.getIndentation(3))
++                lines_cpp.append("%s}" % self.getIndentation(2))
++                lines_cpp.append("%ssize_t move_length = remaining - len;" % self.getIndentation(2))
++                lines_cpp.append("%sstd::memmove(dst, src, move_length);" % self.getIndentation(2))
+                 lines_cpp.append("%s}" % self.getIndentation(1))
+ 
+             marker = "%s_%s_%s_%s" % (self.CODE_CLASS_ALLOC_INSERT,
+diff --git a/framework/tlvf/yaml/tlvf/association_frame/cQosCapability.yaml b/framework/tlvf/yaml/tlvf/association_frame/cQosCapability.yaml
+index 61b890a39..743b382b9 100644
+--- a/framework/tlvf/yaml/tlvf/association_frame/cQosCapability.yaml
++++ b/framework/tlvf/yaml/tlvf/association_frame/cQosCapability.yaml
+@@ -13,7 +13,7 @@ cQosCapability:
+   _is_tlv_class: True
+   type:
+     _type: eElementID
+-    _value: ID_RSN
++    _value: ID_QOS_CAPABILITY
+   length:
+     _type: uint8_t
+   qos_info:
+diff --git a/framework/tlvf/yaml/tlvf/wfa_map/tlvBackhaulStaRadioCapabilities.yaml b/framework/tlvf/yaml/tlvf/wfa_map/tlvBackhaulStaRadioCapabilities.yaml
+index 2473d6436..d109376ae 100644
+--- a/framework/tlvf/yaml/tlvf/wfa_map/tlvBackhaulStaRadioCapabilities.yaml
++++ b/framework/tlvf/yaml/tlvf/wfa_map/tlvBackhaulStaRadioCapabilities.yaml
+@@ -14,6 +14,7 @@ tlvBackhaulStaRadioCapabilities:
+     _comment: Radio Unique Identifier of the radio for which capabilities are reported.
+   sta_mac_included:
+     _type: eStaMacIncluded
++    _value: FIELD_NOT_PRESENT
+   sta_mac:
+     _type: sMacAddr
+     _condition:
+diff --git a/framework/tlvf/yaml/tlvf/wfa_map/tlvSteeringBTMReport.yaml b/framework/tlvf/yaml/tlvf/wfa_map/tlvSteeringBTMReport.yaml
+index 23c0d3211..3dde8f7ad 100644
+--- a/framework/tlvf/yaml/tlvf/wfa_map/tlvSteeringBTMReport.yaml
++++ b/framework/tlvf/yaml/tlvf/wfa_map/tlvSteeringBTMReport.yaml
+@@ -11,12 +11,15 @@ tlvSteeringBTMReport:
+   length: uint16_t
+   bssid: sMacAddr
+   sta_mac: sMacAddr
+-  btm_status_code: eBTMStatusCode
++  btm_status_code:
++    _type: eBTMStatusCode
++    _value: REJECT_UNSPECIFIED
+   target_bssid:
+     _type: sMacAddr
+     _condition:
+       _using_members: btm_status_code
+       _phrase: btm_status_code == eBTMStatusCode::ACCEPT
++    _validate_tlv_length: true
+     _comment: |
+       Target BSSID in the 1905 / 802.11 BTM Steering Request
+       This field is present if the status code == 0, i.e., the station accepted the steering request.
+-- 
+2.34.1
+
