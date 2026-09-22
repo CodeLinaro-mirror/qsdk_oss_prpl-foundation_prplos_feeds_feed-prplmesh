@@ -1,0 +1,1610 @@
+From 4b82807fa453bff7150a0c959819399e3db7f2e8 Mon Sep 17 00:00:00 2001
+From: Sandeep Tomer <stomer@qti.qualcomm.com>
+Date: Wed, 23 Sep 2026 20:33:43 +0530
+Subject: [PATCH] [prplmesh] support wireless bSTA DPP onboarding
+
+Complete wireless bSTA DPP onboarding across the agent and the WHM HAL.
+
+The WHM HAL side implements the DPP endpoint RPCs for bootstrap generation, extra configuration, persisted credentials, and chirping. It also implements the DPP-over-TCP relay lifecycle and per-BSS DPP AKM/CCE credential handling.
+
+The agent side now keeps bootstrap state per bSTA radio, re-registers bootstrap data after HAL recreation, clears stale event handlers before WPA re-attach, retries setup, uses bounded DPP recovery windows, and schedules chirps with the radio-owned bootstrap ID. Successful provisioning stops the retry cycle.
+
+Change-Id: If890c238acaf4657f0e6073aebe6529504317af2
+
+Signed-off-by: Sandeep Tomer <stomer@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/agent_db.h           |   2 +-
+ .../backhaul_manager/backhaul_manager.cpp     | 162 +++++++--
+ .../slave/backhaul_manager/backhaul_manager.h |  24 +-
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   | 327 ++++++++++++++----
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.h     |   4 +
+ .../beerocks/bwl/whm/slave_wlan_hal_whm.cpp   | 206 +++++++++--
+ common/beerocks/bwl/whm/slave_wlan_hal_whm.h  |  21 +-
+ common/beerocks/bwl/whm/sta_wlan_hal_whm.cpp  | 235 ++++++++-----
+ 8 files changed, 758 insertions(+), 223 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 2183cdccd..8e780dde3 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -351,7 +351,7 @@ public:
+         int wpa_bootstrap_id    = -1;       // id returned by wpa_supplicant's DPP_BOOTSTRAP_GEN,
+                                              // used for DPP_BOOTSTRAP_GET_URI / DPP_CHIRP (bSTA)
+         int chirp_start_delay_sec    = 60; // delay before first DPP_CHIRP after bootstrap injection
+-        int chirp_retry_interval_sec = 60; // interval between subsequent DPP_CHIRP retries
++        int chirp_retry_interval_sec = 120; // interval between subsequent DPP_CHIRP retries
+ 
+         ~sDppBootstrapKey() {
+             if (private_key) {
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 9d704465f..0ad593c0f 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -99,6 +99,9 @@ constexpr auto dev_reset_default_timeout = std::chrono::seconds(UCC_REPLY_COMPLE
+  * ignores it instead of starting a fresh exchange.
+  */
+ constexpr auto dpp_chirp_fail_retry_delay = std::chrono::seconds(25);
++constexpr auto dpp_setup_retry_delay      = std::chrono::seconds(5);
++constexpr auto dpp_progress_timeout       = std::chrono::seconds(120);
++constexpr unsigned int dpp_setup_max_attempts = 3;
+ 
+ const std::string dev_set_config_backhaul_param = "backhaul";
+ const std::string dev_set_config_bss_info_param = "bss_info";
+@@ -1492,6 +1495,14 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+             // Clear the flags when restarting
+             radio_info->sta_hal_initialized = false;
+             radio_info->sta_hal_disconnected_for_eth = false;
++            // The HAL/ctrl_iface is recreated after RESTART, so the bootstrap must be
++            // registered again even though the AgentDB key itself is persistent.
++            radio_info->dpp_bootstrap_injected = false;
++            radio_info->dpp_bootstrap_id = -1;
++            radio_info->dpp_setup_attempts = 0;
++            radio_info->dpp_recovery_attempts = 0;
++            radio_info->dpp_setup_retry_at = {};
++            radio_info->dpp_provisioning_done = false;
+             cancel_dpp_chirp_timer(radio_info);
+         }
+ 
+@@ -1577,6 +1588,18 @@ bool BackhaulManager::backhaul_fsm_wireless(bool &skip_select)
+                 LOG_IF(!radio_info->sta_wlan_hal, FATAL) << "Failed creating HAL instance!";
+             } else {
+                 LOG(DEBUG) << "STA HAL exists...";
++
++                // WPA_ATTACH can be retried while the existing HAL is still present.
++                // Remove handlers from the previous attach before registering the same
++                // internal/external event descriptors again. Otherwise the event loop
++                // rejects the duplicate descriptor with EEXIST and the agent exits
++                // before reaching WAIT_WPS (and therefore before starting DPP chirping).
++                if (radio_info->sta_hal_int_events !=
++                        beerocks::net::FileDescriptor::invalid_descriptor ||
++                    !radio_info->sta_hal_ext_events.empty()) {
++                    LOG(DEBUG) << "Clearing old STA HAL event handlers before re-attach";
++                    clear_radio_handlers(radio_info);
++                }
+             }
+             LOG(DEBUG) << "clearing HAL Network status";
+             radio_info->added_network_status=false;
+@@ -1697,14 +1720,10 @@ bool BackhaulManager::backhaul_fsm_wireless(bool &skip_select)
+                 // DPP_BOOTSTRAP_GEN id with wpa_supplicant on every HAL re-init (e.g. reconnect
+                 // after a backhaul disconnect).
+                 //
+-                // db->dpp_bootstrap.wpa_bootstrap_id (and the bootstrap key itself) are a single
+-                // device-global identity, not one per radio — so also check that no OTHER radio
+-                // has already injected before doing it here. Without this, a device with more
+-                // than one STA-capable radio (band-separate bSTA, not MLO) would inject/chirp
+-                // independently per radio and stomp on that shared global state.
++                // Each bSTA radio has its own wpa_supplicant instance and therefore owns its
++                // own DPP bootstrap ID. Register the bootstrap independently on every radio.
+                 if (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP &&
+-                    db->dpp_bootstrap.valid && !radio_info->dpp_bootstrap_injected &&
+-                    !is_dpp_bootstrap_injected_on_any_radio()) {
++                    db->dpp_bootstrap.valid && !radio_info->dpp_bootstrap_injected) {
+                     radio_info->dpp_bootstrap_injected =
+                         inject_dpp_bootstrap_key_and_conf_req(radio_info);
+                 }
+@@ -1778,6 +1797,7 @@ bool BackhaulManager::backhaul_fsm_wireless(bool &skip_select)
+ 
+         state_time_stamp_timeout =
+             std::chrono::steady_clock::now() + std::chrono::seconds(STATE_WAIT_WPS_TIMEOUT_SECONDS);
++        m_dpp_progress_deadline = std::chrono::steady_clock::now() + dpp_progress_timeout;
+         FSM_MOVE_STATE(WAIT_WPS);
+         break;
+     }
+@@ -1793,8 +1813,17 @@ bool BackhaulManager::backhaul_fsm_wireless(bool &skip_select)
+         if (!db->device_conf.local_gw) {
+             auto now = std::chrono::steady_clock::now();
+ 
++            // Keep the legacy WPS timeout for ordinary onboarding. During a genuinely
++            // initialized DPP exchange, use the bounded DPP recovery deadline below so a
++            // chirp retry is not cut off exactly when the 120s WPS timer expires.
++            const bool dpp_recovery_active = is_dpp_recovery_active();
++            if (dpp_recovery_active && now > m_dpp_progress_deadline) {
++                handle_dpp_onboarding_timeout();
++                break;
++            }
++
+             // Check if timeout has expired
+-            if (now > state_time_stamp_timeout) {
++            if (!dpp_recovery_active && now > state_time_stamp_timeout) {
+                 LOG(ERROR) << STATE_WAIT_WPS_TIMEOUT_SECONDS
+                            << " seconds has passed on state WAIT_WPS, move state to RESTART!";
+                 FSM_MOVE_STATE(RESTART);
+@@ -3184,6 +3213,14 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+ 
+         auto db = AgentDB::get();
+ 
++        auto dpp_radio = get_radio_info_by_iface(iface);
++        if (dpp_radio && dpp_radio->dpp_bootstrap_injected) {
++            dpp_radio->dpp_provisioning_done = true;
++            dpp_radio->dpp_recovery_attempts = 0;
++            cancel_dpp_chirp_timer(dpp_radio);
++            LOG(DEBUG) << "DPP: bSTA connected on " << iface << " - stopping chirp cycle";
++        }
++
+         // Wired backhaul already selected and reachable - this wireless STA connection is
+         // redundant (e.g. driver/radio_enable-driven auto-reconnect racing with an already-up
+         // wired link, rather than this FSM's own wireless-backhaul establishment attempt).
+@@ -3529,17 +3566,9 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+         }
+         if (iface == db->backhaul.selected_iface_name) {
+ 
+-            // Restart the DPP chirp cycle immediately on disconnect (rather than waiting for the
+-            // next WAIT_WPS tick) if this radio was bootstrap-injected but hasn't yet completed
+-            // DPP provisioning.
+-            auto radio_it =
+-                std::find_if(m_radios_info.begin(), m_radios_info.end(),
+-                             [&](const auto &r) { return r->sta_iface == iface; });
+-            if (radio_it != m_radios_info.end() && !(*radio_it)->dpp_provisioning_done &&
+-                (*radio_it)->dpp_bootstrap_injected) {
+-                arm_dpp_chirp_timer(*radio_it,
+-                                    std::chrono::seconds(db->dpp_bootstrap.chirp_start_delay_sec));
+-            }
++            // The normal WAIT_WPS path owns chirp startup. Avoid arming a timer here,
++            // because this event can race with scan/restart and produce EBUSY.
++
+ 
+             // If ethernet is available, switch to wired without sending bSTA disconnect
+             // notification or restarting — the backhaul path is still up via ethernet.
+@@ -6733,10 +6762,12 @@ void BackhaulManager::process_dpp_bridge_events(const std::string &sta_iface,
+             std::find_if(m_radios_info.begin(), m_radios_info.end(),
+                          [&](const auto &r) { return r->sta_iface == sta_iface; });
+         if (radio_it != m_radios_info.end()) {
++            (*radio_it)->dpp_recovery_attempts = 0;
+             arm_dpp_chirp_timer(*radio_it,
+                                std::chrono::seconds(db->dpp_bootstrap.chirp_retry_interval_sec));
+         }
+         LOG(DEBUG) << "DPP bridge: DPP-AUTH-SUCCESS on " << sta_iface << " — chirp timer reset";
++        m_dpp_progress_deadline = std::chrono::steady_clock::now() + dpp_progress_timeout;
+     } else if (event.rfind("DPP-FAIL", 0) == 0) {
+         // wpa_supplicant tears down the whole DPP exchange on failure (e.g. a TX status
+         // timeout for an off-channel DPP action frame) and does not resume chirping on its own.
+@@ -7026,9 +7057,9 @@ bool BackhaulManager::inject_dpp_bootstrap_key_and_conf_req(
+                    << radio_info->sta_iface;
+         return false;
+     }
+-    db->dpp_bootstrap.wpa_bootstrap_id = bootstrap_id;
+-    LOG(INFO) << "DPP: bootstrap key registered, wpa_bootstrap_id="
+-              << db->dpp_bootstrap.wpa_bootstrap_id;
++    radio_info->dpp_bootstrap_id = bootstrap_id;
++    LOG(INFO) << "DPP: bootstrap key registered on " << radio_info->sta_iface
++              << ", wpa_bootstrap_id=" << radio_info->dpp_bootstrap_id;
+ 
+     // wpa_supplicant re-derives the URI from the bootstrap key it just parsed; persist that
+     // version so wpa_supplicant is the single source of truth — this is the one genuinely new
+@@ -7049,14 +7080,6 @@ bool BackhaulManager::inject_dpp_bootstrap_key_and_conf_req(
+     return true;
+ }
+ 
+-bool BackhaulManager::is_dpp_bootstrap_injected_on_any_radio() const
+-{
+-    return std::any_of(m_radios_info.begin(), m_radios_info.end(),
+-                        [](const std::shared_ptr<sRadioInfo> &radio_info) {
+-                            return radio_info->dpp_bootstrap_injected;
+-                        });
+-}
+-
+ std::string BackhaulManager::extract_net_role_from_connector(const std::string &connector_jws)
+ {
+     // JWS compact: header_b64u.payload_b64u.sig_b64u — netRole lives in the payload JSON.
+@@ -7118,6 +7141,54 @@ bool BackhaulManager::is_bsta_connected() const
+     return FSM_IS_IN_STATE(CONNECTED) || FSM_IS_IN_STATE(OPERATIONAL);
+ }
+ 
++bool BackhaulManager::is_dpp_recovery_active() const
++{
++    auto db = AgentDB::get();
++    if (!FSM_IS_IN_STATE(WAIT_WPS) ||
++        db->dpp_extender_config.onboarding_type != AgentDB::OnboardingType::DPP ||
++        !db->dpp_bootstrap.valid) {
++        return false;
++    }
++    return std::any_of(m_radios_info.begin(), m_radios_info.end(), [](const auto &radio_info) {
++        return radio_info && radio_info->sta_hal_initialized && radio_info->sta_wlan_hal &&
++               radio_info->dpp_bootstrap_injected && !radio_info->dpp_provisioning_done &&
++               !radio_info->radio_disabled &&
++               !radio_info->sta_wlan_hal->is_connected();
++    });
++}
++
++void BackhaulManager::handle_dpp_onboarding_timeout()
++{
++    const auto now = std::chrono::steady_clock::now();
++    bool active = false;
++    for (const auto &radio_info : m_radios_info) {
++        if (!radio_info || !radio_info->sta_hal_initialized || !radio_info->sta_wlan_hal ||
++            !radio_info->dpp_bootstrap_injected || radio_info->dpp_provisioning_done ||
++            radio_info->radio_disabled ||
++            radio_info->sta_wlan_hal->is_connected()) {
++            continue;
++        }
++        active = true;
++        ++radio_info->dpp_recovery_attempts;
++        if (radio_info->dpp_recovery_attempts >= dpp_setup_max_attempts) {
++            LOG(WARNING) << "DPP: onboarding progress stalled on " << radio_info->sta_iface
++                         << " after " << radio_info->dpp_recovery_attempts
++                         << " recovery windows; restarting FSM";
++            for (const auto &r : m_radios_info) {
++                cancel_dpp_chirp_timer(r);
++            }
++            FSM_MOVE_STATE(RESTART);
++            return;
++        }
++        LOG(WARNING) << "DPP: onboarding progress window expired on " << radio_info->sta_iface
++                     << ", retry=" << radio_info->dpp_recovery_attempts << "/"
++                     << dpp_setup_max_attempts;
++        arm_dpp_chirp_timer(radio_info, dpp_chirp_fail_retry_delay);
++    }
++    if (active) {
++        m_dpp_progress_deadline = now + dpp_progress_timeout;
++    }
++}
+ void BackhaulManager::maybe_start_dpp_chirp()
+ {
+     auto db = AgentDB::get();
+@@ -7126,7 +7197,29 @@ void BackhaulManager::maybe_start_dpp_chirp()
+         return;
+     }
+ 
++    // MLO may expose multiple radio records backed by one shared STA HAL/control
++    // interface. Register and chirp once per HAL; band-separated bSTA radios have
++    // distinct HAL instances and therefore remain independent.
++    std::vector<std::shared_ptr<bwl::sta_wlan_hal>> dpp_hals;
+     for (auto &radio_info : m_radios_info) {
++        if (radio_info->sta_hal_initialized && radio_info->sta_wlan_hal &&
++            std::find(dpp_hals.begin(), dpp_hals.end(), radio_info->sta_wlan_hal) !=
++                dpp_hals.end()) {
++            continue;
++        }
++        if (FSM_IS_IN_STATE(WAIT_WPS) && radio_info->sta_hal_initialized &&
++            !radio_info->dpp_bootstrap_injected &&
++            radio_info->dpp_setup_attempts < dpp_setup_max_attempts &&
++            std::chrono::steady_clock::now() >= radio_info->dpp_setup_retry_at &&
++            db->dpp_bootstrap.valid && radio_info->sta_wlan_hal) {
++            ++radio_info->dpp_setup_attempts;
++            radio_info->dpp_setup_retry_at = std::chrono::steady_clock::now() + dpp_setup_retry_delay;
++            radio_info->dpp_bootstrap_injected =
++                inject_dpp_bootstrap_key_and_conf_req(radio_info);
++        }
++        if (radio_info->sta_hal_initialized && radio_info->sta_wlan_hal) {
++            dpp_hals.push_back(radio_info->sta_wlan_hal);
++        }
+         if (radio_info->sta_iface.empty() || !radio_info->dpp_bootstrap_injected ||
+             radio_info->dpp_provisioning_done ||
+             radio_info->dpp_chirp_timer_fd != beerocks::net::FileDescriptor::invalid_descriptor) {
+@@ -7158,6 +7251,7 @@ void BackhaulManager::cancel_dpp_chirp_timer(const std::shared_ptr<sRadioInfo> &
+ {
+     if (radio_info->dpp_chirp_timer_fd != beerocks::net::FileDescriptor::invalid_descriptor) {
+         m_timer_manager->remove_timer(radio_info->dpp_chirp_timer_fd);
++        radio_info->dpp_chirp_timer_fd = beerocks::net::FileDescriptor::invalid_descriptor;
+     }
+ }
+ 
+@@ -7165,14 +7259,18 @@ void BackhaulManager::handle_dpp_chirp_timeout(const std::shared_ptr<sRadioInfo>
+ {
+     auto db = AgentDB::get();
+ 
+-    if (is_bsta_connected()) {
++    if (!radio_info || !radio_info->sta_wlan_hal || radio_info->dpp_bootstrap_id < 0) {
++        LOG(WARNING) << "DPP: no per-radio bootstrap ID for chirp";
++        return;
++    }
++    if (radio_info->sta_wlan_hal->is_connected()) {
+         radio_info->dpp_provisioning_done = true;
+         LOG(DEBUG) << "DPP: bSTA connected on " << radio_info->sta_iface
+                    << " — stopping chirp cycle";
+         return;
+     }
+ 
+-    if (!radio_info->sta_wlan_hal->dpp_chirp(db->dpp_bootstrap.wpa_bootstrap_id, "mapAgent", 3)) {
++    if (!radio_info->sta_wlan_hal->dpp_chirp(radio_info->dpp_bootstrap_id, "mapAgent", 3)) {
+         LOG(WARNING) << "DPP: DPP_CHIRP failed on " << radio_info->sta_iface;
+     } else {
+         LOG(DEBUG) << "DPP: DPP_CHIRP sent on " << radio_info->sta_iface;
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+index acedb9871..3e4d9b5b1 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+@@ -573,17 +573,6 @@ private:
+      */
+     bool inject_dpp_bootstrap_key_and_conf_req(const std::shared_ptr<sRadioInfo> &radio_info);
+ 
+-    /**
+-     * @brief Checks whether any bSTA radio has already injected the DPP bootstrap key.
+-     *
+-     * db->dpp_bootstrap.wpa_bootstrap_id (and the bootstrap key itself) are a single
+-     * device-global identity, not one per radio, so a device with more than one STA-capable
+-     * radio (band-separate bSTA, not MLO) must not inject/chirp independently per radio.
+-     *
+-     * @return true if dpp_bootstrap_injected is set on at least one radio in m_radios_info.
+-     */
+-    bool is_dpp_bootstrap_injected_on_any_radio() const;
+-
+     /**
+      * @brief Extracts the "netRole" field from a DPP Connector's JWS payload.
+      *
+@@ -599,6 +588,12 @@ private:
+      */
+     void maybe_start_dpp_chirp();
+ 
++    /** Returns true only while a valid, initialized DPP bSTA recovery cycle is active. */
++    bool is_dpp_recovery_active() const;
++
++    /** Handles an expired DPP progress window; restarts after bounded retries. */
++    void handle_dpp_onboarding_timeout();
++
+     /**
+      * @brief Whether the backhaul FSM currently considers the bSTA connected/operational.
+      *
+@@ -755,6 +750,8 @@ private:
+     const int DEAUTH_REASON_PASSPHRASE_MISMACH        = 2;
+ 
+     std::chrono::steady_clock::time_point state_time_stamp_timeout;
++    // Independent DPP progress deadline; legacy WPS timeout remains the fallback.
++    std::chrono::steady_clock::time_point m_dpp_progress_deadline{};
+     int state_attempts;
+     bool reassociation = false;
+ 
+@@ -860,6 +857,11 @@ public:
+         bool dpp_bootstrap_injected = false;        /**< Flag: Set once the DPP bootstrap key has
+                                                           been registered with wpa_supplicant on
+                                                           this radio's bSTA interface */
++        int dpp_bootstrap_id = -1;                  /**< Bootstrap ID owned by this radio's
++                                                          wpa_supplicant instance */
++        unsigned int dpp_setup_attempts = 0;
++        unsigned int dpp_recovery_attempts = 0;
++        std::chrono::steady_clock::time_point dpp_setup_retry_at{};
+         bool dpp_credentials_restored = false;       /**< Flag: Set once a reboot-time attempt to
+                                                           restore the persisted WLAN/backhaul and
+                                                           1905 connectors has been made on this
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index 218e4c62b..d842d3def 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -44,6 +44,24 @@ constexpr char CODE_INSUFFICIENT_BANDWIDTH[] = "33";
+ /////////////////////////// Local Module Functions ///////////////////////////
+ //////////////////////////////////////////////////////////////////////////////
+ 
++static bool is_dpp_hex_digit(char c)
++{
++    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
++}
++
++static bool is_dpp_mac_string(const std::string &mac)
++{
++    if (mac.size() != 17) {
++        return false;
++    }
++    for (size_t i = 0; i < mac.size(); ++i) {
++        if (i % 3 == 2 ? mac[i] != ':' : !is_dpp_hex_digit(mac[i])) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ static ap_wlan_hal::Event wpaCtrl_to_bwl_event(const std::string &opcode)
+ {
+     if (opcode == "DFS-CAC-START") {
+@@ -68,6 +86,8 @@ static ap_wlan_hal::Event wpaCtrl_to_bwl_event(const std::string &opcode)
+         return ap_wlan_hal::Event::AP_Sta_Possible_Psk_Mismatch;
+     } else if (opcode == "ACL-DENY") {
+         return ap_wlan_hal::Event::ACL_DENY;
++    } else if (opcode == "DPP-CHIRP-RX") {
++        return ap_wlan_hal::Event::DPP_PRESENCE_ANNOUNCEMENT;
+     } else if (opcode == "CTRL-EVENT-CONNECTION-FAIL") {
+         // EasyMesh R6.1: STA (re)association/authentication failure reported by hostapd
+         // (requires report_connection_failures=1). Forwarded by pWHM with addr/bssid/
+@@ -789,6 +809,37 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+     int new_vap_index = m_radio_info.available_vaps.size();
+ 
+     for (const auto &bss_info_conf : bss_info_conf_list) {
++        const bool dpp_akm =
++            (bss_info_conf.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP) != 0;
++        const auto security_auth_type = static_cast<WSC::eWscAuth>(
++            bss_info_conf.authentication_type & ~WSC::eWscAuth::WSC_AUTH_DPP);
++        const bool dpp_only = dpp_akm && security_auth_type == 0;
++        // None is only the base mode for explicit AKMMode=DPPOnly. Both are
++        // committed with the AP/SSID disabled; pWHM generates RSN with DPP only.
++        std::string security_mode = dpp_only ? "None" : wbapi_utils::security_mode_to_string(
++            security_auth_type, bss_info_conf.additional_auth, bss_info_conf.freq_band);
++        if (!bss_info_conf.teardown && dpp_akm) {
++            // Validate before creating/enabling a VAP or changing its SSID/security. A
++            // later, incomplete credential update must preserve the known-good BSS.
++            if (bss_info_conf.dpp_connector.empty() || bss_info_conf.dpp_csign_der.empty() ||
++                bss_info_conf.dpp_netaccesskey_der.empty() ||
++                !std::all_of(bss_info_conf.dpp_connector.begin(),
++                             bss_info_conf.dpp_connector.end(),
++                             [](unsigned char c) { return c > 0x20 && c < 0x7f; })) {
++                LOG(ERROR) << "Incomplete or invalid DPP credential triplet for BSS "
++                           << bss_info_conf.bssid;
++                update_success = false;
++                continue;
++            }
++            if (bss_info_conf.encryption_type != WSC::eWscEncr::WSC_ENCR_AES ||
++                (!dpp_only && security_mode != "WPA2-Personal" &&
++                 security_mode.compare(0, 13, "WPA3-Personal") != 0)) {
++                LOG(ERROR) << "Unsupported DPP AKM/encryption combination for BSS "
++                           << bss_info_conf.bssid;
++                update_success = false;
++                continue;
++            }
++        }
+         std::string wifi_vap_path, wifi_ssid_path;
+         std::string ifname = "new_interface";
+ 
+@@ -812,6 +863,7 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+             std::string radio_name;
+             if (!m_ambiorix_cl.get_param(radio_name, m_radio_path, "Alias")) {
+                 LOG(ERROR) << "cannot read radio name for " << m_radio_path;
++                update_success &= !dpp_akm;
+                 continue;
+             }
+ 
+@@ -823,7 +875,13 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+             args.add_child("vap", new_vap_name);
+             args.add_child("radio", radio_name);
+ 
+-            m_ambiorix_cl.call("Device.WiFi.", "addVAPIntf", args, result);
++            const bool vap_created =
++                m_ambiorix_cl.call("Device.WiFi.", "addVAPIntf", args, result);
++            if (dpp_akm && !vap_created) {
++                LOG(ERROR) << "Failed to create VAP for DPP BSS " << bss_info_conf.bssid;
++                update_success = false;
++                continue;
++            }
+ 
+             // ex of call: Device.WiFi.addVAPIntf(vap="new5g10", radio="radio2")
+             // use the parameter 'vap', "new5g10", as Alias to retrieve the new
+@@ -832,11 +890,13 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+             std::string search_path = wbapi_utils::search_path_ssid_by_alias(new_vap_name);
+             if (!m_ambiorix_cl.resolve_path(search_path, wifi_ssid_path)) {
+                 LOG(ERROR) << "new SSID not found";
++                update_success &= !dpp_akm;
+                 continue;
+             }
+ 
+             if (!get_accesspoint_by_ssid(wifi_ssid_path, wifi_vap_path)) {
+                 LOG(ERROR) << "new AccessPoint not found";
++                update_success &= !dpp_akm;
+                 continue;
+             }
+ 
+@@ -863,6 +923,7 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+             auto vap_it    = m_vapsExtInfo.find(ifname);
+             if (vap_it == m_vapsExtInfo.end()) {
+                 LOG(ERROR) << "fail to get ifname of " << bssid;
++                update_success &= !dpp_akm;
+                 continue;
+             }
+             wifi_vap_path  = vap_it->second.path;
+@@ -876,6 +937,59 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+         * wifi_ssid_path
+         * */
+ 
++        const std::string dpp_path = wifi_vap_path + "DPP.";
++        auto current_dpp = m_ambiorix_cl.get_object(dpp_path);
++        // Legacy platforms without a DPP object must still support ordinary BSS
++        // configuration and teardown. Explicit DPP-AKM provisioning requires it.
++        if (!current_dpp && dpp_akm && !bss_info_conf.teardown) {
++            LOG(ERROR) << "Cannot read DPP state before BSS update at " << dpp_path;
++            update_success = false;
++            continue;
++        }
++        std::string current_dpp_mode;
++        const bool has_akm_mode = current_dpp &&
++                                  current_dpp->read_child(current_dpp_mode, "AKMMode");
++        bool current_dpp_enabled = false;
++        std::string current_connector, current_csign, current_netaccesskey;
++        if (current_dpp) {
++            current_dpp->read_child(current_dpp_enabled, "Enable");
++            current_dpp->read_child(current_connector, "Connector");
++            current_dpp->read_child(current_csign, "CSign");
++            current_dpp->read_child(current_netaccesskey, "NetAccessKey");
++        }
++        const bool had_dpp_security = (has_akm_mode && current_dpp_mode != "Auto" &&
++                                      current_dpp_mode != "Disabled") ||
++                                     !current_connector.empty() || !current_csign.empty() ||
++                                     !current_netaccesskey.empty();
++        const bool dpp_security_change = dpp_akm || had_dpp_security;
++        if (!bss_info_conf.teardown && dpp_akm && !has_akm_mode) {
++            LOG(ERROR) << "pWHM lacks explicit DPP AKM support at " << dpp_path;
++            update_success = false;
++            continue;
++        }
++
++        // These fields form one transaction: never install or clear only part of a
++        // triplet. An explicit non-DPP BSS configuration removes old DPP credentials,
++        // including credentials left behind by older pWHM versions without AKM flags.
++        AmbiorixVariant dpp_obj(AMXC_VAR_ID_HTABLE);
++        if (has_akm_mode) {
++            dpp_obj.add_child("AKMMode", dpp_akm && !bss_info_conf.teardown
++                                             ? (dpp_only ? "DPPOnly" : "Mixed")
++                                             : "Disabled");
++        }
++        if (dpp_security_change) {
++            const bool install = dpp_akm && !bss_info_conf.teardown;
++            dpp_obj.add_child("Connector", install ? bss_info_conf.dpp_connector : std::string());
++            dpp_obj.add_child("CSign", install ? beerocks::string_utils::bytes_to_hex_string(
++                                                   bss_info_conf.dpp_csign_der.data(),
++                                                   bss_info_conf.dpp_csign_der.size())
++                                               : std::string());
++            dpp_obj.add_child("NetAccessKey", install ? beerocks::string_utils::bytes_to_hex_string(
++                                                          bss_info_conf.dpp_netaccesskey_der.data(),
++                                                          bss_info_conf.dpp_netaccesskey_der.size())
++                                                      : std::string());
++        }
++
+         AmbiorixVariant new_obj(AMXC_VAR_ID_HTABLE);
+         if (bss_info_conf.teardown) {
+             // Re-check validity right before use; VAP may have been removed meanwhile.
+@@ -900,11 +1014,21 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+             if (!ret) {
+                 LOG(ERROR) << "Failed to disable vap " << ifname;
+                 update_success = false;
++                continue;
++            }
++            if (had_dpp_security || current_dpp_enabled) {
++                dpp_obj.add_child("Enable", false);
++                if (!m_ambiorix_cl.update_object(dpp_path, dpp_obj)) {
++                    LOG(ERROR) << "Failed to remove DPP credentials at " << dpp_path;
++                    update_success = false;
++                }
+             }
+             continue;
+         } else {
+-            LOG(DEBUG) << "enable vap " << wifi_vap_path;
+-            new_obj.add_child("Enable", true);
++            // Hold a DPP security transition disabled until both the base security
++            // and DPP transactions succeed. Failure leaves the BSS closed.
++            LOG(DEBUG) << "configure vap " << wifi_vap_path;
++            new_obj.add_child("Enable", !dpp_security_change);
+             std::string multi_ap;
+             if (bss_info_conf.fronthaul) {
+                 multi_ap += "FronthaulBSS";
+@@ -944,6 +1068,9 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+                 LOG(ERROR) << "Failed to enable vap " << wifi_vap_path
+                            << " or to configure MultiAPType thereof " << multi_ap;
+                 update_success = false;
++                if (dpp_security_change) {
++                    continue;
++                }
+             }
+         }
+ 
+@@ -968,50 +1095,35 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+ 
+         LOG(DEBUG) << "Autoconfiguration for ssid: " << bss_info_conf.ssid
+                    << " auth_type: " << auth_type << " encr_type: " << encryption_mode
+-                   << " network_key: " << bss_info_conf.network_key
++                   << " network_key: <redacted>"
+                    << " fronthaul: " << bss_info_conf.fronthaul
+                    << " backhaul: " << bss_info_conf.backhaul
+                    << " hidden_SSID: " << bss_info_conf.hidden_ssid
+                    << " authentication_type: " << bss_info_conf.authentication_type
+                    << " mld_unit: " << mld_unit;
+ 
+-        // prplOS owns hostapd through PWHM.  DPP credentials must therefore be
+-        // installed in the persistent per-AccessPoint DPP object; writing
+-        // hostapd dpp_* parameters directly would bypass the platform owner and
+-        // those credentials would be lost on the next PWHM regeneration.
+-        if (bss_info_conf.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP) {
+-            AmbiorixVariant dpp_obj(AMXC_VAR_ID_HTABLE);
++        const bool cce_relay = bss_info_conf.fronthaul && m_cce_indication_received &&
++                               m_advertise_cce;
++        const bool dpp_relay = cce_relay ||
++                               (bss_info_conf.fronthaul && bss_info_conf.em_ap_controller_found) ||
++                               (beerocks::bpl::cfg_get_onboarding_type() == "DPP" && dpp_akm);
++        if (dpp_akm || dpp_relay) {
+             dpp_obj.add_child("Enable", true);
+-            if (bss_info_conf.dpp_connector.empty() ||
+-                bss_info_conf.dpp_csign_der.empty() ||
+-                bss_info_conf.dpp_netaccesskey_der.empty()) {
+-                LOG(ERROR) << "DPP credentials incomplete for " << wifi_vap_path
+-                           << " (connector=" << !bss_info_conf.dpp_connector.empty()
+-                           << ", csign=" << !bss_info_conf.dpp_csign_der.empty()
+-                           << ", netaccesskey=" << !bss_info_conf.dpp_netaccesskey_der.empty()
+-                           << ")";
+-                update_success = false;
+-                continue;
+-            }
+-
+-            dpp_obj.add_child("Connector", bss_info_conf.dpp_connector);
+-            dpp_obj.add_child(
+-                "CSign", beerocks::string_utils::bytes_to_hex_string(
+-                              bss_info_conf.dpp_csign_der.data(),
+-                              bss_info_conf.dpp_csign_der.size()));
+-            dpp_obj.add_child(
+-                "NetAccessKey", beerocks::string_utils::bytes_to_hex_string(
+-                                     bss_info_conf.dpp_netaccesskey_der.data(),
+-                                     bss_info_conf.dpp_netaccesskey_der.size()));
+-
+-            const std::string dpp_path = wifi_vap_path + "DPP.";
+-            if (!m_ambiorix_cl.update_object(dpp_path, dpp_obj)) {
+-                LOG(ERROR) << "Failed to update DPP object " << dpp_path
+-                           << " for " << bss_info_conf.ssid;
+-                update_success = false;
+-                continue;
+-            }
+-            LOG(DEBUG) << "Updated PWHM DPP credentials for " << bss_info_conf.ssid;
++            dpp_obj.add_child("Role", dpp_relay ? "Relay" : "Configurator");
++        } else if (had_dpp_security || current_dpp_enabled) {
++            dpp_obj.add_child("Enable", false);
++        }
++        if (bss_info_conf.fronthaul && m_cce_indication_received) {
++            dpp_obj.add_child("ConfiguratorConnectivity", m_advertise_cce);
++        } else if (!bss_info_conf.fronthaul && !dpp_obj.empty()) {
++            dpp_obj.add_child("ConfiguratorConnectivity", false);
++        }
++        // Relay/CCE updates may be applied even when the ordinary credentials match.
++        if (!dpp_security_change && !dpp_obj.empty() &&
++            !m_ambiorix_cl.update_object(dpp_path, dpp_obj)) {
++            LOG(ERROR) << "Failed to update DPP operation at " << dpp_path;
++            update_success = false;
++            continue;
+         }
+ 
+         // Skip update if no changes for FronthaulBSS/BackhaulBSS
+@@ -1105,17 +1217,6 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+         // where SSID / passphrase / MLD / SSIDAdvertisement are all unchanged) would compare the
+         // current pWHM ModeEnabled against the un-refined union string, wrongly conclude "no
+         // change", skip the write, and leave the Agent stuck on the old ModeEnabled.
+-        // DPP is an onboarding mechanism and may be carried together with the
+-        // primary AKM (for example, SAE | DPP).  security_mode_to_string()
+-        // intentionally uses exact enum matches, so passing the combined value
+-        // makes it return "None".  Keep the raw authentication_type above for
+-        // DPP object handling, but remove the DPP marker when deriving the
+-        // normal Wi-Fi Security.ModeEnabled value.
+-        const WSC::eWscAuth security_auth_type = static_cast<WSC::eWscAuth>(
+-            bss_info_conf.authentication_type & ~WSC::eWscAuth::WSC_AUTH_DPP);
+-        std::string security_mode = wbapi_utils::security_mode_to_string(
+-            security_auth_type, bss_info_conf.additional_auth, bss_info_conf.freq_band);
+-
+         if (security_mode == "WPA3-Personal-Compatibility" &&
+             !bss_info_conf.security_ies.empty()) {
+             bool has_akm8 = false, has_akm24 = false;
+@@ -1130,7 +1231,7 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+                        << " has_akm24=" << has_akm24 << " -> ModeEnabled=" << security_mode;
+         }
+ 
+-        if (params_retrieved &&
++        if (!dpp_security_change && params_retrieved &&
+             current_ssid == bss_info_conf.ssid && current_password == bss_info_conf.network_key &&
+             current_mode == security_mode &&
+                 current_mldID == mld_unit &&
+@@ -1146,15 +1247,30 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+         new_obj.set_type(AMXC_VAR_ID_HTABLE);
+         new_obj.add_child("SSID", bss_info_conf.ssid);
+         new_obj.add_child("MLDUnit", mld_unit);
+-        new_obj.add_child("Enable", 1);
++        // pWHM may synchronize SSID.Enable back to AccessPoint.Enable. Keep both
++        // disabled until all security writes have succeeded.
++        new_obj.add_child("Enable", dpp_security_change ? 0 : 1);
+ 
+         ret = m_ambiorix_cl.update_object(wifi_ssid_path, new_obj);
+ 
+         if (!ret) {
+             LOG(ERROR) << "Failed to update SSID object";
++            update_success &= !dpp_security_change;
+             continue;
+         }
+ 
++        if (dpp_security_change && has_akm_mode && current_dpp_mode != "Disabled") {
++            // Temporarily remove the old AKM policy before changing the base mode:
++            // DPPOnly requires None, while Mixed requires a secure base mode.
++            AmbiorixVariant disable_akm_obj(AMXC_VAR_ID_HTABLE);
++            disable_akm_obj.add_child("AKMMode", "Disabled");
++            if (!m_ambiorix_cl.update_object(dpp_path, disable_akm_obj)) {
++                LOG(ERROR) << "Failed to stage DPP security transition at " << dpp_path;
++                update_success = false;
++                continue;
++            }
++        }
++
+         LOG(DEBUG) << "Security Mode:" << security_mode << " Encryption Mode:" << encryption_mode;
+ 
+         std::string wifi_ap_sec_path = wifi_vap_path + "Security.";
+@@ -1176,7 +1292,7 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+         // so they are already committed on the object by the time ModeEnabled is written (and
+         // validated) in a SECOND, separate call.
+         AmbiorixVariant sec_cred_obj(AMXC_VAR_ID_HTABLE);
+-        if (security_mode != "None") {
++        if (!dpp_only && security_mode != "None") {
+             std::string current_encryption_mode;
+             m_ambiorix_cl.get_param(current_encryption_mode, wifi_vap_path + "Security.",
+                                     "EncryptionMode");
+@@ -1195,6 +1311,7 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+                 LOG(ERROR) << "Failed to update Security credentials (KeyPassPhrase/"
+                               "SAEPassphrase/EncryptionMode) at "
+                            << wifi_ap_sec_path << " before ModeEnabled";
++                update_success &= !dpp_security_change;
+                 continue;
+             }
+         }
+@@ -1204,10 +1321,14 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+         if (security_mode == "None") {
+             new_obj.add_child("EncryptionMode", "Default");
+         }
+-        ret = m_ambiorix_cl.update_object(wifi_ap_sec_path, new_obj);
+-
+-        if (!ret) {
++        if (!m_ambiorix_cl.update_object(wifi_ap_sec_path, new_obj)) {
+             LOG(ERROR) << "Failed to update Security object " << wifi_ap_sec_path;
++            update_success &= !dpp_security_change;
++            continue;
++        }
++        if (dpp_security_change && !m_ambiorix_cl.update_object(dpp_path, dpp_obj)) {
++            LOG(ERROR) << "Failed to update DPP security at " << dpp_path;
++            update_success = false;
+             continue;
+         }
+ 
+@@ -1217,7 +1338,7 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+         // later at AP_ENABLED from the stashed security_ies.
+         const bool bssid_is_wildcard =
+             (bssid == beerocks::net::network_utils::WILD_MAC_STRING);
+-        if ((bss_info_conf.additional_auth ==
++        if (!dpp_only && (bss_info_conf.additional_auth ==
+                  son::wireless_utils::eAdditionalAuth::WPA3_PERSONAL_COMPATIBILITY ||
+              !bss_info_conf.security_ies.empty()) &&
+             ifname != "new_interface" && !bssid_is_wildcard) {
+@@ -1225,7 +1346,7 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+                 LOG(WARNING) << "update_vap_credentials: failed to apply RSN Override for "
+                              << bss_info_conf.bssid << " (ssid=" << bss_info_conf.ssid << ")";
+             }
+-        } else if ((bss_info_conf.additional_auth ==
++        } else if (!dpp_only && (bss_info_conf.additional_auth ==
+                         son::wireless_utils::eAdditionalAuth::WPA3_PERSONAL_COMPATIBILITY ||
+                     !bss_info_conf.security_ies.empty())) {
+             LOG(DEBUG) << "update_vap_credentials: deferring RSN Override for new/unresolved VAP "
+@@ -1361,6 +1482,17 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+             }
+         }
+ 
++        if (dpp_security_change) {
++            AmbiorixVariant enable_obj(AMXC_VAR_ID_HTABLE);
++            enable_obj.add_child("Enable", true);
++            if (!m_ambiorix_cl.update_object(wifi_ssid_path, enable_obj) ||
++                !m_ambiorix_cl.update_object(wifi_vap_path, enable_obj)) {
++                LOG(ERROR) << "Failed to enable BSS after DPP security update at " << wifi_vap_path;
++                update_success = false;
++                continue;
++            }
++        }
++
+         if (ifname == "new_interface") {
+             // skip update of vap_info, new instance in vap_info will be added asynchronously on a pwhm event
+             continue;
+@@ -2514,16 +2646,16 @@ bool ap_wlan_hal_whm::set_cce_indication(uint16_t advertise_cce)
+ {
+     LOG(DEBUG) << "ap_wlan_hal_whm: set_cce_indication, advertise_cce=" << advertise_cce;
+ 
+-    // DPP_CCE_INDICATION_MESSAGE from the Controller is a network-wide, radio-scoped
+-    // signal to advertise (or stop advertising) DPP Configurator Connectivity - it is
+-    // NOT tied to any particular BSS's chosen AKM. On this platform (pwhm/whm), the CCE
+-    // beacon bit ("dpp_configurator_connectivity=1" in hostapd.conf) is driven entirely
+-    // by AccessPoint.{i}.DPP.Enable (see wld_hostapd_cfgFile.c::wld_hostapd_cfgFile_setVapConfig()).
+-    // Previously this function was a no-op, so the Controller's CCE broadcast never
+-    // reached hostapd, and DPP.Enable was only ever set for the one VAP whose own M2
+-    // happened to carry the DPP AKM bit (see update_vap_credentials() below). Apply the
+-    // requested CCE state to every fronthaul VAP on this radio so all of them advertise
+-    // (or stop advertising) DPP support, independent of any BSS's specific AKM.
++    if (advertise_cce > 1) {
++        LOG(ERROR) << "Invalid CCE indication value " << advertise_cce;
++        return false;
++    }
++    m_cce_indication_received = true;
++    m_advertise_cce           = advertise_cce != 0;
++
++    // CCE is advertisement policy, independent of the BSS's AKMs and credentials.
++    // Advertising connectivity also requires an operational relay to the controller.
++    // Withdrawing CCE must leave that operation and any installed credentials intact.
+     bool success = true;
+     bool any_vap = false;
+     for (const auto &vap_kv : m_radio_info.available_vaps) {
+@@ -2535,19 +2667,39 @@ bool ap_wlan_hal_whm::set_cce_indication(uint16_t advertise_cce)
+         if (vap_it == m_vapsExtInfo.end()) {
+             LOG(WARNING) << "set_cce_indication: no ambiorix path known for VAP "
+                          << vap_info.bss;
++            success = false;
+             continue;
+         }
++        if (vap_it->second.teardown) {
++            continue;
++        }
++        if (m_advertise_cce) {
++            bool enabled = false;
++            if (!m_ambiorix_cl.get_param(enabled, vap_it->second.path, "Enable")) {
++                LOG(ERROR) << "set_cce_indication: failed to read AP Enable for "
++                           << vap_info.bss;
++                success = false;
++                continue;
++            }
++            if (!enabled) {
++                continue;
++            }
++        }
+         any_vap                     = true;
+         const std::string dpp_path = vap_it->second.path + "DPP.";
+         AmbiorixVariant dpp_obj(AMXC_VAR_ID_HTABLE);
+-        dpp_obj.add_child("Enable", advertise_cce != 0);
++        dpp_obj.add_child("ConfiguratorConnectivity", m_advertise_cce);
++        if (m_advertise_cce) {
++            dpp_obj.add_child("Enable", true);
++            dpp_obj.add_child("Role", "Relay");
++        }
+         if (!m_ambiorix_cl.update_object(dpp_path, dpp_obj)) {
+             LOG(ERROR) << "set_cce_indication: failed to update " << dpp_path;
+             success = false;
+             continue;
+         }
+         LOG(DEBUG) << "set_cce_indication: set " << dpp_path
+-                   << "Enable=" << (advertise_cce != 0);
++                   << "ConfiguratorConnectivity=" << m_advertise_cce;
+     }
+     if (!any_vap) {
+         LOG(DEBUG) << "set_cce_indication: no fronthaul VAPs available yet on this radio";
+@@ -3143,7 +3295,6 @@ bool ap_wlan_hal_whm::process_wpa_ctrl_event(const beerocks::wbapi::AmbiorixVari
+         LOG(WARNING) << "Unable to retrieve wpaCtrl event data from pwhm notification";
+         return false;
+     }
+-    LOG(DEBUG) << "wpaCtrl event: " << event_str;
+ 
+     std::string interface;
+     if (!event_data.read_child<>(interface, "ifName") || interface.empty()) {
+@@ -3160,6 +3311,8 @@ bool ap_wlan_hal_whm::process_wpa_ctrl_event(const beerocks::wbapi::AmbiorixVari
+           !(opcode = parsed_obj[bwl::EVENT_KEYLESS_PARAM_OPCODE]).empty())) {
+         return false;
+     }
++    // DPP events can carry connectors or key material. Log only their opcode.
++    LOG(DEBUG) << "wpaCtrl event: " << (opcode.compare(0, 4, "DPP-") == 0 ? opcode : event_str);
+ 
+     auto event = wpaCtrl_to_bwl_event(opcode);
+ 
+@@ -3304,6 +3457,36 @@ bool ap_wlan_hal_whm::process_wpa_ctrl_event(const beerocks::wbapi::AmbiorixVari
+         event_queue_push(event);
+         break;
+     }
++    case Event::DPP_PRESENCE_ANNOUNCEMENT: {
++        const auto src_it  = parsed_obj.find("src");
++        const auto hash_it = parsed_obj.find("hash");
++        if (src_it == parsed_obj.end() || !is_dpp_mac_string(src_it->second) ||
++            hash_it == parsed_obj.end() || hash_it->second.size() != 64 ||
++            !std::all_of(hash_it->second.begin(), hash_it->second.end(), is_dpp_hex_digit)) {
++            LOG(ERROR) << "Invalid DPP-CHIRP-RX MAC or hash, hash_length="
++                       << (hash_it == parsed_obj.end() ? 0 : hash_it->second.size());
++            return false;
++        }
++        const auto enrollee_mac = tlvf::mac_from_string(src_it->second);
++        if (enrollee_mac == net::network_utils::ZERO_MAC || (enrollee_mac.oct[0] & 1)) {
++            LOG(ERROR) << "Invalid DPP-CHIRP-RX enrollee MAC";
++            return false;
++        }
++
++        auto msg_buff = ALLOC_SMART_BUFFER(sizeof(sACTION_APMANAGER_DPP_PRESENCE_ANNOUNCEMENT));
++        auto msg = reinterpret_cast<sACTION_APMANAGER_DPP_PRESENCE_ANNOUNCEMENT *>(msg_buff.get());
++        LOG_IF(!msg, FATAL) << "Memory allocation failed!";
++
++        memset(msg_buff.get(), 0, sizeof(sACTION_APMANAGER_DPP_PRESENCE_ANNOUNCEMENT));
++        msg->enrollee_mac = enrollee_mac;
++        std::copy(hash_it->second.begin(), hash_it->second.end(), msg->hash);
++
++        LOG(INFO) << "DPP presence announcement received on " << interface
++                  << ": enrollee=" << msg->enrollee_mac
++                  << " freq=" << parsed_obj["freq"];
++        event_queue_push(Event::DPP_PRESENCE_ANNOUNCEMENT, msg_buff);
++        break;
++    }
+     case Event::AWGN_Detected: {
+         // Parse AWGN event: INTERFERENCE-DETECTED type=AWGN
+         std::string interference_type = parsed_obj["type"];
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
+index 8bf7dddf6..58b22f72f 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
+@@ -329,6 +329,10 @@ private:
+ 
+     std::unordered_set<std::string> m_unassociated_stations;
+ 
++    // Remember the controller's CCE policy for VAPs configured after the indication.
++    bool m_cce_indication_received = false;
++    bool m_advertise_cce           = true;
++
+     /**
+      * Set to true when CAC fails (success == 0). In this case, the next
+      * DFS-triggered channel change event is accepted and processed instead
+diff --git a/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
+index 9f59844be..94cca0da2 100644
+--- a/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/slave_wlan_hal_whm.cpp
+@@ -8,6 +8,8 @@
+ #include <bcl/beerocks_utils.h>
+ #include <bcl/network/network_utils.h>
+ #include <easylogging++.h>
++#include <algorithm>
++#include <cctype>
+ 
+ using namespace beerocks;
+ using namespace beerocks::wbapi;
+@@ -19,7 +21,10 @@ namespace whm {
+ //       need to explicitly call it from any deriving class.
+ slave_wlan_hal_whm::slave_wlan_hal_whm(const std::string &iface_name, hal_event_cb_t callback,
+                                       const bwl::hal_conf_t &hal_conf)
+-    : base_wlan_hal(bwl::HALType::Slave, iface_name, IfaceType::Intel, callback, hal_conf),
++    : base_wlan_hal(bwl::HALType::Slave, iface_name, IfaceType::Intel,
++                    [this, callback](hal_event_ptr_t event) {
++                        return deliver_dpp_event(event, callback);
++                    }, hal_conf),
+       base_wlan_hal_whm(bwl::HALType::Slave, iface_name, callback, hal_conf)
+ {
+     // Unlike ap_wlan_hal_whm, the ambiorix fds are not registered here - DPP relay is only
+@@ -43,6 +48,17 @@ const std::string slave_wlan_hal_whm::get_iface_from_fd(int fd)
+ 
+ bool slave_wlan_hal_whm::init_dpp_relay()
+ {
++    if (m_dpp_relay_active) {
++        if (read_dpp_relay_state()) {
++            return true;
++        }
++        // Re-resolve and subscribe on the next attempt after a provider restart.
++        stop_dpp_relay();
++        return false;
++    }
++    if (m_dpp_relay_enabled) {
++        stop_dpp_relay();
++    }
+     int amx_fd  = m_ambiorix_cl.get_fd();
+     int amxp_fd = m_ambiorix_cl.get_signal_fd();
+     if (amx_fd < 0 || amxp_fd < 0) {
+@@ -56,14 +72,24 @@ bool slave_wlan_hal_whm::init_dpp_relay()
+         return false;
+     }
+ 
+-    AmbiorixVariant enable_map(AMXC_VAR_ID_HTABLE);
+-    enable_map.add_child("RelayEnable", true);
+-    if (!m_ambiorix_cl.update_object(m_dpp_path, enable_map)) {
+-        LOG(ERROR) << "DPP: failed to enable relay listener at " << m_dpp_path;
++    // Subscribe before the synchronous start: hostapd can connect immediately.
++    if (!subscribe_to_dpp_events()) {
++        LOG(ERROR) << "DPP: failed to subscribe at " << m_dpp_path;
+         return false;
+     }
+ 
+-    subscribe_to_dpp_events();
++    AmbiorixVariant args(AMXC_VAR_ID_HTABLE), result;
++    m_dpp_relay_enabled = true;
++    if (!m_ambiorix_cl.call(m_dpp_path, "StartRelay", args, result)) {
++        LOG(ERROR) << "DPP: StartRelay failed at " << m_dpp_path;
++        stop_dpp_relay();
++        return false;
++    }
++
++    if (!read_dpp_relay_state()) {
++        stop_dpp_relay();
++        return false;
++    }
+ 
+     event_queue_push(Event::Register_Ext_Event_Fd, std::make_shared<int>(amx_fd));
+     event_queue_push(Event::Register_Ext_Event_Fd, std::make_shared<int>(amxp_fd));
+@@ -71,64 +97,199 @@ bool slave_wlan_hal_whm::init_dpp_relay()
+     return true;
+ }
+ 
++bool slave_wlan_hal_whm::read_dpp_relay_state()
++{
++    // ListenerReady reports the real bind/listen/register result, not RelayEnable.
++    const auto callbacks_before_read = m_dpp_callback_count;
++    const auto listener_before_read  = m_dpp_listener_revision;
++    auto relay                       = m_ambiorix_cl.get_object(m_dpp_path);
++    bool ready = false, connected = false;
++    uint64_t generation = 0;
++    if (!relay || !relay->read_child(ready, "ListenerReady") || !ready ||
++        !relay->read_child(connected, "ClientConnected") ||
++        !relay->read_child(generation, "ClientGeneration") || (connected && !generation) ||
++        (callbacks_before_read == m_dpp_callback_count && generation < m_dpp_session_id)) {
++        std::string error;
++        if (relay) {
++            relay->read_child(error, "LastError");
++        }
++        LOG(ERROR) << "DPP: relay is not ready or has no connection generation: " << error;
++        return false;
++    }
++    if (listener_before_read != m_dpp_listener_revision && !m_dpp_relay_active) {
++        return false;
++    }
++    m_dpp_relay_active = true;
++    // amxb_get may dispatch a newer notification while waiting for its reply.
++    if (callbacks_before_read == m_dpp_callback_count && generation >= m_dpp_session_id) {
++        const bool changed = m_dpp_client_connected != connected || m_dpp_session_id != generation;
++        m_dpp_session_id       = generation;
++        m_dpp_client_connected = connected;
++        if (!connected) {
++            m_dpp_closed_generation = std::max(m_dpp_closed_generation, generation);
++        }
++        if (changed) {
++            event_queue_push(
++                connected ? Event::Dpp_Client_Connected : Event::Dpp_Client_Disconnected,
++                std::make_shared<sRelayClientEvent>(sRelayClientEvent{generation, m_dpp_epoch}));
++        }
++    }
++
++    return true;
++}
++
+ void slave_wlan_hal_whm::stop_dpp_relay()
+ {
++    ++m_dpp_epoch;
++    m_dpp_relay_active        = false;
++    m_dpp_client_connected    = false;
++    m_dpp_delivery_session_id = 0;
++    m_dpp_session_id          = 0;
++    m_dpp_closed_generation   = 0;
+     for (int fd : m_fds_ext_events) {
+         event_queue_push(Event::Unregister_Ext_Event_Fd, std::make_shared<int>(fd));
+     }
+     m_fds_ext_events.clear();
+ 
+     if (m_dpp_event_handler && !m_dpp_path.empty()) {
+-        m_ambiorix_cl.unsubscribe_from_object_event(m_dpp_event_handler);
++        if (!m_ambiorix_cl.unsubscribe_from_object_event(m_dpp_event_handler)) {
++            LOG(WARNING) << "DPP: failed to unsubscribe at " << m_dpp_path;
++        }
+     }
+     m_dpp_event_handler.reset();
+     m_dpp_client_connected = false;
+ 
+-    if (!m_dpp_path.empty()) {
++    if (m_dpp_relay_enabled && !m_dpp_path.empty()) {
+         AmbiorixVariant enable_map(AMXC_VAR_ID_HTABLE);
+         enable_map.add_child("RelayEnable", false);
+         if (!m_ambiorix_cl.update_object(m_dpp_path, enable_map)) {
+             LOG(WARNING) << "DPP: failed to disable relay listener at " << m_dpp_path;
+         }
+     }
++    m_dpp_relay_enabled = false;
++    m_dpp_path.clear();
+ }
+ 
+-void slave_wlan_hal_whm::subscribe_to_dpp_events()
++bool slave_wlan_hal_whm::subscribe_to_dpp_events()
+ {
++    if (m_dpp_event_handler) {
++        return true;
++    }
+     m_dpp_event_handler               = std::make_shared<sAmbiorixEventHandler>();
+     m_dpp_event_handler->event_type   = "DppFrameReceived";
+-    m_dpp_event_handler->callback_fn  = [this](AmbiorixVariant &event_data) {
+-        on_dpp_ambiorix_event(event_data);
++    const auto epoch = m_dpp_epoch;
++    m_dpp_event_handler->callback_fn  = [this, epoch](AmbiorixVariant &event_data) {
++        if (epoch == m_dpp_epoch) {
++            on_dpp_ambiorix_event(event_data);
++        }
+     };
+     std::string filter =
+         "(path matches '" + m_dpp_path + "$') && (notification == 'DppFrameReceived')";
+-    m_ambiorix_cl.subscribe_to_object_event(m_dpp_path, m_dpp_event_handler, filter);
++    if (!m_ambiorix_cl.subscribe_to_object_event(m_dpp_path, m_dpp_event_handler, filter)) {
++        m_dpp_event_handler.reset();
++        return false;
++    }
++    return true;
+ }
+ 
+ void slave_wlan_hal_whm::on_dpp_ambiorix_event(AmbiorixVariant &event_data)
+ {
++    ++m_dpp_callback_count;
++    bool listener_ready = false;
++    if (event_data.read_child(listener_ready, "listenerReady")) {
++        // Listener events have no client generation. A stopped listener is
++        // reconciled by init_dpp_relay(), including subscription replacement.
++        if (!listener_ready) {
++            ++m_dpp_listener_revision;
++            m_dpp_relay_active = false;
++            m_dpp_client_connected = false;
++            event_queue_push(Event::Dpp_Client_Disconnected,
++                             std::make_shared<sRelayClientEvent>(
++                                 sRelayClientEvent{m_dpp_session_id, m_dpp_epoch}));
++        }
++        return;
++    }
++    uint64_t generation = 0;
++    if (!m_dpp_relay_enabled || !event_data.read_child(generation, "connectionId") ||
++        !generation || generation < m_dpp_session_id) {
++        return;
++    }
+     std::string state;
+     if (event_data.read_child(state, "state")) {
+         if (state == "connected") {
++            if (generation <= m_dpp_closed_generation) {
++                return;
++            }
++            m_dpp_session_id = generation;
+             m_dpp_client_connected = true;
+-            event_queue_push(Event::Dpp_Client_Connected);
++            event_queue_push(
++                Event::Dpp_Client_Connected,
++                std::make_shared<sRelayClientEvent>(sRelayClientEvent{generation, m_dpp_epoch}));
+         } else if (state == "disconnected") {
++            m_dpp_session_id = generation;
++            m_dpp_closed_generation = generation;
+             m_dpp_client_connected = false;
+-            event_queue_push(Event::Dpp_Client_Disconnected);
++            event_queue_push(
++                Event::Dpp_Client_Disconnected,
++                std::make_shared<sRelayClientEvent>(sRelayClientEvent{generation, m_dpp_epoch}));
+         }
+         return;
+     }
+ 
+     std::string frame_hex;
+     uint8_t tcp_type = 0;
+-    if (!event_data.read_child(frame_hex, "frame") ||
+-        !event_data.read_child(tcp_type, "tcpType")) {
++    if (!m_dpp_client_connected || generation != m_dpp_session_id ||
++        !event_data.read_child(frame_hex, "frame") ||
++        !event_data.read_child(tcp_type, "tcpType") || frame_hex.empty() ||
++        frame_hex.size() % 2 || frame_hex.size() > 2 * (16 * 1024 - 5) ||
++        !std::all_of(frame_hex.begin(), frame_hex.end(),
++                     [](unsigned char c) { return std::isxdigit(c); })) {
+         return;
+     }
+ 
+-    auto frame = string_utils::hex_to_bytes<std::vector<uint8_t>>(frame_hex);
+-    event_queue_push(Event::Dpp_Frame_Received,
+-                     std::make_shared<sDppFrameEvent>(sDppFrameEvent{tcp_type, frame}));
++    auto event        = std::make_shared<sRelayFrameEvent>();
++    event->tcp_type   = tcp_type;
++    event->frame      = string_utils::hex_to_bytes<std::vector<uint8_t>>(frame_hex);
++    event->session_id = generation;
++    event->epoch      = m_dpp_epoch;
++    event_queue_push(Event::Dpp_Frame_Received, event);
++}
++
++bool slave_wlan_hal_whm::deliver_dpp_event(hal_event_ptr_t event,
++                                          const hal_event_cb_t &callback)
++{
++    // The Ambiorix and HAL event queues can advance independently. Keep the
++    // generation delivered to the task separate from the latest provider state.
++    const auto type = static_cast<Event>(event->first);
++    if ((type == Event::Dpp_Client_Connected || type == Event::Dpp_Client_Disconnected) &&
++        std::static_pointer_cast<sRelayClientEvent>(event->second)->epoch != m_dpp_epoch) {
++        return true;
++    }
++    if (type == Event::Dpp_Client_Connected) {
++        const auto generation = std::static_pointer_cast<sRelayClientEvent>(event->second)->session_id;
++        if (m_dpp_delivery_session_id && m_dpp_delivery_session_id != generation) {
++            callback(std::make_shared<hal_event_t>(int(Event::Dpp_Client_Disconnected), nullptr));
++        }
++        m_dpp_delivery_session_id = generation;
++    } else if (type == Event::Dpp_Client_Disconnected) {
++        const auto generation = std::static_pointer_cast<sRelayClientEvent>(event->second)->session_id;
++        if (generation < m_dpp_delivery_session_id) {
++            return true;
++        }
++        m_dpp_delivery_session_id = 0;
++    } else if (type == Event::Dpp_Frame_Received) {
++        auto frame = std::static_pointer_cast<sRelayFrameEvent>(event->second);
++        // pWHM drains complete frames before reporting EOF in the same bus read.
++        // Those frames (notably Configuration Result) belong to the delivered
++        // session even if the latest provider state is already disconnected.
++        if (frame->epoch != m_dpp_epoch ||
++            frame->session_id != m_dpp_delivery_session_id) {
++            return true;
++        }
++        event = std::make_shared<hal_event_t>(event->first,
++                                             std::static_pointer_cast<sDppFrameEvent>(frame));
++    }
++    return callback(event);
+ }
+ 
+ bool slave_wlan_hal_whm::dpp_send_frame(uint8_t tcp_type, const uint8_t *frame, size_t frame_len)
+@@ -136,14 +297,17 @@ bool slave_wlan_hal_whm::dpp_send_frame(uint8_t tcp_type, const uint8_t *frame,
+     LOG(DEBUG) << "DPP: dpp_send_frame diag: m_dpp_path='" << m_dpp_path << "' amxb_fd="
+               << m_ambiorix_cl.get_fd() << " amxp_fd=" << m_ambiorix_cl.get_signal_fd();
+ 
+-    if (m_dpp_path.empty()) {
+-        LOG(ERROR) << "DPP: SendDppFrame failed - m_dpp_path is empty";
++    if (!m_dpp_relay_active || !m_dpp_client_connected || !frame || !frame_len ||
++        frame_len > 16 * 1024 - 5 ||
++        !m_dpp_delivery_session_id || m_dpp_delivery_session_id != m_dpp_session_id) {
++        LOG(ERROR) << "DPP: SendDppFrame has no matching live relay connection";
+         return false;
+     }
+ 
+     AmbiorixVariant args(AMXC_VAR_ID_HTABLE), result;
+     args.add_child("tcpType", tcp_type);
+     args.add_child("frame", string_utils::bytes_to_hex_string(frame, frame_len));
++    args.add_child("connectionId", m_dpp_delivery_session_id);
+ 
+     if (!m_ambiorix_cl.call(m_dpp_path, "SendDppFrame", args, result)) {
+         LOG(ERROR) << "DPP: SendDppFrame failed - amxb_fd=" << m_ambiorix_cl.get_fd()
+diff --git a/common/beerocks/bwl/whm/slave_wlan_hal_whm.h b/common/beerocks/bwl/whm/slave_wlan_hal_whm.h
+index 027c4339d..f17deae33 100644
+--- a/common/beerocks/bwl/whm/slave_wlan_hal_whm.h
++++ b/common/beerocks/bwl/whm/slave_wlan_hal_whm.h
+@@ -35,12 +35,31 @@ protected:
+     }
+ 
+ private:
+-    void subscribe_to_dpp_events();
++    bool subscribe_to_dpp_events();
++    bool read_dpp_relay_state();
+     void on_dpp_ambiorix_event(beerocks::wbapi::AmbiorixVariant &event_data);
++    bool deliver_dpp_event(hal_event_ptr_t event, const hal_event_cb_t &callback);
++
++    struct sRelayFrameEvent : sDppFrameEvent {
++        uint64_t session_id = 0;
++        uint64_t epoch      = 0;
++    };
++    struct sRelayClientEvent {
++        uint64_t session_id;
++        uint64_t epoch;
++    };
+ 
+     std::shared_ptr<beerocks::wbapi::sAmbiorixEventHandler> m_dpp_event_handler;
+     std::string m_dpp_path;
++    bool m_dpp_relay_enabled    = false;
++    bool m_dpp_relay_active     = false;
+     bool m_dpp_client_connected = false;
++    uint64_t m_dpp_session_id          = 0;
++    uint64_t m_dpp_delivery_session_id = 0;
++    uint64_t m_dpp_closed_generation   = 0;
++    uint64_t m_dpp_callback_count      = 0;
++    uint64_t m_dpp_listener_revision   = 0;
++    uint64_t m_dpp_epoch               = 0;
+ };
+ 
+ } // namespace whm
+diff --git a/common/beerocks/bwl/whm/sta_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/sta_wlan_hal_whm.cpp
+index 665e5245d..bc54308bf 100644
+--- a/common/beerocks/bwl/whm/sta_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/sta_wlan_hal_whm.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include <cstring>
+ #include <easylogging++.h>
++#include <limits>
+ #include <sstream>
+ 
+ using namespace beerocks;
+@@ -88,6 +89,63 @@ static bool parse_dpp_bootstrap_info(const std::string &reply, int &bootstrap_id
+     return (bootstrap_id > 0 && !uri.empty());
+ }
+ 
++// LIST_NETWORKS reports escaped SSIDs. An unrecognized representation is a
++// mismatch: recovery must never fall back to another saved network.
++static bool select_current_dpp_network(const std::string &networks, const std::string &ssid,
++                                       uint32_t &network_id)
++{
++    bool found = false;
++    std::istringstream stream(networks);
++    std::string line;
++    std::getline(stream, line); // header
++    while (std::getline(stream, line)) {
++        auto id_end   = line.find('\t');
++        auto ssid_end = line.find('\t', id_end == std::string::npos ? 0 : id_end + 1);
++        auto bssid_end = line.find('\t', ssid_end == std::string::npos ? 0 : ssid_end + 1);
++        if (id_end == std::string::npos || ssid_end == std::string::npos ||
++            bssid_end == std::string::npos ||
++            line.find("[CURRENT]", bssid_end + 1) == std::string::npos) {
++            continue;
++        }
++        if (found || id_end == 0 || line.substr(id_end + 1, ssid_end - id_end - 1) != ssid) {
++            return false;
++        }
++        uint32_t id = 0;
++        for (size_t i = 0; i < id_end; ++i) {
++            if (line[i] < '0' || line[i] > '9' ||
++                id > (uint32_t(std::numeric_limits<int>::max()) - (line[i] - '0')) / 10) {
++                return false;
++            }
++            id = id * 10 + (line[i] - '0');
++        }
++        network_id = id;
++        found      = true;
++    }
++    return found;
++}
++
++static bool normalize_dpp_network_value(std::string &value, bool hex)
++{
++    auto end = value.find_last_not_of("\r\n");
++    value.erase(end == std::string::npos ? 0 : end + 1);
++    if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
++        value = value.substr(1, value.size() - 2);
++    }
++    if (value.empty() || value.compare(0, 4, "FAIL") == 0) {
++        return false;
++    }
++    if (hex) {
++        return value.size() % 2 == 0 &&
++               value.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos;
++    }
++    const auto first_dot = value.find('.');
++    const auto last_dot  = value.rfind('.');
++    return first_dot != std::string::npos && first_dot > 0 && last_dot > first_dot + 1 &&
++           last_dot + 1 < value.size() && value.find('.', first_dot + 1) == last_dot &&
++           value.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.") ==
++               std::string::npos;
++}
++
+ sta_wlan_hal_whm::sta_wlan_hal_whm(const std::string &iface_name, hal_event_cb_t callback,
+                                    const bwl::hal_conf_t &hal_conf)
+     : base_wlan_hal(bwl::HALType::Station, iface_name, IfaceType::Intel, callback, hal_conf),
+@@ -274,17 +332,15 @@ void sta_wlan_hal_whm::subscribe_to_ep_wpaCtrl_events()
+             return;
+         }
+ 
+-        // Only handle events for our own resolved EndPoint. If not yet resolved,
+-        // fall back to matching on ifName so early DPP events aren't dropped.
++        // Both the object and control interface must belong to this HAL.
++        std::string if_name;
++        if (!event_data.read_child(if_name, "ifName") || if_name != get_iface_name()) {
++            return;
++        }
+         if (!m_ep_path.empty()) {
+             if (m_ep_path != ep_path) {
+                 return;
+             }
+-        } else {
+-            std::string if_name;
+-            if (!event_data.read_child(if_name, "ifName") || if_name != get_iface_name()) {
+-                return;
+-            }
+         }
+ 
+         std::string data;
+@@ -999,6 +1055,8 @@ bool sta_wlan_hal_whm::add_new_network(son::wireless_utils::sBssInfoConf bSta_co
+ bool sta_wlan_hal_whm::dpp_bootstrap_gen_and_get_uri(const std::vector<uint8_t> &private_key_der,
+                                                      int &bootstrap_id, std::string &uri)
+ {
++    LOG(INFO) << "DPP TRACE WHM: bootstrap_gen start iface=" << get_iface_name()
++              << " ep_path=" << m_ep_path << " key_len=" << private_key_der.size();
+     if (m_ep_path.empty()) {
+         LOG(ERROR) << "DPP: endpoint path is empty on " << get_iface_name();
+         return false;
+@@ -1018,6 +1076,7 @@ bool sta_wlan_hal_whm::dpp_bootstrap_gen_and_get_uri(const std::vector<uint8_t>
+         LOG(ERROR) << "DPP: dpp_bootstrap_gen_info failed on " << get_iface_name();
+         return false;
+     }
++    LOG(INFO) << "DPP TRACE WHM: bootstrap_gen call returned iface=" << get_iface_name();
+ 
+     std::string reply;
+     if (!read_call_string_result(result, reply) ||
+@@ -1025,12 +1084,16 @@ bool sta_wlan_hal_whm::dpp_bootstrap_gen_and_get_uri(const std::vector<uint8_t>
+         LOG(ERROR) << "DPP: invalid dpp_bootstrap_gen_info reply on " << get_iface_name();
+         return false;
+     }
++    LOG(INFO) << "DPP TRACE WHM: bootstrap_gen parsed iface=" << get_iface_name()
++              << " id=" << bootstrap_id << " uri_len=" << uri.size();
+ 
+     return true;
+ }
+ 
+ bool sta_wlan_hal_whm::dpp_set_extra_conf_req_bsta_list(const std::string &json_value)
+ {
++    LOG(INFO) << "DPP TRACE WHM: extra_conf start iface=" << get_iface_name()
++              << " ep_path=" << m_ep_path << " value_len=" << json_value.size();
+     if (m_ep_path.empty()) {
+         LOG(ERROR) << "DPP: endpoint path is empty on " << get_iface_name();
+         return false;
+@@ -1045,106 +1108,104 @@ bool sta_wlan_hal_whm::dpp_set_extra_conf_req_bsta_list(const std::string &json_
+         LOG(ERROR) << "DPP: setDppExtraConfReq failed on " << get_iface_name();
+         return false;
+     }
++    LOG(INFO) << "DPP TRACE WHM: extra_conf call returned iface=" << get_iface_name();
+ 
+     bool ok = false;
+-    return read_call_bool_result(result, ok) && ok;
++    const bool parsed = read_call_bool_result(result, ok);
++    LOG(INFO) << "DPP TRACE WHM: extra_conf complete iface=" << get_iface_name()
++              << " parsed=" << parsed << " result=" << ok;
++    return parsed && ok;
+ }
+ 
+ bool sta_wlan_hal_whm::get_persisted_dpp_credentials(sPersistedDppCredentials &creds)
+ {
+     creds = sPersistedDppCredentials{};
+-
+     if (m_ep_path.empty()) {
+-        LOG(ERROR) << "DPP: endpoint path is empty on " << get_iface_name();
+         return false;
+     }
+-
+     const auto dpp_path = m_ep_path + "DPP.";
+-
+-    AmbiorixVariant args(AMXC_VAR_ID_HTABLE), result;
+-    if (!m_ambiorix_cl.call(dpp_path, "listDppNetworks", args, result)) {
+-        LOG(ERROR) << "DPP: listDppNetworks failed on " << get_iface_name();
+-        return false;
+-    }
+-
+-    std::string networks;
+-    if (!read_call_string_result(result, networks)) {
+-        LOG(ERROR) << "DPP: empty listDppNetworks reply on " << get_iface_name();
+-        return false;
+-    }
+-
+-    int network_id = -1;
+-    std::istringstream networks_stream(networks);
+-    std::string line;
+-    std::getline(networks_stream, line);
+-    while (std::getline(networks_stream, line)) {
+-        auto tab = line.find('\t');
+-        if (tab == std::string::npos) {
+-            continue;
+-        }
+-
+-        int id = beerocks::string_utils::stoi(line.substr(0, tab));
+-        AmbiorixVariant get_args(AMXC_VAR_ID_HTABLE), get_result;
+-        get_args.add_child("id", uint32_t(id));
+-        get_args.add_child("field", std::string("dpp_connector"));
+-        if (!m_ambiorix_cl.call(dpp_path, "getDppNetworkValue", get_args, get_result)) {
+-            continue;
+-        }
+-
+-        std::string connector;
+-        if (read_call_string_result(get_result, connector) && !connector.empty()) {
+-            creds.has_wlan_connector = true;
+-            creds.wlan_connector     = connector;
+-            network_id               = id;
+-            break;
++    auto read_owner = [&](std::string &profile_path, std::string &ssid) {
++        auto ep = m_ambiorix_cl.get_object(m_ep_path);
++        std::string reference;
++        if (!ep || !ep->read_child(reference, "ProfileReference") || reference.empty()) {
++            return false;
+         }
+-    }
+-
+-    if (network_id >= 0) {
+-        AmbiorixVariant nak_args(AMXC_VAR_ID_HTABLE), nak_result;
+-        nak_args.add_child("id", uint32_t(network_id));
+-        nak_args.add_child("field", std::string("dpp_netaccesskey"));
+-
+-        std::string nak_hex;
+-        if (m_ambiorix_cl.call(dpp_path, "getDppNetworkValue", nak_args, nak_result)) {
+-            read_call_string_result(nak_result, nak_hex);
++        if (reference.back() != '.') {
++            reference += '.';
+         }
+-
+-        AmbiorixVariant csign_args(AMXC_VAR_ID_HTABLE), csign_result;
+-        csign_args.add_child("id", uint32_t(network_id));
+-        csign_args.add_child("field", std::string("dpp_csign"));
+-
+-        std::string csign_hex;
+-        if (m_ambiorix_cl.call(dpp_path, "getDppNetworkValue", csign_args, csign_result)) {
+-            read_call_string_result(csign_result, csign_hex);
++        if (!m_ambiorix_cl.resolve_path(reference, profile_path)) {
++            return false;
+         }
+-
+-        if (!nak_hex.empty() && !csign_hex.empty()) {
+-            creds.nak_private_der =
+-                beerocks::string_utils::hex_to_bytes<std::vector<uint8_t>>(nak_hex);
+-            creds.c_sign_key_der =
+-                beerocks::string_utils::hex_to_bytes<std::vector<uint8_t>>(csign_hex);
+-        } else {
+-            LOG(WARNING) << "DPP: persisted connector found on " << get_iface_name()
+-                         << " but NAK/C-sign-key could not be read";
++        auto without_device = [](std::string path) {
++            if (path.compare(0, 7, "Device.") == 0) {
++                path.erase(0, 7);
++            }
++            return path;
++        };
++        const auto profiles_path = without_device(m_ep_path) + "Profile.";
++        if (without_device(profile_path).compare(0, profiles_path.size(), profiles_path) != 0) {
++            return false;
+         }
++        auto profile = m_ambiorix_cl.get_object(profile_path);
++        bool enabled = false;
++        return profile && profile->read_child(enabled, "Enable") && enabled &&
++               profile->read_child(ssid, "SSID") && !ssid.empty();
++    };
++    auto read_current = [&](const std::string &ssid, uint32_t &id) {
++        AmbiorixVariant args(AMXC_VAR_ID_HTABLE), result;
++        std::string networks;
++        return m_ambiorix_cl.call(dpp_path, "listDppNetworks", args, result) &&
++               read_call_string_result(result, networks) &&
++               select_current_dpp_network(networks, ssid, id);
++    };
++    std::string profile_path, ssid;
++    uint32_t network_id;
++    if (!read_owner(profile_path, ssid) || !read_current(ssid, network_id)) {
++        return false;
+     }
+-
+-    AmbiorixVariant conn1905_result;
+-    if (m_ambiorix_cl.call(dpp_path, "getDpp1905Connector", args, conn1905_result)) {
+-        std::string connector;
+-        if (read_call_string_result(conn1905_result, connector) && !connector.empty()) {
+-            creds.has_1905_connector  = true;
+-            creds.dpp_1905_connector = connector;
++    auto read_value = [&](const char *field, std::string &value, bool hex) {
++        AmbiorixVariant args(AMXC_VAR_ID_HTABLE), result;
++        args.add_child("id", network_id);
++        args.add_child("field", std::string(field));
++        return m_ambiorix_cl.call(dpp_path, "getDppNetworkValue", args, result) &&
++               read_call_string_result(result, value) && normalize_dpp_network_value(value, hex);
++    };
++    std::string connector, nak, csign;
++    if (!read_value("dpp_connector", connector, false) ||
++        !read_value("dpp_netaccesskey", nak, true) || !read_value("dpp_csign", csign, true)) {
++        return false;
++    }
++    // Calls are separate RPCs. Reject a changed profile/network or triplet
++    // instead of publishing a mixture if reconfiguration happens during reads.
++    const std::pair<const char *, std::string> values[] = {
++        {"dpp_connector", connector}, {"dpp_netaccesskey", nak}, {"dpp_csign", csign}};
++    for (size_t i = 0; i < 3; ++i) {
++        std::string check;
++        if (!read_value(values[i].first, check, i != 0) || check != values[i].second) {
++            return false;
+         }
+     }
+-
+-
++    std::string check_profile, check_ssid;
++    uint32_t check_id;
++    if (!read_owner(check_profile, check_ssid) || check_profile != profile_path ||
++        check_ssid != ssid || !read_current(ssid, check_id) || check_id != network_id) {
++        return false;
++    }
++    creds.wlan_connector     = connector;
++    creds.nak_private_der    = beerocks::string_utils::hex_to_bytes<std::vector<uint8_t>>(nak);
++    creds.c_sign_key_der     = beerocks::string_utils::hex_to_bytes<std::vector<uint8_t>>(csign);
++    creds.has_wlan_connector = true;
++    // GET dpp_1905_connector is global and has no network/session ownership.
++    // The HAL result has only one key pair; never attach that global connector
++    // to the WLAN keys. Independent 1905 recovery needs its own complete set.
+     return true;
+ }
+ 
+ bool sta_wlan_hal_whm::dpp_chirp(int bootstrap_id, const std::string &net_role, int iterations)
+ {
++    LOG(INFO) << "DPP TRACE WHM: chirp start iface=" << get_iface_name()
++              << " ep_path=" << m_ep_path << " id=" << bootstrap_id
++              << " netrole=" << net_role << " iterations=" << iterations;
+     if (m_ep_path.empty()) {
+         LOG(ERROR) << "DPP: endpoint path is empty on " << get_iface_name();
+         return false;
+@@ -1160,9 +1221,13 @@ bool sta_wlan_hal_whm::dpp_chirp(int bootstrap_id, const std::string &net_role,
+         LOG(WARNING) << "DPP: chirp failed on " << get_iface_name();
+         return false;
+     }
++    LOG(INFO) << "DPP TRACE WHM: chirp call returned iface=" << get_iface_name();
+ 
+     bool ok = false;
+-    return read_call_bool_result(result, ok) && ok;
++    const bool parsed = read_call_bool_result(result, ok);
++    LOG(INFO) << "DPP TRACE WHM: chirp complete iface=" << get_iface_name()
++              << " parsed=" << parsed << " result=" << ok;
++    return parsed && ok;
+ }
+ 
+ bool sta_wlan_hal_whm::enable_disable_ep(bool enable)
+-- 
+2.34.1
+
