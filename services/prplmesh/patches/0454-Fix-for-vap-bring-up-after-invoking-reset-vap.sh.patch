@@ -1,0 +1,159 @@
+From 6a6b07a4fd35f89599cbd9e60b437a8e052adc29 Mon Sep 17 00:00:00 2001
+From: Sonali Naresh <sonanare@qti.qualcomm.com>
+Date: Wed, 23 Sep 2026 23:27:46 +0530
+Subject: [PATCH] Fix for vap bring up after invoking reset-vap.sh
+
+Signed-off-by: Sonali Naresh <sonanare@qti.qualcomm.com>
+---
+ .../backhaul_manager/backhaul_manager.cpp     | 70 ++++++++++++++++++++---
+ .../slave/backhaul_manager/backhaul_manager.h | 14 +++++
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  3 ++-
+ 3 files changed, 77 insertions(+), 10 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 9d70446..d80605c 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -92,6 +92,13 @@ constexpr auto backhaul_steering_timeout = std::chrono::milliseconds(10000);
+  */
+ constexpr auto dev_reset_default_timeout = std::chrono::seconds(UCC_REPLY_COMPLETE_TIMEOUT_SEC);
+ 
++/**
++ * Bounded wait for all radios to confirm VAP teardown during "dev_reset_default" before
++ * proceeding with reset_vaps.sh regardless, so a missing/lost confirmation can't stall the
++ * command until the outer dev_reset_default_timeout fires.
++ */
++constexpr auto dev_reset_default_teardown_wait = std::chrono::seconds(3);
++
+ /**
+  * Delay before retrying DPP chirp after a DPP-FAIL or DPP-CONF-FAILED event. Kept past the DPP
+  * Controller's connection staleness window, so a retry chirp's Presence Announcement doesn't
+@@ -854,15 +861,59 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+     if (m_is_in_reset_state) {
+         if (m_eFSMState == EState::ENABLED) {
+             if (!m_dev_reset_default_completed) {
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
++                if (m_dev_reset_default_teardown_sent == false) {
++                    // Tear down all VAPs so no station can connect until the APs are
++                    // reconfigured. Clear any stale confirmation left over from an earlier,
++                    // unrelated teardown/enable cycle so the wait below reflects only this
++                    // command's teardown.
++                    for (auto &radio_info : m_radios_info) {
++                        radio_info->vaps_teardown_confirmed = false;
++                    }
++                    LOG(INFO) << "backhaul_fsm_main: dev_reset_default -"
++                              << " calling send_slaves_tear_down() to tear down all VAPs";
++                    send_slaves_tear_down();
++
++                    m_dev_reset_default_teardown_sent = true;
++                    m_dev_reset_default_teardown_deadline =
++                        std::chrono::steady_clock::now() + dev_reset_default_teardown_wait;
++                    return true;
++                }
++
++                // Wait for the AP manager to confirm that VAP teardown has actually completed
++                // on every radio before rewriting the wireless config and reloading it - running
++                // reset_vaps.sh while the async teardown is still in flight can race it and leave
++                // the freshly-reconfigured VAPs administratively down. Bounded by
++                // dev_reset_default_teardown_wait so a missing/lost confirmation can't stall the
++                // command indefinitely (the outer dev_reset_default_timer is still the ultimate
++                // safety net).
++                bool teardown_confirmed = all_radios_teardown_confirmed();
++                bool teardown_wait_expired =
++                    std::chrono::steady_clock::now() >= m_dev_reset_default_teardown_deadline;
++                if (teardown_confirmed == false && teardown_wait_expired == false) {
++                    return true;
++                }
++                if (teardown_confirmed == false) {
++                    LOG(WARNING) << "backhaul_fsm_main: dev_reset_default - VAP teardown not"
++                                  << " confirmed by AP manager within "
++                                  << dev_reset_default_teardown_wait.count()
++                                  << "s, proceeding with reset_vaps.sh anyway";
++                } else {
++                    LOG(INFO) << "backhaul_fsm_main: dev_reset_default - VAP teardown confirmed"
++                              << " on all radios, proceeding with reset_vaps.sh";
++                }
++#else
++                // Backends without an AP-manager teardown-confirmation notification (see
++                // sRadioInfo::vaps_teardown_confirmed) tear down and proceed unconditionally,
++                // matching this backend's pre-existing behavior.
++                LOG(INFO) << "backhaul_fsm_main: dev_reset_default -"
++                          << " calling send_slaves_tear_down() to tear down all VAPs";
++                send_slaves_tear_down();
++#endif
++
+                 // The "dev_reset_default" asynchronous command processing is complete.
+                 m_dev_reset_default_completed = true;
+ 
+-                // Tear down all VAPs so no station can connect until the APs are
+-                // reconfigured.
+-                LOG(INFO) << "backhaul_fsm_main: dev_reset_default -"
+-                          << " calling send_slaves_tear_down() to tear down all VAPs";
+-                send_slaves_tear_down();
+-
+                 // Invoke reset_vaps.sh AFTER teardown, but only in certification mode
+                 // and only via the dev_reset_default path (m_is_in_reset_state +
+                 // !m_dev_reset_default_completed). This script rebuilds the wireless UCI
+@@ -6139,9 +6181,10 @@ void BackhaulManager::handle_dev_reset_default(
+         return;
+     }
+ 
+-    m_selected_backhaul           = "";
+-    m_is_in_reset_state           = true;
+-    m_dev_reset_default_completed = false;
++    m_selected_backhaul                = "";
++    m_is_in_reset_state                = true;
++    m_dev_reset_default_completed      = false;
++    m_dev_reset_default_teardown_sent  = false;
+ 
+     // NOTE: The AP/STA VAP default reset (1 AP + 1 STA per radio via
+     // reset_vaps.sh) is NOT performed here. It is triggered from
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+index acedb98..8daaa9b 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+@@ -1101,6 +1101,20 @@ private:
+      */
+     bool m_dev_reset_default_completed = false;
+ 
++    /**
++     * Flag meaning that send_slaves_tear_down() has already been issued for the current
++     * "dev_reset_default" command, so backhaul_fsm_main() should wait for teardown confirmation
++     * (or its bounded fallback deadline) instead of re-sending the teardown request every tick.
++     */
++    bool m_dev_reset_default_teardown_sent = false;
++
++    /**
++     * Deadline after which backhaul_fsm_main() proceeds with reset_vaps.sh even if not all
++     * radios have confirmed VAP teardown yet, so "dev_reset_default" can never hang indefinitely
++     * on a missing/lost confirmation.
++     */
++    std::chrono::steady_clock::time_point m_dev_reset_default_teardown_deadline{};
++
+     /**
+      * File descriptor of the timer to check if a "dev_reset_default" command handling timed out.
+      */
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 2cb45a3..c724ba9 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -6295,6 +6295,7 @@ bool ApAutoConfigurationTask::handle_bss_reconfiguration(
+         return false;
+     }
+
++#if 0
+     // ----------------------------------------------------------------------
+     // PPM-FIX (certification-only): "Don't orphan a radio" guard.
+     //
+@@ -6361,7 +6362,7 @@ bool ApAutoConfigurationTask::handle_bss_reconfiguration(
+             return true;
+         }
+     }
+-
++#endif
+     using sBssid = beerocks::AgentDB::sRadio::sFront::sBssid;
+
+     // Local device BSS configs list (only active)
+--
+2.34.1
+
