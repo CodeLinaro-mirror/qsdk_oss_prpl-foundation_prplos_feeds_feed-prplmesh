@@ -1,0 +1,563 @@
+From 7ed69603bbe7461cb2bcda9b9a98b55cf689d78f Mon Sep 17 00:00:00 2001
+From: Parimalarengan Gururajan <gururaja@qti.qualcomm.com>
+Date: Fri, 18 Sep 2026 09:39:51 +0530
+Subject: [PATCH] dpp: URI to ODL handling - TS retry
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- controller: fix ProvisionDPP NBAPI table entries not syncing to the DPP
+  URI cache file when their "on event" handler fires during datamodel
+  restore, before g_database exists. Extract the sync into
+  sync_provision_dpp_table_to_file() and call it explicitly once in
+  Controller::start(), after g_database and DppConfiguratorTask are both
+  guaranteed to be initialized.
+- controller: avoid creating an empty /etc/prplmesh/dpp_uri as a side
+  effect of write_dpp_uris() when there's nothing to persist and the file
+  doesn't exist yet — an empty file created here would make the agent's
+  key/URI recovery check wrongly think it's already provisioned.
+- agent: preserve admin-provisioned ProvisionDPP entries already synced
+  into /etc/prplmesh/dpp_uri when (re)writing the agent's own
+  "# local-agent" URI line, instead of truncating the file and losing
+  them.
+- agent: retry Peer Discovery Request / BSS Configuration Request with
+  backoff, to recover from the kernel bridge silently dropping frames on
+  a backhaul STA port still in STP learning state (e.g. right after a
+  traffic-separation VLAN subinterface rebuild).
+- controller: resend the Peer Discovery Response for a duplicate request
+  from an already-onboarded agent instead of tearing down its live
+  session and re-running the 4-way handshake.
+
+Signed-off-by: Parimalarengan Gururajan <gururaja@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/agent_db.h           |  7 ++
+ agent/src/beerocks/slave/son_slave_thread.cpp | 50 +++++++++-
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  5 +
+ .../beerocks/slave/tasks/dpp_agent_task.cpp   | 93 ++++++++++++++++++-
+ .../src/beerocks/slave/tasks/dpp_agent_task.h | 25 +++++
+ controller/nbapi/on_action.cpp                | 57 +++++++-----
+ controller/nbapi/on_action.h                  | 14 +++
+ controller/src/beerocks/master/controller.cpp | 11 +++
+ .../master/tasks/dpp_configurator_task.cpp    | 34 ++++++-
+ .../master/tasks/dpp_configurator_task.h      |  6 ++
+ .../beerocks/master/tasks/dpp_key_store.cpp   | 10 ++
+ 11 files changed, 280 insertions(+), 32 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index d2f7e56d0..ed6a6aefa 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -313,6 +313,13 @@ public:
+         /// (where dpp_credentials.initialized is never set via the wireless path).
+         bool bss_config_sent = false;
+ 
++        /// Set true as soon as a BSS_CONFIGURATION_RESPONSE_MESSAGE is received from the
++        /// controller (before any of its processing), independent of bss_config_sent —
++        /// lets DppAgentTask's retry loop (which never sees this CMDU itself) know a
++        /// response arrived and stop resending the BSS Config Request, even if downstream
++        /// processing (e.g. pushing credentials to ap_manager) hasn't finished yet.
++        bool bss_config_response_received = false;
++
+         /// Count of radios with a queued/in-flight BSS config push (incremented when a
+         /// radio's credentials are queued in ApAutoConfigurationTask, decremented once that
+         /// radio reaches eState::CONFIGURED again). Unlike bss_config_sent (sticky forever)
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index ed8231437..393ace17c 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -1185,16 +1185,56 @@ bool slave_thread::load_dpp_provisioned_keys()
+         std::string new_uri = "DPP:V:3;K:" + key_b64 + ";;";
+ 
+         // Save URI to the shared whitelist file, which the co-located Controller's
+-        // DppConfiguratorTask also reads/rewrites — flock() so the two processes can't
+-        // interleave a partial write/read of the same file.
+-        FILE *uf = fopen(uri_path.c_str(), "w");
++        // DppConfiguratorTask also reads/rewrites. Open with "a+" (not "w") and read the
++        // existing content first, under the same flock() the Controller uses in
++        // write_dpp_uris() (dpp_key_store.cpp), so any admin-provisioned ProvisionDPP
++        // entries the Controller already synced into this file survive this rewrite
++        // instead of being silently truncated away.
++        FILE *uf = fopen(uri_path.c_str(), "a+");
+         if (!uf) {
+-            LOG(ERROR) << "DPP: cannot create " << uri_path;
++            LOG(ERROR) << "DPP: cannot open " << uri_path;
+             EVP_PKEY_free(new_key);
+             return false;
+         }
+         flock(fileno(uf), LOCK_EX);
+-        fprintf(uf, "# local-agent\n%s\n", new_uri.c_str());
++
++        constexpr const char *local_agent_tag = "# local-agent";
++        std::vector<std::string> other_lines;
++        rewind(uf);
++        {
++            char rd_buf[1024];
++            bool skip_next = false;
++            while (fgets(rd_buf, sizeof(rd_buf), uf)) {
++                std::string line(rd_buf);
++                while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
++                    line.pop_back();
++                if (skip_next) {
++                    skip_next = false; // this line was the previous local-agent tag's URI
++                    continue;
++                }
++                if (line == local_agent_tag) {
++                    skip_next = true;
++                    continue;
++                }
++                if (!line.empty()) {
++                    other_lines.push_back(line);
++                }
++            }
++        }
++
++        if (ftruncate(fileno(uf), 0) != 0) {
++            LOG(ERROR) << "DPP: failed to truncate " << uri_path;
++            flock(fileno(uf), LOCK_UN);
++            fclose(uf);
++            EVP_PKEY_free(new_key);
++            return false;
++        }
++        rewind(uf);
++
++        fprintf(uf, "%s\n%s\n", local_agent_tag, new_uri.c_str());
++        for (const auto &line : other_lines) {
++            fprintf(uf, "%s\n", line.c_str());
++        }
+         flock(fileno(uf), LOCK_UN);
+         fclose(uf);
+ 
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index ce59eafd6..8fe66f9ad 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -2224,6 +2224,11 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+ {
+     auto db = AgentDB::get();
+ 
++    // Set before any parsing below so DppAgentTask's retry loop (which never sees this
++    // CMDU itself) knows a response arrived and stops resending the BSS Config Request,
++    // regardless of how the rest of this handler's processing turns out.
++    db->dpp_extender_config.bss_config_response_received = true;
++
+     LOG(INFO) << "DPP: BSS Configuration Response from " << src_mac
+               << " — applying VAP credentials";
+ 
+diff --git a/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp b/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
+index 8af3703bd..ba935d2bb 100644
+--- a/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
++++ b/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
+@@ -474,6 +474,77 @@ void DppAgentTask::work()
+         db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wired ||
+         db->device_conf.local_controller;
+ 
++    // Peer Discovery Request / BSS Configuration Request retry with backoff.
++    // send_cmdu_to_controller() writes to the bridge's raw socket, not the specific bSTA
++    // port — if that port is still in STP "learning" state (e.g. right after a
++    // traffic-separation VLAN subinterface rebuild forces STP re-convergence on the
++    // backhaul STA's bridge port), the kernel bridge silently drops the frame with no
++    // send-time error. Applies to both wired and wireless onboarding — placed here,
++    // before the wired-only sess.active early return below, so it always runs.
++    if (m_peer_discovery_sent_time != std::chrono::steady_clock::time_point{}) {
++        if (db->peer_1905_security.count(m_dpp_controller_mac)) {
++            m_peer_discovery_sent_time   = {};
++            m_peer_discovery_retry_count = 0;
++        } else {
++            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
++                               now - m_peer_discovery_sent_time).count();
++            int backoff = std::min(DPP_RETRY_BASE_SECONDS << m_peer_discovery_retry_count,
++                                    DPP_RETRY_MAX_BACKOFF_SECONDS);
++            if (elapsed > backoff) {
++                if (m_peer_discovery_retry_count >= DPP_RETRY_MAX_COUNT) {
++                    LOG(ERROR) << "DPP: Peer Discovery Response not received after "
++                               << m_peer_discovery_retry_count
++                               << " retries — restarting Autoconfig Search";
++                    m_peer_discovery_sent_time   = {};
++                    m_peer_discovery_retry_count = 0;
++                    m_btl_ctx.task_pool_send_event(eTaskType::AP_AUTOCONFIGURATION,
++                        static_cast<uint8_t>(ApAutoConfigurationTask::eEvent::INIT_TASK));
++                    m_btl_ctx.task_pool_send_event(eTaskType::AP_AUTOCONFIGURATION,
++                        static_cast<uint8_t>(ApAutoConfigurationTask::eEvent::START_AP_AUTOCONFIGURATION));
++                } else {
++                    LOG(WARNING) << "DPP: Peer Discovery Response not received within "
++                                 << backoff << "s — retrying (attempt "
++                                 << (m_peer_discovery_retry_count + 1) << "/"
++                                 << DPP_RETRY_MAX_COUNT << ")";
++                    m_peer_discovery_retry_count++;
++                    initiate_peer_discovery(m_dpp_controller_mac);
++                }
++            }
++        }
++    }
++
++    if (m_bss_config_request_sent_time != std::chrono::steady_clock::time_point{}) {
++        if (db->dpp_extender_config.bss_config_response_received) {
++            m_bss_config_request_sent_time   = {};
++            m_bss_config_request_retry_count = 0;
++        } else {
++            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
++                               now - m_bss_config_request_sent_time).count();
++            int backoff = std::min(DPP_RETRY_BASE_SECONDS << m_bss_config_request_retry_count,
++                                    DPP_RETRY_MAX_BACKOFF_SECONDS);
++            if (elapsed > backoff) {
++                if (m_bss_config_request_retry_count >= DPP_RETRY_MAX_COUNT) {
++                    LOG(ERROR) << "DPP: BSS Configuration Response not received after "
++                               << m_bss_config_request_retry_count
++                               << " retries — restarting Autoconfig Search";
++                    m_bss_config_request_sent_time   = {};
++                    m_bss_config_request_retry_count = 0;
++                    m_btl_ctx.task_pool_send_event(eTaskType::AP_AUTOCONFIGURATION,
++                        static_cast<uint8_t>(ApAutoConfigurationTask::eEvent::INIT_TASK));
++                    m_btl_ctx.task_pool_send_event(eTaskType::AP_AUTOCONFIGURATION,
++                        static_cast<uint8_t>(ApAutoConfigurationTask::eEvent::START_AP_AUTOCONFIGURATION));
++                } else {
++                    LOG(WARNING) << "DPP: BSS Configuration Response not received within "
++                                 << backoff << "s — retrying (attempt "
++                                 << (m_bss_config_request_retry_count + 1) << "/"
++                                 << DPP_RETRY_MAX_COUNT << ")";
++                    m_bss_config_request_retry_count++;
++                    send_bss_configuration_request(m_dpp_controller_mac);
++                }
++            }
++        }
++    }
++
+     if (!sess.active) {
+         if (wired_style_onboarding) {
+             if (db->dpp_bootstrap.valid &&
+@@ -706,11 +777,18 @@ void DppAgentTask::reset_onboarding_progress()
+     m_chirp_sent_time         = {};
+     m_bss_config_request_sent = false;
+ 
++    m_peer_discovery_sent_time       = {};
++    m_peer_discovery_retry_count     = 0;
++    m_bss_config_request_sent_time   = {};
++    m_bss_config_request_retry_count = 0;
++    m_dpp_controller_mac             = {};
++
+     // Also drop any in-progress wired DPP Auth exchange left over from before the switch —
+     // otherwise a genuine fresh wired Auth Request after switching back to Wired is rejected
+     // as a duplicate by the stale `active` latch (see the guard at the top of the wired Auth
+     // Request handler).
+     auto db = AgentDB::get();
++    db->dpp_extender_config.bss_config_response_received = false;
+     if (db->dpp_wired_session.active) {
+         LOG(INFO) << "DPP: clearing stale wired session (controller="
+                    << db->dpp_wired_session.controller_mac << ") on connection type switch";
+@@ -2121,7 +2199,12 @@ bool DppAgentTask::initiate_peer_discovery(const sMacAddr &controller_mac)
+     memcpy(dpp_tlv->dpp_frame(), frame.data(), frame.size());
+ 
+     LOG(INFO) << "DPP: sent Peer Discovery Request to " << controller_mac;
+-    return m_btl_ctx.send_cmdu_to_controller({}, m_cmdu_tx);
++    bool sent = m_btl_ctx.send_cmdu_to_controller({}, m_cmdu_tx);
++    if (sent) {
++        m_dpp_controller_mac      = controller_mac;
++        m_peer_discovery_sent_time = std::chrono::steady_clock::now();
++    }
++    return sent;
+ }
+ 
+ bool DppAgentTask::send_bss_configuration_request(const sMacAddr &controller_mac)
+@@ -2203,7 +2286,13 @@ bool DppAgentTask::send_bss_configuration_request(const sMacAddr &controller_mac
+ 
+     LOG(INFO) << "DPP: BSS Config Request JSON (full, no truncation): " << req_json;
+     LOG(INFO) << "DPP: sending BSS_CONFIGURATION_REQUEST to " << controller_mac;
+-    return m_btl_ctx.send_cmdu_to_controller({}, m_cmdu_tx);
++    bool sent = m_btl_ctx.send_cmdu_to_controller({}, m_cmdu_tx);
++    if (sent) {
++        m_dpp_controller_mac            = controller_mac;
++        m_bss_config_request_sent_time  = std::chrono::steady_clock::now();
++        db->dpp_extender_config.bss_config_response_received = false;
++    }
++    return sent;
+ }
+ 
+ bool DppAgentTask::handle_agent_list(const sMacAddr &src_mac,
+diff --git a/agent/src/beerocks/slave/tasks/dpp_agent_task.h b/agent/src/beerocks/slave/tasks/dpp_agent_task.h
+index a04b8b8e2..b54ee3f1e 100644
+--- a/agent/src/beerocks/slave/tasks/dpp_agent_task.h
++++ b/agent/src/beerocks/slave/tasks/dpp_agent_task.h
+@@ -629,9 +629,34 @@ private:
+     // per radio's AP-Autoconfig Response) — there is no response/ack to key a retry off of.
+     bool m_bss_config_request_sent = false;
+ 
++    // Peer Discovery Request sent time and retry count. The request (or its response)
++    // can be silently dropped by the kernel bridge if the backhaul STA's port is still
++    // in STP "learning" state — e.g. right after a traffic-separation VLAN subinterface
++    // rebuild tears down and re-adds that port. Resend with backoff until
++    // db->peer_1905_security has an entry for m_dpp_controller_mac.
++    std::chrono::steady_clock::time_point m_peer_discovery_sent_time{};
++    int m_peer_discovery_retry_count = 0;
++
++    // BSS Configuration Request sent time and retry count — same rationale as above.
++    // Resend with backoff until db->dpp_extender_config.bss_config_response_received.
++    std::chrono::steady_clock::time_point m_bss_config_request_sent_time{};
++    int m_bss_config_request_retry_count = 0;
++
++    // Controller AL-MAC targeted by the in-flight Peer Discovery / BSS Config Request
++    // retry loop in work() (which takes no arguments).
++    sMacAddr m_dpp_controller_mac{};
++
+     static constexpr int DPP_AUTH_TIMEOUT_SECONDS         = 10;
+     static constexpr int DPP_AUTH_REQUEST_TIMEOUT_SECONDS = 10; // spec §5.3.5 DPP_TIMER
+ 
++    // Peer Discovery Request / BSS Config Request retry backoff: base delay, doubled on
++    // each retry up to a cap, for DPP_RETRY_MAX_COUNT attempts (2,4,8,16,16,16s ≈ 62s
++    // total — comfortably outlasts a bridge port re-traversing STP learning->forwarding
++    // after a traffic-separation VLAN subinterface rebuild).
++    static constexpr int DPP_RETRY_BASE_SECONDS        = 2;
++    static constexpr int DPP_RETRY_MAX_BACKOFF_SECONDS = 16;
++    static constexpr int DPP_RETRY_MAX_COUNT           = 6;
++
+     // DPP frame type constants (Easy Connect §8.2.1)
+     static constexpr uint8_t DPP_PA_AUTHENTICATION_REQUEST  = 0x00;
+     static constexpr uint8_t DPP_PA_AUTHENTICATION_CONFIRM  = 0x02;
+diff --git a/controller/nbapi/on_action.cpp b/controller/nbapi/on_action.cpp
+index 390a51aa9..b08c2a0a5 100644
+--- a/controller/nbapi/on_action.cpp
++++ b/controller/nbapi/on_action.cpp
+@@ -2577,46 +2577,39 @@ static void event_network_enable_changed(const char *const sig_name, const amxc_
+ }
+ 
+ /**
+- * @brief Event handler for Network.ProvisionDPP table changes.
+- *
+- * Invoked on any add/edit/remove of a Device.WiFi.DataElements.Network.ProvisionDPP.{i}
+- * row. Rewrites the Configurator's file-backed DPP URI cache from the full, current set
+- * of DPPURI entries in the table — the table is the source of truth, the file is a mirror
+- * picked up by the Configurator's existing inotify watcher.
++ * @brief Rewrite the Configurator's file-backed DPP URI cache from the full, current set
++ * of DPPURI entries in the Network.ProvisionDPP table — the table is the source of truth,
++ * the file is a mirror picked up by the Configurator's existing inotify watcher.
+  *
+- * Note: this can also fire on transient/incomplete states (e.g. instance
+- * (re)creation during datamodel restore at startup, before a persisted DPPURI
+- * value has been reapplied to the new instance). write_dpp_uris() guards
+- * against destructively truncating the mirror file to empty in that case.
++ * Looks up the ProvisionDPP object directly by its absolute data-model path rather than via
++ * a signal's payload, so it can be called both reactively (from the "on event" handler below)
++ * and proactively (e.g. a one-time sync at controller startup, once g_database and the
++ * DppConfiguratorTask are both guaranteed to exist — see Controller::start()).
+  */
+-static void event_provision_dpp_changed(const char *const sig_name, const amxc_var_t *const data,
+-                                        void *const priv)
++bool sync_provision_dpp_table_to_file()
+ {
+     if (!g_database) {
+         LOG(ERROR) << "Can't sync ProvisionDPP, g_database is nullptr";
+-        return;
++        return false;
+     }
+ 
+     auto controller_ctx = g_database->get_controller_ctx();
+     if (!controller_ctx) {
+         LOG(WARNING) << "Failed to get controller context, cannot sync ProvisionDPP.";
+-        return;
++        return false;
+     }
+ 
+     auto dpp_task = controller_ctx->get_dpp_configurator_task();
+     if (!dpp_task) {
+         LOG(WARNING) << "DppConfiguratorTask not initialized, cannot sync ProvisionDPP.";
+-        return;
++        return false;
+     }
+ 
+-    amxd_object_t *provision_dpp_entry =
+-        amxd_dm_signal_get_object(beerocks::nbapi::Amxrt::getDatamodel(), data);
+-    amxd_object_t *provision_dpp =
+-        provision_dpp_entry ? amxd_object_get_parent(provision_dpp_entry) : nullptr;
+-
++    amxd_object_t *provision_dpp = amxd_dm_findf(beerocks::nbapi::Amxrt::getDatamodel(), "%s",
++                                                 DATAELEMENTS_ROOT_DM ".Network.ProvisionDPP");
+     if (!provision_dpp) {
+         LOG(WARNING) << "Failed to get object " DATAELEMENTS_ROOT_DM ".Network.ProvisionDPP.";
+-        return;
++        return false;
+     }
+ 
+     std::vector<std::string> uris;
+@@ -2631,7 +2624,29 @@ static void event_provision_dpp_changed(const char *const sig_name, const amxc_v
+ 
+     if (!dpp_task->sync_provisioned_uris(uris)) {
+         LOG(ERROR) << "Failed to rewrite DPP URI cache file from ProvisionDPP table.";
++        return false;
+     }
++
++    return true;
++}
++
++/**
++ * @brief Event handler for Network.ProvisionDPP table changes.
++ *
++ * Invoked on any add/edit/remove of a Device.WiFi.DataElements.Network.ProvisionDPP.{i}
++ * row.
++ *
++ * Note: this can also fire on transient/incomplete states (e.g. instance
++ * (re)creation during datamodel restore at startup, before a persisted DPPURI
++ * value has been reapplied to the new instance, or before g_database/the
++ * DppConfiguratorTask exist yet). sync_provision_dpp_table_to_file() simply skips the sync
++ * in that case (logging why); Controller::start() performs an explicit one-time sync once
++ * everything is initialized, so no persisted entry is permanently missed.
++ */
++static void event_provision_dpp_changed(const char *const sig_name, const amxc_var_t *const data,
++                                        void *const priv)
++{
++    sync_provision_dpp_table_to_file();
+ }
+ 
+ /**
+diff --git a/controller/nbapi/on_action.h b/controller/nbapi/on_action.h
+index 9809d01f8..c4136eae0 100644
+--- a/controller/nbapi/on_action.h
++++ b/controller/nbapi/on_action.h
+@@ -23,6 +23,20 @@ std::vector<beerocks::nbapi::sEvents> get_events_list(void);
+ std::vector<beerocks::nbapi::sFunctions> get_func_list(void);
+ beerocks::nbapi::ambiorix_func_ptr get_access_point_commit(void);
+ 
++/**
++ * @brief Rewrite the DPP Configurator's file-backed URI cache from the full, current set
++ * of DPPURI entries in the Network.ProvisionDPP table.
++ *
++ * This is the same sync performed reactively by the ProvisionDPP table's "on event" handler,
++ * exposed here so callers that don't have a data-model signal to hand (e.g. an explicit
++ * one-time sync at controller startup, once g_database and the DppConfiguratorTask are both
++ * available) can trigger it directly.
++ *
++ * @return True on success, false if the sync could not be performed (e.g. prerequisites not
++ * yet initialized, or the table/file could not be accessed).
++ */
++bool sync_provision_dpp_table_to_file();
++
+ // AWGN Simulation function
+ amxd_status_t simulate_awgn_6ghz(amxd_object_t *object, amxd_function_t *func,
+                                  amxc_var_t *args, amxc_var_t *ret);
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 9204cb371..e2e6281b7 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "controller.h"
++#include "on_action.h"
+ #include "periodic/persistent_data_commit_operation.h"
+ #include "periodic/persistent_database_aging.h"
+ #include "son_actions.h"
+@@ -380,6 +381,16 @@ bool Controller::start()
+         << "Failed adding DppConfiguratorTask!";
+     LOG(INFO) << "DPP Configurator Task initialized";
+ 
++    // The ProvisionDPP table's "on event" handler (on_action.cpp) may have already fired
++    // during datamodel restore at process startup, before g_database/this task existed —
++    // it skips the sync in that case (see event_provision_dpp_changed()). Do one explicit
++    // sync now that both are guaranteed to be initialized, so a persisted ProvisionDPP entry
++    // restored before that point isn't left unsynced to the DPP URI cache file.
++    if (!prplmesh::controller::actions::sync_provision_dpp_table_to_file()) {
++        LOG(WARNING) << "Initial ProvisionDPP-to-file sync did not complete; "
++                        "continuing startup regardless.";
++    }
++
+     transaction.commit();
+ 
+     LOG(DEBUG) << "started";
+diff --git a/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp b/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp
+index 599740ef7..57a42ce19 100644
+--- a/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp
++++ b/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp
+@@ -2258,6 +2258,21 @@ bool DppConfiguratorTask::handle_peer_discovery_request(const sMacAddr &agent_ma
+ 
+     // Find or create session
+     auto *session = get_session_by_agent(agent_mac);
++
++    // A duplicate Peer Discovery Request for an agent that has already completed
++    // onboarding is a legitimate retransmission (the agent's retry fired because our
++    // *response* was lost, not because the request was lost) — not a stale/incomplete
++    // session. Just resend the (deterministic, session-independent) response without
++    // tearing down the live session: doing the full teardown below would deinstall the
++    // already-installed TK and force a fresh 4-way handshake on a working link.
++    if (session && session->state == eDppSessionState::ONBOARDING_DONE) {
++        LOG(INFO) << "DPP: duplicate PeerDiscReq from " << agent_mac
++                  << " — session already ONBOARDING_DONE, resending response without "
++                     "disturbing live session";
++        EVP_PKEY_free(agent_nak);
++        return send_peer_discovery_response(agent_mac, attrs, attrs_len);
++    }
++
+     if (session) {
+         // EXT sent PeerDiscReq — always clear the old session and restart.
+         // GW never initiates PeerDiscReq; EXT always drives this exchange.
+@@ -2364,6 +2379,20 @@ bool DppConfiguratorTask::handle_peer_discovery_request(const sMacAddr &agent_ma
+     LOG(INFO) << "DPP: 1905 PMK established with " << agent_mac;
+     LOG(INFO) << "DPP: PMK (from Peer Discovery) = " << DppCryptoHelper::to_hex(session->pmk_1905.data(), 32);
+ 
++    if (!send_peer_discovery_response(agent_mac, attrs, attrs_len)) {
++        return false;
++    }
++
++    LOG(DEBUG) << "DPP: waiting 500ms before sending EAPOL M1 to " << agent_mac;
++    std::this_thread::sleep_for(std::chrono::milliseconds(500));
++
++    return initiate_1905_4way_handshake(agent_mac, *session);
++}
++
++bool DppConfiguratorTask::send_peer_discovery_response(const sMacAddr &agent_mac,
++                                                          const uint8_t *attrs,
++                                                          size_t attrs_len)
++{
+     // Build and send Peer Discovery Response
+     // Per hostapd wpa_supplicant/dpp_supplicant.c, the response must contain:
+     //   1. DPP_ATTR_TRANSACTION_ID (echo from request)
+@@ -2400,10 +2429,7 @@ bool DppConfiguratorTask::handle_peer_discovery_request(const sMacAddr &agent_ma
+         return false;
+     }
+ 
+-    LOG(DEBUG) << "DPP: waiting 500ms before sending EAPOL M1 to " << agent_mac;
+-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+-
+-    return initiate_1905_4way_handshake(agent_mac, *session);
++    return true;
+ }
+ 
+ bool DppConfiguratorTask::handle_peer_discovery_response(const sMacAddr &agent_mac,
+diff --git a/controller/src/beerocks/master/tasks/dpp_configurator_task.h b/controller/src/beerocks/master/tasks/dpp_configurator_task.h
+index 72a5697d2..b3a19d7c1 100644
+--- a/controller/src/beerocks/master/tasks/dpp_configurator_task.h
++++ b/controller/src/beerocks/master/tasks/dpp_configurator_task.h
+@@ -341,6 +341,12 @@ private:
+ 
+     bool handle_peer_discovery_request(const sMacAddr &agent_mac, const uint8_t *frame,
+                                         size_t len);
++    // Build and send the Peer Discovery Response (transaction-ID echo + DPP_STATUS_OK +
++    // controller connector). Deterministic and session-independent — safe to call again
++    // on a duplicate request without touching any session state. Used both by the normal
++    // flow and by the ONBOARDING_DONE fast path in handle_peer_discovery_request().
++    bool send_peer_discovery_response(const sMacAddr &agent_mac, const uint8_t *attrs,
++                                       size_t attrs_len);
+     bool handle_peer_discovery_response(const sMacAddr &agent_mac,
+                                          const uint8_t *frame, size_t len);
+     bool initiate_1905_4way_handshake(const sMacAddr &agent_mac, sDppSession &session);
+diff --git a/controller/src/beerocks/master/tasks/dpp_key_store.cpp b/controller/src/beerocks/master/tasks/dpp_key_store.cpp
+index 95de239a5..c418a766f 100644
+--- a/controller/src/beerocks/master/tasks/dpp_key_store.cpp
++++ b/controller/src/beerocks/master/tasks/dpp_key_store.cpp
+@@ -392,6 +392,16 @@ bool DppKeyStore::write_dpp_uris(const std::vector<std::string> &uris) const
+     constexpr const char *uris_file       = "/etc/prplmesh/dpp_uri";
+     constexpr const char *local_agent_tag = "# local-agent";
+ 
++    if (uris.empty() && access(uris_file, F_OK) != 0) {
++        // Nothing to persist (no NBAPI-provisioned URIs) and no local-agent line to
++        // preserve either (the file doesn't exist yet). Don't create it merely by opening
++        // it below — the co-located Agent (son_slave_thread.cpp) uses this file's mere
++        // *existence* to decide whether its own URI still needs to be (re)generated from a
++        // pre-provisioned key; an empty file created here as a side effect would make that
++        // check see a false "already provisioned" and skip regeneration.
++        return true;
++    }
++
+     FILE *f = fopen(uris_file, "a+");
+     if (!f) {
+         MAPF_ERR("DppKeyStore: failed to open " << uris_file << " for write");
+-- 
+2.34.1
+
