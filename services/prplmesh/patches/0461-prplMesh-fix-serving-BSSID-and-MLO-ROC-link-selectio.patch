@@ -1,0 +1,179 @@
+From 0f895aadfa3757e4bd763da30aaf1885f47abbf7 Mon Sep 17 00:00:00 2001
+From: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+Date: Thu, 1 Oct 2026 00:42:20 +0530
+Subject: [PATCH] prplMesh: fix serving BSSID and MLO ROC link selection
+
+Problem:
+
+Steering consumers could receive an incorrect serving BSSID for
+single-link MLD and SLO clients. Unassociated STA measurements also
+failed on non-default MLO links when remain-on-channel was rejected.
+
+Root cause:
+
+Single-link handling treated STA peer link indices as AP MLD link
+ordering, while periodic SLO processing overwrote the association
+BSSID. The ROC request used the base MLD netdev but omitted the MLO
+link ID, causing nl80211 to validate the channel against link 0.
+
+Fix:
+
+Use the affiliated link MAC as the authoritative BSSID for single-link
+MLD clients and preserve the association-frame BSSID for SLO clients.
+For unassociated measurements, retain the base netdev ifindex and add
+NL80211_ATTR_MLO_LINK_ID when the monitor represents an MLO link.
+
+Signed-off-by: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 | 38 ++++++++++++++-----
+ agent/src/beerocks/slave/son_slave_thread.cpp | 21 ++++++++--
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 19 ++++++++--
+ 3 files changed, 62 insertions(+), 16 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 08be4594e..64247f49e 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -4077,20 +4077,40 @@ bool ApManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+             return false;
+         }
+ 
+-        notification->mac()          = msg->params.mac;
+-        notification->vap_id()       = msg->params.vap_id;
+-        notification->link_mac()     = tlvf::mac_from_string(vap_node->second.mac);
++        notification->mac()    = msg->params.mac;
++        notification->vap_id() = msg->params.vap_id;
+ 
+         LOG(DEBUG) << "BSSID: " << vap_node->second.mac << " AP_MLD_MAC: " << vap_node->second.ap_mld_mac;
+ 
++        // The association-frame BSSID is authoritative for the serving link. This
++        // also applies to a single-link non-AP MLD that the HAL reports as MLO.
++        // Periodic client enumeration may otherwise resolve the STA through a
++        // different VAP in the MLD. Fall back to the enumerated VAP MAC only when
++        // the HAL did not provide an association BSSID.
++        auto serving_link_mac = msg->params.bssid;
++        if (serving_link_mac == beerocks::net::network_utils::ZERO_MAC) {
++            serving_link_mac = tlvf::mac_from_string(vap_node->second.mac);
++            LOG(DEBUG) << "STA association BSSID is empty - falling back to VAP MAC "
++                       << serving_link_mac;
++        } else {
++            LOG(DEBUG) << "Preserving association-frame serving BSSID " << serving_link_mac;
++        }
++
++        notification->link_mac() = serving_link_mac;
++
+         // Spec §17.2.6: BSSID = AP MLD MAC only for MLO clients.
+-        // Legacy STAs on MLO-capable APs must use the link BSSID, not the AP MLD MAC.
+-        if (msg->params.is_mlo && !vap_node->second.ap_mld_mac.empty()) {
+-            LOG(DEBUG) << "MLO STA + AP_MLD_MAC is not empty - use ap_mld_mac as parent bssid";
+-            notification->bssid()        = tlvf::mac_from_string(vap_node->second.ap_mld_mac);
++        // Legacy STAs on MLO-capable APs must use the serving link BSSID.
++        if (msg->params.is_mlo) {
++            if (!vap_node->second.ap_mld_mac.empty()) {
++                LOG(DEBUG) << "MLO STA + AP_MLD_MAC is not empty - use ap_mld_mac as parent bssid";
++                notification->bssid() =
++                    tlvf::mac_from_string(vap_node->second.ap_mld_mac);
++            } else {
++                LOG(DEBUG) << "MLO STA + AP_MLD_MAC is empty - use link MAC as parent bssid";
++                notification->bssid() = notification->link_mac();
++            }
+         } else {
+-            LOG(DEBUG) << "Legacy STA or AP_MLD_MAC is empty - use link mac as parent bssid";
+-            notification->bssid()        = tlvf::mac_from_string(vap_node->second.mac);
++            notification->bssid() = serving_link_mac;
+         }
+ 
+         notification->capabilities() = msg->params.capabilities;
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 46638a985..31baff86f 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -3718,6 +3718,7 @@ bool slave_thread::process_client_association(
+     auto db          = AgentDB::get();
+     auto &client_mac = notification_in->mac();
+     auto &bssid      = notification_in->bssid();
++    auto &link_mac   = notification_in->link_mac();
+ 
+     // Handle MLO client
+     if (notification_in->is_mlo()) {
+@@ -3756,6 +3757,23 @@ bool slave_thread::process_client_association(
+             affiliated_entry.bssid              = affiliated_sta_obj.bssid();
+             affiliated_entry.affiliated_sta_mac = affiliated_sta_obj.mac();
+ 
++            // For an MLD-capable STA operating with a single associated link,
++            // link_mac is the authoritative BSSID of the VAP which reported the
++            // association. The HAL derives affiliated BSSIDs from peer_addr[]
++            // indices, but those indices are STA link IDs and do not necessarily
++            // match the AP MLD link ordering. Correct the only affiliated entry so
++            // the Associated STA MLD Configuration Report identifies the actual
++            // serving BSS. Do not apply this to multi-link associations, where
++            // each affiliated STA must retain its own BSSID.
++            if (num_affiliated == 1 &&
++                link_mac != beerocks::net::network_utils::ZERO_MAC &&
++                affiliated_entry.bssid != link_mac) {
++                LOG(INFO) << "Correcting single-link MLD affiliated BSSID for STA "
++                          << client_mac << " from " << affiliated_entry.bssid << " to "
++                          << link_mac;
++                affiliated_entry.bssid = link_mac;
++            }
++
+             if (affiliated_entry.affiliated_sta_mac == beerocks::net::network_utils::ZERO_MAC) {
+                 LOG(ERROR) << "Affiliated STA[" << idx << "] has ZERO MAC address!";
+                 continue;
+@@ -3768,9 +3786,6 @@ bool slave_thread::process_client_association(
+             mld_info.affiliated_stas.push_back(affiliated_entry);
+         }
+ 
+-        // Parse link_mac from the notification message
+-        auto &link_mac = notification_in->link_mac();
+-
+         // For MLO clients, bssid is the AP MLD MAC which is NOT a link-specific BSSID.
+         // get_radio_by_mac(bssid, BSSID) searches in bssids[].mac and would fail because
+         // the AP MLD MAC is stored in bssids[].apmld_mac, not bssids[].mac.
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index f825ad5fb..2d293a11d 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -2185,6 +2185,9 @@ bool mon_wlan_hal_nl80211::trigger_roc_scan(uint8_t channel, uint32_t duration_m
+ 
+     std::string base_interface;
+     extractBase1Interface(interface_name, base_interface);
++    int link_id = -1;
++    extractLinkId(interface_name, link_id);
++    const bool is_mlo_link = (link_id >= 0);
+ 
+     LOG(DEBUG) << "Steering: trigger_roc_scan - interface=" << interface_name
+                << ", base=" << base_interface
+@@ -2218,7 +2221,8 @@ bool mon_wlan_hal_nl80211::trigger_roc_scan(uint8_t channel, uint32_t duration_m
+                 << ", channel=" << int(channel)
+                 << ", freq=" << freq
+                 << ", duration_ms=" << duration_ms
+-                << ", iface_index=" << iface_index;
++                << ", iface_index=" << iface_index
++                << ", link_id=" << link_id;
+ 
+     LOG(DEBUG) << "Requesting remain-on-channel on interface " << interface_name << " (idx "
+         << iface_index << ") for " << duration_ms << "ms on channel " << int(channel)
+@@ -2229,9 +2233,16 @@ bool mon_wlan_hal_nl80211::trigger_roc_scan(uint8_t channel, uint32_t duration_m
+             NL80211_CMD_REMAIN_ON_CHANNEL, 0,
+             // Lambda to populate the netlink message with necessary attributes
+             [&](struct nl_msg *msg) -> bool {
+-            nla_put_u32(msg, NL80211_ATTR_IFINDEX, iface_index);
+-            nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, freq);
+-            nla_put_u32(msg, NL80211_ATTR_DURATION, duration_ms);
++            if (nla_put_u32(msg, NL80211_ATTR_IFINDEX, iface_index) ||
++                nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, freq) ||
++                nla_put_u32(msg, NL80211_ATTR_DURATION, duration_ms)) {
++                return false;
++            }
++
++            if (is_mlo_link &&
++                nla_put_u8(msg, NL80211_ATTR_MLO_LINK_ID, static_cast<uint8_t>(link_id))) {
++                return false;
++            }
+             return true;
+             },
+             // No response is expected for a successful command, only an error on failure.
+-- 
+2.34.1
+
