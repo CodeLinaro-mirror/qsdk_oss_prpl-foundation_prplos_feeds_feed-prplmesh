@@ -1,0 +1,110 @@
+From 06177c8c3e2a147f7ebf2eccccd445d6b5932d3d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Petr=20=C5=A0tetiar?= <petr.stetiar@prplfoundation.org>
+Date: Thu, 24 Sep 2026 17:35:03 +0200
+Subject: [PATCH 1/2] nl80211: use a unique hostapd phy label per Radio on a
+ shared wiphy
+
+hostapd's "ADD bss_config=<phy>:<conf>" control command groups the new
+BSS/iface-level config onto an existing hostapd_iface purely by an exact
+string match of <phy> against hostapd_interface_init_bss()'s cached
+iface->phy label (src/ap/hostapd.c in the hostapd tree). pWHM always
+passed the bare NL80211_ATTR_WIPHY_NAME (T_Radio::wiphyName, filled in
+wifiGen_rad.c around wifiGen_rad_supports()) as that label, at both ADD
+call sites:
+
+ - wld_ap_hostapd_addBssConf() in src/nl80211/wld_hostapd_ap_api.c
+ - wld_rad_hostapd_addConf() in src/nl80211/wld_rad_hostapd_api.c
+
+On real boards each Radio sits on its own wiphy (phy0/phy1/phy2), so the
+label is already unique and this is harmless. But on a single-wiphy
+tri-band setup (our x86-64 QEMU testbed's multi_radio=1 mac80211_hwsim
+config: one phy, three Radios for 2.4/5/6 GHz), all three Radios report
+the identical wiphyName "phy0". hostapd then matches the 2nd and 3rd
+Radio's ADD onto the 1st Radio's already-registered iface and only
+appends bss[0] to it, silently discarding the new iface-level config
+(channel, hw_mode, op_class, eht_oper_chwidth). Whichever Radio starts
+first "wins", and the other Radios' non-MLO APs become extra BSSes of
+the first iface at its channel, instead of getting their own.
+
+This does not affect MLD APs (mld_ap=1 makes hostapd force iface = NULL
+in hostapd_interface_init_bss(), bypassing the phy-label grouping).
+
+Fix: at both ADD sites, use the Radio's own netdev name (T_Radio::Name)
+as the hostapd phy label instead of the bare wiphy name, but only when
+more than one Radio currently shares that wiphy - determined with the
+existing wld_rad_countWiphyRads() helper (src/wld_radio.c), already used
+for an analogous shared-wiphy decision in wld_nl80211_scan.c. A Radio's
+netdev name is already unique and stable, so it needs no new counter or
+ordering state, unlike an OpenWrt hostapd.uc-style "phy0.N" suffix.
+Single-Radio wiphys (real boards, and multi-wiphy boards) keep emitting
+the plain wiphy name unchanged, so their behavior does not change.
+
+Audited other consumers of the same label string for regressions: the
+REMOVE counterparts (wld_ap_hostapd_removeBss()'s "REMOVE <alias>" and
+wld_rad_hostapd_removeConf()'s "REMOVE <skname>") match hostapd_iface by
+BSS netdev/alias name or wpactrl socket name, not by the phy label
+(hostapd_remove_iface(), src/ap/hostapd.c also accepts a phy-label match,
+but pWHM never sends one), so neither REMOVE path is affected by this
+change.
+---
+ src/nl80211/wld_hostapd_ap_api.c  | 22 ++++++++++++++++++++--
+ src/nl80211/wld_rad_hostapd_api.c | 13 ++++++++++++-
+ 2 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/src/nl80211/wld_hostapd_ap_api.c b/src/nl80211/wld_hostapd_ap_api.c
+index 372f7124ab55..786f3eb2d98c 100644
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -1731,8 +1731,26 @@ swl_rc_ne wld_ap_hostapd_addBssConf(T_AccessPoint* pAP) {
+     const char* confFilePath = wld_wpaCtrlInterface_getCfgFilePath(pAP->wpaCtrlInterface);
+     ASSERTI_FALSE(swl_str_isEmpty(confFilePath), SWL_RC_ERROR, ME, "%s: empty config file", pAP->alias);
+ 
+-    SAH_TRACEZ_INFO(ME, "%s: adding bss config using %s", pAP->alias, confFilePath);
+-    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "ADD bss_config=%s:%s", pRad->wiphyName, confFilePath);
++    /*
++     * hostapd's "ADD bss_config=<phy>:<conf>" groups the new iface-level
++     * config onto an existing hostapd_iface purely by exact string match of
++     * <phy> (hostapd_interface_init_bss(), src/ap/hostapd.c). On a shared
++     * wiphy (e.g. our single-phy multi_radio=1 setup with one 2.4/5/6 GHz
++     * Radio each), all Radios report the same NL80211_ATTR_WIPHY_NAME, so
++     * the 2nd/3rd Radio would silently become extra BSSes of the 1st
++     * Radio's iface, inheriting its channel/hw_mode/op_class instead of
++     * getting their own. Use the Radio's own (already unique and stable)
++     * netdev name as the hostapd phy label instead of the bare wiphy name
++     * whenever more than one Radio shares this wiphy; single-Radio wiphys
++     * (today's real boards, and multi-wiphy boards) keep the plain wiphy
++     * name, so their behavior is unchanged.
++     */
++    const char* phyLabel = pRad->wiphyName;
++    if(wld_rad_countWiphyRads(pRad->wiphy) > 1) {
++        phyLabel = pRad->Name;
++    }
++    SAH_TRACEZ_INFO(ME, "%s: adding bss config using %s (phy label %s)", pAP->alias, confFilePath, phyLabel);
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "ADD bss_config=%s:%s", phyLabel, confFilePath);
+     ASSERT_TRUE(swl_rc_isOk(rc), rc, ME, "%s: fail to add bss config", pAP->alias);
+ 
+     return rc;
+diff --git a/src/nl80211/wld_rad_hostapd_api.c b/src/nl80211/wld_rad_hostapd_api.c
+index 84f9b449bbb5..74c216af9fb5 100644
+--- a/src/nl80211/wld_rad_hostapd_api.c
++++ b/src/nl80211/wld_rad_hostapd_api.c
+@@ -504,7 +504,18 @@ swl_rc_ne wld_rad_hostapd_addConf(T_Radio* pR) {
+     ASSERT_NOT_NULL(pgIface, SWL_RC_ERROR, ME, "%s: hostapd has no global iface ready", pR->Name);
+     ASSERT_STR(pR->wiphyName, SWL_RC_ERROR, ME, "%s: Empty wPhy name", pR->Name);
+     swl_rc_ne rc;
+-    rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "ADD bss_config=%s:%s", pR->wiphyName, pR->hostapd->cfgFile);
++    /*
++     * See matching comment in wld_ap_hostapd_addBssConf() (wld_hostapd_ap_api.c):
++     * on a shared wiphy, hostapd groups "ADD bss_config=<phy>:<conf>" onto an
++     * existing iface by exact string match of <phy>, so every Radio sharing
++     * this wiphy must get a unique label here instead of the bare wiphy name,
++     * or the non-first Radio silently loses its iface-level config (U18).
++     */
++    const char* phyLabel = pR->wiphyName;
++    if(wld_rad_countWiphyRads(pR->wiphy) > 1) {
++        phyLabel = pR->Name;
++    }
++    rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "ADD bss_config=%s:%s", phyLabel, pR->hostapd->cfgFile);
+     //the call may timeout while being applied, but that only happens on success
+     if(rc == SWL_RC_NOT_AVAILABLE) {
+         rc = SWL_RC_CONTINUE;
