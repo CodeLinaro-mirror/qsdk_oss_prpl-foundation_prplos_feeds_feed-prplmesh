@@ -1,0 +1,269 @@
+From 6b2c8d1e0f9a7c5b4d3e2f1a0b9c8d7e6f5a4b3c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Petr=20=C5=A0tetiar?= <petr.stetiar@prplfoundation.org>
+Date: Thu, 25 Sep 2026 14:00:00 +0200
+Subject: [PATCH] nl80211: remove the other loaded hostapd ifaces before the main
+ iface on a radio re-add
+
+wld_rad_hostapd_removeConf() implements the "re-add radio config"
+fallback (SECDMN_ACTION_OK_NEED_RE_ADD in src/Plugin/wifiGen_fsm.c,
+taken by s_doRemoveLink() whenever hostapd does not offer LINK_REMOVE
+and by s_removeBss() when the target is the main VAP) with a single
+global "REMOVE <main VAP socket name>", after which
+wld_rad_hostapd_addConf() re-adds the radio config listing every enabled
+VAP of the radio.
+
+That assumes all VAPs of the radio are BSSes of the main VAP's
+hostapd_iface, so that the one REMOVE tears down the whole radio. With
+hostapd 2024.09 ("AP MLD: Allow new link to be added through control
+interface") this no longer holds for AP MLD links: in
+hostapd_interface_init_bss() (src/ap/hostapd.c) an "ADD bss_config="
+whose BSS has mld_ap=1 always gets a hostapd_iface of its own, even when
+an iface with the same phy label exists. Since pWHM warm-adds each VAP
+with its own per-BSS config (s_doAddLink() -> wld_ap_hostapd_addBssConf()),
+a 6 GHz radio hosting wlan0.1 (link of MLD wlan2.1), wlan0.2 (link of
+MLD wlan2.2) and wlan0.3 ends up as three hostapd_ifaces with phy label
+"wlan0".
+
+Observed on a mac80211 AP MLD setup (three MLDs across three radios)
+during Freedom 100-pwhm_step_2.t, first step AccessPoint.9.Enable=0
+(wlan0.3, non-Tx BSS):
+
+  wlan0.3: disabling non Tx BSS, scheduling re-add link of Tx bss wlan0.1
+  hostapd: Remove interface 'wlan2.1_link2'          <- wlan0.1's iface only
+  hostapd: wlan2.1_link2: interface state ENABLED->DISABLED  (one BSS)
+  hostapd: Configuration file: /tmp/wlan0_hapd.conf (phy wlan0)  (no "new PHY")
+  hostapd: wlan2.1: interface state UNINITIALIZED->COUNTRY_UPDATE
+  hostapd: MLD: Failed to add link 3 in MLD wlan2.2
+  hostapd: Interface initialization failed
+
+wlan0.2's hostapd_iface (socket wlan2.2_link2) and its kernel link 2 on
+netdev wlan2.2 stay registered; the re-added radio config carries wlan0.2
+again with the same bssid, hostapd allocates MLD link id 3 for it and the
+kernel refuses NL80211_CMD_ADD_LINK (mac80211
+ieee80211_check_dup_link_addrs(), duplicate link address on the same
+netdev: -EALREADY by source, hostapd logs the errno only at MSG_DEBUG).
+AccessPoint.9 never reports Disabled ("enable=0 timed out"). The next
+step (AccessPoint.8.Enable=0, 5 GHz) repeats it with "Failed to add link
+4 in MLD wlan2.2" because wlan1.2's iface is alive too, that ADD fails
+synchronously and s_doAddHostapd() escalates to "warm apply failed to add
+iface conf => restart to recover": the whole shared hostapd is restarted.
+The same trigger in 101-mlo_step_2.t passed because there the wlan0
+BSSes were plain BSSes of one hostapd_iface (hostapd logged
+wlan0.1/wlan0.2/wlan0.3 AP-DISABLED for the single REMOVE and "--> new
+PHY" on the ADD).
+
+Fix: before removing the main iface, remove every other VAP of the radio
+that hostapd currently has loaded (its control socket exists) as the
+first BSS of a hostapd_iface of its own, with the recipe already used
+for the main iface: "SET interface <sockname>" on the BSS socket when
+the socket name is not the bare ifname (MLD link sockets are
+"<iface>_link<N>", and hostapd_remove_iface() matches the configured
+interface name of bss[0]), then the global "REMOVE <sockname>", which
+runs the whole-iface teardown and thereby removes the kernel MLD link
+(hostapd_cleanup_driver() -> hostapd_if_link_remove()).
+
+A VAP that is a secondary BSS of a hostapd_iface owned by another VAP of
+the radio is deliberately left alone. This is the layout after the first
+re-add: the full radio config goes in as one "ADD bss_config=", so the
+main VAP is bss[0] and the other MLD links are bss[1..] of one iface.
+Addressing such a BSS with the recipe above is wrong because hostapd's
+"SET interface" rewrites the interface name of bss[0] of the iface
+holding the addressed BSS, exactly like the "interface=" config line
+(hostapd_config_fill(), hostapd/config_file.c: os_strlcpy(
+conf->bss[0]->iface, ...)), not the name of the addressed BSS. The
+second non-Tx BSS disable of the test (AccessPoint.6.Enable=0, wlan0.2)
+showed it with a first version of this change that removed every loaded
+VAP:
+
+  wlan0.2: disabling non Tx BSS, scheduling re-add link of Tx bss wlan0.1
+  hostapd: Remove interface 'wlan2.2_link3'    <- the main VAP wlan0.1, renamed
+  hostapd: wlan2.2_link3: interface state ENABLED->DISABLED
+  hostapd: wlan2.2: AP-DISABLED                <- bss[1] = wlan0.2
+  hostapd: wlan2.2_link3: AP-DISABLED          <- bss[0] = wlan0.1
+  wld: wlan0: fail to restore iface name (wlan0.1->wlan2.1_link3)
+  wld: wlan0: warm apply failed to remove iface conf => restart to recover
+
+The whole iface went away under the main VAP's feet and the main-iface
+step then failed on a dead socket. Such a secondary BSS is removed by
+its owner's whole-iface teardown anyway (hostapd_free_hapd_data() calls
+hostapd_if_link_remove() for a started non-first MLD link BSS that is
+not bss[0]), so skipping it keeps the kernel state correct.
+
+Whether a BSS is bss[0] of its iface is read from hostapd itself: the
+"STATUS" reply on any BSS socket lists the BSSes of the iface holding it
+(bss[N]=/bssid[N]=, hostapd_ctrl_iface_status()), so the VAP is the
+first BSS iff bssid[0] is its own BSSID. The connection socket names are
+refreshed first (wld_wpaCtrlMngr_checkAllIfaces()) since a BSS socket is
+renamed to its MLD link socket after setup, and the command wrapper
+already uses a temporary connection when the BSS's wpactrl client is not
+connected, so a loaded-but-unready BSS is handled too. A VAP whose socket
+is gone is skipped as already removed. Any SET or REMOVE failure, or a
+BSS whose iface membership cannot be determined, makes the function
+fail, so that s_doRemoveHostapd() runs its existing recovery instead of
+re-adding a config on top of a live duplicate. The main-iface removal
+itself is unchanged.
+
+pWHM v7.29.20 is the newest source available locally and the upstream
+pwhm repository could not be reached from here (HTTP 403), so the
+current upstream wld_rad_hostapd_removeConf() was not compared.
+
+Signed-off-by: Petr Štetiar <petr.stetiar@prplfoundation.org>
+---
+ src/nl80211/wld_rad_hostapd_api.c |  135 +++++++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 123 insertions(+), 12 deletions(-)
+
+diff --git a/src/nl80211/wld_rad_hostapd_api.c b/src/nl80211/wld_rad_hostapd_api.c
+--- a/src/nl80211/wld_rad_hostapd_api.c
++++ b/src/nl80211/wld_rad_hostapd_api.c
+@@ -524,6 +524,80 @@
+ }
+ 
+ /**
++ * @brief remove one hostapd iface, addressed by the control socket name of its first BSS
++ *
++ * hostapd's global "REMOVE <name>" tears down the whole hostapd_iface whose
++ * first BSS (bss[0]) is configured with interface name <name>
++ * (hostapd_remove_iface(), src/ap/hostapd.c), including its secondary BSSes.
++ * For an AP MLD link BSS the control socket is named "<iface>_link<N>" while
++ * the configured interface name is the MLD's netdev, shared by all its links,
++ * so the interface name is first set to the socket name to make the REMOVE
++ * target unambiguous. Note that "SET interface" always rewrites the name of
++ * bss[0] of the iface owning the addressed BSS (hostapd_config_fill(),
++ * hostapd/config_file.c, same as the "interface=" config line), which is why
++ * this helper must only be used with the first BSS of an iface.
++ * The command wrapper uses a temporary connection when the wpactrl client of
++ * the BSS is not connected, so a loaded BSS is removed even while its client
++ * is unready.
++ *
++ * @param pR radio context
++ * @param pgIface hostapd global control interface
++ * @param pIface control interface of the first BSS of the iface to remove
++ *
++ * @return SWL_RC_OK when the removing cmd is accepted.
++ *         SWL_RC_CONTINUE when the command is accepted but still being processed by hostapd
++ *         Otherwise error code (also when the interface name could not be set).
++ */
++static swl_rc_ne s_removeIfaceBySockName(T_Radio* pR, wld_wpaCtrlInterface_t* pgIface, wld_wpaCtrlInterface_t* pIface) {
++    swl_rc_ne rc;
++    const char* skname = wld_wpaCtrlInterface_getConnectionSockName(pIface);
++    const char* ifname = wld_wpaCtrlInterface_getName(pIface);
++    if(!swl_str_matches(skname, ifname)) {
++        rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pIface, "OK", "SET interface %s", skname);
++        ASSERT_TRUE(swl_rc_isOk(rc), rc, ME, "%s: fail to restore iface name (%s->%s)", pR->Name, ifname, skname);
++    }
++    rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "REMOVE %s", skname);
++    //the call may timeout while being applied, but that only happens on success
++    if(rc == SWL_RC_NOT_AVAILABLE) {
++        rc = SWL_RC_CONTINUE;
++    }
++    return rc;
++}
++
++/**
++ * @brief check whether a loaded BSS is the first BSS (bss[0]) of its hostapd iface
++ *
++ * hostapd reports on the control socket of any BSS the BSS list of the
++ * hostapd_iface holding it ("STATUS" reply lines bss[N]=/bssid[N]=,
++ * hostapd_ctrl_iface_status(), src/ap/ctrl_iface_ap.c). bss[0] is the BSS
++ * whose interface name the global "REMOVE" matches for the whole iface and
++ * whose interface name "SET interface" rewrites.
++ *
++ * @param pR radio context
++ * @param pAP the VAP
++ * @param pIface control interface of the VAP's BSS
++ *
++ * @return SWL_TRL_TRUE when the BSS is bss[0] of its hostapd iface
++ *         SWL_TRL_FALSE when it is a secondary BSS of an iface owned by another VAP
++ *         SWL_TRL_UNKNOWN when hostapd could not be queried
++ */
++static swl_trl_e s_isBssIfaceFirst(T_Radio* pR, T_AccessPoint* pAP, wld_wpaCtrlInterface_t* pIface) {
++    ASSERTS_NOT_NULL(pAP->pSSID, SWL_TRL_UNKNOWN, ME, "NULL");
++    size_t maxMsgLen = wld_wpaCtrl_getMaxMsgLen();
++    char reply[maxMsgLen];
++    memset(reply, 0, sizeof(reply));
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(pIface, reply, sizeof(reply), "STATUS");
++    ASSERTW_TRUE(swl_rc_isOk(rc), SWL_TRL_UNKNOWN, ME, "%s: fail to get status of bss %s", pR->Name, pAP->alias);
++    char bssid0Str[SWL_MAC_CHAR_LEN] = {0};
++    rc = wld_wpaCtrl_getInReplyParamValStr(reply, "bssid[0]", bssid0Str, sizeof(bssid0Str));
++    ASSERTW_TRUE(swl_rc_isOk(rc), SWL_TRL_UNKNOWN, ME, "%s: no bssid[0] in status of bss %s", pR->Name, pAP->alias);
++    swl_macBin_t bssid0 = SWL_MAC_BIN_NEW();
++    ASSERTW_TRUE(swl_typeMacBin_fromChar(&bssid0, bssid0Str), SWL_TRL_UNKNOWN, ME, "%s: invalid bssid[0] (%s) of bss %s",
++                 pR->Name, bssid0Str, pAP->alias);
++    return SWL_MAC_BIN_MATCHES(&bssid0, pAP->pSSID->BSSID) ? SWL_TRL_TRUE : SWL_TRL_FALSE;
++}
++
++/**
+  * @brief remove entire radio and vaps config from hostapd
+  * (this will trigger removing all secondary BSSs netdev ifaces and stop radio activity)
+  *
+@@ -543,19 +617,56 @@
+     ASSERT_NOT_NULL(pIface, SWL_RC_ERROR, ME, "%s: hostapd has no default wpactrl iface ready", pR->Name);
+     wld_wpaCtrlInterface_t* pgIface = wld_secDmn_getGlobalCtrlIface(pSecDmn);
+     ASSERT_NOT_NULL(pgIface, SWL_RC_ERROR, ME, "%s: hostapd has no global iface ready", pR->Name);
+-    swl_rc_ne rc;
+-    const char* skname = wld_wpaCtrlInterface_getConnectionSockName(pIface);
+-    const char* ifname = wld_wpaCtrlInterface_getName(pIface);
+-    if(!swl_str_matches(skname, ifname)) {
+-        rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pIface, "OK", "SET interface %s", skname);
+-        ASSERT_TRUE(swl_rc_isOk(rc), rc, ME, "%s: fail to restore main iface name (%s->%s)", pR->Name, ifname, skname);
+-    }
+-    rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "REMOVE %s", skname);
+-    //the call may timeout while being applied, but that only happens on success
+-    if(rc == SWL_RC_NOT_AVAILABLE) {
+-        rc = SWL_RC_CONTINUE;
++
++    /*
++     * A secondary VAP added with its own "ADD bss_config=" as an AP MLD link
++     * (mld_ap=1) is not a BSS of the main VAP's hostapd iface: hostapd allocates
++     * a separate hostapd_iface for every such ADD (hostapd_interface_init_bss(),
++     * src/ap/hostapd.c, "AP MLD can be enabled with the same interface name").
++     * "REMOVE <main>" therefore leaves those VAPs, and their kernel MLD links,
++     * fully registered, and the radio config re-added right after (which lists
++     * every enabled VAP of the radio) duplicates them: the driver link add for
++     * the duplicate is refused by the kernel (same link address already present
++     * on the MLD netdev), hostapd reports "MLD: Failed to add link N in MLD X"
++     * and the warm re-add fails.
++     * So remove, before the main iface, every other VAP of the radio that
++     * hostapd currently has loaded (its control socket exists) as the first
++     * BSS of a hostapd iface of its own. A VAP that is a secondary BSS of an
++     * iface owned by another VAP of the radio (e.g. all VAPs of a radio config
++     * re-added as one "ADD bss_config=" get one iface, the main VAP first) is
++     * left alone: it is removed together with that iface, and addressing it
++     * directly would rename and remove the owner's iface instead (see
++     * s_removeIfaceBySockName()). A VAP whose socket is already gone (not
++     * loaded, or removed together with a previously removed iface) is skipped.
++     * Any failure aborts the removal so that the caller runs its recovery
++     * instead of re-adding a config on top of a live duplicate.
++     */
++    wld_wpaCtrlMngr_checkAllIfaces(pMgr);
++    T_AccessPoint* pAP = NULL;
++    wld_rad_forEachAp(pAP, pR) {
++        wld_wpaCtrlInterface_t* pApIface = pAP->wpaCtrlInterface;
++        if((pApIface == NULL) || (pApIface == pIface)) {
++            continue;
++        }
++        if(!wld_wpaCtrlInterface_checkConnectionPath(pApIface)) {
++            SAH_TRACEZ_INFO(ME, "%s: bss %s not loaded, skip removal", pR->Name, pAP->alias);
++            continue;
++        }
++        const char* apSkname = wld_wpaCtrlInterface_getConnectionSockName(pApIface);
++        swl_trl_e isFirst = s_isBssIfaceFirst(pR, pAP, pApIface);
++        ASSERT_NOT_EQUALS(isFirst, SWL_TRL_UNKNOWN, SWL_RC_ERROR, ME, "%s: unknown hostapd iface of bss %s (%s), abort radio removal",
++                          pR->Name, pAP->alias, apSkname);
++        if(isFirst == SWL_TRL_FALSE) {
++            SAH_TRACEZ_INFO(ME, "%s: bss %s (%s) is a secondary bss of another iface, removed with it", pR->Name, pAP->alias, apSkname);
++            continue;
++        }
++        SAH_TRACEZ_INFO(ME, "%s: remove iface of bss %s (%s) before main iface", pR->Name, pAP->alias, apSkname);
++        swl_rc_ne apRc = s_removeIfaceBySockName(pR, pgIface, pApIface);
++        ASSERT_TRUE(swl_rc_isOk(apRc), apRc, ME, "%s: fail to remove bss %s (%s) rc %d, abort radio removal",
++                    pR->Name, pAP->alias, apSkname, apRc);
+     }
+-    return rc;
++
++    return s_removeIfaceBySockName(pR, pgIface, pIface);
+ }
+ 
+ swl_trl_e wld_rad_hostapd_getCfgParamSupp(T_Radio* pRad, const char* param) {
+-- 
+2.51.0
