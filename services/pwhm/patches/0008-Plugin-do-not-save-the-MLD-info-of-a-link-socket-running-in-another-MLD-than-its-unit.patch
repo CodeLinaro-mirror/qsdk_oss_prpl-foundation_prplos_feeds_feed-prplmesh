@@ -1,0 +1,153 @@
+From 6aa2fa634b8b9606129878b226d17e88b2ed893c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Petr=20=C5=A0tetiar?= <petr.stetiar@prplfoundation.org>
+Date: Fri, 25 Sep 2026 21:00:00 +0200
+Subject: [PATCH] Plugin: do not save the MLD info of a link socket running in
+ another MLD than the link's unit is configured with
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+wifiGen_mld_fetchSockLinkSSID() maps a hostapd control socket to its SSID
+for the wpactrl manager (wld_wpaCtrlMngr_checkAllIfaces() ->
+fFetchSockLinkIface, src/nl80211/wld_wpaCtrlMngr.c) and, on the way,
+saves the MLD info carried by the socket name into that SSID when the
+socket belongs to the manager's radio and the SSID is configured with a
+link id other than the running one: the running link id, the PRIMARY
+role when the socket's MLD netdev is the SSID's own interface name
+(which makes the link the primary link of its MLD unit,
+wld_ssid_setMLDRole() -> wld_mld_setPrimaryLink()), and in that case a
+reset of the link id of every neighbour link running in another MLD
+netdev.
+
+That takes a running BSS as proof that the desired MLD config of the
+link has been applied. It has not when the link was just moved to
+another MLD unit: s_checkMLDUnit() (src/wld_ssid.c) moves the link
+object to the target unit at once, the FSM marks it configured before
+any teardown (s_checkApDependency() -> wld_mld_saveLinkConfigured(),
+"configured" meaning being/been configured by the FSM), and the BSS
+added for the previous unit stays loaded in hostapd until
+GEN_FSM_REMOVE_LINK / GEN_FSM_REMOVE_HOSTAPD tear it down. Every socket
+scan in between adopts the old BSS into the new unit.
+
+Observed on a mac80211 AP MLD setup during Freedom 102-apmld_step_2.t
+(AP1 = wlan2.1, 2.4 GHz; private MLD wlan1.1 with the 5/6 GHz links 1/2
+and AP1 as link 3). SSID.1.MLDUnit 0 -> 12 makes AP1 a single-link MLD
+wlan2.1 (socket wlan2.1_link0); MLDUnit 12 -> 0 then gives:
+
+  mld: reset primary link DEFAULT_RADIO0 (s_takeLink)     <- unit 12 emptied
+  genFsm: wlan2.1: target is main AP, schedule re-add config
+  ssid: DEFAULT_RADIO1: ssid has no mld link id           <- 5 GHz link
+  ssid: DEFAULT_RADIO2: ssid has no mld link id           <- 6 GHz link
+  hostapd: Remove interface 'wlan2.1_link0'
+  hostapd: Configuration file: /tmp/wlan2_hapd.conf (phy wlan2) --> new PHY
+  nlApi: link:Id(0) in mld iface(ifName:wlan2.1) (ifId:18) nLinks(1)
+
+The socket refresh run by wld_rad_hostapd_removeConf() before the
+removal (patch "nl80211: remove the other loaded hostapd ifaces before
+the main iface on a radio re-add") maps the still running wlan2.1_link0
+by its link MAC to AP1, already registered in unit 0 and configured
+with link id -1, and adopts it: AP1 becomes the primary link of unit 0
+and the 5/6 GHz links lose their link ids because they run in wlan1.1.
+The radio removal only resets the link ids of the radio's own APs
+(wld_rad_resetApMldLinks()), not the primary pointer, and the config
+written after it follows the configured primary
+(wifiGen_mld_selectPrimLinkSSID() via wld_hostapd_ap_selectApLinkIface()):
+interface=wlan2.1, mld_addr=<AP1 MAC>. hostapd groups AP MLD links by
+that interface name (hostapd_bss_setup_multi_link(), src/ap/hostapd.c,
+strcmp of conf->iface with mld->name; mld_addr is not compared), so it
+creates a new MLD wlan2.1 instead of adding AP1 to wlan1.1: the private
+MLD is split, APMLD.MLDMACAddress switches to AP1's MAC and the test
+finds a single link. The same round trip in a run where AP1 was not the
+running main VAP of its radio took the secondary BSS removal, which has
+no scan before the removal, and joined wlan1.1.
+
+The refresh before the removal is not the defect, it only makes it
+deterministic: the same adoption runs from every other socket scan (the
+wpactrl connect timer, s_syncOnRadUp() and s_ifaceCreated() in
+src/Plugin/wifiGen_eventHandlers.c and src/Plugin/wifiGen_fsm.c) and
+adopts the same stale BSS when one of them runs between the MLDUnit
+change and the teardown.
+
+Fix: save the MLD info of a link socket only when the socket's MLD
+netdev is the one the link's MLD unit is configured with. hostapd names
+the MLD after the "interface=" line of the config the BSS was added
+with, i.e. after the primary link selected when that config was
+written, and wifiGen_mld_selectPrimLinkSSID() always selects the unit's
+configured primary link when there is one. A running link socket whose
+MLD netdev differs from the interface name of the unit's configured
+primary link is therefore that of a BSS added for a previous MLD
+configuration of the link (such as its previous unit), still loaded in
+hostapd. Its SSID is still returned, so the socket is still mapped to
+its wpactrl interface and the BSS is removed exactly as before; only its
+link id, role, the primary pointer and the neighbours' link ids are left
+alone, and a warning names the two ifaces. When the unit has no
+configured primary link (first setup, or the primary link just left the
+unit) the running MLD defines it, as before.
+
+With that, unit 0 keeps wlan1.1 as primary link over the move-back, the
+regenerated radio config carries interface=wlan1.1 and
+mld_addr=<wlan1.1 MAC> for AP1, and hostapd adds AP1 as a link of the
+existing MLD wlan1.1.
+
+Signed-off-by: Petr Štetiar <petr.stetiar@prplfoundation.org>
+---
+ src/Plugin/wifiGen_mld.c | 39 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/src/Plugin/wifiGen_mld.c b/src/Plugin/wifiGen_mld.c
+index 6e25c2988934..68714949f8de 100644
+--- a/src/Plugin/wifiGen_mld.c
++++ b/src/Plugin/wifiGen_mld.c
+@@ -165,6 +165,34 @@ static T_SSID* s_fetchLinkSSID(const char* mldIface, int32_t linkId, const char*
+     return pSSID;
+ }
+ 
++/**
++ * @brief check whether a running BSS socket is of the MLD its link is configured with
++ *
++ * The MLD netdev of a running link socket ("<mldIface>_link<N>") is the
++ * interface name hostapd groups the MLD by: the "interface=" line of the
++ * config the BSS was added with, i.e. the interface name of the primary link
++ * selected when that config was written. The MLD pWHM configures the link
++ * with is its MLD unit, whose configured primary link
++ * (wifiGen_mld_selectPrimLinkSSID()) names the netdev every config of the
++ * unit is written with. When the two differ, the socket is of a BSS added
++ * for a previous MLD configuration of the link (e.g. its previous MLD unit,
++ * after an MLDUnit change) which is still loaded in hostapd, so its MLD
++ * info must not be saved into the link's current unit.
++ *
++ * @param pLinkSSID ssid of the link mapped to the socket
++ * @param mldIface MLD netdev of the socket
++ *
++ * @return true when the MLD info of the socket applies to the link's MLD unit
++ *         (also when the unit has no configured primary link yet)
++ */
++static bool s_isSockOfConfiguredMld(T_SSID* pLinkSSID, const char* mldIface) {
++    wld_mldLink_t* pPrimLink = wld_mld_getPrimaryLink(pLinkSSID->pMldLink);
++    if((pPrimLink == NULL) || !wld_mld_isLinkConfigured(pPrimLink)) {
++        return true;
++    }
++    return swl_str_matches(wld_mld_getLinkIfName(pPrimLink), mldIface);
++}
++
+ T_SSID* wifiGen_mld_fetchSockLinkSSID(wld_wpaCtrlMngr_t* pMgr, const char* sockName) {
+     ASSERT_STR(sockName, NULL, ME, "empty socket name");
+     const char* refIface = wld_wpaCtrlInterface_getName(wld_wpaCtrlMngr_getFirstInterface(pMgr));
+@@ -184,6 +212,17 @@ T_SSID* wifiGen_mld_fetchSockLinkSSID(wld_wpaCtrlMngr_t* pMgr, const char* sockN
+     T_SSID* pLinkSSID = s_fetchLinkSSID(mldIface, linkId, sockName);
+     ASSERTS_NOT_NULL(pLinkSSID, NULL, ME, "sock(%s): Fail to match any SSID", sockName);
+ 
++    /*
++     * A socket of a BSS still running in another MLD than the one the link's
++     * unit is configured with (e.g. the BSS of its previous unit, pending
++     * removal) is only mapped: its MLD info is not that of the link's unit.
++     */
++    if(!s_isSockOfConfiguredMld(pLinkSSID, mldIface)) {
++        SAH_TRACEZ_WARNING(ME, "%s: sock(%s) runs in mld iface(%s) but mld unit(%d) is configured with primary link iface(%s): skip saving its MLD info",
++                           pLinkSSID->Name, sockName, mldIface, pLinkSSID->mldUnit, wld_mld_getPrimaryLinkIfName(pLinkSSID->pMldLink));
++        return pLinkSSID;
++    }
++
+     /*
+      * update SSID MLD info of fetched wpactrl sock, when:
+      * 0) sock belongs the current wpactrl mngr (ie same SSID's radio)
