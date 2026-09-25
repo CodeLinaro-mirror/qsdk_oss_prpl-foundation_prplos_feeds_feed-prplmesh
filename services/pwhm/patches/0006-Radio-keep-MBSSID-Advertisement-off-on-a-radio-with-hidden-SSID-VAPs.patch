@@ -1,0 +1,203 @@
+From b10d5b245e3384ced9e97a1df16ea656500b91e6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Petr=20=C5=A0tetiar?= <petr.stetiar@prplfoundation.org>
+Date: Fri, 25 Sep 2026 16:30:00 +0200
+Subject: [PATCH] Radio: keep MBSSID Advertisement off on a radio with hidden
+ SSID VAPs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+pWHM runs one global hostapd process for all radios. On the Wi-Fi 7 /
+MLO QEMU (mac80211_hwsim) board the default config has a hidden
+(SSIDAdvertisementEnabled=0) backhaul VAP on every radio (AP7/8/9) and
+IEEE80211ax.MBSSIDAdvertisementMode is left at its default "Auto"
+(odl/wld_radio.odl:3284). wld_rad_getMbssidAdsMode()
+(src/wld_radio.c:3276-3296) resolves Auto to the highest driver
+supported mode, on 6 GHz only; hwsim advertises 8 MBSSID interfaces
+and EMA profile periodicity 3 (mac80211_hwsim.c:5335-5336, read by
+s_parseMbssidAds(), src/nl80211/wld_nl80211_parser.c:1110-1150, and
+turned into the On and Enhanced support bits by
+src/Plugin/wifiGen_rad.c:319-324), so the 6 GHz radio (wlan0) resolves
+to Enhanced and wld_hostapd_cfgFile_setRadioConfig()
+(src/nl80211/wld_hostapd_cfgFile.c:594-600) writes "mbssid=2" into
+wlan0's radio section, while s_setVapCommonConfig() (:927)
+independently writes "ignore_broadcast_ssid=2" for the hidden backhaul
+BSS of that same radio. Nothing in pWHM checks the combination.
+
+Upstream hostapd rejects it: hostapd_config_check_bss()
+(src/ap/ap_config.c:1516 in the deployed 2025 source, unchanged in
+current hostap main: "full_config && bss->ignore_broadcast_ssid &&
+conf->mbssid") fails the whole /tmp/wlan0_hapd.conf with "Hidden SSID
+is not suppored when MBSSID is enabled", hostapd exits at startup,
+wldDmn respawns it every 5 s and, as it is the one hostapd of all
+three radios, every Radio stays Down and every AccessPoint Disabled
+from the moment the hidden VAP is enabled together with the others
+(109-pwhm-power-save.t, "Enable all AccessPoints"). The same board
+config works on Freedom only because its QCA hostapd fork implements
+hidden non-transmitted MBSSID profiles and has no such check; OpenWrt's
+own hostapd writers do not work around the upstream check either, so
+any pWHM build against an upstream hostapd is exposed.
+
+Fix: resolve the effective MBSSID Advertisement mode to Off when any
+VAP configured on the radio is hidden. The check is placed in
+wld_rad_getMbssidAdsMode() itself (the standards/requested/supported
+resolution is kept verbatim as s_getReqMbssidAdsMode()) rather than in
+the config writer only, so that every consumer of the decision agrees:
+the radio section writer (no "mbssid" / "mbssid_max"), the per-BSS
+"mbssid_index" (wld_hostapd_cfgFile.c:906), the config main VAP
+selection (wld_rad_hostapd_getCfgMainVap(),
+src/nl80211/wld_rad_hostapd_api.c:701-714), the BSS inclusion rule
+(wld_hostapd_ap_needWpaCtrlIface(),
+src/nl80211/wld_hostapd_ap_api.c:1639-1650) and the FSM's non-Tx BSS
+disable path (src/Plugin/wifiGen_fsm.c:599). All configured VAPs are
+considered, not only the enabled ones: the config main VAP is written
+with start_disabled=1 when it is disabled and hostapd's check does not
+exempt it, and an enabled-only rule would flip the radio's "mbssid"
+under a running hostapd on every enable/disable of a hidden VAP, where
+the warm "ADD bss_config" of the hidden BSS would then trip the very
+same hostapd check. The requested mode and the reported capability
+(suppMbssidAdsModes) are left as they are, and the requested SSID
+visibility is preserved: no BSS is unhidden or dropped. The writer
+logs one NOTICE per radio config generation when the fallback is in
+effect (new wld_rad_isMbssidAdsBlockedByHiddenVap()).
+
+Runtime: toggling SSIDAdvertisementEnabled on a radio whose VAPs were
+all visible changes the radio level "mbssid", which the per-BSS SET
+commands can not apply. wld_ap_hostapd_setNoSecParams()
+(src/nl80211/wld_hostapd_ap_api.c:784-821, run from the FSM's
+GEN_FSM_MOD_AP, i.e. before GEN_FSM_MOD_HOSTAPD rewrites the config
+file) already loads the saved config and regenerates the new one to
+diff the per-BSS params; compare the radio "mbssid" of both first
+(absent means 0) and return SECDMN_ACTION_OK_NEED_RESTART, the existing
+FSM path that stops hostapd and starts it again with the rewritten
+config, when it differs.
+
+Not specific to hwsim: any pWHM build against upstream hostapd with a
+hidden VAP on a radio where MBSSID Advertisement resolves to On or
+Enhanced hits the same crash loop.
+
+Signed-off-by: Petr Štetiar <petr.stetiar@prplfoundation.org>
+---
+ include/wld/wld_radio.h           |  1 +
+ src/nl80211/wld_hostapd_ap_api.c  | 19 +++++++++++--
+ src/nl80211/wld_hostapd_cfgFile.c |  2 ++
+ src/wld_radio.c                   | 44 ++++++++++++++++++++++++++++++-
+ 4 files changed, 63 insertions(+), 3 deletions(-)
+
+diff --git a/include/wld/wld_radio.h b/include/wld/wld_radio.h
+index a90a7d58bd34..3d844ecabefa 100644
+--- a/include/wld/wld_radio.h
++++ b/include/wld/wld_radio.h
+@@ -154,6 +154,7 @@ T_AccessPoint* wld_rad_getFirstEnabledVap(T_Radio* pR);
+ uint32_t wld_rad_countEnabledVaps(T_Radio* pR);
+ wld_mbssidAdvertisement_mode_e wld_rad_getMbssidAdsMode(T_Radio* pRad);
+ bool wld_rad_hasMbssidAds(T_Radio* pRad);
++bool wld_rad_isMbssidAdsBlockedByHiddenVap(T_Radio* pRad);
+ 
+ T_AccessPoint* wld_rad_getVapByIndex(T_Radio* pRad, int index);
+ T_EndPoint* wld_rad_getEpByIndex(T_Radio* pRad, int index);
+diff --git a/src/nl80211/wld_hostapd_ap_api.c b/src/nl80211/wld_hostapd_ap_api.c
+index 786f3eb2d98c..f6ceeeb0b848 100644
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -813,8 +813,23 @@ wld_secDmn_action_rc_ne wld_ap_hostapd_setNoSecParams(T_AccessPoint* pAP) {
+         "vendor_elements", "assocresp_elements",
+         "ttlm_enable"
+     };
+-    s_setChangedMultiParams(pAP, pCurrVapParams, pNewVapParams,
+-                            params, SWL_ARRAY_SIZE(params), &action);
++    /*
++     * The effective radio MBSSID mode follows the VAPs' SSID visibility
++     * (wld_rad_getMbssidAdsMode()): a change of the radio level "mbssid"
++     * (absent means off) can not be applied with per-BSS SET commands,
++     * hostapd has to be restarted with the regenerated config.
++     */
++    const char* oldMbssid = wld_hostapd_getConfigParamValStr(config, NULL, "mbssid");
++    const char* newMbssid = wld_hostapd_getConfigParamValStr(pNewCfg, NULL, "mbssid");
++    oldMbssid = swl_str_isEmpty(oldMbssid) ? "0" : oldMbssid;
++    newMbssid = swl_str_isEmpty(newMbssid) ? "0" : newMbssid;
++    if(!swl_str_matches(oldMbssid, newMbssid)) {
++        SAH_TRACEZ_WARNING(ME, "%s: radio mbssid changed (%s -> %s): need hostapd restart", pAP->alias, oldMbssid, newMbssid);
++        action = SECDMN_ACTION_OK_NEED_RESTART;
++    } else {
++        s_setChangedMultiParams(pAP, pCurrVapParams, pNewVapParams,
++                                params, SWL_ARRAY_SIZE(params), &action);
++    }
+     wld_hostapd_deleteConfig(pNewCfg);
+     wld_hostapd_deleteConfig(config);
+     return action;
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index 94659967e9de..ae66ab8308b0 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -597,6 +597,8 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
+         SAH_TRACEZ_INFO(ME, "%s: Setting MBSSID Advertisement %d", pRad->Name, mbssidAdsMode);
+         swl_mapCharFmt_addValInt32(radConfigMap, "mbssid", (mbssidAdsMode == MBSSID_ADVERTISEMENT_MODE_ENHANCED) ? 2 : 1);
+         wld_secDmn_addToMapSuppCfgParamValueInt32(pRad->hostapd, radConfigMap, "mbssid_max", amxc_llist_size(&pRad->llAP));
++    } else if(wld_rad_isMbssidAdsBlockedByHiddenVap(pRad)) {
++        SAH_TRACEZ_NOTICE(ME, "%s: MBSSID Advertisement kept off: hidden SSID VAP(s) configured, hostapd rejects hidden BSSes with mbssid", pRad->Name);
+     }
+ 
+     pRad->pFA->mfn_wrad_updateConfigMap(pRad, radConfigMap);
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index c13da2cc776f..e08c170b2a6a 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -3273,7 +3273,12 @@ uint32_t wld_rad_countEnabledVaps(T_Radio* pR) {
+     return count;
+ }
+ 
+-wld_mbssidAdvertisement_mode_e wld_rad_getMbssidAdsMode(T_Radio* pRad) {
++/*
++ * MBSSID Advertisement mode resolved from the radio's standards, the
++ * requested mode and the driver's supported modes, i.e. the mode the radio
++ * would use if the hostapd config allowed it.
++ */
++static wld_mbssidAdvertisement_mode_e s_getReqMbssidAdsMode(T_Radio* pRad) {
+     wld_mbssidAdvertisement_mode_e mode = MBSSID_ADVERTISEMENT_MODE_OFF;
+     ASSERTS_NOT_NULL(pRad, mode, ME, "NULL");
+     swl_radioStandard_m stds = pRad->supportedStandards;
+@@ -3295,6 +3300,43 @@ wld_mbssidAdvertisement_mode_e wld_rad_getMbssidAdsMode(T_Radio* pRad) {
+     return mode;
+ }
+ 
++/*
++ * true when any VAP configured on the radio has SSID broadcasting disabled,
++ * i.e. would be written to hostapd as a hidden BSS (ignore_broadcast_ssid != 0).
++ * All configured VAPs are considered (not only the enabled ones): the config
++ * main VAP is written with start_disabled=1 when disabled, and hostapd's
++ * config check does not exempt it.
++ */
++static bool s_hasHiddenVap(T_Radio* pRad) {
++    T_AccessPoint* pAP = NULL;
++    wld_rad_forEachAp(pAP, pRad) {
++        if(!pAP->SSIDAdvertisementEnabled) {
++            return true;
++        }
++    }
++    return false;
++}
++
++bool wld_rad_isMbssidAdsBlockedByHiddenVap(T_Radio* pRad) {
++    ASSERTS_NOT_NULL(pRad, false, ME, "NULL");
++    return ((s_getReqMbssidAdsMode(pRad) != MBSSID_ADVERTISEMENT_MODE_OFF) && s_hasHiddenVap(pRad));
++}
++
++wld_mbssidAdvertisement_mode_e wld_rad_getMbssidAdsMode(T_Radio* pRad) {
++    wld_mbssidAdvertisement_mode_e mode = s_getReqMbssidAdsMode(pRad);
++    /*
++     * hostapd (hostapd_config_check_bss()) rejects the whole radio config when
++     * any of its BSSes is hidden while mbssid is enabled: keep MBSSID
++     * Advertisement off on a radio with hidden VAP(s), whatever the requested
++     * and supported modes, so that the effective mode is the same for the
++     * config writer, the BSS selection and the main VAP selection.
++     */
++    if((mode != MBSSID_ADVERTISEMENT_MODE_OFF) && s_hasHiddenVap(pRad)) {
++        mode = MBSSID_ADVERTISEMENT_MODE_OFF;
++    }
++    return mode;
++}
++
+ bool wld_rad_hasMbssidAds(T_Radio* pRad) {
+     return (wld_rad_getMbssidAdsMode(pRad) != MBSSID_ADVERTISEMENT_MODE_OFF);
+ }
