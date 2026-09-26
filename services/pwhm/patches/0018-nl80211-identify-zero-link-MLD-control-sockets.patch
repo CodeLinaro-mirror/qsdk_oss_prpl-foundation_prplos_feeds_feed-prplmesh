@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Petr=20=C5=A0tetiar?= <petr.stetiar@prplfoundation.org>
+Date: Sat, 26 Sep 2026 12:00:00 +0000
+Subject: [PATCH] nl80211: identify zero-link MLD control sockets
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A hostapd AP MLD control endpoint survives removal of its last active
+link while retained BSSes still reference the MLD. GET_CONFIG and STATUS
+then return FAIL because there is no first BSS to receive the command.
+After TERMINATING resets a local AP connection to its bare name, radio
+removal mistakes this endpoint for an unresolved local BSS:
+
+  wlan0: unresolved local socket wlan0.1, abort radio removal
+
+When both identity queries explicitly fail, probe with LINKID 0 PING.
+Only the MLD control handler accepts the LINKID prefix and returns
+NO LINKS ACTIVE when no first BSS exists; hostapd sends that reply as
+16 bytes, LF included and without a NUL, and the command transport
+strips the trailing LF. Ordinary BSS sockets return UNKNOWN COMMAND.
+Require the exact reply and an unchanged socket inode before marking the
+endpoint nonBss. Keep it unresolved so it cannot be adopted as an AP or
+become a REMOVE target. Do not infer endpoint type from a bare pathname,
+FAIL, or missing BSS fields alone. Trace the outcome either way, so a
+FAIL/FAIL socket that is not an MLD endpoint is visible in the log
+before the removal preflight aborts on it.
+
+Leave the unknown-local-BSS and radio-local first-BSS owner guards
+unchanged.
+
+Signed-off-by: Petr Štetiar <petr.stetiar@prplfoundation.org>
+---
+ src/nl80211/wld_hostapd_sock.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/src/nl80211/wld_hostapd_sock.c b/src/nl80211/wld_hostapd_sock.c
+index 9cf9af15cf1e..a0218a234610 100644
+--- a/src/nl80211/wld_hostapd_sock.c
++++ b/src/nl80211/wld_hostapd_sock.c
+@@ -138,12 +138,36 @@ swl_rc_ne wld_hostapd_resolveSock(const char* dir, const char* name, wld_hostapd
+     char value[128] = {0};
+     memset(reply, 0, sizeof(reply));
+     swl_rc_ne rc = wld_wpaCtrl_queryToSock(dir, name, "GET_CONFIG", reply, sizeof(reply));
++    bool configFailed = swl_rc_isOk(rc) && swl_str_matches(reply, "FAIL");
+     bool hasBssid = swl_rc_isOk(rc) && s_value(reply, "bssid", value, sizeof(value)) &&
+                     swl_typeMacBin_fromChar(&pSock->bssid, value) && !swl_mac_binIsNull(&pSock->bssid);
+     /* STATUS can still identify a local candidate if GET_CONFIG timed out. */
+     memset(reply, 0, sizeof(reply));
+     rc = wld_wpaCtrl_queryToSock(dir, name, "STATUS", reply, sizeof(reply));
+     ASSERTI_TRUE(swl_rc_isOk(rc), SWL_RC_ERROR, ME, "STATUS unavailable: %s", name);
++    if(configFailed && swl_str_matches(reply, "FAIL")) {
++        /*
++         * An AP MLD control endpoint survives its last active link. Bare
++         * GET_CONFIG/STATUS then return FAIL, so neither can identify a
++         * redirect. Only the MLD handler understands LINKID and replies
++         * "NO LINKS ACTIVE\n" (16 bytes, LF included, no NUL) when it has
++         * no first BSS; the command transport strips that trailing LF.
++         * A BSS socket returns UNKNOWN COMMAND instead; FAIL alone must
++         * never exempt a socket.
++         */
++        memset(reply, 0, sizeof(reply));
++        rc = wld_wpaCtrl_queryToSock(dir, name, "LINKID 0 PING", reply, sizeof(reply));
++        bool sameInode = (pSock->inode == s_inode(dir, name));
++        pSock->nonBss = swl_rc_isOk(rc) && swl_str_matches(reply, "NO LINKS ACTIVE") && sameInode;
++        if(pSock->nonBss) {
++            SAH_TRACEZ_INFO(ME, "zero-link MLD endpoint %s", name);
++        } else {
++            SAH_TRACEZ_WARNING(ME, "%s: FAIL/FAIL socket is not an MLD endpoint (rc %d, reply '%s'%s)",
++                               name, rc, reply, sameInode ? "" : ", socket replaced");
++        }
++        /* A confirmed MLD endpoint still has no resolved BSS identity. */
++        return SWL_RC_ERROR;
++    }
+     pSock->enabled = s_value(reply, "state", value, sizeof(value)) && swl_str_matches(value, "ENABLED");
+     s_value(reply, "phy", pSock->phy, sizeof(pSock->phy));
+     pSock->hasBand = s_value(reply, "freq", value, sizeof(value)) && (atoi(value) > 0) &&
+-- 
+2.55.0
+
