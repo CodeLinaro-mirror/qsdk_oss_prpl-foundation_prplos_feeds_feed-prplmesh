@@ -1,0 +1,273 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Petr Štetiar <petr.stetiar@prplfoundation.org>
+Date: Sat, 26 Sep 2026 18:00:00 +0000
+Subject: [PATCH] Plugin: recover unexpected loss of hostapd radio config
+
+Hostapd can delete retained AP MLD partner interfaces when a plain BSS
+claims their names. The last-VAP CTRL-EVENT-TERMINATING only restarts
+socket discovery today. An enabled partner radio with no outstanding
+configuration action stays absent after the connection retry budget.
+
+Schedule a one-shot recovery after a one-second settling delay when
+that notification arrives on an enabled, startable, idle radio. Check
+radio, AP and endpoint action bitmaps as well as daemon and group
+restart state both before scheduling and before execution. Keep normal
+socket reconnection in place.
+
+Use a dedicated radio FSM action so the down-radio dependency does not
+turn this recovery into STOP/START. Under the FSM lock, require a live
+global control socket and no loaded or unresolved local BSS in a fresh
+identity snapshot before using the existing configuration ADD path.
+Leave the loaded-interface removal and foreign-owner guards unchanged.
+
+Allow one attempt per outage, rearmed only after 30 seconds of full
+control connectivity. A failed ADD retains its existing restart
+fallback but cannot feed another recovery loop. Cancel timers and
+queued recovery on daemon stop, and delete the timer on radio cleanup.
+Concurrent controller work takes precedence over recovery.
+
+Signed-off-by: Petr Štetiar <petr.stetiar@prplfoundation.org>
+---
+ include/wld/wld.h                  |    3 +
+ include_priv/Plugin/wifiGen_fsm.h  |    3 +
+ src/Plugin/wifiGen_eventHandlers.c |    1 
+ src/Plugin/wifiGen_fsm.c           |  138 ++++++++++++++++++++++++++++++++++++
+ src/Plugin/wifiGen_hapd.c          |    3 +
+ 5 files changed, 148 insertions(+)
+
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+index 74cc163e79ff..234923daad9c 100644
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1757,6 +1757,9 @@ struct WLD_RADIO {
+     wld_autoCommitRadData_t autoCommitData;                 /* struct for managing auto commiting */
+     wld_nl80211_listener_t* nl80211Listener;                /* nl80211 events listener */
+     wld_secDmn_t* hostapd;                                  /* hostapd daemon context. */
++    amxp_timer_t* hapdRecoveryTimer;                        /* unexpected last-VAP loss / stable-ready rearm */
++    bool hapdRecoveryUsed;                                  /* one attempt until a stable reconnection */
++    bool hapdRecoveryQueued;                                /* dedicated FSM action, never a normal full sync */
+     uint32_t wiphy;                                         /* nl80211 wireless physical device id */
+     char wiphyName[IFNAMSIZ];                               /* nl80211 wireless physical device name */
+     wld_nl80211_channelSurveyInfo_t* pLastSurvey;           /* last active chan survey result (cached) */
+diff --git a/include_priv/Plugin/wifiGen_fsm.h b/include_priv/Plugin/wifiGen_fsm.h
+index 6ab89fe48205..bb9dcbec0dcd 100644
+--- a/include_priv/Plugin/wifiGen_fsm.h
++++ b/include_priv/Plugin/wifiGen_fsm.h
+@@ -98,9 +98,12 @@ typedef enum {
+     GEN_FSM_SYNC_STATE,           /* Sync all interfaces state */
+     GEN_FSM_CONNECT_EP,           /* Connect Endpoint using current profile */
+     GEN_FSM_START_WPASUPP,        /* Start wpa_supplicant */
++    GEN_FSM_RECOVER_HOSTAPD,      /* Reapply unexpectedly deleted radio config */
+     GEN_FSM_MAX
+ } wifiGen_fsmStates_e;
+ 
+ void wifiGen_fsm_doInit(vendor_t* vendor);
++void wifiGen_fsm_hapdCtrlReady(T_Radio* pRad, bool ready);
++void wifiGen_fsm_cancelHapdRecovery(T_Radio* pRad);
+ 
+ #endif /* INCLUDE_PRIV_PLUGIN_WIFIGEN_FSM_H_ */
+diff --git a/src/Plugin/wifiGen_eventHandlers.c b/src/Plugin/wifiGen_eventHandlers.c
+index 331a071305ed..3f2f5791bf43 100644
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -400,6 +400,7 @@ static void s_mngrReadyCb(void* userData, char* ifName, bool isReady) {
+     T_AccessPoint* pAP = wld_rad_vap_from_name(pRad, ifName);
+     T_EndPoint* pEP = wld_rad_ep_from_name(pRad, ifName);
+     if(pAP != NULL) {
++        wifiGen_fsm_hapdCtrlReady(pRad, isReady);
+         if(!isReady) {
+             wld_wpaCtrlMngr_t* pMgr = wld_secDmn_getWpaCtrlMgr(pRad->hostapd);
+             if((pMgr != NULL) && (!wld_wpaCtrlMngr_isReady(pMgr)) && (wld_secDmn_isEnabled(pRad->hostapd))) {
+diff --git a/src/Plugin/wifiGen_fsm.c b/src/Plugin/wifiGen_fsm.c
+index 3d9278035fae..9ca41b161e05 100644
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -62,6 +62,7 @@
+ #include "swl/swl_common.h"
+ 
+ #include "wld/wld_common.h"
++#include "nl80211/wld_hostapd_sock.h"
+ #include "wld/wld_linuxIfUtils.h"
+ #include "wld/wld_rad_hostapd_api.h"
+ #include "wld/wld_hostapd_ap_api.h"
+@@ -1290,6 +1291,134 @@ static bool s_doAddHostapd(T_Radio* pRad) {
+     return true;
+ }
+ 
++/* A failed ADD must not start a recovery/restart loop. Re-arm only after
++ * all expected VAP sockets have stayed connected for this interval. */
++#define HAPD_RECOVERY_SETTLE_MS 1000
++#define HAPD_RECOVERY_REARM_MS 30000
++
++static bool s_hapdRecoveryHasActions(T_FSM* fsm) {
++    unsigned long actions[FSM_BW];
++    longArrayCopy(actions, fsm->FSM_BitActionArray, FSM_BW);
++    longArrayBitOr(actions, fsm->FSM_AC_BitActionArray, FSM_BW);
++    clearBitLongArray(actions, FSM_BW, GEN_FSM_RECOVER_HOSTAPD);
++    return fsm->FSM_SyncAll || (getLowestBitLongArray(actions, FSM_BW) >= 0);
++}
++
++static bool s_hapdRecoveryHasWork(T_Radio* pRad) {
++    if(s_hapdRecoveryHasActions(&pRad->fsmRad)) {
++        return true;
++    }
++    T_AccessPoint* pAP;
++    wld_rad_forEachAp(pAP, pRad) {
++        if(s_hapdRecoveryHasActions(&pAP->fsm)) {
++            return true;
++        }
++    }
++    T_EndPoint* pEP;
++    wld_rad_forEachEp(pEP, pRad) {
++        if(s_hapdRecoveryHasActions(&pEP->fsm)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static bool s_hapdRecoveryAllowed(T_Radio* pRad) {
++    return pRad->enable && wifiGen_hapd_isStartable(pRad) &&
++           wld_secDmn_isEnabled(pRad->hostapd) &&
++           wld_secDmn_isRunning(pRad->hostapd) &&
++           !wld_secDmn_isRestarting(pRad->hostapd) &&
++           !wld_secDmn_isGrpRestarting(pRad->hostapd) &&
++           !wld_secDmn_checkRestartNeeded(pRad->hostapd);
++}
++
++void wifiGen_fsm_cancelHapdRecovery(T_Radio* pRad) {
++    if(pRad->hapdRecoveryTimer != NULL) {
++        amxp_timer_stop(pRad->hapdRecoveryTimer);
++    }
++    pRad->hapdRecoveryQueued = false;
++    clearBitLongArray(pRad->fsmRad.FSM_BitActionArray, FSM_BW, GEN_FSM_RECOVER_HOSTAPD);
++    wld_rad_fsm_clearFsmBitForAll(pRad, GEN_FSM_RECOVER_HOSTAPD);
++}
++
++static void s_hapdRecoveryTimer(amxp_timer_t* timer _UNUSED, void* userdata) {
++    T_Radio* pRad = userdata;
++    wld_wpaCtrlMngr_t* mgr = wld_secDmn_getWpaCtrlMgr(pRad->hostapd);
++    if(pRad->hapdRecoveryUsed) {
++        if(s_hapdRecoveryAllowed(pRad) && wld_wpaCtrlMngr_isReady(mgr)) {
++            pRad->hapdRecoveryUsed = false;
++        }
++        return;
++    }
++    if(!s_hapdRecoveryAllowed(pRad) || s_hapdRecoveryHasWork(pRad) ||
++       (pRad->fsmRad.FSM_State != FSM_IDLE) || pRad->fsmRad.FSM_ComPend ||
++       wld_wpaCtrlMngr_countReadyInterfaces(mgr)) {
++        return;
++    }
++    pRad->hapdRecoveryUsed = true;
++    pRad->hapdRecoveryQueued = true;
++    SAH_TRACEZ_WARNING(ME, "%s: unexpected last-VAP loss: schedule hostapd config recovery", pRad->Name);
++    setBitLongArray(pRad->fsmRad.FSM_BitActionArray, FSM_BW, GEN_FSM_RECOVER_HOSTAPD);
++    wld_rad_doCommitIfUnblocked(pRad);
++}
++
++/* false is emitted only by last-ready-interface CTRL-EVENT-TERMINATING.
++ * Never infer config loss from ordinary connect retries or AP-DISABLED. */
++void wifiGen_fsm_hapdCtrlReady(T_Radio* pRad, bool ready) {
++    if(pRad->hapdRecoveryTimer != NULL) {
++        amxp_timer_stop(pRad->hapdRecoveryTimer);
++    }
++    if(ready) {
++        if(!pRad->hapdRecoveryUsed) {
++            return;
++        }
++    } else if(pRad->hapdRecoveryUsed || !s_hapdRecoveryAllowed(pRad) ||
++              s_hapdRecoveryHasWork(pRad) || (pRad->fsmRad.FSM_State != FSM_IDLE) ||
++              pRad->fsmRad.FSM_ComPend) {
++        return;
++    }
++    if(pRad->hapdRecoveryTimer == NULL) {
++        ASSERT_TRUE(amxp_timer_new(&pRad->hapdRecoveryTimer, s_hapdRecoveryTimer, pRad) == 0,
++                    , ME, "%s: cannot allocate recovery timer", pRad->Name);
++    }
++    amxp_timer_start(pRad->hapdRecoveryTimer, ready ? HAPD_RECOVERY_REARM_MS : HAPD_RECOVERY_SETTLE_MS);
++}
++
++/* Run under the ordinary radio FSM lock. A socket can reappear while this
++ * action waits, and desired configuration can change, so check again here. */
++static bool s_doRecoverHostapd(T_Radio* pRad) {
++    bool queued = pRad->hapdRecoveryQueued;
++    pRad->hapdRecoveryQueued = false;
++    if(!queued || !s_hapdRecoveryAllowed(pRad) || s_hapdRecoveryHasWork(pRad)) {
++        return true;
++    }
++    wld_wpaCtrlMngr_t* mgr = wld_secDmn_getWpaCtrlMgr(pRad->hostapd);
++    if(wld_wpaCtrlMngr_countReadyInterfaces(mgr)) {
++        return true;
++    }
++    wld_wpaCtrlInterface_t* global = wld_secDmn_getGlobalCtrlIface(pRad->hostapd);
++    if(!wld_wpaCtrlInterface_isReady(global) ||
++       !wld_wpaCtrl_sendCmdCheckResponseExt(global, "PING", "PONG", 100)) {
++        return true;
++    }
++    wld_hostapd_sock_t* socks = NULL;
++    bool empty = swl_rc_isOk(wld_hostapd_snapshot(mgr, &socks));
++    for(wld_hostapd_sock_t* sock = socks; sock != NULL; sock = sock->next) {
++        if((sock->ap && (sock->ap->pRadio == pRad)) ||
++           wld_hostapd_mayBelongToRadio(sock, pRad)) {
++            empty = false;
++        }
++    }
++    wld_hostapd_freeSnapshot(&socks);
++    if(!empty) {
++        SAH_TRACEZ_WARNING(ME, "%s: skip recovery: loaded or unresolved local BSS remains", pRad->Name);
++        return true;
++    }
++    /* Existing ADD writes current config and retains its single restart
++     * fallback. The one-shot latch is not cleared by that restart. */
++    return s_doAddHostapd(pRad);
++}
++
+ /**
+  * @brief fsm execution handler for action GEN_FSM_REMOVE_HOSTAPD
+  *
+@@ -2107,6 +2236,14 @@ static bool s_doReloadHostapd(T_Radio* pRad) {
+  * Check if we need to do radio up down actions. Need to happen if it's first interface that goes up.
+  */
+ static void s_checkPreRadDependency(T_Radio* pRad _UNUSED) {
++    if(pRad->hapdRecoveryQueued) {
++        if(!s_hapdRecoveryHasWork(pRad) && s_hapdRecoveryAllowed(pRad)) {
++            /* An absent config needs ADD, not the normal down-radio
++             * dependency that schedules STOP/START for a state change. */
++            return;
++        }
++        wifiGen_fsm_cancelHapdRecovery(pRad);
++    }
+     if(isBitSetLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_ENABLE_RAD) || (pRad->status == RST_ERROR)) {
+         SAH_TRACEZ_ERROR(ME, "%s : no pre dep change", pRad->Name);
+         return;
+@@ -2307,6 +2444,7 @@ wld_fsmMngr_action_t actions[GEN_FSM_MAX] = {
+     {FSM_ACTION(GEN_FSM_SYNC_STATE), .doRadFsmAction = s_doSyncState},
+     {FSM_ACTION(GEN_FSM_CONNECT_EP), .doEpFsmAction = s_doConnectEp},
+     {FSM_ACTION(GEN_FSM_START_WPASUPP), .doEpFsmAction = s_doStartWpaSupp},
++    {FSM_ACTION(GEN_FSM_RECOVER_HOSTAPD), .doRadFsmAction = s_doRecoverHostapd},
+ };
+ 
+ wld_fsmMngr_t mngr = {
+diff --git a/src/Plugin/wifiGen_hapd.c b/src/Plugin/wifiGen_hapd.c
+index 731509907448..015685aa330d 100644
+--- a/src/Plugin/wifiGen_hapd.c
++++ b/src/Plugin/wifiGen_hapd.c
+@@ -390,6 +390,8 @@ swl_rc_ne wifiGen_hapd_initVAP(T_AccessPoint* pAP) {
+ void wifiGen_hapd_cleanup(T_Radio* pRad) {
+     ASSERT_NOT_NULL(pRad, , ME, "NULL");
+     SAH_TRACEZ_INFO(ME, "%s: Destroy hostapd", pRad->Name);
++    wifiGen_fsm_cancelHapdRecovery(pRad);
++    amxp_timer_delete(&pRad->hapdRecoveryTimer);
+     wld_secDmn_cleanup(&pRad->hostapd);
+ }
+ 
+@@ -426,6 +428,7 @@ swl_rc_ne wifiGen_hapd_startDaemon(T_Radio* pRad) {
+ swl_rc_ne wifiGen_hapd_stopDaemon(T_Radio* pRad) {
+     ASSERTS_NOT_NULL(pRad, SWL_RC_INVALID_PARAM, ME, "NULL");
+     SAH_TRACEZ_WARNING(ME, "%s: Stop hostapd", pRad->Name);
++    wifiGen_fsm_cancelHapdRecovery(pRad);
+     swl_rc_ne rc = wld_secDmn_stop(pRad->hostapd);
+     wld_rad_resetApMldLinks(pRad);
+     ASSERTI_NOT_EQUALS(rc, SWL_RC_CONTINUE, rc, ME, "%s: hostapd being stopped", pRad->Name);
+-- 
+2.51.0
