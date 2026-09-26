@@ -1,0 +1,716 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Petr=20=C5=A0tetiar?= <petr.stetiar@prplfoundation.org>
+Date: Sat, 26 Sep 2026 06:00:00 +0000
+Subject: [PATCH 1/3] Plugin: resolve loaded hostapd BSS identities
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Retained AP MLD sockets can outlive their kernel links. Matching a zero
+link netdev address or guessing from a one-link interface then
+identifies the wrong AP, especially when the desired MLD has already
+changed.
+
+Resolve GET_CONFIG BSSID against STATUS radio, band and BSS membership.
+Keep unresolved evidence separate from a successfully identified BSS.
+Prefer current addresses over a single remembered loaded address. Keep
+old identity available during a BSSID change without adopting old MLD
+metadata; require the exact active kernel link and the 0008 MLD guard.
+
+An unpark can recreate a socket under the same name without a netdev
+event. Keep path availability independent of cached identity. Refresh
+connected command and event clients when their server inode changes.
+
+Prepare the private resolver for manager-local reconciliation and the
+radio-local removal preflight in the following patches.
+
+Signed-off-by: Petr Štetiar <petr.stetiar@prplfoundation.org>
+---
+diff --git a/include_priv/nl80211/wld_hostapd_sock.h b/include_priv/nl80211/wld_hostapd_sock.h
+new file mode 100644
+--- /dev/null
++++ b/include_priv/nl80211/wld_hostapd_sock.h
+@@ -0,0 +1,92 @@
++/****************************************************************************
++**
++** SPDX-License-Identifier: BSD-2-Clause-Patent
++**
++** SPDX-FileCopyrightText: Copyright (c) 2026 prpl Foundation
++**
++** Redistribution and use in source and binary forms, with or
++** without modification, are permitted provided that the following
++** conditions are met:
++**
++** 1. Redistributions of source code must retain the above copyright
++** notice, this list of conditions and the following disclaimer.
++**
++** 2. Redistributions in binary form must reproduce the above
++** copyright notice, this list of conditions and the following
++** disclaimer in the documentation and/or other materials provided
++** with the distribution.
++**
++** Subject to the terms and conditions of this license, each
++** copyright holder and contributor hereby grants to those receiving
++** rights under this license a perpetual, worldwide, non-exclusive,
++** no-charge, royalty-free, irrevocable (except for failure to
++** satisfy the conditions of this license) patent license to make,
++** have made, use, offer to sell, sell, import, and otherwise
++** transfer this software, where such license applies only to those
++** patent claims, already acquired or hereafter acquired, licensable
++** by such copyright holder or contributor that are necessarily
++** infringed by:
++**
++** (a) their Contribution(s) (the licensed copyrights of copyright
++** holders and non-copyrightable additions of contributors, in
++** source or binary form) alone; or
++**
++** (b) combination of their Contribution(s) with the work of
++** authorship to which such Contribution(s) was added by such
++** copyright holder or contributor, if, at the time the Contribution
++** is added, such addition causes such combination to be necessarily
++** infringed. The patent license shall not apply to any other
++** combinations which include the Contribution.
++**
++** Except as expressly stated above, no rights or licenses from any
++** copyright holder or contributor is granted under this license,
++** whether expressly, by implication, estoppel or otherwise.
++**
++** DISCLAIMER
++**
++** THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
++** CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
++** INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
++** MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++** DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR
++** CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++** SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++** LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
++** USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++** AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++** LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++** ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++** POSSIBILITY OF SUCH DAMAGE.
++**
++****************************************************************************/
++
++#ifndef WLD_HOSTAPD_SOCK_H
++#define WLD_HOSTAPD_SOCK_H
++
++#include "wld/wld.h"
++#include "wld/wld_wpaCtrlMngr.h"
++
++#define WLD_HAPD_SOCK_NAME_LEN (IFNAMSIZ + 16)
++
++/* One entry per loaded BSS instance, including old/new overlap for one AP. */
++typedef struct wld_hostapd_sock {
++    struct wld_hostapd_sock* next;
++    T_AccessPoint* ap;
++    char name[WLD_HAPD_SOCK_NAME_LEN];
++    char owner[WLD_HAPD_SOCK_NAME_LEN];
++    swl_macBin_t bssid;
++    uint64_t inode;
++    bool enabled;
++    bool resolved;
++    bool nonBss;
++    char phy[128];
++    swl_chanspec_t chspec;
++    bool hasBand;
++} wld_hostapd_sock_t;
++
++/* Read-only: neither desired MLD metadata nor saved associations are changed. */
++swl_rc_ne wld_hostapd_resolveSock(const char* dir, const char* name, wld_hostapd_sock_t* sock);
++swl_rc_ne wld_hostapd_getSock(wld_wpaCtrlMngr_t* mgr, const char* name, wld_hostapd_sock_t* sock);
++void wld_hostapd_rememberBssid(T_AccessPoint* ap);
++
++#endif
+diff --git a/include_priv/nl80211/wld_wpaCtrlInterface_priv.h b/include_priv/nl80211/wld_wpaCtrlInterface_priv.h
+--- a/include_priv/nl80211/wld_wpaCtrlInterface_priv.h
++++ b/include_priv/nl80211/wld_wpaCtrlInterface_priv.h
+@@ -70,6 +70,8 @@
+ struct wld_wpaCtrlInterface {
+     char* name;                          /** interface name */
+     char* cfgFile;                       /** bss config file path */
++    uint8_t loadedBssid[6];              /** last uniquely observed BSS */
++    uint64_t serverInode;               /** connected/reconciled server inode */
+     bool enable;                         /** establish connection */
+     wpaCtrlConnection_t* cmdConn;
+     wpaCtrlConnection_t* eventConn;
+diff --git a/src/Plugin/wifiGen_hapd.c b/src/Plugin/wifiGen_hapd.c
+--- a/src/Plugin/wifiGen_hapd.c
++++ b/src/Plugin/wifiGen_hapd.c
+@@ -74,6 +74,7 @@
+ #include "wld/wld_wpaCtrlGSock.h"
+ #include "wld/wld_hostapd_ap_api.h"
+ #include "wifiGen_hapd.h"
++#include "nl80211/wld_hostapd_sock.h"
+ #include "wifiGen_events.h"
+ #include "wifiGen_fsm.h"
+ #include "wifiGen_rad.h"
+@@ -124,61 +125,13 @@
+ }
+ 
+ T_AccessPoint* wifiGen_hapd_fetchSockApLink(T_AccessPoint* pAPMld, const char* sockName) {
+-    ASSERT_STR(sockName, NULL, ME, "empty socket name");
+     ASSERT_NOT_NULL(pAPMld, NULL, ME, "NULL");
+-    wld_wpaCtrlMngr_t* pMgr = wld_wpaCtrlInterface_getMgr(pAPMld->wpaCtrlInterface);
+-    wld_secDmn_t* pSecDmn = wld_wpaCtrlMngr_getSecDmn(pMgr);
+-    const char* serverPath = wld_secDmn_getCtrlIfaceDirPath(pSecDmn);
+-    ASSERT_STR(serverPath, NULL, ME, "%s: empty wpa server path", pAPMld->alias);
+-    T_SSID* pMldSSID = pAPMld->pSSID;
+-    ASSERT_NOT_NULL(pMldSSID, NULL, ME, "NULL");
+-    T_SSID* pLinkSSID = NULL;
+-    size_t maxMsgLen = wld_wpaCtrl_getMaxMsgLen();
+-    char reply[maxMsgLen];
+-    memset(reply, 0, sizeof(reply));
+-    swl_rc_ne rc = wld_wpaCtrl_queryToSock(serverPath, sockName, "GET_CONFIG", reply, sizeof(reply));
+-    ASSERTI_TRUE(swl_rc_isOk(rc), NULL, ME, "%s: fail to get hostapd config over %s/%s", pAPMld->alias, serverPath, sockName);
+-    char valStr[128] = {0};
+-    char ssidStr[64] = {0};
+-    swl_macBin_t macBin = SWL_MAC_BIN_NEW();
+-    if((wld_wpaCtrl_getValueStr(reply, "bssid", valStr, sizeof(valStr)) > 0) &&
+-       (swl_typeMacBin_fromChar(&macBin, valStr)) && (!swl_mac_binIsNull(&macBin)) &&
+-       ((pLinkSSID = wld_ssid_getSsidByMacAddress(&macBin)) != NULL)) {
+-        SAH_TRACEZ_INFO(ME, "sock(%s): GET_CONFIG linkMac(%s) => pSSID(%s)",
+-                        sockName, swl_typeMacBin_toBuf32(macBin).buf, pLinkSSID->Name);
+-        return pLinkSSID->AP_HOOK;
+-    }
+-    if(wld_wpaCtrl_getValueStr(reply, "ssid", ssidStr, sizeof(ssidStr)) <= 0) {
+-        SAH_TRACEZ_INFO(ME, "sock(%s): no ssid is set in config", sockName);
+-    }
+-    rc = wld_wpaCtrl_queryToSock(serverPath, sockName, "STATUS", reply, sizeof(reply));
+-    ASSERTI_TRUE(swl_rc_isOk(rc), NULL, ME, "%s: fail to get hostapd status over %s/%s", pAPMld->alias, serverPath, sockName);
+-    swl_chanspec_t chspec = SWL_CHANSPEC_EMPTY;
+-    int32_t freq = 0;
+-    if((wld_wpaCtrl_getValueIntExt(reply, "freq", &freq)) &&
+-       (swl_chanspec_channelFromMHz(&chspec, freq) >= SWL_RC_OK)) {
+-        SAH_TRACEZ_INFO(ME, "sock(%s): STATUS: bssid(%s) ssid(%s) freq:%d chspec(%s)",
+-                        sockName, swl_typeMacBin_toBuf32(macBin).buf, ssidStr,
+-                        freq, swl_typeChanspecExt_toBuf32(chspec).buf);
+-    }
+-    ASSERTI_TRUE(chspec.channel > 0, NULL, ME, "%s: no channel configured", pAPMld->alias);
+-    T_Radio* pRad = NULL;
+-    wld_for_eachRad(pRad) {
+-        if(pRad->operatingFrequencyBand != chspec.band) {
+-            continue;
+-        }
+-        T_AccessPoint* pAP = NULL;
+-        wld_rad_forEachAp(pAP, pRad) {
+-            pLinkSSID = pAP->pSSID;
+-            if((pLinkSSID != NULL) && (pLinkSSID->mldUnit == pMldSSID->mldUnit) &&
+-               ((swl_str_isEmpty(ssidStr) || (swl_str_matches(pLinkSSID->SSID, ssidStr))))) {
+-                SAH_TRACEZ_INFO(ME, "sock(%s): BASIC MATCH ssid(%s) mldUnit(%d) => pSSID(%s)",
+-                                sockName, pLinkSSID->SSID, pLinkSSID->mldUnit, pLinkSSID->Name);
+-                return pLinkSSID->AP_HOOK;
+-            }
+-        }
+-    }
+-    return NULL;
++    wld_wpaCtrlMngr_t* mgr = wld_wpaCtrlInterface_getMgr(pAPMld->wpaCtrlInterface);
++    wld_hostapd_sock_t sock;
++    if(!swl_rc_isOk(wld_hostapd_getSock(mgr, sockName, &sock))) {
++        return NULL;
++    }
++    return sock.ap;
+ }
+ 
+ bool wifiGen_hapd_isStartable(T_Radio* pRad) {
+diff --git a/src/Plugin/wifiGen_mld.c b/src/Plugin/wifiGen_mld.c
+--- a/src/Plugin/wifiGen_mld.c
++++ b/src/Plugin/wifiGen_mld.c
+@@ -71,98 +71,36 @@
+ #include "wld/wld_hostapd_ap_api.h"
+ #include "wld/Utils/wld_autoCommitMgr.h"
+ #include "wifiGen_hapd.h"
++#include "nl80211/wld_hostapd_sock.h"
+ 
+ #define ME "genMld"
+ 
+-static T_SSID* s_fetchLinkSSIDWithNl80211(const char* mldIface, int32_t linkId) {
++static bool s_hasActiveSockLink(T_SSID* ssid, const char* iface, int32_t linkId) {
++    if(linkId < 0) {
++        return true;
++    }
+     int ifIndex = -1;
+-    int ret = wld_linuxIfUtils_getIfIndexExt((char*) mldIface, &ifIndex);
+-    ASSERTS_TRUE(ret >= 0, NULL, ME, "fail to get iface %s index", mldIface);
+-    wld_nl80211_ifaceInfo_t ifaceInfo;
+-    memset(&ifaceInfo, 0, sizeof(ifaceInfo));
+-    ret = wld_nl80211_getInterfaceInfo(wld_nl80211_getSharedState(), ifIndex, &ifaceInfo);
+-    ASSERTS_TRUE(swl_rc_isOk(ret), NULL, "fail to get nl iface %s info", mldIface);
+-    swl_macBin_t* pMac = NULL;
+-    T_SSID* pSSID = NULL;
+-    if((ifaceInfo.nMloLinks > 0) && (linkId >= 0)) {
+-        wld_nl80211_ifaceMloLinkInfo_t* pLinkInfo =
+-            (wld_nl80211_ifaceMloLinkInfo_t* ) wld_nl80211_fetchIfaceMloLinkById(&ifaceInfo, linkId);
+-        ASSERTI_NOT_NULL(pLinkInfo, NULL, ME, "mld iface(%s) linkId(%d) is not found", mldIface, linkId);
+-        pMac = &pLinkInfo->link.linkMac;
+-        ASSERTS_FALSE(swl_mac_binIsNull(pMac), NULL, ME, "iface(%s) linkId(%d) has null mac", mldIface, linkId);
+-        pSSID = wld_ssid_getSsidByMacAddress(pMac);
+-        if(pSSID == NULL) {
+-            T_SSID* pRefSsid = wld_ssid_getSsidByIfName(mldIface);
+-            ASSERT_NOT_NULL(pRefSsid, NULL, ME, "no ref mld ssid matching ifname(%s)", mldIface);
+-            swl_chanspec_t swlChanSpec = SWL_CHANSPEC_EMPTY;
+-            if(ifaceInfo.nMloLinks == 1) {
+-                pSSID = pRefSsid;
+-            } else if(swl_rc_isOk(wld_nl80211_chanSpecNlToSwl(&swlChanSpec, &pLinkInfo->chanSpec)) &&
+-                      (swlChanSpec.band < SWL_FREQ_BAND_EXT_NONE)) {
+-                pSSID = wld_mld_getNeighLinkSsidByChanInfo(pRefSsid, &swlChanSpec);
+-            }
+-        }
+-    } else {
+-        pMac = &ifaceInfo.mac;
+-        ASSERTS_FALSE(swl_mac_binIsNull(pMac), NULL, ME, "iface(%s) linkId(%d) has null mac", mldIface, linkId);
+-        pSSID = wld_ssid_getSsidByMacAddress(pMac);
+-    }
+-    ASSERTS_NOT_NULL(pSSID, NULL, ME, "iface(%s) linkId(%d) has no ssid ctx", mldIface, linkId);
+-    SAH_TRACEZ_INFO(ME, "fetch with NL80211: iface(%s) linkId(%d) => linkMac(%s) => pSSID(%s)",
+-                    mldIface, linkId,
+-                    swl_typeMacBin_toBuf32Ref(pMac).buf, pSSID->Name);
+-    return pSSID;
+-}
+-
+-static T_SSID* s_fetchLinkSSIDWithWpaCtrl(const char* mldIface, int32_t linkId, const char* sockName) {
+-    T_SSID* pLinkSSID = NULL;
+-    T_SSID* pMldSSID = wld_ssid_getSsidByIfName(mldIface);
+-    ASSERTS_NOT_NULL(pMldSSID, NULL, ME, "NULL");
+-    if(pMldSSID->AP_HOOK != NULL) {
+-        T_AccessPoint* pAPLink = wifiGen_hapd_fetchSockApLink(pMldSSID->AP_HOOK, sockName);
+-        ASSERTI_NOT_NULL(pAPLink, NULL, ME, "no APLink for mld %s link %d (sock %s)", mldIface, linkId, sockName);
+-        SAH_TRACEZ_INFO(ME, "Found APLink %s for mld %s link %d (sock %s)", pAPLink->alias, mldIface, linkId, sockName);
+-        pLinkSSID = pAPLink->pSSID;
+-    } else if(pMldSSID->ENDP_HOOK != NULL) {
+-        /*
+-         * TODO: manage STA link fetch with wpa_supplicant cmds
+-         */
+-        SAH_TRACEZ_ERROR(ME, "no STALink can be fetched for mld %s link %d (sock %s)", mldIface, linkId, sockName);
+-        return NULL;
+-    }
+-    ASSERTI_NOT_NULL(pLinkSSID, NULL, ME, "iface(%s) linkId(%d) (sock %s) has no ssid", mldIface, linkId, sockName);
+-    SAH_TRACEZ_INFO(ME, "fetch with CUSTOM wpa: iface(%s) linkId(%d) sock(%s) => pSSID(%s)",
+-                    mldIface, linkId, sockName, pLinkSSID->Name);
+-    return pLinkSSID;
+-}
+-
+-static T_SSID* s_fetchLinkSSID(const char* mldIface, int32_t linkId, const char* sockName) {
+-    T_SSID* pSSID = wld_ssid_getSsidByIfName(mldIface);
+-    ASSERT_NOT_NULL(pSSID, NULL, ME, "no ssid is matching iface(%s) linkId(%d) of sock(%s)",
+-                    mldIface, linkId, sockName);
+-
+-    T_Radio* pRad = pSSID->RADIO_PARENT;
+-    ASSERT_NOT_NULL(pRad, NULL, ME, "no radio mapped to iface(%s) linkId(%d) of sock(%s)",
+-                    mldIface, linkId, sockName);
+-
+-    if(linkId < 0) {
+-        ASSERTI_FALSE(wld_mld_isLinkEnabled(pSSID->pMldLink), NULL,
+-                      ME, "skip sock(%s): wait for mld link socket for ssid %s", sockName, pSSID->Name);
+-        SAH_TRACEZ_INFO(ME, "fetch DIRECT: iface(%s) linkId(%d) sock(%s) => pSSID(%s)",
+-                        mldIface, linkId, sockName, pSSID->Name);
+-        return pSSID;
+-    }
+-
+-    if(wld_rad_is11beMldUnitRequired(pRad)) {
+-        ASSERT_TRUE(pSSID->mldUnit >= 0, NULL, ME, "iface(%s) linkId(%d) sock(%s) => ssid(%s) is not mld member",
+-                    mldIface, linkId, sockName, pSSID->Name);
+-    }
+-
+-    if(((pSSID = s_fetchLinkSSIDWithNl80211(mldIface, linkId)) == NULL) &&
+-       ((pSSID = s_fetchLinkSSIDWithWpaCtrl(mldIface, linkId, sockName)) == NULL)) {
+-        SAH_TRACEZ_WARNING(ME, "sock(%s): Fail to match any SSID", sockName);
+-    }
+-    return pSSID;
++    if(wld_linuxIfUtils_getIfIndexExt((char*) iface, &ifIndex) < 0) {
++        return false;
++    }
++    wld_nl80211_ifaceInfo_t info;
++    memset(&info, 0, sizeof(info));
++    if(!swl_rc_isOk(wld_nl80211_getInterfaceInfo(wld_nl80211_getSharedState(),
++                                               ifIndex, &info))) {
++        return false;
++    }
++    const wld_nl80211_ifaceMloLinkInfo_t* link = wld_nl80211_fetchIfaceMloLinkById(&info, linkId);
++    if((link == NULL) || swl_mac_binIsNull(&link->link.linkMac)) {
++        return false;
++    }
++    /*
++     * The link MAC is compared with the SSID's own addresses, not with
++     * wld_ssid_getMLDLinkMac(): that accessor needs a saved link ID, which
++     * is exactly what this check gates on first discovery.
++     */
++    const swl_macBin_t* assigned = &ssid->currentAssignedMldLinkMac;
++    return !memcmp(&link->link.linkMac, ssid->BSSID, 6) ||
++           (!swl_mac_binIsNull(assigned) && !memcmp(&link->link.linkMac, assigned, 6));
+ }
+ 
+ /**
+@@ -195,7 +124,9 @@
+ 
+ T_SSID* wifiGen_mld_fetchSockLinkSSID(wld_wpaCtrlMngr_t* pMgr, const char* sockName) {
+     ASSERT_STR(sockName, NULL, ME, "empty socket name");
+-    const char* refIface = wld_wpaCtrlInterface_getName(wld_wpaCtrlMngr_getFirstInterface(pMgr));
++    wld_wpaCtrlInterface_t* pRef = wld_wpaCtrlMngr_getFirstInterface(pMgr);
++    ASSERTI_NOT_NULL(pRef, NULL, ME, "no registered interface");
++    const char* refIface = wld_wpaCtrlInterface_getName(pRef);
+     ASSERT_STR(refIface, NULL, ME, "Fail to get reference wpactrl iface (pMgr:%p)", pMgr);
+ 
+     char mldIface[swl_str_len(sockName) + 1];
+@@ -209,7 +140,10 @@
+     }
+     ASSERT_STR(mldIface, NULL, ME, "fail to parse sockName (%s)", sockName);
+ 
+-    T_SSID* pLinkSSID = s_fetchLinkSSID(mldIface, linkId, sockName);
++    wld_hostapd_sock_t sock;
++    ASSERTI_TRUE(swl_rc_isOk(wld_hostapd_getSock(pMgr, sockName, &sock)),
++                NULL, ME, "cannot resolve loaded socket %s", sockName);
++    T_SSID* pLinkSSID = sock.ap->pSSID;
+     ASSERTS_NOT_NULL(pLinkSSID, NULL, ME, "sock(%s): Fail to match any SSID", sockName);
+ 
+     /*
+@@ -217,6 +151,14 @@
+      * unit is configured with (e.g. the BSS of its previous unit, pending
+      * removal) is only mapped: its MLD info is not that of the link's unit.
+      */
++    if((linkId < 0) && wld_mld_isLinkEnabled(pLinkSSID->pMldLink)) {
++        return pLinkSSID;
++    }
++    if((linkId >= 0) &&
++       (!sock.enabled || !s_hasActiveSockLink(pLinkSSID, mldIface, linkId) ||
++        (wld_rad_is11beMldUnitRequired(pLinkSSID->RADIO_PARENT) && (pLinkSSID->mldUnit < 0)))) {
++        return pLinkSSID;
++    }
+     if(!s_isSockOfConfiguredMld(pLinkSSID, mldIface)) {
+         SAH_TRACEZ_WARNING(ME, "%s: sock(%s) runs in mld iface(%s) but mld unit(%d) is configured with primary link iface(%s): skip saving its MLD info",
+                            pLinkSSID->Name, sockName, mldIface, pLinkSSID->mldUnit, wld_mld_getPrimaryLinkIfName(pLinkSSID->pMldLink));
+diff --git a/src/nl80211/wld_hostapd_ap_api.c b/src/nl80211/wld_hostapd_ap_api.c
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -67,6 +67,7 @@
+ #include "wld_hostapd_cfgFile.h"
+ #include "wld_hostapd_cfgManager_priv.h"
+ #include "wld_hostapd_ap_api.h"
++#include "wld_hostapd_sock.h"
+ #include "wld_wpaCtrl_api.h"
+ #include "wld_accesspoint.h"
+ #include "wld_ssid.h"
+@@ -1752,6 +1753,7 @@
+     SAH_TRACEZ_INFO(ME, "%s: adding bss config using %s (phy label %s)", pAP->alias, confFilePath, phyLabel);
+     swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "ADD bss_config=%s:%s", phyLabel, confFilePath);
+     ASSERT_TRUE(swl_rc_isOk(rc), rc, ME, "%s: fail to add bss config", pAP->alias);
++    wld_hostapd_rememberBssid(pAP);
+ 
+     return rc;
+ }
+diff --git a/src/nl80211/wld_hostapd_sock.c b/src/nl80211/wld_hostapd_sock.c
+new file mode 100644
+--- /dev/null
++++ b/src/nl80211/wld_hostapd_sock.c
+@@ -0,0 +1,214 @@
++/****************************************************************************
++**
++** SPDX-License-Identifier: BSD-2-Clause-Patent
++**
++** SPDX-FileCopyrightText: Copyright (c) 2026 prpl Foundation
++**
++** Redistribution and use in source and binary forms, with or
++** without modification, are permitted provided that the following
++** conditions are met:
++**
++** 1. Redistributions of source code must retain the above copyright
++** notice, this list of conditions and the following disclaimer.
++**
++** 2. Redistributions in binary form must reproduce the above
++** copyright notice, this list of conditions and the following
++** disclaimer in the documentation and/or other materials provided
++** with the distribution.
++**
++** Subject to the terms and conditions of this license, each
++** copyright holder and contributor hereby grants to those receiving
++** rights under this license a perpetual, worldwide, non-exclusive,
++** no-charge, royalty-free, irrevocable (except for failure to
++** satisfy the conditions of this license) patent license to make,
++** have made, use, offer to sell, sell, import, and otherwise
++** transfer this software, where such license applies only to those
++** patent claims, already acquired or hereafter acquired, licensable
++** by such copyright holder or contributor that are necessarily
++** infringed by:
++**
++** (a) their Contribution(s) (the licensed copyrights of copyright
++** holders and non-copyrightable additions of contributors, in
++** source or binary form) alone; or
++**
++** (b) combination of their Contribution(s) with the work of
++** authorship to which such Contribution(s) was added by such
++** copyright holder or contributor, if, at the time the Contribution
++** is added, such addition causes such combination to be necessarily
++** infringed. The patent license shall not apply to any other
++** combinations which include the Contribution.
++**
++** Except as expressly stated above, no rights or licenses from any
++** copyright holder or contributor is granted under this license,
++** whether expressly, by implication, estoppel or otherwise.
++**
++** DISCLAIMER
++**
++** THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
++** CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
++** INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
++** MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++** DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR
++** CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++** SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++** LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
++** USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++** AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++** LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++** ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++** POSSIBILITY OF SUCH DAMAGE.
++**
++****************************************************************************/
++
++#include <dirent.h>
++#include <sys/stat.h>
++#include "wld_hostapd_sock.h"
++#include "wld_radio.h"
++#include "wld_accesspoint.h"
++#include "wld_wpaCtrl_api.h"
++#include "wld_wpaCtrlGSock.h"
++#include "wld_wpaCtrlInterface_priv.h"
++
++#define ME "hapdSock"
++
++static uint64_t s_inode(const char* dir, const char* name) {
++    char path[PATH_MAX];
++    struct stat st;
++    snprintf(path, sizeof(path), "%s/%s", dir, name);
++    return ((stat(path, &st) == 0) && S_ISSOCK(st.st_mode)) ? st.st_ino : 0;
++}
++
++/* Match complete reply keys: a vendor-prefixed key is not the requested key. */
++static bool s_value(const char* reply, const char* key, char* value, size_t len) {
++    size_t keyLen = strlen(key);
++    for(const char* line = reply; *line; ) {
++        const char* end = strchr(line, '\n');
++        if(end == NULL) {
++            end = line + strlen(line);
++        }
++        if(((size_t) (end - line) > keyLen) && !strncmp(line, key, keyLen) && (line[keyLen] == '=')) {
++            size_t n = end - line - keyLen - 1;
++            if(n >= len) {
++                return false;
++            }
++            memcpy(value, line + keyLen + 1, n);
++            value[n] = 0;
++            return true;
++        }
++        line = *end ? end + 1 : end;
++    }
++    return false;
++}
++
++static bool s_bssName(const char* reply, unsigned int i, char* name, size_t len) {
++    char key[32], iface[IFNAMSIZ + 1] = {0}, value[32] = {0};
++    snprintf(key, sizeof(key), "bss[%u]", i);
++    if(!s_value(reply, key, iface, sizeof(iface))) {
++        return false;
++    }
++    snprintf(key, sizeof(key), "mld_link_id[%u]", i);
++    if(s_value(reply, key, value, sizeof(value)) && (atoi(value) >= 0)) {
++        snprintf(name, len, "%s_link%d", iface, atoi(value));
++    } else {
++        swl_str_copy(name, len, iface);
++    }
++    return true;
++}
++
++static bool s_radioMatches(const wld_hostapd_sock_t* pSock, T_Radio* pRad) {
++    bool label = swl_str_matches(pSock->phy, pRad->Name);
++    return (label || swl_str_matches(pSock->phy, pRad->wiphyName)) &&
++           (!pSock->hasBand || (pSock->chspec.band == pRad->operatingFrequencyBand)) &&
++           (label || pSock->hasBand || (wld_rad_countWiphyRads(pRad->wiphy) == 1));
++}
++
++/**
++ * @brief Resolve one loaded BSS without adopting desired MLD metadata.
++ * Keep partial evidence on failure for radio-local removal preflight.
++ */
++swl_rc_ne wld_hostapd_resolveSock(const char* dir, const char* name, wld_hostapd_sock_t* pSock) {
++    ASSERT_NOT_NULL(pSock, SWL_RC_INVALID_PARAM, ME, "NULL");
++    memset(pSock, 0, sizeof(*pSock));
++    ASSERTI_TRUE(swl_str_len(name) < sizeof(pSock->name), SWL_RC_ERROR, ME, "long socket name %s", name);
++    swl_str_copy(pSock->name, sizeof(pSock->name), name);
++    pSock->inode = s_inode(dir, name);
++    ASSERTI_TRUE(pSock->inode != 0, SWL_RC_ERROR, ME, "missing socket %s", name);
++    char reply[wld_wpaCtrl_getMaxMsgLen()];
++    char value[128] = {0};
++    memset(reply, 0, sizeof(reply));
++    swl_rc_ne rc = wld_wpaCtrl_queryToSock(dir, name, "GET_CONFIG", reply, sizeof(reply));
++    bool hasBssid = swl_rc_isOk(rc) && s_value(reply, "bssid", value, sizeof(value)) &&
++                    swl_typeMacBin_fromChar(&pSock->bssid, value) && !swl_mac_binIsNull(&pSock->bssid);
++    /* STATUS can still identify a local candidate if GET_CONFIG timed out. */
++    memset(reply, 0, sizeof(reply));
++    rc = wld_wpaCtrl_queryToSock(dir, name, "STATUS", reply, sizeof(reply));
++    ASSERTI_TRUE(swl_rc_isOk(rc), SWL_RC_ERROR, ME, "STATUS unavailable: %s", name);
++    pSock->enabled = s_value(reply, "state", value, sizeof(value)) && swl_str_matches(value, "ENABLED");
++    s_value(reply, "phy", pSock->phy, sizeof(pSock->phy));
++    pSock->hasBand = s_value(reply, "freq", value, sizeof(value)) && (atoi(value) > 0) &&
++                     swl_rc_isOk(swl_chanspec_channelFromMHz(&pSock->chspec, atoi(value)));
++    ASSERTI_TRUE(s_bssName(reply, 0, pSock->owner, sizeof(pSock->owner)), SWL_RC_ERROR, ME, "no owner: %s", name);
++    bool self = false, redirect = false;
++    char bssName[WLD_HAPD_SOCK_NAME_LEN];
++    for(unsigned int i = 0; s_bssName(reply, i, bssName, sizeof(bssName)); i++) {
++        char key[32], base[IFNAMSIZ + 1] = {0};
++        snprintf(key, sizeof(key), "bss[%u]", i);
++        s_value(reply, key, base, sizeof(base));
++        if(swl_str_matches(base, name) && !swl_str_matches(bssName, name)) {
++            redirect = true;
++        }
++        if(!swl_str_matches(bssName, name)) {
++            continue;
++        }
++        swl_macBin_t mac = SWL_MAC_BIN_NEW();
++        snprintf(key, sizeof(key), "bssid[%u]", i);
++        ASSERTI_TRUE(hasBssid && s_value(reply, key, value, sizeof(value)) &&
++                     swl_typeMacBin_fromChar(&mac, value) && !memcmp(&mac, &pSock->bssid, sizeof(mac)),
++                     SWL_RC_ERROR, ME, "inconsistent BSSID: %s", name);
++        ASSERTI_FALSE(self, SWL_RC_ERROR, ME, "duplicate self entry: %s", name);
++        self = true;
++    }
++    /* Positive STATUS evidence, never directory sort order, identifies redirects. */
++    pSock->nonBss = !self && redirect;
++    ASSERTI_TRUE(self, SWL_RC_ERROR, ME, "not a BSS socket: %s", name);
++    T_AccessPoint* pCurrent = NULL;
++    T_AccessPoint* pOld = NULL;
++    unsigned int currentCount = 0, oldCount = 0;
++    T_Radio* pRad = NULL;
++    wld_for_eachRad(pRad) {
++        if((pRad->hostapd == NULL) || !s_radioMatches(pSock, pRad) ||
++           !swl_str_matches(dir, wld_wpaCtrlMngr_getCtrlIfaceDirPath(wld_secDmn_getWpaCtrlMgr(pRad->hostapd)))) {
++            continue;
++        }
++        T_AccessPoint* pAP = NULL;
++        wld_rad_forEachAp(pAP, pRad) {
++            if((pAP->pSSID == NULL) || (pAP->wpaCtrlInterface == NULL)) {
++                continue;
++            }
++            if(!memcmp(pAP->pSSID->BSSID, &pSock->bssid, 6)) {
++                pCurrent = pAP;
++                currentCount++;
++            } else if(!memcmp(pAP->wpaCtrlInterface->loadedBssid, &pSock->bssid, 6)) {
++                pOld = pAP;
++                oldCount++;
++            }
++        }
++    }
++    ASSERTI_TRUE((currentCount == 1) || ((currentCount == 0) && (oldCount == 1)),
++                 SWL_RC_ERROR, ME, "unknown or ambiguous AP: %s", name);
++    ASSERTI_TRUE(pSock->inode == s_inode(dir, name), SWL_RC_ERROR, ME, "socket replaced: %s", name);
++    pSock->ap = currentCount ? pCurrent : pOld;
++    pSock->resolved = true;
++    return SWL_RC_OK;
++}
++
++swl_rc_ne wld_hostapd_getSock(wld_wpaCtrlMngr_t* pMgr, const char* name, wld_hostapd_sock_t* pSock) {
++    return wld_hostapd_resolveSock(wld_wpaCtrlMngr_getCtrlIfaceDirPath(pMgr), name, pSock);
++}
++
++void wld_hostapd_rememberBssid(T_AccessPoint* pAP) {
++    if((pAP != NULL) && (pAP->pSSID != NULL) && (pAP->wpaCtrlInterface != NULL) &&
++       swl_mac_binIsNull((swl_macBin_t*) pAP->wpaCtrlInterface->loadedBssid)) {
++        memcpy(pAP->wpaCtrlInterface->loadedBssid, pAP->pSSID->BSSID, 6);
++    }
++}
+diff --git a/src/nl80211/wld_rad_hostapd_api.c b/src/nl80211/wld_rad_hostapd_api.c
+--- a/src/nl80211/wld_rad_hostapd_api.c
++++ b/src/nl80211/wld_rad_hostapd_api.c
+@@ -65,6 +65,7 @@
+ #include "wld_accesspoint.h"
+ #include "wld_wpaCtrl_api.h"
+ #include "wld_rad_hostapd_api.h"
++#include "wld_hostapd_sock.h"
+ #include "wld_hostapd_ap_api.h"
+ #include "wld_hostapd_cfgFile.h"
+ #include "wld_hostapd_cfgManager_priv.h"
+@@ -516,6 +517,14 @@
+         phyLabel = pR->Name;
+     }
+     rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "ADD bss_config=%s:%s", phyLabel, pR->hostapd->cfgFile);
++    if(swl_rc_isOk(rc) || (rc == SWL_RC_NOT_AVAILABLE)) {
++        T_AccessPoint* ap = NULL;
++        wld_rad_forEachAp(ap, pR) {
++            if(wld_ap_isEnabledWithRef(ap)) {
++                wld_hostapd_rememberBssid(ap);
++            }
++        }
++    }
+     //the call may timeout while being applied, but that only happens on success
+     if(rc == SWL_RC_NOT_AVAILABLE) {
+         rc = SWL_RC_CONTINUE;
+diff --git a/src/nl80211/wld_wpaCtrlInterface.c b/src/nl80211/wld_wpaCtrlInterface.c
+--- a/src/nl80211/wld_wpaCtrlInterface.c
++++ b/src/nl80211/wld_wpaCtrlInterface.c
+@@ -77,6 +77,18 @@
+     WPA_CONNECTION_MAX
+ } wld_wpaCtrlConnectionType_e;
+ 
++/* A hostapd unpark can recreate a server without any netdev event. */
++static void s_refreshConnection(wld_wpaCtrlInterface_t* pIface) {
++    if((pIface == NULL) || !pIface->isReady) {
++        return;
++    }
++    uint64_t inode = wld_wpaCtrlInterface_getConnectionInode(pIface);
++    if(inode && pIface->serverInode && (inode != pIface->serverInode)) {
++        wld_wpaCtrlInterface_close(pIface);
++        wld_wpaCtrlInterface_open(pIface);
++    }
++}
++
+ /**
+  * @brief send command to wap_ctrl server
+  *
+@@ -88,6 +100,7 @@
+  */
+ bool wld_wpaCtrl_sendCmd(wld_wpaCtrlInterface_t* pIface, const char* cmd) {
+     ASSERTS_NOT_NULL(pIface, false, ME, "NULL");
++    s_refreshConnection(pIface);
+     return swl_rc_isOk(wld_wpaCtrlConnection_sendCmd(pIface->cmdConn, cmd));
+ }
+ 
+@@ -103,6 +116,7 @@
+  */
+ bool wld_wpaCtrl_sendCmdSynced(wld_wpaCtrlInterface_t* pIface, const char* cmd, char* reply, size_t reply_len) {
+     ASSERTS_NOT_NULL(pIface, false, ME, "NULL");
++    s_refreshConnection(pIface);
+     return swl_rc_isOk(wld_wpaCtrlConnection_sendCmdSynced(pIface->cmdConn, cmd, reply, reply_len));
+ }
+ 
+@@ -189,6 +203,7 @@
+  */
+ bool wld_wpaCtrl_sendCmdCheckResponseExt(wld_wpaCtrlInterface_t* pIface, char* cmd, char* expectedResponse, uint32_t tmOutMSec) {
+     ASSERTS_NOT_NULL(pIface, false, ME, "NULL");
++    s_refreshConnection(pIface);
+     return swl_rc_isOk(wld_wpaCtrlConnection_sendCmdCheckResponseExt(pIface->cmdConn, cmd, expectedResponse, tmOutMSec));
+ }
+ 
+@@ -204,6 +219,7 @@
+  */
+ bool wld_wpaCtrl_sendCmdCheckResponse(wld_wpaCtrlInterface_t* pIface, char* cmd, char* expectedResponse) {
+     ASSERTS_NOT_NULL(pIface, false, ME, "NULL");
++    s_refreshConnection(pIface);
+     return swl_rc_isOk(wld_wpaCtrlConnection_sendCmdCheckResponse(pIface->cmdConn, cmd, expectedResponse));
+ }
+ 
+@@ -227,6 +243,7 @@
+ static swl_rc_ne s_sendCmdFmtGetResponseExt(wld_wpaCtrlInterface_t* pIface, char* reply, size_t replySize, uint32_t tmOutMSec, char* cmdStr) {
+     const char* wpaCtrlIfName = wld_wpaCtrlInterface_getName(pIface);
+     ASSERTS_TRUE(wld_wpaCtrlInterface_checkConnectionPath(pIface), SWL_RC_INVALID_STATE, ME, "%s: wpactrl link not ready", wpaCtrlIfName);
++    s_refreshConnection(pIface);
+     if(wld_wpaCtrlInterface_isReady(pIface)) {
+         return wld_wpaCtrlConnection_sendCmdSyncedExt(pIface->cmdConn, cmdStr, reply, replySize, tmOutMSec);
+     }
+@@ -655,6 +672,7 @@
+     amxo_connection_remove(get_wld_plugin_parser(), pIface->cmdConn->wpaPeer);
+ 
+     SAH_TRACEZ_INFO(ME, "%s: Successfully connected to %s", pIface->name, wld_wpaCtrlInterface_getPath(pIface));
++    pIface->serverInode = wld_wpaCtrlInterface_getConnectionInode(pIface);
+     pIface->isReady = true;
+ 
+     return true;
