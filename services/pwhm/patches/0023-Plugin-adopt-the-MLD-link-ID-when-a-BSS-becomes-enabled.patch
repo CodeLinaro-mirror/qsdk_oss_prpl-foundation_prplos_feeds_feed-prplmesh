@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Petr Štetiar <petr.stetiar@prplfoundation.org>
+Date: Sat, 26 Sep 2026 22:00:00 +0000
+Subject: [PATCH] Plugin: adopt the MLD link ID when a BSS becomes enabled
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A BSS that pWHM adds to a running radio is discovered by the wpactrl
+manager scan while hostapd still initializes it. On 5 GHz that window is
+the HT40 coexistence scan (COUNTRY_UPDATE -> HT_SCAN -> ENABLED, one to
+two seconds under mac80211_hwsim): STATUS does not report state=ENABLED
+yet, so the adoption gate of wifiGen_mld_fetchSockLinkSSID() keeps the
+MLD info of the socket unadopted, as it should for a BSS that is not
+active yet. Nothing re-runs the adoption afterwards: MOD_MLD ran before
+the BSS was added, the FSM commit that follows AP-ENABLED carries only
+UPDATE_BEACON, and s_apEnabledCb() only refreshes the VAP state. The
+SSID keeps MLDLinkID -1 and never joins the AffiliatedAP list of its
+APMLD, although its AccessPoint already reports Status Enabled.
+
+Q:100-pwhm_step_1 shows it on every boot since the adoption gate exists:
+AP4 (wlan1.2, guest MLD, socket wlan2.2_link1) and AP8 (wlan1.3,
+backhaul MLD, socket wlan2.3_link1) fail "Check wpacltrl socket file"
+with "not found", while the sockets exist; pWHM's own nl80211 lookups
+for these SSIDs pass linkId(-1) where they passed linkId(1) before the
+gate. The 2.4 GHz links run 20 MHz and 6 GHz has no HT scan, so those
+sockets are ENABLED at first discovery and adopt as before.
+
+Re-run the same gated adoption from s_apEnabledCb(): when the enabled
+AP's SSID has no valid MLD link ID and its connection socket is an MLD
+link socket of the radio's own manager, fetch that socket again. The
+identity gate stays as it is (STATUS ENABLED, kernel link carrying the
+SSID's MAC, MLD unit); the event only supplies the moment at which it
+can pass. Only MLD metadata is written; no FSM bit is set.
+
+The event path runs outside the discovery reconciliation, so it asks
+for more than the shared gate: the destination MLD unit must have a
+configured primary link and the socket's MLD netdev must be that link's
+netdev. The shared gate accepts a socket when the unit has no configured
+primary yet, which the discovery path needs to learn the primary at
+start-up; an enable event may also reach a link that moved to a fresh
+unit while its old BSS still runs (its old link ID and configured flag
+are reset on registration, the FSM dependency phase marks it configured
+again before the old hostapd configuration is removed), and there the
+old kernel link still carries the SSID's MAC. Such a link is left to the
+discovery path, logged at INFO. The same holds for a primary link whose
+own socket comes up before it has been adopted: the discovery path
+adopts it when it is ENABLED at discovery, as today.
+
+The first BSS of a radio interface emits AP-ENABLED too (the main-AP and
+the per-AP callbacks both fire), so it takes the same path when the MLD
+sync on radio-up did not adopt; a BSS that hostapd recreates after
+CTRL-EVENT-TERMINATING is re-adopted by the resumed connect cycle or,
+when that scan still found it initializing, by its AP-ENABLED here.
+
+Signed-off-by: Petr Štetiar <petr.stetiar@prplfoundation.org>
+---
+ src/Plugin/wifiGen_eventHandlers.c | 61 ++++++++++++++++++++++++++++++
+ 1 file changed, 61 insertions(+)
+
+diff --git a/src/Plugin/wifiGen_eventHandlers.c b/src/Plugin/wifiGen_eventHandlers.c
+index 331a071305ed..0673a0e0abef 100644
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -901,11 +901,72 @@ static void s_wpsSetupLocked(void* userData, char* ifName _UNUSED, bool setupLoc
+     wld_wps_updateState(pAP);
+ }
+ 
++/*
++ * Event-time adoption runs outside the discovery reconciliation, so it needs
++ * positive proof that the socket belongs to the current MLD of the link: the
++ * destination unit has a configured primary link and the socket's MLD netdev
++ * is that link's netdev. A unit without one (a migrated link in its fresh
++ * unit while its old BSS still runs, a primary not adopted yet) is left to
++ * the discovery path, whose semantics are unchanged.
++ */
++static bool s_isSockOfCurrentPrimLink(T_AccessPoint* pAP, const char* sockName, const char* mldIface) {
++    T_SSID* pSSID = pAP->pSSID;
++    wld_mldLink_t* pPrimLink = wld_mld_getPrimaryLink(pSSID->pMldLink);
++    if((pPrimLink == NULL) || !wld_mld_isLinkConfigured(pPrimLink)) {
++        SAH_TRACEZ_INFO(ME, "%s: skip adopting sock(%s): mld unit(%d) has no configured primary link",
++                        pAP->alias, sockName, pSSID->mldUnit);
++        return false;
++    }
++    const char* primIface = wld_mld_getLinkIfName(pPrimLink);
++    if(!swl_str_matches(primIface, mldIface)) {
++        SAH_TRACEZ_INFO(ME, "%s: skip adopting sock(%s): mld iface(%s) is not the primary link iface(%s) of mld unit(%d)",
++                        pAP->alias, sockName, mldIface, primIface, pSSID->mldUnit);
++        return false;
++    }
++    return true;
++}
++
++/*
++ * The manager scan discovers the socket of a BSS added to a running radio
++ * while hostapd still initializes that BSS (COUNTRY_UPDATE, HT_SCAN): STATUS
++ * does not report ENABLED yet, so wifiGen_mld_fetchSockLinkSSID() keeps the
++ * MLD info of the socket unadopted, as for any inactive BSS. Nothing re-runs
++ * the adoption afterwards (the FSM commit following AP-ENABLED carries no MLD
++ * sync), so the SSID stays without MLD link ID while its AccessPoint already
++ * reports Enabled. Re-run the same gated adoption on the enabled event, when
++ * the socket's BSS is ENABLED for sure. Only MLD metadata is written: no FSM
++ * bit is set here.
++ */
++static void s_adoptEnabledApSockLink(T_AccessPoint* pAP) {
++    T_SSID* pSSID = pAP->pSSID;
++    ASSERTS_NOT_NULL(pSSID, , ME, "%s: no ssid", pAP->alias);
++    ASSERTS_FALSE(wld_ssid_hasValidMLDLinkID(pSSID), , ME, "%s: mld link id (%d) already adopted",
++                  pAP->alias, wld_ssid_getMLDLinkID(pSSID));
++    ASSERTS_NOT_NULL(pSSID->pMldLink, , ME, "%s: no mld link", pAP->alias);
++    wld_wpaCtrlInterface_t* pIface = pAP->wpaCtrlInterface;
++    ASSERTS_TRUE(wld_wpaCtrlInterface_checkConnectionPath(pIface), , ME, "%s: no wpactrl connection path", pAP->alias);
++    const char* sockName = wld_wpaCtrlInterface_getConnectionSockName(pIface);
++    char mldIface[swl_str_len(sockName) + 1];
++    int32_t linkId = NO_LINK_ID;
++    ASSERTS_TRUE(wifiGen_hapd_parseSockName(sockName, mldIface, sizeof(mldIface), &linkId) && (linkId >= 0), ,
++                 ME, "%s: sock(%s) is not an mld link socket", pAP->alias, sockName);
++    T_Radio* pRad = pAP->pRadio;
++    ASSERTS_NOT_NULL(pRad, , ME, "%s: no radio", pAP->alias);
++    ASSERTS_NOT_NULL(pRad->hostapd, , ME, "%s: no hostapd", pRad->Name);
++    wld_wpaCtrlMngr_t* pMgr = wld_secDmn_getWpaCtrlMgr(pRad->hostapd);
++    ASSERTS_NOT_NULL(pMgr, , ME, "%s: no wpactrl manager", pRad->Name);
++    ASSERTS_EQUALS(wld_wpaCtrlInterface_getMgr(pIface), pMgr, , ME, "%s: sock(%s) of a foreign manager", pAP->alias, sockName);
++    ASSERTS_TRUE(s_isSockOfCurrentPrimLink(pAP, sockName, mldIface), , ME, "%s: sock(%s) not proven current", pAP->alias, sockName);
++    SAH_TRACEZ_INFO(ME, "%s: adopt mld info of enabled sock(%s) (mldIface:%s) (linkId:%d)", pAP->alias, sockName, mldIface, linkId);
++    wifiGen_mld_fetchSockLinkSSID(pMgr, sockName);
++}
++
+ static void s_apEnabledCb(void* userData, char* ifName) {
+     ASSERTS_STR(ifName, , ME, "NULL");
+     SAH_TRACEZ_INFO(ME, "%s: AP iface enabled", ifName);
+     T_AccessPoint* pAP = (T_AccessPoint*) userData;
+     ASSERT_TRUE(debugIsVapPointer(pAP), , ME, "INVALID");
++    s_adoptEnabledApSockLink(pAP);
+     wld_vap_updateState(pAP);
+ }
+ 
