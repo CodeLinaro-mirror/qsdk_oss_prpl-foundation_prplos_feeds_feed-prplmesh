@@ -1,0 +1,380 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Petr=20=C5=A0tetiar?= <petr.stetiar@prplfoundation.org>
+Date: Sat, 26 Sep 2026 06:00:00 +0000
+Subject: [PATCH 3/3] nl80211: validate radio-local hostapd removal targets
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A reused MLD socket path can remain associated with an AP of another
+radio. The 0004 preflight then correctly refuses its foreign owner:
+
+  bss wlan1.2 (wlan1.2_link0) is held by iface of unknown bss wlan0.1_link0, abort radio removal
+
+Build the removal set from loaded identity instead of saved client
+paths. Exclude unresolved sockets individually. Preserve the
+conservative guard when partial radio/BSSID evidence or a saved local
+association makes an unresolved socket a candidate for this radio.
+Unrelated transients do not prevent removing known local interfaces or
+accepting an empty local set.
+
+Retain 0004's local first-BSS owner and self-membership checks. Validate
+all local candidates before issuing commands, then re-resolve each owner
+before SET and recheck its BSSID and inode before REMOVE. Use temporary
+clients for those verified targets; removal does not close or rebind any
+manager's live connections.
+
+Signed-off-by: Petr Štetiar <petr.stetiar@prplfoundation.org>
+---
+diff --git a/include_priv/nl80211/wld_hostapd_sock.h b/include_priv/nl80211/wld_hostapd_sock.h
+--- a/include_priv/nl80211/wld_hostapd_sock.h
++++ b/include_priv/nl80211/wld_hostapd_sock.h
+@@ -89,6 +89,7 @@
+ swl_rc_ne wld_hostapd_snapshot(wld_wpaCtrlMngr_t* mgr, wld_hostapd_sock_t** socks);
+ void wld_hostapd_freeSnapshot(wld_hostapd_sock_t** socks);
+ swl_rc_ne wld_hostapd_reconcile(wld_wpaCtrlMngr_t* mgr, wld_hostapd_sock_t* socks);
++bool wld_hostapd_mayBelongToRadio(const wld_hostapd_sock_t* sock, T_Radio* rad);
+ swl_rc_ne wld_hostapd_getSock(wld_wpaCtrlMngr_t* mgr, const char* name, wld_hostapd_sock_t* sock);
+ void wld_hostapd_rememberBssid(T_AccessPoint* ap);
+ 
+diff --git a/src/nl80211/wld_hostapd_sock.c b/src/nl80211/wld_hostapd_sock.c
+--- a/src/nl80211/wld_hostapd_sock.c
++++ b/src/nl80211/wld_hostapd_sock.c
+@@ -203,6 +203,37 @@
+     return SWL_RC_OK;
+ }
+ 
++/** @brief Does an unresolved socket carry evidence requiring the 0004 guard? */
++bool wld_hostapd_mayBelongToRadio(const wld_hostapd_sock_t* pSock, T_Radio* pRad) {
++    if(pSock->nonBss) {
++        return false;
++    }
++    if(swl_str_matches(pSock->phy, pRad->Name) || s_radioMatches(pSock, pRad)) {
++        return true;
++    }
++    bool knownRadio = false;
++    T_Radio* pOther = NULL;
++    wld_for_eachRad(pOther) {
++        knownRadio |= swl_str_matches(pSock->phy, pOther->Name) || s_radioMatches(pSock, pOther);
++    }
++    T_AccessPoint* pAP = NULL;
++    wld_rad_forEachAp(pAP, pRad) {
++        wld_wpaCtrlInterface_t* pIface = pAP->wpaCtrlInterface;
++        if((pAP->pSSID == NULL) || (pIface == NULL)) {
++            continue;
++        }
++        if(!swl_mac_binIsNull(&pSock->bssid) &&
++           (!memcmp(pAP->pSSID->BSSID, &pSock->bssid, 6) ||
++            !memcmp(pIface->loadedBssid, &pSock->bssid, 6))) {
++            return true;
++        }
++        if(!knownRadio && swl_str_matches(pSock->name, wld_wpaCtrlInterface_getConnectionSockName(pIface))) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ void wld_hostapd_freeSnapshot(wld_hostapd_sock_t** socks) {
+     while(*socks != NULL) {
+         wld_hostapd_sock_t* next = (*socks)->next;
+diff --git a/src/nl80211/wld_rad_hostapd_api.c b/src/nl80211/wld_rad_hostapd_api.c
+--- a/src/nl80211/wld_rad_hostapd_api.c
++++ b/src/nl80211/wld_rad_hostapd_api.c
+@@ -557,7 +557,8 @@
+  *         SWL_RC_CONTINUE when the command is accepted but still being processed by hostapd
+  *         Otherwise error code (also when the interface name could not be set).
+  */
+-static swl_rc_ne s_removeIfaceBySockName(T_Radio* pR, wld_wpaCtrlInterface_t* pgIface, wld_wpaCtrlInterface_t* pIface) {
++static swl_rc_ne s_removeIfaceBySockName(T_Radio* pR, wld_wpaCtrlInterface_t* pgIface, wld_wpaCtrlInterface_t* pIface,
++                                          const wld_hostapd_sock_t* identity) {
+     swl_rc_ne rc;
+     const char* skname = wld_wpaCtrlInterface_getConnectionSockName(pIface);
+     const char* ifname = wld_wpaCtrlInterface_getName(pIface);
+@@ -565,6 +566,18 @@
+         rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pIface, "OK", "SET interface %s", skname);
+         ASSERT_TRUE(swl_rc_isOk(rc), rc, ME, "%s: fail to restore iface name (%s->%s)", pR->Name, ifname, skname);
+     }
++    /* SET changes bss[0]'s configured name, but not its socket or BSSID. */
++    char reply[wld_wpaCtrl_getMaxMsgLen()];
++    memset(reply, 0, sizeof(reply));
++    char value[32] = {0};
++    swl_macBin_t mac = SWL_MAC_BIN_NEW();
++    rc = wld_wpaCtrl_queryToSock(wld_wpaCtrlInterface_getConnectionDirPath(pIface), skname,
++                                "GET_CONFIG", reply, sizeof(reply));
++    ASSERT_TRUE(swl_rc_isOk(rc) &&
++                (wld_wpaCtrlInterface_getConnectionInode(pIface) == identity->inode) &&
++                (wld_wpaCtrl_getValueStr(reply, "bssid", value, sizeof(value)) > 0) &&
++                swl_typeMacBin_fromChar(&mac, value) && !memcmp(&mac, &identity->bssid, sizeof(mac)),
++                SWL_RC_ERROR, ME, "%s: socket changed before REMOVE %s", pR->Name, skname);
+     rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "REMOVE %s", skname);
+     //the call may timeout while being applied, but that only happens on success
+     if(rc == SWL_RC_NOT_AVAILABLE) {
+@@ -573,201 +586,80 @@
+     return rc;
+ }
+ 
+-/* control socket name of a hostapd BSS: "<ifname>" or "<ifname>_link<N>" */
+-#define HAPD_BSS_SOCK_NAME_LEN (IFNAMSIZ + 16)
+-
+-/**
+- * @brief rebuild the control socket name of the N-th BSS listed in a "STATUS" reply
+- *
+- * hostapd names the control socket of a BSS after its configured interface
+- * name (bss[N]= in the reply), suffixed with "_link<mld_link_id[N]>" for an
+- * AP MLD link BSS (hostapd_set_ctrl_sock_iface(), src/ap/hostapd.c).
+- *
+- * @param reply "STATUS" reply
+- * @param idx index N of the BSS in the reply
+- * @param skname output buffer for the socket name
+- * @param sknameSize size of the output buffer
+- *
+- * @return SWL_RC_OK when the N-th BSS is listed, SWL_RC_ERROR otherwise
+- */
+-static swl_rc_ne s_getStatusBssSockName(const char* reply, uint32_t idx, char* skname, size_t sknameSize) {
+-    char key[32] = {0};
+-    char ifname[IFNAMSIZ + 1] = {0};
+-    snprintf(key, sizeof(key), "bss[%u]", idx);
+-    swl_rc_ne rc = wld_wpaCtrl_getInReplyParamValStr(reply, key, ifname, sizeof(ifname));
+-    ASSERTS_TRUE(swl_rc_isOk(rc), SWL_RC_ERROR, ME, "no %s", key);
+-    char linkId[8] = {0};
+-    snprintf(key, sizeof(key), "mld_link_id[%u]", idx);
+-    rc = wld_wpaCtrl_getInReplyParamValStr(reply, key, linkId, sizeof(linkId));
+-    if(swl_rc_isOk(rc) && !swl_str_isEmpty(linkId)) {
+-        snprintf(skname, sknameSize, "%s_link%s", ifname, linkId);
+-    } else {
+-        swl_str_copy(skname, sknameSize, ifname);
+-    }
+-    return SWL_RC_OK;
+-}
+-
+-/* a BSS of the radio currently loaded in hostapd (its control socket exists) */
+-typedef struct {
+-    T_AccessPoint* pAP;
+-    wld_wpaCtrlInterface_t* pIface;
+-    /* socket name of bss[0] of the hostapd iface holding this BSS, as reported by hostapd */
+-    char ownerSkname[HAPD_BSS_SOCK_NAME_LEN];
+-} s_loadedBss_t;
+-
+-/**
+- * @brief resolve from hostapd the owner (bss[0]) of the hostapd iface holding a loaded BSS
+- *
+- * hostapd reports on the control socket of any BSS the BSS list of the
+- * hostapd_iface holding it ("STATUS" reply lines bss[N]=/bssid[N]=/
+- * mld_link_id[N]=, hostapd_ctrl_iface_status(), src/ap/ctrl_iface_ap.c),
+- * bss[0] first. bss[0] is the BSS whose interface name the global "REMOVE"
+- * matches for the whole iface and whose interface name "SET interface"
+- * rewrites. The socket names are rebuilt from that list, so the identity
+- * comes from hostapd's running state and not from pWHM's configuration
+- * (e.g. pSSID->BSSID, which is already updated while the old BSS still
+- * runs). The addressed BSS has to appear in the list under its own socket
+- * name, otherwise the reply is not trusted.
+- *
+- * @param pR radio context
+- * @param pBss the loaded BSS (pAP and pIface set), ownerSkname is filled on success
+- *
+- * @return SWL_RC_OK when the owner socket name is resolved
+- *         SWL_RC_ERROR when hostapd could not be queried or the reply is inconsistent
+- */
+-static swl_rc_ne s_getLoadedBssOwner(T_Radio* pR, s_loadedBss_t* pBss) {
+-    const char* skname = wld_wpaCtrlInterface_getConnectionSockName(pBss->pIface);
+-    size_t maxMsgLen = wld_wpaCtrl_getMaxMsgLen();
+-    char reply[maxMsgLen];
+-    memset(reply, 0, sizeof(reply));
+-    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(pBss->pIface, reply, sizeof(reply), "STATUS");
+-    ASSERTW_TRUE(swl_rc_isOk(rc), SWL_RC_ERROR, ME, "%s: fail to get status of bss %s (%s)", pR->Name, pBss->pAP->alias, skname);
+-    rc = s_getStatusBssSockName(reply, 0, pBss->ownerSkname, sizeof(pBss->ownerSkname));
+-    ASSERTW_TRUE(swl_rc_isOk(rc), SWL_RC_ERROR, ME, "%s: no bss[0] in status of bss %s (%s)", pR->Name, pBss->pAP->alias, skname);
+-    char bssSkname[HAPD_BSS_SOCK_NAME_LEN] = {0};
+-    for(uint32_t i = 0; swl_rc_isOk(s_getStatusBssSockName(reply, i, bssSkname, sizeof(bssSkname))); i++) {
+-        if(swl_str_matches(bssSkname, skname)) {
+-            return SWL_RC_OK;
+-        }
+-    }
+-    SAH_TRACEZ_WARNING(ME, "%s: bss %s (%s) not listed in its own status (bss[0]=%s)", pR->Name, pBss->pAP->alias, skname, pBss->ownerSkname);
+-    return SWL_RC_ERROR;
+-}
+-
+-static s_loadedBss_t* s_findLoadedBssBySockName(s_loadedBss_t* bsses, uint32_t nBss, const char* skname) {
+-    for(uint32_t i = 0; i < nBss; i++) {
+-        if(swl_str_matches(wld_wpaCtrlInterface_getConnectionSockName(bsses[i].pIface), skname)) {
+-            return &bsses[i];
+-        }
+-    }
+-    return NULL;
+-}
+-
+-static bool s_isLoadedBssOwner(s_loadedBss_t* pBss) {
+-    return swl_str_matches(wld_wpaCtrlInterface_getConnectionSockName(pBss->pIface), pBss->ownerSkname);
+-}
+-
+-/**
+- * @brief remove entire radio and vaps config from hostapd
+- * (this will trigger removing all secondary BSSs netdev ifaces and stop radio activity)
+- *
+- * @param pR radio context
+- *
+- * @return SWL_RC_OK when the the removing cmd is accepted.
+- *         SWL_RC_CONTINUE when the command is accepted but still being processed by hostapd
+-           (taking more than 1sec)
+- * Otherwise error code.
+- */
++/* Revalidate after earlier REMOVE commands: they can disable other owners. */
++static swl_rc_ne s_removeLoadedOwner(T_Radio* rad, wld_wpaCtrlInterface_t* global,
++                                   const char* dir, const wld_hostapd_sock_t* owner) {
++    wld_hostapd_sock_t now;
++    swl_rc_ne rc = wld_hostapd_resolveSock(dir, owner->name, &now);
++    ASSERT_TRUE(swl_rc_isOk(rc) && (now.ap == owner->ap) && (now.inode == owner->inode) &&
++                !memcmp(&now.bssid, &owner->bssid, sizeof(now.bssid)) &&
++                swl_str_matches(now.owner, owner->name),
++                SWL_RC_ERROR, ME, "%s: owner changed before REMOVE %s", rad->Name, owner->name);
++    wld_wpaCtrlInterface_t* iface = NULL;
++    ASSERT_TRUE(wld_wpaCtrlInterface_initWithSockName(&iface, owner->ap->alias, dir, owner->name),
++                SWL_RC_ERROR, ME, "%s: no temporary client for %s", rad->Name, owner->name);
++    rc = s_removeIfaceBySockName(rad, global, iface, owner);
++    wld_wpaCtrlInterface_cleanup(&iface);
++    return rc;
++}
++
++/** Remove only interfaces whose loaded BSSes and first BSS belong to this radio. */
+ swl_rc_ne wld_rad_hostapd_removeConf(T_Radio* pR) {
+     ASSERT_NOT_NULL(pR, SWL_RC_INVALID_PARAM, ME, "NULL");
+-    wld_wpaCtrlMngr_t* pMgr = wld_secDmn_getWpaCtrlMgr(pR->hostapd);
+-    wld_secDmn_t* pSecDmn = wld_wpaCtrlMngr_getSecDmn(pMgr);
+-    ASSERT_NOT_NULL(pSecDmn, SWL_RC_INVALID_STATE, ME, "NULL");
+-    wld_wpaCtrlInterface_t* pgIface = wld_secDmn_getGlobalCtrlIface(pSecDmn);
+-    ASSERT_NOT_NULL(pgIface, SWL_RC_ERROR, ME, "%s: hostapd has no global iface ready", pR->Name);
+-    /*
+-     * Refresh the connection socket names first (a BSS socket is renamed to
+-     * its MLD link socket after setup), before anything is selected from them.
+-     */
+-    swl_rc_ne rc = wld_wpaCtrlMngr_checkAllIfaces(pMgr);
+-    ASSERT_TRUE(swl_rc_isOk(rc), rc, ME, "%s: fail to check hostapd ctrl sockets", pR->Name);
+-    wld_wpaCtrlInterface_t* pIface = wld_wpaCtrlMngr_getDefaultInterface(pMgr);
+-    ASSERT_NOT_NULL(pIface, SWL_RC_ERROR, ME, "%s: hostapd has no default wpactrl iface ready", pR->Name);
+-
+-    /*
+-     * A secondary VAP added with its own "ADD bss_config=" as an AP MLD link
+-     * (mld_ap=1) is not a BSS of the main VAP's hostapd iface: hostapd allocates
+-     * a separate hostapd_iface for every such ADD (hostapd_interface_init_bss(),
+-     * src/ap/hostapd.c, "AP MLD can be enabled with the same interface name").
+-     * "REMOVE <main>" therefore leaves those VAPs, and their kernel MLD links,
+-     * fully registered, and the radio config re-added right after (which lists
+-     * every enabled VAP of the radio) duplicates them: the driver link add for
+-     * the duplicate is refused by the kernel (same link address already present
+-     * on the MLD netdev), hostapd reports "MLD: Failed to add link N in MLD X"
+-     * and the warm re-add fails.
+-     * So every hostapd iface holding a loaded BSS of the radio is removed, each
+-     * one addressed by its own first BSS (bss[0]): addressing a secondary BSS
+-     * would rename and remove the owner's iface instead (see
+-     * s_removeIfaceBySockName()), e.g. all VAPs of a radio config re-added as
+-     * one "ADD bss_config=" get one iface, the main VAP first. The layout is
+-     * read from hostapd for every loaded BSS before any destructive command,
+-     * and the iface holding pWHM's default connection is removed last. A VAP
+-     * whose socket is gone is not loaded and is skipped. Any failure, or a
+-     * BSS whose iface cannot be mapped to a loaded owner, aborts the removal
+-     * so that the caller runs its recovery instead of re-adding a config on
+-     * top of a live duplicate.
+-     */
+-    s_loadedBss_t bsses[MAXNROF_ACCESSPOINT];
+-    memset(bsses, 0, sizeof(bsses));
+-    uint32_t nBss = 0;
+-    T_AccessPoint* pAP = NULL;
+-    wld_rad_forEachAp(pAP, pR) {
+-        wld_wpaCtrlInterface_t* pApIface = pAP->wpaCtrlInterface;
+-        if((pApIface == NULL) || !wld_wpaCtrlInterface_checkConnectionPath(pApIface)) {
+-            SAH_TRACEZ_INFO(ME, "%s: bss %s not loaded, skip removal", pR->Name, pAP->alias);
++    wld_wpaCtrlMngr_t* mgr = wld_secDmn_getWpaCtrlMgr(pR->hostapd);
++    wld_wpaCtrlInterface_t* global = wld_secDmn_getGlobalCtrlIface(pR->hostapd);
++    ASSERT_NOT_NULL(global, SWL_RC_ERROR, ME, "%s: no global interface", pR->Name);
++    const char* dir = wld_wpaCtrlMngr_getCtrlIfaceDirPath(mgr);
++    wld_hostapd_sock_t* socks = NULL;
++    swl_rc_ne rc = wld_hostapd_snapshot(mgr, &socks);
++    ASSERT_TRUE(swl_rc_isOk(rc), rc, ME, "%s: incomplete socket snapshot, abort radio removal", pR->Name);
++    /* Removal is read-only until the plan is checked; no manager is rebound. */
++    wld_wpaCtrlInterface_t* pDefault = wld_wpaCtrlMngr_getDefaultInterface(mgr);
++    const char* defaultName = pDefault ? wld_wpaCtrlInterface_getConnectionSockName(pDefault) : NULL;
++    wld_hostapd_sock_t* last = NULL;
++    for(wld_hostapd_sock_t* bss = socks; bss != NULL; bss = bss->next) {
++        if(!bss->resolved) {
++            if(wld_hostapd_mayBelongToRadio(bss, pR)) {
++                SAH_TRACEZ_WARNING(ME, "%s: unresolved local socket %s, abort radio removal", pR->Name, bss->name);
++                rc = SWL_RC_ERROR;
++                goto out;
++            }
+             continue;
+         }
+-        ASSERT_TRUE(nBss < SWL_ARRAY_SIZE(bsses), SWL_RC_ERROR, ME, "%s: too many loaded bss, abort radio removal", pR->Name);
+-        s_loadedBss_t* pBss = &bsses[nBss];
+-        pBss->pAP = pAP;
+-        pBss->pIface = pApIface;
+-        rc = s_getLoadedBssOwner(pR, pBss);
+-        ASSERT_TRUE(swl_rc_isOk(rc), SWL_RC_ERROR, ME, "%s: unknown hostapd iface of bss %s (%s), abort radio removal",
+-                    pR->Name, pAP->alias, wld_wpaCtrlInterface_getConnectionSockName(pApIface));
+-        nBss++;
+-    }
+-    /* every loaded BSS must belong to an iface owned by a loaded BSS of the radio */
+-    s_loadedBss_t* pLastBss = NULL;
+-    for(uint32_t i = 0; i < nBss; i++) {
+-        s_loadedBss_t* pBss = &bsses[i];
+-        s_loadedBss_t* pOwner = s_findLoadedBssBySockName(bsses, nBss, pBss->ownerSkname);
+-        ASSERT_TRUE((pOwner != NULL) && s_isLoadedBssOwner(pOwner), SWL_RC_ERROR, ME,
+-                    "%s: bss %s (%s) is held by iface of unknown bss %s, abort radio removal",
+-                    pR->Name, pBss->pAP->alias, wld_wpaCtrlInterface_getConnectionSockName(pBss->pIface), pBss->ownerSkname);
+-        if(pBss->pIface == pIface) {
+-            pLastBss = pOwner;
+-        }
+-    }
+-    ASSERT_NOT_NULL(pLastBss, SWL_RC_ERROR, ME, "%s: default wpactrl iface (%s) is not a loaded bss of the radio, abort radio removal",
+-                    pR->Name, wld_wpaCtrlInterface_getConnectionSockName(pIface));
+-    for(uint32_t i = 0; i < nBss; i++) {
+-        s_loadedBss_t* pBss = &bsses[i];
+-        const char* apSkname = wld_wpaCtrlInterface_getConnectionSockName(pBss->pIface);
+-        if(!s_isLoadedBssOwner(pBss)) {
+-            SAH_TRACEZ_INFO(ME, "%s: bss %s (%s) is a secondary bss of iface %s, removed with it", pR->Name, pBss->pAP->alias, apSkname, pBss->ownerSkname);
++        if(bss->ap->pRadio != pR) {
+             continue;
+         }
+-        if(pBss == pLastBss) {
++        wld_hostapd_sock_t* owner = socks;
++        while((owner != NULL) && !swl_str_matches(owner->name, bss->owner)) {
++            owner = owner->next;
++        }
++        /* Preserve 0004's radio-local owner and self-membership guard. */
++        if((owner == NULL) || !owner->resolved || (owner->ap->pRadio != pR) || !swl_str_matches(owner->name, owner->owner)) {
++            SAH_TRACEZ_ERROR(ME, "%s: bss %s (%s) is held by iface of unknown bss %s, abort radio removal",
++                            pR->Name, bss->ap->alias, bss->name, bss->owner);
++            rc = SWL_RC_ERROR;
++            goto out;
++        }
++        if((last == NULL) || swl_str_matches(defaultName, bss->name)) {
++            last = owner;
++        }
++    }
++    /* Unresolved foreign sockets do not prevent a valid empty local set. */
++    for(wld_hostapd_sock_t* bss = socks; bss != NULL; bss = bss->next) {
++        if(!bss->resolved || (bss->ap->pRadio != pR) || (bss == last) || !swl_str_matches(bss->name, bss->owner)) {
+             continue;
+         }
+-        SAH_TRACEZ_INFO(ME, "%s: remove iface of bss %s (%s)", pR->Name, pBss->pAP->alias, apSkname);
+-        rc = s_removeIfaceBySockName(pR, pgIface, pBss->pIface);
+-        ASSERT_TRUE(swl_rc_isOk(rc), rc, ME, "%s: fail to remove bss %s (%s) rc %d, abort radio removal",
+-                    pR->Name, pBss->pAP->alias, apSkname, rc);
+-    }
+-    SAH_TRACEZ_INFO(ME, "%s: remove iface of bss %s (%s) holding the default connection", pR->Name, pLastBss->pAP->alias,
+-                    wld_wpaCtrlInterface_getConnectionSockName(pLastBss->pIface));
+-    return s_removeIfaceBySockName(pR, pgIface, pLastBss->pIface);
++        rc = s_removeLoadedOwner(pR, global, dir, bss);
++        if(!swl_rc_isOk(rc)) {
++            goto out;
++        }
++    }
++    if(last != NULL) {
++        rc = s_removeLoadedOwner(pR, global, dir, last);
++    }
++out:
++    wld_hostapd_freeSnapshot(&socks);
++    return rc;
+ }
+ 
+ swl_trl_e wld_rad_hostapd_getCfgParamSupp(T_Radio* pRad, const char* param) {
