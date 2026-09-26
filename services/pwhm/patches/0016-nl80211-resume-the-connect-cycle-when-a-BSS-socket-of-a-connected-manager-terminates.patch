@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Petr=20=C5=A0tetiar?= <petr.stetiar@prplfoundation.org>
+Date: Sat, 26 Sep 2026 09:07:36 +0200
+Subject: [PATCH] nl80211: resume the connect cycle when a BSS socket of a
+ connected manager terminates
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+hostapd can remove and recreate a BSS that pWHM did not ask for: an AP MLD
+partner link is parked while the owner of its driver context is re-added,
+and comes back one second later under the same control socket name. The
+AP-DISABLED on the link socket resets the MLD link ID of that VAP and
+removes its AffiliatedAP entry, as for any BSS that goes away. Nothing
+re-adopts it afterwards: the manager only restarts its connect cycle when
+its last ready interface terminates, wld_wpaCtrlMngr_connect() is a no-op
+while any interface is ready, hostapd sends AP-ENABLED for the first BSS of
+an interface only, and a link adds no netdev. When the SYNC_STATE refresh
+later found such a socket it re-opened it directly, without the manager
+scan, so the link identity and the VAP state were never refreshed.
+
+On a Wi-Fi 7 three-radio target this leaves Device.WiFi.APMLD.*.
+AffiliatedAPNumberOfEntries at 2 (or 1) and the re-added link
+AccessPoints Disabled while the driver beacons all three links, after
+moving one AccessPoint out of and back into its MLD.
+
+Resume the manager connect cycle from the TERMINATING handler when the
+manager stays connected, its interface is still enabled and its daemon is
+still enabled. The cycle rescans until every enabled interface is back or
+the retry budget (20 x 500 ms) is spent; the scan re-adopts the MLD link
+identity through the plugin socket resolver, re-attaches, and reports the
+manager ready, which refreshes the radio and VAP states. Let the SYNC_STATE
+refresh of a not-ready VAP socket go through the same cycle instead of a
+bare open. A VAP that pWHM disables itself has its interface disabled
+before the removal and arms nothing; the last-interface path is unchanged.
+
+Signed-off-by: Petr Štetiar <petr.stetiar@prplfoundation.org>
+---
+ src/Plugin/wifiGen_eventHandlers.c |  7 ++++++-
+ src/nl80211/wld_wpaCtrl_events.c   | 21 ++++++++++++++++++++-
+ 2 files changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/src/Plugin/wifiGen_eventHandlers.c b/src/Plugin/wifiGen_eventHandlers.c
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -745,7 +745,12 @@ void wifiGen_refreshVapsIfIdx(T_Radio* pRad) {
+                (wld_hostapd_ap_needWpaCtrlIface(pAP)) &&
+                (wld_wpaCtrlInterface_checkConnectionPath(pAP->wpaCtrlInterface)) &&
+                (!wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface))) {
+-                wld_wpaCtrlInterface_open(pAP->wpaCtrlInterface);
++                /*
++                 * Re-attach through the manager connect cycle, not with a bare
++                 * open: only the manager scan re-adopts the MLD link identity of
++                 * a recreated link socket and refreshes the VAP state afterwards.
++                 */
++                wld_wpaCtrlMngr_resumeConnect(wld_wpaCtrlInterface_getMgr(pAP->wpaCtrlInterface), 0);
+             }
+         }
+     }
+diff --git a/src/nl80211/wld_wpaCtrl_events.c b/src/nl80211/wld_wpaCtrl_events.c
+--- a/src/nl80211/wld_wpaCtrl_events.c
++++ b/src/nl80211/wld_wpaCtrl_events.c
+@@ -568,11 +568,30 @@ static void s_ifaceTerminatingEvt(wld_wpaCtrlInterface_t* pInterface, char* even
+         return;
+     }
+     SAH_TRACEZ_WARNING(ME, "%s: %s", pInterface->name, event);
+-    bool isMgrTerm = (pInterface->isReady && (wld_wpaCtrlMngr_countReadyInterfaces(pInterface->pMgr) == 1));
++    wld_wpaCtrlMngr_t* pMgr = pInterface->pMgr;
++    bool isMgrTerm = (pInterface->isReady && (wld_wpaCtrlMngr_countReadyInterfaces(pMgr) == 1));
+     pInterface->isReady = false;
+     wld_wpaCtrlInterface_reset(pInterface);
+     if(isMgrTerm) {
+         CALL_MGR_I(pInterface, fMngrReadyCb, false);
++        return;
++    }
++    /*
++     * One BSS of a manager that stays connected went away while its daemon is
++     * still enabled. hostapd can bring such a BSS back on its own (an AP MLD
++     * partner parked while the owner of its driver context is re-added), under
++     * the same socket name and without any event this client still receives:
++     * no AP-ENABLED for a non-first BSS, no netdev for a link. Resume the
++     * connect cycle: its scan re-adopts the socket, the MLD link identity and,
++     * once every enabled interface is back, the VAP states, or it gives up
++     * after the usual retry budget.
++     */
++    if(wld_wpaCtrlInterface_isEnabled(pInterface) &&
++       wld_secDmn_isEnabled(pMgr->pSecDmn) &&
++       !wld_wpaCtrlMngr_isReady(pMgr)) {
++        SAH_TRACEZ_WARNING(ME, "%s: manager stays connected: resume connect cycle to re-adopt the socket",
++                           pInterface->name);
++        wld_wpaCtrlMngr_resumeConnect(pMgr, RETRY_DELAY_MS);
+     }
+ }
+ 
