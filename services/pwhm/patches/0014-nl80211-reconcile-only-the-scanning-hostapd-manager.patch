@@ -1,0 +1,292 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Petr=20=C5=A0tetiar?= <petr.stetiar@prplfoundation.org>
+Date: Sat, 26 Sep 2026 06:00:00 +0000
+Subject: [PATCH 2/3] nl80211: reconcile only the scanning hostapd manager
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A shared hostapd control directory can contain unrelated radios in ACS,
+retained partners, unknown BSSes and temporarily unresponsive sockets.
+Treating one unresolved entry as failure of the entire directory
+prevents healthy managers from connecting.
+
+Collect one result per socket and reconcile only the calling manager.
+Use STATUS membership to distinguish MLD redirects from BSS sockets,
+without relying on directory sort order. Preserve live connections on
+initial observation, reopen changed live associations and leave foreign
+managers alone. Invalidate missing or positively reassigned
+associations, but retain an unresolved connection for a later retry.
+
+Pass the scan results through the private manager context to the plugin
+callback. Query each socket identity once per scan with GET_CONFIG and
+STATUS, and reuse that result for metadata adoption. Retire remembered
+addresses when an AP disappears or its current BSSID is observed.
+
+Signed-off-by: Petr Štetiar <petr.stetiar@prplfoundation.org>
+---
+diff --git a/include_priv/nl80211/wld_hostapd_sock.h b/include_priv/nl80211/wld_hostapd_sock.h
+--- a/include_priv/nl80211/wld_hostapd_sock.h
++++ b/include_priv/nl80211/wld_hostapd_sock.h
+@@ -86,6 +86,9 @@
+ 
+ /* Read-only: neither desired MLD metadata nor saved associations are changed. */
+ swl_rc_ne wld_hostapd_resolveSock(const char* dir, const char* name, wld_hostapd_sock_t* sock);
++swl_rc_ne wld_hostapd_snapshot(wld_wpaCtrlMngr_t* mgr, wld_hostapd_sock_t** socks);
++void wld_hostapd_freeSnapshot(wld_hostapd_sock_t** socks);
++swl_rc_ne wld_hostapd_reconcile(wld_wpaCtrlMngr_t* mgr, wld_hostapd_sock_t* socks);
+ swl_rc_ne wld_hostapd_getSock(wld_wpaCtrlMngr_t* mgr, const char* name, wld_hostapd_sock_t* sock);
+ void wld_hostapd_rememberBssid(T_AccessPoint* ap);
+ 
+diff --git a/include_priv/nl80211/wld_wpaCtrlInterface_priv.h b/include_priv/nl80211/wld_wpaCtrlInterface_priv.h
+--- a/include_priv/nl80211/wld_wpaCtrlInterface_priv.h
++++ b/include_priv/nl80211/wld_wpaCtrlInterface_priv.h
+@@ -72,6 +72,7 @@
+     char* cfgFile;                       /** bss config file path */
+     uint8_t loadedBssid[6];              /** last uniquely observed BSS */
+     uint64_t serverInode;               /** connected/reconciled server inode */
++    bool hostapdIdentityValid;
+     bool enable;                         /** establish connection */
+     wpaCtrlConnection_t* cmdConn;
+     wpaCtrlConnection_t* eventConn;
+diff --git a/include_priv/nl80211/wld_wpaCtrlMngr_priv.h b/include_priv/nl80211/wld_wpaCtrlMngr_priv.h
+--- a/include_priv/nl80211/wld_wpaCtrlMngr_priv.h
++++ b/include_priv/nl80211/wld_wpaCtrlMngr_priv.h
+@@ -72,6 +72,9 @@
+ #include "wld_secDmn.h"
+ 
+ struct wld_wpaCtrlMngr {
++    /* Borrowed only during this manager's synchronous hostapd scan. */
++    const struct wld_hostapd_sock* hostapdSnapshot;
++    bool hostapdScanning;
+     amxp_timer_t* connectTimer;
+     uint8_t wpaCtrlConnectAttempts;
+     /* wpaCtrlMngr refers to one secDmn instance, relative to one radio */
+diff --git a/src/nl80211/wld_hostapd_sock.c b/src/nl80211/wld_hostapd_sock.c
+--- a/src/nl80211/wld_hostapd_sock.c
++++ b/src/nl80211/wld_hostapd_sock.c
+@@ -68,6 +68,7 @@
+ #include "wld_wpaCtrl_api.h"
+ #include "wld_wpaCtrlGSock.h"
+ #include "wld_wpaCtrlInterface_priv.h"
++#include "wld_wpaCtrlMngr_priv.h"
+ 
+ #define ME "hapdSock"
+ 
+@@ -202,8 +203,117 @@
+     return SWL_RC_OK;
+ }
+ 
++void wld_hostapd_freeSnapshot(wld_hostapd_sock_t** socks) {
++    while(*socks != NULL) {
++        wld_hostapd_sock_t* next = (*socks)->next;
++        free(*socks);
++        *socks = next;
++    }
++}
++
++static int s_filter(const struct dirent* entry) {
++    return entry->d_name[0] != '.';
++}
++
++/** @brief Collect independent results, including unresolved local evidence. */
++swl_rc_ne wld_hostapd_snapshot(wld_wpaCtrlMngr_t* pMgr, wld_hostapd_sock_t** socks) {
++    *socks = NULL;
++    const char* dir = wld_wpaCtrlMngr_getCtrlIfaceDirPath(pMgr);
++    struct dirent** names = NULL;
++    int n = scandir(dir, &names, s_filter, alphasort);
++    ASSERTI_TRUE(n >= 0, SWL_RC_ERROR, ME, "cannot scan %s", dir);
++    swl_rc_ne rc = SWL_RC_OK;
++    for(int i = 0; i < n; i++) {
++        const char* name = names[i]->d_name;
++        if((wld_wpaCtrlGSock_fetchByGName(name) != NULL) || !s_inode(dir, name)) {
++            continue;
++        }
++        wld_hostapd_sock_t* pSock = calloc(1, sizeof(*pSock));
++        if(pSock == NULL) {
++            rc = SWL_RC_ERROR;
++            break;
++        }
++        if(!swl_rc_isOk(wld_hostapd_resolveSock(dir, name, pSock))) {
++            SAH_TRACEZ_INFO(ME, "exclude unresolved BSS socket %s", name);
++        }
++        pSock->next = *socks;
++        *socks = pSock;
++    }
++    for(int i = 0; i < n; i++) {
++        free(names[i]);
++    }
++    free(names);
++    if(!swl_rc_isOk(rc)) {
++        wld_hostapd_freeSnapshot(socks);
++    }
++    return rc;
++}
++
++/** @brief Reuse this scan's result in the plugin metadata-adoption callback. */
+ swl_rc_ne wld_hostapd_getSock(wld_wpaCtrlMngr_t* pMgr, const char* name, wld_hostapd_sock_t* pSock) {
+-    return wld_hostapd_resolveSock(wld_wpaCtrlMngr_getCtrlIfaceDirPath(pMgr), name, pSock);
++    if(!pMgr->hostapdScanning) {
++        return wld_hostapd_resolveSock(wld_wpaCtrlMngr_getCtrlIfaceDirPath(pMgr), name, pSock);
++    }
++    for(const wld_hostapd_sock_t* pEntry = pMgr->hostapdSnapshot; pEntry != NULL; pEntry = pEntry->next) {
++        if(swl_str_matches(pEntry->name, name) && pEntry->resolved) {
++            *pSock = *pEntry;
++            return SWL_RC_OK;
++        }
++    }
++    return SWL_RC_NOT_AVAILABLE;
++}
++
++/** @brief Reconcile only this manager; leave foreign managers' clients alone. */
++swl_rc_ne wld_hostapd_reconcile(wld_wpaCtrlMngr_t* pMgr, wld_hostapd_sock_t* socks) {
++    const char* dir = wld_wpaCtrlMngr_getCtrlIfaceDirPath(pMgr);
++    T_Radio* pRad = NULL;
++    wld_for_eachRad(pRad) {
++        if((pRad->hostapd == NULL) || (wld_secDmn_getWpaCtrlMgr(pRad->hostapd) != pMgr)) {
++            continue;
++        }
++        T_AccessPoint* pAP = NULL;
++        wld_rad_forEachAp(pAP, pRad) {
++            wld_wpaCtrlInterface_t* pIface = pAP->wpaCtrlInterface;
++            if((pIface == NULL) || (wld_wpaCtrlInterface_getMgr(pIface) != pMgr)) {
++                continue;
++            }
++            wld_hostapd_sock_t* pMatch = NULL;
++            unsigned int count = 0;
++            bool unresolved = false;
++            for(wld_hostapd_sock_t* pSock = socks; pSock != NULL; pSock = pSock->next) {
++                if(pSock->resolved && (pSock->ap == pAP)) {
++                    pMatch = pSock;
++                    count++;
++                }
++                unresolved |= !pSock->resolved && !pSock->nonBss &&
++                              swl_str_matches(pSock->name, wld_wpaCtrlInterface_getConnectionSockName(pIface));
++            }
++            pIface->hostapdIdentityValid = (count == 1);
++            if(count != 1) {
++                if(!unresolved) {
++                    wld_wpaCtrlInterface_close(pIface);
++                    pIface->serverInode = 0;
++                    if(count == 0) {
++                        memset(pIface->loadedBssid, 0, sizeof(pIface->loadedBssid));
++                    }
++                }
++                continue;
++            }
++            /* Initial observation alone must not tear down a working ATTACH. */
++            if(((pIface->serverInode != 0) && (pIface->serverInode != pMatch->inode)) ||
++               !swl_str_matches(wld_wpaCtrlInterface_getConnectionSockName(pIface), pMatch->name)) {
++                bool wasReady = wld_wpaCtrlInterface_isReady(pIface);
++                ASSERT_TRUE(wld_wpaCtrlInterface_setConnectionInfo(pIface, dir, pMatch->name),
++                            SWL_RC_ERROR, ME, "cannot rebind %s", pAP->alias);
++                if(wasReady) {
++                    wld_wpaCtrlInterface_open(pIface);
++                }
++            }
++            pIface->serverInode = pMatch->inode;
++            memcpy(pIface->loadedBssid, &pMatch->bssid, 6);
++        }
++    }
++    return SWL_RC_OK;
+ }
+ 
+ void wld_hostapd_rememberBssid(T_AccessPoint* pAP) {
+diff --git a/src/nl80211/wld_wpaCtrlMngr.c b/src/nl80211/wld_wpaCtrlMngr.c
+--- a/src/nl80211/wld_wpaCtrlMngr.c
++++ b/src/nl80211/wld_wpaCtrlMngr.c
+@@ -66,12 +66,33 @@
+ #include "wld_wpaCtrlInterface_priv.h"
+ #include "wld_wpaCtrlGSock.h"
+ #include "wld_ssid.h"
++#include "wld_accesspoint.h"
++#include "wld_radio.h"
++#include "wld_hostapd_sock.h"
+ #include <dirent.h>
+ 
+ #define ME "wpaCtrl"
+ 
+ static T_SSID* s_fetchLinkSSID(wld_wpaCtrlMngr_t* pMgr, const char* sockName) {
+     ASSERTS_STR(sockName, NULL, ME, "empty socket name");
++    wld_wpaCtrlInterface_t* pRef = wld_wpaCtrlMngr_getFirstInterface(pMgr);
++    const char* ref = pRef ? wld_wpaCtrlInterface_getName(pRef) : NULL;
++    if((ref != NULL) && (wld_vap_from_name(ref) != NULL)) {
++        wld_hostapd_sock_t sock;
++        if(!swl_rc_isOk(wld_hostapd_getSock(pMgr, sockName, &sock))) {
++            return NULL;
++        }
++        wld_wpaCtrlInterface_t* iface = sock.ap->wpaCtrlInterface;
++        if((wld_wpaCtrlInterface_getMgr(iface) != pMgr) || !iface->hostapdIdentityValid ||
++           !swl_str_matches(wld_wpaCtrlInterface_getConnectionSockName(iface), sockName)) {
++            return NULL;
++        }
++        /* Only the plugin callback may adopt verified, active MLD metadata. */
++        char* linkIface = NULL;
++        CALL_MGR(pMgr, pMgr, fFetchSockLinkIface, sockName, &linkIface);
++        free(linkIface);
++        return sock.ap->pSSID;
++    }
+     T_SSID* pSSID = wld_ssid_getSsidByIfName(sockName);
+     if(pSSID != NULL) {
+         SAH_TRACEZ_INFO(ME, "fetch DIRECT: sock(%s) => pSSID(%s)",
+@@ -123,11 +144,31 @@
+  */
+ swl_rc_ne wld_wpaCtrlMngr_checkAllIfaces(wld_wpaCtrlMngr_t* pMgr) {
+     ASSERTS_NOT_NULL(pMgr, SWL_RC_INVALID_PARAM, ME, "NULL");
++    ASSERTI_FALSE(pMgr->hostapdScanning, SWL_RC_CONTINUE, ME, "scan already in progress");
+     const char* ctrlDirPath = wld_wpaCtrlMngr_getCtrlIfaceDirPath(pMgr);
+     ASSERT_STR(ctrlDirPath, SWL_RC_INVALID_STATE, ME, "no ctrl iface dir");
++    wld_wpaCtrlInterface_t* pRef = wld_wpaCtrlMngr_getFirstInterface(pMgr);
++    const char* ref = pRef ? wld_wpaCtrlInterface_getName(pRef) : NULL;
++    bool isHostapd = (ref != NULL) && (wld_vap_from_name(ref) != NULL);
++    wld_hostapd_sock_t* socks = NULL;
++    if(isHostapd) {
++        swl_rc_ne rc = wld_hostapd_snapshot(pMgr, &socks);
++        if(swl_rc_isOk(rc)) {
++            rc = wld_hostapd_reconcile(pMgr, socks);
++        }
++        if(!swl_rc_isOk(rc)) {
++            wld_hostapd_freeSnapshot(&socks);
++            return rc;
++        }
++    }
+     struct dirent** namelist = NULL;
+     int n = scandir(ctrlDirPath, &namelist, s_filterNames, alphasort);
+-    ASSERT_NOT_EQUALS(n, -1, SWL_RC_ERROR, ME, "fail to scan dir %s", ctrlDirPath);
++    if(n < 0) {
++        wld_hostapd_freeSnapshot(&socks);
++        return SWL_RC_ERROR;
++    }
++    pMgr->hostapdSnapshot = socks;
++    pMgr->hostapdScanning = isHostapd;
+     for(int i = 0; i < n; i++) {
+         const char* sockName = namelist[i]->d_name;
+         const char* nextSockName = (i + 1 < n) ? namelist[i + 1]->d_name : NULL;
+@@ -136,13 +177,11 @@
+         if(pGlSk != NULL) {
+             pIface = wld_wpaCtrlGSock_getGIface(pGlSk);
+         } else if((pMgr->pSecDmn != NULL) &&
+-                  !(swl_str_startsWith(nextSockName, sockName) &&
+-                    swl_str_startsWith(&nextSockName[swl_str_len(sockName)], "_link"))) {
++                  (isHostapd || !(swl_str_startsWith(nextSockName, sockName) &&
++                    swl_str_startsWith(&nextSockName[swl_str_len(sockName)], "_link")))) {
+             /*
+-             * only fetch linkSSID of effective wpaCtrl sockets, by excluding:
+-             * - global socket
+-             * - redirection socket to main mld link
+-             *   (list is alpha sorted, so redirection has same prefix as next mld link sock name)
++             * Hostapd BSS membership comes from this scan's STATUS evidence.
++             * Keep the legacy name filter for other security daemons.
+              */
+             T_SSID* pSSID = s_fetchLinkSSID(pMgr, sockName);
+             pIface = wld_ssid_getWpaCtrlIface(pSSID);
+@@ -190,6 +229,9 @@
+         free(namelist[i]);
+     }
+     free(namelist);
++    pMgr->hostapdScanning = false;
++    pMgr->hostapdSnapshot = NULL;
++    wld_hostapd_freeSnapshot(&socks);
+     return SWL_RC_OK;
+ }
+ 
