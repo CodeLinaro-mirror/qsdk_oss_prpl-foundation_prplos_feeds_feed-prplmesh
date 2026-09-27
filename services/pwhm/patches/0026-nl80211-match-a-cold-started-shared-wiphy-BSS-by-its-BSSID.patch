@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Petr Štetiar <petr.stetiar@prplfoundation.org>
+Date: Sun, 27 Sep 2026 06:30:00 +0000
+Subject: [PATCH v2] nl80211: match a cold-started shared-wiphy BSS by its BSSID
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Build-20 lane d aborts once per boot inside the F108 window (run-47d,
+d01 a03-full-logread.txt:8448, d02 :8625):
+
+  wld: hapdRad - [x]wlan0: bss wlan0.3 (wlan0.3) is held by iface of
+  unknown bss wlan0.1, abort radio removal
+  wld: genFsm  - [x]wlan0: warm apply failed to remove iface conf =>
+  restart to recover
+
+F108 sets Radio.*.RegulatoryDomain=DE, which makes pWHM restart the
+hostapd process cold with the three radio config files. The new ifaces
+enter COUNTRY_UPDATE and stay there: setup_interface() (src/ap/hostapd.c
+in the hostapd tree) sees a previous country different from the new one
+and waits up to 5 s for the channel list update. Two seconds later F108
+sets Radio.3.PowerType=VeryLowPower on the same 6 GHz radio (wlan0),
+whose FSM commit then runs GEN_FSM_REMOVE_HOSTAPD to rewrite its iface
+config, and wld_rad_hostapd_removeConf() takes its socket snapshot in
+that window.
+
+What hostapd exposes there: start_ctrl_iface() has already published
+every BSS socket; STATUS reports state=COUNTRY_UPDATE, phy=<wiphy name>
+(a cold start carries no ADD label) and freq=0, since iface->freq is
+only set by setup_interface2(). bss[0] already has its nonzero own_addr
+from i802_init(), the secondary BSSes keep 00:00:00:00:00:00 until
+hostapd_setup_bss() runs after the country update.
+
+wld_hostapd_resolveSock() classifies wlan0.2/wlan0.3 as initializing
+(zero BSSID in COUNTRY_UPDATE, 0022). For wlan0.1 it never compares the
+BSSID: s_radioMatches() rejects every Radio because phy is the shared
+wiphy name, no frequency is available and the multi_radio=1 hwsim wiphy
+hosts three Radios (0001). With zero candidate Radios the socket ends
+"unknown or ambiguous AP" and unresolved. removeConf() then finds the
+initializing local wlan0.3 held by that unresolved owner and aborts
+before the 0022 retry can return NOT_AVAILABLE, so the FSM falls back
+to a full process restart. Real boards, with one Radio per wiphy, pass
+the same predicate and resolve the same socket.
+
+Let a self-listed BSS with a nonzero BSSID, the shared physical wiphy
+name and no usable frequency reach the BSSID comparison against every
+Radio of that wiphy in the same control directory. Such a candidate has
+no radio evidence of its own, so s_matchAP() does not apply its
+current-first policy to it: the BSSID must be the current identity of
+exactly one candidate AP and the remembered identity of none, over all
+candidate Radios. A remembered identity alone, or one current match
+next to an AP that still remembers the same address (reused address
+with the previous configuration still loaded), stays unresolved. A
+logical Radio label or a usable frequency keeps the strict predicate
+and its policy, and zero-BSSID sockets keep their 0022 classification.
+The removal owner guard is unchanged; wld_hostapd_mayBelongToRadio() is
+not widened, it already compares the BSSID against the Radio's own APs.
+With wlan0.1 resolved the snapshot returns NOT_AVAILABLE for the
+initializing secondaries and s_tryRemoveHostapd() retries within its
+bounded budget instead of restarting hostapd.
+
+Signed-off-by: Petr Štetiar <petr.stetiar@prplfoundation.org>
+---
+ src/nl80211/wld_hostapd_sock.c | 35 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/src/nl80211/wld_hostapd_sock.c b/src/nl80211/wld_hostapd_sock.c
+index e7bb41948fda..ee5ba7271d75 100644
+--- a/src/nl80211/wld_hostapd_sock.c
++++ b/src/nl80211/wld_hostapd_sock.c
+@@ -126,6 +126,26 @@ static bool s_radioMatches(const wld_hostapd_sock_t* pSock, T_Radio* pRad) {
+            (label || pSock->hasBand || (wld_rad_countWiphyRads(pRad->wiphy) == 1));
+ }
+ 
++/*
++ * A cold-started hostapd iface reports the physical wiphy name and no
++ * frequency until setup_interface2() runs (COUNTRY_UPDATE, channel list
++ * wait). On a wiphy shared by several Radios that evidence identifies no
++ * single Radio, but the first BSS already carries its driver-initialized
++ * nonzero BSSID. Let such a BSS reach the BSSID comparison against every
++ * Radio of that wiphy. Without positive radio evidence s_matchAP() then
++ * accepts only a BSSID that exactly one candidate AP holds as its current
++ * identity and none holds as a remembered one; anything else stays
++ * unresolved. A logical Radio label or a usable frequency keeps the
++ * strict predicate above and its current-first policy.
++ * wld_hostapd_mayBelongToRadio() is not widened: it already compares the
++ * BSSID against the Radio's own APs.
++ */
++static bool s_sharedWiphyCandidate(const wld_hostapd_sock_t* pSock, T_Radio* pRad) {
++    return !pSock->hasBand && !swl_mac_binIsNull(&pSock->bssid) &&
++           swl_str_matches(pSock->phy, pRad->wiphyName) &&
++           (wld_rad_countWiphyRads(pRad->wiphy) > 1);
++}
++
+ /* Re-evaluate current/remembered BSSIDs on every hit; retain no AP pointers. */
+ static swl_rc_ne s_matchAP(const char* dir, wld_hostapd_sock_t* pSock) {
+     pSock->ap = NULL;
+@@ -133,12 +153,18 @@ static swl_rc_ne s_matchAP(const char* dir, wld_hostapd_sock_t* pSock) {
+     T_AccessPoint* pCurrent = NULL;
+     T_AccessPoint* pOld = NULL;
+     unsigned int currentCount = 0, oldCount = 0;
++    bool fallback = false;
+     T_Radio* pRad = NULL;
+     wld_for_eachRad(pRad) {
+-        if((pRad->hostapd == NULL) || !s_radioMatches(pSock, pRad) ||
++        if(pRad->hostapd == NULL) {
++            continue;
++        }
++        bool strict = s_radioMatches(pSock, pRad);
++        if((!strict && !s_sharedWiphyCandidate(pSock, pRad)) ||
+            !swl_str_matches(dir, wld_wpaCtrlMngr_getCtrlIfaceDirPath(wld_secDmn_getWpaCtrlMgr(pRad->hostapd)))) {
+             continue;
+         }
++        fallback |= !strict;
+         T_AccessPoint* pAP = NULL;
+         wld_rad_forEachAp(pAP, pRad) {
+             if((pAP->pSSID == NULL) || (pAP->wpaCtrlInterface == NULL)) {
+@@ -155,6 +181,13 @@ static swl_rc_ne s_matchAP(const char* dir, wld_hostapd_sock_t* pSock) {
+     }
+     ASSERTI_TRUE((currentCount == 1) || ((currentCount == 0) && (oldCount == 1)),
+                  SWL_RC_ERROR, ME, "unknown or ambiguous AP: %s", pSock->name);
++    /* A shared-wiphy candidate has no radio evidence of its own, so neither
++     * a current match over a remembered one nor a remembered identity alone
++     * may pick an AP across Radios: the BSSID must be unique over the union
++     * of current and remembered identities of every candidate AP.
++     */
++    ASSERTI_FALSE(fallback && ((currentCount != 1) || (oldCount != 0)),
++                  SWL_RC_ERROR, ME, "shared-wiphy BSSID is not unique: %s", pSock->name);
+     pSock->ap = currentCount ? pCurrent : pOld;
+     pSock->resolved = true;
+     return SWL_RC_OK;
