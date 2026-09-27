@@ -16,7 +16,23 @@ hostapd_ready()
 	    hostapd_path="$hostapd_path/$1"
 	fi
 	echo "Interface $1: hostapd_path - $hostapd_path"
-        hostapd_cli -i$1 -p$hostapd_path stat &>/dev/null || ubus call WiFi.Radio _get '{"depth":"0"}' &> /dev/null
+
+	if is_openwrt_os; then
+		hostapd_stat_output="$(hostapd_cli -i "$1" -p "$hostapd_path" stat 2>&1)"
+		hostapd_stat_rc=$?
+		hostapd_status_output="$(hostapd_cli -i "$1" -p "$hostapd_path" status 2>&1)"
+		hostapd_status_rc=$?
+		hostapd_state="$(printf '%s\n' "$hostapd_status_output" | sed -n 's/^state=//p' | head -n 1)"
+		ubus_output="$(ubus call WiFi.Radio _get '{"depth":"0"}' 2>&1)"
+		ubus_rc=$?
+		logger -t "${NAME}" -p daemon.debug \
+			"hostapd_ready iface=$1 path=$hostapd_path stat_rc=$hostapd_stat_rc status_rc=$hostapd_status_rc state=${hostapd_state:-unknown} ubus_rc=$ubus_rc"
+
+		[ "$hostapd_stat_rc" -eq 0 ] || [ "$ubus_rc" -eq 0 ]
+	else
+		hostapd_cli -i$1 -p$hostapd_path stat &>/dev/null || \
+			ubus call WiFi.Radio _get '{"depth":"0"}' &> /dev/null
+	fi
 }
 
 # Confirms hostapd's global control interface itself is up and responsive,
@@ -25,7 +41,11 @@ hostapd_ready()
 # while hostapd is still starting up.
 hostapd_global_ready()
 {
-        [ -e "/tmp/run/hostapd.lock" ]
+        if is_openwrt_os; then
+                hostapd_cli -p "/var/run/hostapd" -i global ping 2>/dev/null | grep -qx "PONG"
+        else
+                [ -e "/tmp/run/hostapd.lock" ]
+        fi
 }
 
 hostapd_global_ready_poll()
@@ -33,22 +53,85 @@ hostapd_global_ready_poll()
         local count=1
         while [ $count -le 120 ]; do
                 if hostapd_global_ready; then
-                        logger -t "${NAME}" -p daemon.info "hostapd lock file present after $count attempt(s)"
+                        if is_openwrt_os; then
+                                logger -t "${NAME}" -p daemon.info "hostapd global control interface responded PONG after $count attempt(s)"
+                        else
+                                logger -t "${NAME}" -p daemon.info "hostapd lock file present after $count attempt(s)"
+                        fi
                         return 0
                 fi
-                logger -t "${NAME}" -p daemon.warn "Waiting for /tmp/run/hostapd.lock to appear (attempt $count/120)"
+                if is_openwrt_os; then
+                        logger -t "${NAME}" -p daemon.warn "Waiting for hostapd global control interface PONG (attempt $count/120)"
+                else
+                        logger -t "${NAME}" -p daemon.warn "Waiting for /tmp/run/hostapd.lock to appear (attempt $count/120)"
+                fi
                 count=$((count + 1))
                 sleep 1
         done
-        logger -t "${NAME}" -p daemon.err "/tmp/run/hostapd.lock did not appear after $count attempts"
+        if is_openwrt_os; then
+                logger -t "${NAME}" -p daemon.err "hostapd global control interface did not respond PONG after $count attempts"
+        else
+                logger -t "${NAME}" -p daemon.err "/tmp/run/hostapd.lock did not appear after $count attempts"
+        fi
         return 1
 }
 
-# The hostapd.lock wait is only meaningful on OpenWrt-based images; other distros
-# using this same init script don't have that lock-file convention.
+# The hostapd global control interface check is only meaningful on OpenWrt-based
+# images; other distros using this same init script may not expose this socket.
 is_openwrt_os()
 {
         grep -q '^NAME="OpenWrt"' /etc/os-release 2>/dev/null
+}
+
+# Wait until the wireless driver exposes at least two usable frequency ranges.
+# During boot, iw may exist and return success before the ath12k PHYs are fully
+# registered; treating that output as ready causes stale hostap_iface values to
+# reach wlan_ready_poll().
+iw_phy_ready_poll()
+{
+        local count=1
+        local iw_output
+        local iw_rc
+        local valid_frequency_count
+
+        while [ "$count" -le 60 ]; do
+                iw_output="$(iw phy 2>&1)"
+                iw_rc=$?
+                valid_frequency_count="$(printf '%s\n' "$iw_output" | awk '
+                /Frequency Range:/ {
+                        line = $0
+                        sub(/.*Frequency Range: */, "", line)
+                        start = line + 0
+                        sub(/[^-]*- */, "", line)
+                        end = line + 0
+                        if (start > 0 && end > start) {
+                                count++
+                        }
+                }
+                END { print count + 0 }
+                ')"
+
+                logger -t "${NAME}" -p daemon.debug \
+                        "iw_phy_ready_poll attempt=$count rc=$iw_rc valid_frequency_ranges=$valid_frequency_count"
+
+                if [ "$iw_rc" -eq 0 ] && [ "$valid_frequency_count" -ge 2 ] 2>/dev/null; then
+                        logger -t "${NAME}" -p daemon.info \
+                                "iw phy ready after $count attempt(s): $valid_frequency_count valid frequency ranges"
+                        return 0
+                fi
+
+                if [ "$iw_rc" -ne 0 ]; then
+                        logger -t "${NAME}" -p daemon.warn \
+                                "iw_phy_ready_poll: iw phy failed output=$(printf '%s' "$iw_output" | tr '\n' ' ' | cut -c1-240)"
+                fi
+
+                count=$((count + 1))
+                sleep 1
+        done
+
+        logger -t "${NAME}" -p daemon.err \
+                "iw phy did not expose at least 2 valid frequency ranges after 60 attempts"
+        return 1
 }
 
 wlan_reset()
@@ -170,7 +253,22 @@ get_prim_ifname() {
 # This avoids brittle exact-start matching: FREQ_* values only need to be a
 # representative frequency within the band, not the exact range-start the driver reports.
 
-    idx=$(iw phy | awk -v target="$freq" '
+    if is_openwrt_os; then
+        iw_output="$(iw phy 2>&1)"
+        iw_rc=$?
+        iw_bytes="$(printf '%s\n' "$iw_output" | wc -c)"
+        iw_idx_count="$(printf '%s\n' "$iw_output" | grep -c 'Idx' 2>/dev/null)"
+        logger -t "${NAME}" -p daemon.debug \
+            "get_prim_ifname freq=$freq: iw phy rc=$iw_rc bytes=$iw_bytes idx_lines=$iw_idx_count"
+        if [ "$iw_rc" -ne 0 ]; then
+            logger -t "${NAME}" -p daemon.warn \
+                "get_prim_ifname freq=$freq: iw phy failed output=$(printf '%s' "$iw_output" | tr '\n' ' ' | cut -c1-240)"
+        elif [ "$iw_idx_count" -eq 0 ] 2>/dev/null; then
+            logger -t "${NAME}" -p daemon.warn \
+                "get_prim_ifname freq=$freq: iw phy succeeded but returned no PHY index; output=$(printf '%s' "$iw_output" | tr '\n' ' ' | cut -c1-240)"
+        fi
+
+        idx="$(printf '%s\n' "$iw_output" | awk -v target="$freq" '
     /Idx/ {i=$3; gsub(":", "", i)}
     /Frequency Range:/ {
         # Use sub() to extract start/end robustly from the line, e.g.:
@@ -187,16 +285,44 @@ get_prim_ifname() {
             print i
         }
     }
+        ')"
+    else
+        idx=$(iw phy | awk -v target="$freq" '
+    /Idx/ {i=$3; gsub(":", "", i)}
+    /Frequency Range:/ {
+        line = $0
+        sub(/.*Frequency Range: */, "", line)
+        start = line + 0
+        sub(/[^-]*- */, "", line)
+        end = line + 0
+        if (start > 0 && end > 0 && target >= start && target <= end) {
+            print i
+        }
+    }
     ')
+    fi
 
 # Check if idx was found
     if [ -z "$idx" ]; then
+        if is_openwrt_os; then
+            logger -t "${NAME}" -p daemon.warn \
+                "get_prim_ifname freq=$freq: no matching PHY index (iw_rc=$iw_rc idx_lines=$iw_idx_count); frequency parser did not match; ranges=$(printf '%s\n' "$iw_output" | grep 'Frequency Range:' | tr '\n' ' ' | cut -c1-240)"
+        fi
         echo "No matching frequency found." >&2
         exit 1
     fi
 
 # Step 2: Build config file path
     conf_file="/var/run/hostapd-phy00.$idx.conf"
+	if is_openwrt_os; then
+	if [ -f "$conf_file" ]; then
+		logger -t "${NAME}" -p daemon.debug \
+			"get_prim_ifname freq=$freq idx=$idx conf=$conf_file present"
+	else
+		logger -t "${NAME}" -p daemon.debug \
+			"get_prim_ifname freq=$freq idx=$idx conf=$conf_file missing -> dummy_ap"
+	fi
+	fi
 
 # If hostapd hasn't started yet (no runtime conf for this radio), fall back to
 # the dummy_ap placeholder instead of failing, so radio config can still be applied.
@@ -254,8 +380,16 @@ derive_radio_macaddr() {
 }
 
 update_radio_hostap_iface() {
-        if _update_radio_hostap_iface_once; then
-                return 0
+	if is_openwrt_os; then
+		logger -t "${NAME}" -p daemon.debug \
+			"update_radio_hostap_iface: before $(uci show prplmesh 2>/dev/null | grep '\.hostap_iface=' | tr '\n' ' ')"
+	fi
+	        if _update_radio_hostap_iface_once; then
+		if is_openwrt_os; then
+			logger -t "${NAME}" -p daemon.debug \
+				"update_radio_hostap_iface: completed $(uci show prplmesh 2>/dev/null | grep '\.hostap_iface=' | tr '\n' ' ')"
+		fi
+	                return 0
         fi
 
         logger -t "${NAME}" -p daemon.warn \
@@ -300,7 +434,16 @@ _update_radio_hostap_iface_once() {
             set -- $out
             radio_id=$1
             ifname=$2
+			if is_openwrt_os; then
+			logger -t "${NAME}" -p daemon.debug \
+				"update_radio_hostap_iface: freq=$freq radio_id=$radio_id resolved_ifname=$ifname"
+			fi
         else
+			if is_openwrt_os; then
+			current_ifname="$(uci -q get "prplmesh.radio${i}.hostap_iface" 2>/dev/null)"
+			logger -t "${NAME}" -p daemon.warn \
+				"update_radio_hostap_iface: freq=$freq discovery failed; radio${i}.hostap_iface remains ${current_ifname:-unset}"
+			fi
             echo "Skipping freq=$freq: get_prim_ifname failed" >&2
             # Move to next frequency on failure
             i=$((i + 1))
@@ -395,13 +538,35 @@ _update_radio_hostap_iface_once() {
 
     uci commit prplmesh
 
+	if is_openwrt_os; then
+		logger -t "${NAME}" -p daemon.debug \
+			"update_radio_hostap_iface: committed $(uci show prplmesh 2>/dev/null | grep '\.hostap_iface=' | tr '\n' ' ')"
+	fi
+
     return $dummy_ap_derived
 
 }
 
 update_radio_sta_iface() {
 
-    num_of_bands=$(iw phy | awk '/Idx/ {count++} END {print count}')
+    if is_openwrt_os; then
+        iw_output="$(iw phy 2>&1)"
+        iw_rc=$?
+        iw_bytes="$(printf '%s\n' "$iw_output" | wc -c)"
+        iw_idx_count="$(printf '%s\n' "$iw_output" | grep -c 'Idx' 2>/dev/null)"
+        logger -t "${NAME}" -p daemon.debug \
+            "update_radio_sta_iface: iw phy rc=$iw_rc bytes=$iw_bytes idx_lines=$iw_idx_count"
+        if [ "$iw_rc" -ne 0 ]; then
+            logger -t "${NAME}" -p daemon.warn \
+                "update_radio_sta_iface: iw phy failed output=$(printf '%s' "$iw_output" | tr '\n' ' ' | cut -c1-240)"
+        elif [ "$iw_idx_count" -eq 0 ] 2>/dev/null; then
+            logger -t "${NAME}" -p daemon.warn \
+                "update_radio_sta_iface: iw phy succeeded but returned no PHY index; output=$(printf '%s' "$iw_output" | tr '\n' ' ' | cut -c1-240)"
+        fi
+        num_of_bands="$(printf '%s\n' "$iw_output" | awk '/Idx/ {count++} END {print count}')"
+    else
+        num_of_bands=$(iw phy | awk '/Idx/ {count++} END {print count}')
+    fi
     echo "Total available bands: $num_of_bands"
  
  
@@ -473,13 +638,19 @@ update_sta_iface_in_prplmesh_config()
 start_function() {
         if [ $(uci -q get prplmesh.config.enable) == "1" ]; then
                 if is_openwrt_os; then
+                        iw_phy_ready_poll || {
+                                logger -t "${NAME}" -p daemon.err "iw phy readiness failed, aborting start"
+                                exit 1
+                        }
                         logger -t "${NAME}" -p daemon.info "Detected OpenWrt - running hostapd global ready poll"
                         hostapd_global_ready_poll || {
                                 logger -t "${NAME}" -p daemon.err "hostapd global ctrl interface never became ready, aborting start"
                                 exit 1
                         }
 
-                        update_radio_hostap_iface
+				        update_radio_hostap_iface
+				        logger -t "${NAME}" -p daemon.debug \
+				                "start_function: hostap_iface after discovery $(uci show prplmesh 2>/dev/null | grep '\.hostap_iface=' | tr '\n' ' ')"
                 else
                         logger -t "${NAME}" -p daemon.info "$(grep '^NAME=' /etc/os-release 2>/dev/null) - skipping hostapd global ready poll"
                 fi
@@ -537,6 +708,10 @@ stop() {
 restart() {
         if [ $(uci -q get prplmesh.config.enable) == "1" ]; then
                 if is_openwrt_os; then
+                        iw_phy_ready_poll || {
+                                logger -t "${NAME}" -p daemon.err "iw phy readiness failed, aborting restart"
+                                exit 1
+                        }
                         logger -t "${NAME}" -p daemon.info "Detected OpenWrt - running hostapd global ready poll"
                         hostapd_global_ready_poll || {
                                 logger -t "${NAME}" -p daemon.err "hostapd global ctrl interface never became ready, aborting restart"

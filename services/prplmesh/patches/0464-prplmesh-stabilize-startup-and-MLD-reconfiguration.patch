@@ -1,0 +1,1422 @@
+From db3c17fcb759d7c3dc48fb7b1c3d2f6be1118975 Mon Sep 17 00:00:00 2001
+From: Girija P <gpandiya@qti.qualcomm.com>
+Date: Sun, 27 Sep 2026 22:17:21 +0530
+Subject: [PATCH] prplmesh: stabilize startup and MLD reconfiguration
+
+- Gate agent startup on hostapd global PONG readiness and explicit launch requests
+- Handle dummy_ap radios without duplicate agent retries
+- Serialize hostapd/driver MLD ADD, REMOVE, and LINK_REMOVE operations
+- Wait for valid hostapd control sockets before MLD_ADD_LINK
+- Clean stale control mappings and preserve per-radio VAP ownership
+- Add configurable unicast-first AP configuration renewal
+
+Signed-off-by: Girija P <gpandiya@qti.qualcomm.com>
+---
+ CMakeLists.txt                                |   9 +
+ .../ap_manager/ap_manager.cpp                 |  21 +-
+ agent/src/beerocks/slave/son_slave_thread.cpp |  15 +
+ .../bcl/include/bcl/beerocks_config_file.h    |   2 +
+ .../bcl/source/beerocks_config_file.cpp       |   1 +
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 580 ++++++++++++------
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     | 136 +++-
+ common/beerocks/scripts/prplmesh_utils.sh.in  |  64 +-
+ controller/config/beerocks_controller.conf.in |   3 +
+ .../beerocks/master/beerocks_master_main.cpp  |   2 +
+ controller/src/beerocks/master/controller.cpp |   9 +
+ controller/src/beerocks/master/db/db.h        |   1 +
+ .../src/beerocks/master/son_management.cpp    |   3 +-
+ .../tasks/ap_config_renew_sequencer_task.cpp  |   6 +-
+ .../tasks/ap_config_renew_sequencer_task.h    |  19 +-
+ .../platform/bpl/cfg/dm/bpl_cfg_wifi.cpp      |  33 +-
+ 16 files changed, 656 insertions(+), 248 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6ca453457..ea44fa996 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -12,6 +12,15 @@ endif()
+ option(USE_PRPLMESH_WHM "Use prplMesh Wireless Hardware Manager" ON)
+ option(USE_PRPLMESH_NLHAL "Use prplMesh NLHAL" ON)
+ 
++# RDKB has its own RDK/RBus BPL and DWPALD/OneWiFi backends. The WHM backend
++# depends on the prplOS Ambiorix/WBAPI stack and is not available on RDKB.
++# Keep an RDKB build on its native backend even when a shared/default CMake
++# configuration enables WHM (the RDK builder historically defaulted to this).
++if (TARGET_PLATFORM STREQUAL "rdkb" AND USE_PRPLMESH_WHM)
++    message(WARNING "USE_PRPLMESH_WHM is not supported on RDKB; disabling WHM for this build")
++    set(USE_PRPLMESH_WHM OFF CACHE BOOL "Use prplMesh Wireless Hardware Manager" FORCE)
++endif()
++
+ if (USE_PRPLMESH_WHM)
+     set(KEEP_UCI_GENERAL_OPTIONS ON)
+     # USE_PRPLMESH_WHM is consumed by sources in multiple sibling targets
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index d76a43b81..d7690e35b 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -120,6 +120,25 @@ static void copy_vaps_info_and_type(std::shared_ptr<bwl::ap_wlan_hal> &ap_wlan_h
+                    << ", vap_type=" << eVapType_str(curr_vap.vap_type)
+                    << ", vap_label=" << curr_vap.vap_label;
+ 
++        // FIX_VALIDATE_4669407: the VAP being copied into the outgoing VAPS_LIST must belong to
++        // THIS ap_manager's radio. Flag when the VAP BSS base-iface differs from the radio iface
++        // reported by the HAL (get_radio_info().iface_name) — proves whether the 5G/6G cross-bind
++        // is already present in available_vaps when the agent hands it upstream.
++        {
++            const std::string fv_radio_iface = ap_wlan_hal->get_radio_info().iface_name;
++            auto fv_base = [](const std::string &s) {
++                auto p = s.find('.');
++                return (p == std::string::npos) ? s : s.substr(0, p);
++            };
++            const std::string fv_vap_base   = fv_base(curr_vap.bss);
++            const std::string fv_radio_base = fv_base(fv_radio_iface);
++            const bool fv_mismatch = !fv_vap_base.empty() && !fv_radio_base.empty() &&
++                                     fv_vap_base != fv_radio_base;
++            LOG(DEBUG) << "FIX_VALIDATE_4669407: ap_manager copy_vaps radio_iface=" << fv_radio_iface
++                       << " vap_id=" << int(vap_id) << " vap_bss=" << curr_vap.bss
++                       << " vap_mac=" << curr_vap.mac << (fv_mismatch ? "  <<< MISMATCH" : "");
++        }
++
+         if (curr_vap.backhaul) {
+             LOG(DEBUG) << "disallow_profile1="
+                        << curr_vap.profile1_backhaul_sta_association_disallowed
+@@ -3103,7 +3122,7 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+                 std::chrono::steady_clock::now() + std::chrono::seconds(15);
+         }
+ #endif
+-        auto timeout     = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++        auto timeout     = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+         while (std::chrono::steady_clock::now() < timeout) {
+             UTILS_SLEEP_MSEC(500);
+         }
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 68f3b5b74..46638a985 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -8729,6 +8729,21 @@ bool slave_thread::update_vaps_info(const std::string &iface,
+ 
+         const bool has_bssid  = (vaps[vap_idx].mac != network_utils::ZERO_MAC);
+         const auto iface_name = std::string(vaps[vap_idx].iface_name);
++
++        // FIX_VALIDATE_4669407: the whole vaps[] batch is written into the radio resolved from the
++        // 'iface' arg, but each vap carries its OWN iface_name. If a vap's base-iface differs from
++        // the batch radio's base-iface, its BSS is being bound to the WRONG radio (the 5G-under-6G
++        // cross-bind). Log resolved radio vs each non-zero vap's iface_name/mac and flag mismatch.
++        if (has_bssid) {
++            const std::string fv_batch_base = net::strip_link_suffix(iface);
++            const std::string fv_vap_base   = net::strip_link_suffix(iface_name);
++            const bool fv_mismatch          = !iface_name.empty() && !fv_vap_base.empty() &&
++                                     !fv_batch_base.empty() && fv_vap_base != fv_batch_base;
++            LOG(DEBUG) << "FIX_VALIDATE_4669407: update_vaps_info batch_iface=" << iface
++                       << " radio_mac=" << radio->front.iface_mac << " vap_idx=" << int(vap_idx)
++                       << " vap_iface=" << iface_name << " vap_mac=" << vaps[vap_idx].mac
++                       << (fv_mismatch ? "  <<< MISMATCH" : "");
++        }
+         // Save the previous BSS role/operational state before overwriting this
+         // DB entry. After the update we compare old vs new values to detect
+         // real transitions (pure-FH enable/disable or backhaul policy change)
+diff --git a/common/beerocks/bcl/include/bcl/beerocks_config_file.h b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+index 3c97c0824..94159450a 100644
+--- a/common/beerocks/bcl/include/bcl/beerocks_config_file.h
++++ b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+@@ -57,6 +57,8 @@ public:
+         std::string smd_default_dl_drain_time[MAX_SMD_PROFILES];
+         //Enable Unicast Renew
+         std::string enable_unicast_renew;
++        // Enable unicast-first ordering for CLI-triggered AP-Config Renew.
++        std::string unicast_enable_on_cli_renew = "1";
+         std::string load_service_fairness;
+         std::string load_backhaul_measurements;
+         std::string load_front_measurements;
+diff --git a/common/beerocks/bcl/source/beerocks_config_file.cpp b/common/beerocks/bcl/source/beerocks_config_file.cpp
+index 9cb36bfc6..894ff67a6 100644
+--- a/common/beerocks/bcl/source/beerocks_config_file.cpp
++++ b/common/beerocks/bcl/source/beerocks_config_file.cpp
+@@ -57,6 +57,7 @@ bool config_file::read_master_config_file(const std::string &config_file_path, s
+         std::make_tuple("enable_cotdma=", &conf.enable_cotdma, 0),
+         std::make_tuple("smd_profile_count=", &conf.smd_profile_count, 0),
+         std::make_tuple("enable_unicast_renew=", &conf.enable_unicast_renew, 0),
++        std::make_tuple("unicast_enable_on_cli_renew=", &conf.unicast_enable_on_cli_renew, 0),
+         std::make_tuple("load_service_fairness=", &conf.load_service_fairness, mandatory_master),
+         std::make_tuple("load_backhaul_measurements=", &conf.load_backhaul_measurements, 0),
+         std::make_tuple("load_front_measurements=", &conf.load_front_measurements, 0),
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index b20e02d9d..b2458b315 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -12,6 +12,7 @@
+ #include <bcl/beerocks_os_utils.h>
+ #include <bcl/beerocks_string_utils.h>
+ #include <bcl/beerocks_utils.h>
++#include <bcl/network/file_descriptor.h>
+ #include <bcl/network/network_utils.h>
+ #include <bcl/son/son_assoc_frame_utils.h>
+ #include <bcl/son/son_wireless_utils.h>
+@@ -43,12 +44,12 @@
+ namespace bwl {
+ namespace nl80211 {
+ 
+-// Maximum time to wait for the cross-process LINK_REMOVE lock before giving up and
++// Maximum time to wait for the cross-process MLD reconfiguration lock before giving up and
+ // proceeding unlocked. Bounds the wait against a peer process that is alive but wedged
+ // while holding the lock (a genuinely dead peer's lock is released by the kernel when its
+ // last fd to the file closes, so this specifically guards the "stuck, not dead" case).
+-static constexpr auto LINK_REMOVE_LOCK_TIMEOUT       = std::chrono::seconds(10);
+-static constexpr auto LINK_REMOVE_LOCK_POLL_INTERVAL = std::chrono::milliseconds(20);
++static constexpr auto MLD_RECONFIG_LOCK_TIMEOUT       = std::chrono::seconds(10);
++static constexpr auto MLD_RECONFIG_LOCK_POLL_INTERVAL = std::chrono::milliseconds(20);
+ 
+ // A LINK_REMOVE for one MLD link can transiently collide with hostapd's own internal
+ // "one MLD reconfiguration in-flight" guard, which stays busy for a short async tail
+@@ -56,6 +57,89 @@ static constexpr auto LINK_REMOVE_LOCK_POLL_INTERVAL = std::chrono::milliseconds
+ // a few times with a short delay rather than treating the first rejection as final.
+ static constexpr int  LINK_REMOVE_CMD_MAX_ATTEMPTS = 3;
+ static constexpr auto LINK_REMOVE_CMD_RETRY_DELAY  = std::chrono::milliseconds(300);
++static constexpr int  MLD_ADD_CTRL_READY_MAX_RETRIES = 25;
++static constexpr auto MLD_ADD_CTRL_READY_RETRY_DELAY  = std::chrono::milliseconds(200);
++static constexpr int  MLD_ADD_TARGET_READY_MAX_RETRIES = 50;
++static constexpr auto MLD_ADD_TARGET_READY_RETRY_DELAY = std::chrono::milliseconds(200);
++static constexpr char MLD_RECONFIG_LOCK_PATH[] =
++    "/var/lock/prplmesh-mld-reconfig.lock";
++
++class ScopedMldReconfigLock {
++public:
++    ScopedMldReconfigLock(const std::string &iface, const char *operation)
++        : m_iface(iface), m_operation(operation)
++    {
++        // All radios share one hostapd instance and one driver MLO reconfiguration
++        // state machine. A per-interface lock is insufficient: ADD/MLD_ADD_LINK for
++        // different MLDs can still run concurrently and exhaust the driver or make
++        // hostapd create the same cross-radio interface twice.
++        m_fd = open(MLD_RECONFIG_LOCK_PATH, O_CREAT | O_RDWR, 0644);
++        if (m_fd < 0) {
++            LOG(WARNING) << m_operation << " lock open failed for " << m_iface << ": "
++                         << strerror(errno);
++            return;
++        }
++
++        struct flock lk {};
++        lk.l_type   = F_WRLCK;
++        lk.l_whence = SEEK_SET;
++        lk.l_start  = 0;
++        lk.l_len    = 0;
++
++        int ret;
++        const auto deadline = std::chrono::steady_clock::now() + MLD_RECONFIG_LOCK_TIMEOUT;
++        while (true) {
++            ret = fcntl(m_fd, F_SETLK, &lk);
++            if (ret >= 0 || (errno != EAGAIN && errno != EACCES && errno != EINTR)) {
++                break;
++            }
++            if (std::chrono::steady_clock::now() >= deadline) {
++                errno = ETIMEDOUT;
++                break;
++            }
++            std::this_thread::sleep_for(MLD_RECONFIG_LOCK_POLL_INTERVAL);
++        }
++
++        if (ret < 0) {
++            LOG(WARNING) << m_operation << " lock acquire failed for " << m_iface << ": "
++                         << strerror(errno);
++            close(m_fd);
++            m_fd = -1;
++            return;
++        }
++
++        m_locked = true;
++        LOG(INFO) << m_operation << " lock acquired for " << m_iface;
++    }
++
++    ~ScopedMldReconfigLock()
++    {
++        if (m_fd < 0) {
++            return;
++        }
++
++        if (m_locked) {
++            struct flock lk {};
++            lk.l_type   = F_UNLCK;
++            lk.l_whence = SEEK_SET;
++            lk.l_start  = 0;
++            lk.l_len    = 0;
++            if (fcntl(m_fd, F_SETLK, &lk) < 0) {
++                LOG(WARNING) << m_operation << " lock release failed for " << m_iface << ": "
++                             << strerror(errno);
++            } else {
++                LOG(INFO) << m_operation << " lock released for " << m_iface;
++            }
++        }
++        close(m_fd);
++    }
++
++private:
++    std::string m_iface;
++    const char *m_operation = nullptr;
++    int m_fd                = -1;
++    bool m_locked           = false;
++};
+ 
+ // Qualcomm WSI bypass vendor command used by prplOS PowerSaveEnable.
+ static constexpr uint32_t WSI_QCA_VENDOR_ID       = 0x001374u;
+@@ -408,6 +492,9 @@ bool fetch_mld_iface_by_ssid(const std::string &target_ssid, std::string &mld_if
+     std::ifstream file(filename);
+     if (!file.is_open()) {
+         LOG(ERROR) << "Failed to open" << filename;
++        lock.l_type = F_UNLCK;
++        fcntl(fd, F_SETLK, &lock);
++        close(fd);
+         return false;
+     } else {
+         std::string line;
+@@ -4289,15 +4376,12 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+ 
+         // Serialize concurrent LINK_REMOVE / REMOVE calls from multiple radio processes.
+         // Hostapd can only process one LINK_REMOVE at a time, so each radio must wait its
+-        // turn before issuing the command.  The lock is scoped per base radio (not global)
+-        // so unrelated radios never contend with each other, only with their own siblings.
++        // turn before issuing the command. All radios share the same hostapd/driver MLO
++        // reconfiguration state, so this uses the same global lock as ADD/MLD_ADD_LINK.
+         // The same lock file path is derived identically by the teardown path in
+         // update_vap_credentials() so all LINK_REMOVE callers for a given radio are
+         // mutually exclusive.
+-        std::string lr_base_iface;
+-        extractLinkBaseInterface(bss_iface, lr_base_iface);
+-        const std::string lr_lock_path = "/var/lock/prplmesh-link-remove-" + lr_base_iface + ".lock";
+-        int lr_lock_fd = open(lr_lock_path.c_str(), O_CREAT | O_RDWR, 0644);
++        int lr_lock_fd = open(MLD_RECONFIG_LOCK_PATH, O_CREAT | O_RDWR, 0644);
+         if (lr_lock_fd >= 0) {
+             struct flock lr_lk{};
+             lr_lk.l_type   = F_WRLCK;
+@@ -4305,7 +4389,7 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+             lr_lk.l_start  = 0;
+             lr_lk.l_len    = 0;
+             int lr_ret;
+-            const auto lr_deadline = std::chrono::steady_clock::now() + LINK_REMOVE_LOCK_TIMEOUT;
++            const auto lr_deadline = std::chrono::steady_clock::now() + MLD_RECONFIG_LOCK_TIMEOUT;
+             while (true) {
+                 lr_ret = fcntl(lr_lock_fd, F_SETLK, &lr_lk);
+                 if (lr_ret >= 0 || (errno != EAGAIN && errno != EACCES && errno != EINTR)) {
+@@ -4315,7 +4399,7 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+                     errno = ETIMEDOUT;
+                     break;
+                 }
+-                std::this_thread::sleep_for(LINK_REMOVE_LOCK_POLL_INTERVAL);
++                std::this_thread::sleep_for(MLD_RECONFIG_LOCK_POLL_INTERVAL);
+             }
+             if (lr_ret < 0) {
+                 LOG(WARNING) << "handle_wifi_compat_mode: LINK_REMOVE lock acquire failed: "
+@@ -4591,29 +4675,35 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+              return false;
+          }
+ 
+-         // Step 3: Trigger ADD BSS config command (same as add_bss()).
+-         std::stringstream add_cmd;
+-         add_cmd << "ADD bss_config=" << m_radio_info.phy_name << ":" << new_conf_path;
+-         LOG(DEBUG) << "handle_wifi_compat_mode: sending ADD BSS: " << add_cmd.str();
+-         if (!wpa_ctrl_send_msg(add_cmd.str(), global_iface)) {
+-             LOG(WARNING) << "handle_wifi_compat_mode: ADD BSS failed for " << new_bss_name
+-                          << ", retrying once after clearing any stale hostapd/kernel state"
+-                             " left over from a previous cycle";
+-             clear_stale_hostapd_iface(new_bss_name);
++         {
++             ScopedMldReconfigLock add_lock(new_bss_name, "ADD");
++
++             // Step 3: Trigger ADD BSS config command (same as add_bss()).
++             std::stringstream add_cmd;
++             add_cmd << "ADD bss_config=" << m_radio_info.phy_name << ":" << new_conf_path;
++             LOG(DEBUG) << "handle_wifi_compat_mode: sending ADD BSS: " << add_cmd.str();
+              if (!wpa_ctrl_send_msg(add_cmd.str(), global_iface)) {
+-                 LOG(ERROR) << "handle_wifi_compat_mode: ADD BSS failed for " << new_bss_name
+-                            << " (after retry)";
+-                 return false;
++                 LOG(WARNING) << "handle_wifi_compat_mode: ADD BSS failed for " << new_bss_name
++                              << ", retrying once after clearing any stale hostapd/kernel state"
++                                 " left over from a previous cycle";
++                 clear_stale_hostapd_iface(new_bss_name);
++                 if (!wpa_ctrl_send_msg(add_cmd.str(), global_iface)) {
++                     LOG(ERROR) << "handle_wifi_compat_mode: ADD BSS failed for " << new_bss_name
++                                << " (after retry)";
++                     return false;
++                 }
++                 LOG(INFO) << "handle_wifi_compat_mode: ADD BSS succeeded for " << new_bss_name
++                           << " after clearing stale state";
+              }
+-             LOG(INFO) << "handle_wifi_compat_mode: ADD BSS succeeded for " << new_bss_name
+-                       << " after clearing stale state";
+-         }
+ 
+-         // Register the new SLO interface control socket.
+-         int fd = base_wlan_hal_nl80211::add_interface(new_bss_name);
+-         if (fd < 0) {
+-             LOG(WARNING) << "handle_wifi_compat_mode: failed to register new BSS interface "
+-                          << new_bss_name;
++             // Register the new SLO interface control socket before releasing the reconfig lock,
++             // so a sibling radio cannot immediately issue a conflicting hostapd reconfig command
++             // while this BSS is still settling.
++             int fd = base_wlan_hal_nl80211::add_interface(new_bss_name);
++             if (fd < 0) {
++                 LOG(WARNING) << "handle_wifi_compat_mode: failed to register new BSS interface "
++                              << new_bss_name;
++             }
+          }
+ 
+          // Update the default hostapd conf file to include the new BSS so that
+@@ -4854,17 +4944,20 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+                 // Remove old SLO BSS and create a new BSS.
+                 std::string base_iface_fp;
+                 extractLinkBaseInterface(bss_iface, base_iface_fp);
+-                std::stringstream remove_cmd_fp;
+-                remove_cmd_fp << "REMOVE " << base_iface_fp;
+-                if (!wpa_ctrl_send_msg(remove_cmd_fp.str(), global_iface)) {
+-                    LOG(ERROR) << "handle_wifi_compat_mode: REMOVE failed for "
+-                               << base_iface_fp;
+-                    return false;
+-                }
+-                if (if_nametoindex(base_iface_fp.c_str()) != 0) {
+-                    if (!m_nl80211_client->remove_vap_interface(base_iface_fp)) {
+-                        LOG(ERROR) << "handle_wifi_compat_mode: remove_vap_interface"
+-                                   << " failed for " << base_iface_fp;
++                {
++                    ScopedMldReconfigLock remove_lock(base_iface_fp, "REMOVE");
++                    std::stringstream remove_cmd_fp;
++                    remove_cmd_fp << "REMOVE " << base_iface_fp;
++                    if (!wpa_ctrl_send_msg(remove_cmd_fp.str(), global_iface)) {
++                        LOG(ERROR) << "handle_wifi_compat_mode: REMOVE failed for "
++                                   << base_iface_fp;
++                        return false;
++                    }
++                    if (if_nametoindex(base_iface_fp.c_str()) != 0) {
++                        if (!m_nl80211_client->remove_vap_interface(base_iface_fp)) {
++                            LOG(ERROR) << "handle_wifi_compat_mode: remove_vap_interface"
++                                       << " failed for " << base_iface_fp;
++                        }
+                     }
+                 }
+                 if (remove_mld_entry_by_ifname(base_iface_fp) == 0) {
+@@ -4922,20 +5015,23 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+             std::stringstream remove_cmd;
+             extractLinkBaseInterface(bss_iface, base_iface);
+ 
+-            remove_cmd << "REMOVE " << base_iface;
++            {
++                ScopedMldReconfigLock remove_lock(base_iface, "REMOVE");
++                remove_cmd << "REMOVE " << base_iface;
+ 
+-            if (!wpa_ctrl_send_msg(remove_cmd.str(), global_iface)) {
+-                LOG(ERROR) << "Failed to remove iface: " << base_iface;
+-                return false;
+-            }
+-            // If the kernel interface still exists after the REMOVE command
+-            // (e.g. hostapd did not tear it down), force-remove it via nl80211.
+-            if (if_nametoindex(base_iface.c_str()) != 0) {
+-                LOG(WARNING) << "handle_wifi_compat_mode: iface " << base_iface
+-                             << " still exists after REMOVE, calling remove_vap_interface";
+-                if (!m_nl80211_client->remove_vap_interface(base_iface)) {
+-                    LOG(ERROR) << "handle_wifi_compat_mode: remove_vap_interface failed for "
+-                               << base_iface;
++                if (!wpa_ctrl_send_msg(remove_cmd.str(), global_iface)) {
++                    LOG(ERROR) << "Failed to remove iface: " << base_iface;
++                    return false;
++                }
++                // If the kernel interface still exists after the REMOVE command
++                // (e.g. hostapd did not tear it down), force-remove it via nl80211.
++                if (if_nametoindex(base_iface.c_str()) != 0) {
++                    LOG(WARNING) << "handle_wifi_compat_mode: iface " << base_iface
++                                 << " still exists after REMOVE, calling remove_vap_interface";
++                    if (!m_nl80211_client->remove_vap_interface(base_iface)) {
++                        LOG(ERROR) << "handle_wifi_compat_mode: remove_vap_interface failed for "
++                                   << base_iface;
++                    }
+                 }
+             }
+             // Interface fully removed via REMOVE: remove its entry from mld_pair_entrant.txt.
+@@ -6040,14 +6136,8 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                         if (bss_it.teardown) {
+                             // Hostapd can only process one LINK_REMOVE at a time.
+                             // Serialize concurrent calls from multiple radio processes
+-                            // using a file lock so each radio waits its turn. The lock
+-                            // is scoped per base radio so unrelated radios never
+-                            // contend with each other, only with their own siblings.
+-                            std::string lr_base_iface;
+-                            extractLinkBaseInterface(vap_info.bss, lr_base_iface);
+-                            const std::string lr_lock_path =
+-                                "/var/lock/prplmesh-link-remove-" + lr_base_iface + ".lock";
+-                            int lr_lock_fd = open(lr_lock_path.c_str(), O_CREAT | O_RDWR, 0644);
++                            // using the global hostapd/driver MLO reconfiguration lock.
++                            int lr_lock_fd = open(MLD_RECONFIG_LOCK_PATH, O_CREAT | O_RDWR, 0644);
+                             if (lr_lock_fd >= 0) {
+                                 struct flock lr_lk{};
+                                 lr_lk.l_type   = F_WRLCK;
+@@ -6056,7 +6146,7 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                                 lr_lk.l_len    = 0;
+                                 int lr_ret;
+                                 const auto lr_deadline =
+-                                    std::chrono::steady_clock::now() + LINK_REMOVE_LOCK_TIMEOUT;
++                                    std::chrono::steady_clock::now() + MLD_RECONFIG_LOCK_TIMEOUT;
+                                 while (true) {
+                                     lr_ret = fcntl(lr_lock_fd, F_SETLK, &lr_lk);
+                                     if (lr_ret >= 0 ||
+@@ -6067,7 +6157,7 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                                         errno = ETIMEDOUT;
+                                         break;
+                                     }
+-                                    std::this_thread::sleep_for(LINK_REMOVE_LOCK_POLL_INTERVAL);
++                                    std::this_thread::sleep_for(MLD_RECONFIG_LOCK_POLL_INTERVAL);
+                                 }
+                                 if (lr_ret < 0) {
+                                     LOG(WARNING) << "LINK_REMOVE lock acquire failed: " << strerror(errno);
+@@ -8798,22 +8888,37 @@ int ap_wlan_hal_nl80211::add_bss(std::string &ifname, son::wireless_utils::sBssI
+     LOG(DEBUG) << "Adding new BSS on phy " << get_iface_name() << std::endl
+                << "BSS configuration: " << conf_path;
+ 
+-    cmd << "ADD bss_config=" <<m_radio_info.phy_name<< ":" <<conf_path;
+-    if (!wpa_ctrl_send_msg(cmd.str(), global_iface)) {
+-        LOG(WARNING) << "ADD BSS failed for " << ifname << ", retrying once after clearing"
+-                        " any stale hostapd/kernel state left over from a previous cycle";
+-        clear_stale_hostapd_iface(ifname);
++    int fd = beerocks::net::FileDescriptor::invalid_descriptor;
++    {
++        ScopedMldReconfigLock add_lock(ifname, "ADD");
++
++        cmd << "ADD bss_config=" <<m_radio_info.phy_name<< ":" <<conf_path;
+         if (!wpa_ctrl_send_msg(cmd.str(), global_iface)) {
+-            LOG(ERROR) << "Failed to create the new BSS: " << ifname << " (after retry)";
+-            return false;
++            LOG(WARNING) << "ADD BSS failed for " << ifname << ", retrying once after clearing"
++                            " any stale hostapd/kernel state left over from a previous cycle";
++            clear_stale_hostapd_iface(ifname);
++            if (!wpa_ctrl_send_msg(cmd.str(), global_iface)) {
++                LOG(ERROR) << "Failed to create the new BSS: " << ifname << " (after retry)";
++                return false;
++            }
++            LOG(INFO) << "ADD BSS succeeded for " << ifname << " after clearing stale state";
+         }
+-        LOG(INFO) << "ADD BSS succeeded for " << ifname << " after clearing stale state";
+-    }
+ 
+-    int fd = base_wlan_hal_nl80211::add_interface(ifname);
+-    if (fd < 0) {
+-        LOG(DEBUG) << "Failed to register and connect the new BSS interface!";
+-        return false;
++        fd = base_wlan_hal_nl80211::add_interface(ifname);
++        if (fd < 0) {
++            LOG(DEBUG) << "Failed to register and connect the new BSS interface!";
++            // ADD may have returned while hostapd was still completing the
++            // asynchronous netdev/control-socket setup. If registration still
++            // fails, remove the half-created BSS so a later retry cannot meet
++            // a stale "already started" interface and disable a sibling MLD
++            // link (the wlan1_1 failure in the captured log).
++            std::stringstream cleanup_cmd;
++            cleanup_cmd << "REMOVE " << ifname;
++            if (!wpa_ctrl_send_msg(cleanup_cmd.str(), global_iface)) {
++                LOG(WARNING) << "Failed to clean up partially created BSS " << ifname;
++            }
++            return false;
++        }
+     }
+ 
+     // Also mirror this vap's section into the radio's default hostapd-<phy>.conf, tagged
+@@ -9000,84 +9105,131 @@ bool ap_wlan_hal_nl80211::add_mld_link(std::string &new_iface,std::string &prev_
+     }
+ 
+     // Create a WPA control socket for the existing interface where a new link is being added
+-    int fd = base_wlan_hal_nl80211::add_interface(new_iface);
+-    if (fd < 0) {
+-        LOG(ERROR) << "Failed to register and connect the new BSS interface!";
++    // The target can be owned by another radio manager and may not have its
++    // dedicated socket yet. Do not fail before the readiness loop gets a chance
++    // to observe that primary BSS coming up.
++    const bool target_ctrl_was_registered = is_wpa_ctrl_interface_registered(new_iface);
++    if (base_wlan_hal_nl80211::add_interface(new_iface) < 0) {
++        LOG(INFO) << "MLD target control socket for " << new_iface
++                  << " is not ready yet; waiting for the primary BSS";
++    }
++
++    // add_interface() above can register the global control socket before the MLD
++    // primary exists. A PING through that global socket is not sufficient readiness:
++    // hostapd can still reject MLD_ADD_LINK while the primary is being created. Wait
++    // until the target netdev and its dedicated control socket exist and STATUS reports
++    // an enabled AP. This is especially important when all radios start with zero VAPs.
++    bool target_ready = false;
++
++    // base_ctrl_path is the directory used for generated hostapd configuration
++    // files (/var/run/), not the hostapd control-socket directory. Using it here
++    // probes /var/run/<iface>, while the actual sockets are under the configured
++    // control directory (normally /var/run/hostapd/<iface>). The resulting false
++    // negative prevented every cross-radio MLD_ADD_LINK from reaching hostapd.
++    std::string target_ctrl_dir;
++    const auto target_ctrl_dir_pos = m_hal_conf.wpa_ctrl_path.find_last_of('/');
++    if (target_ctrl_dir_pos != std::string::npos) {
++        target_ctrl_dir = m_hal_conf.wpa_ctrl_path.substr(0, target_ctrl_dir_pos + 1);
++    }
++    if (target_ctrl_dir.empty()) {
++        target_ctrl_dir = "/var/run/hostapd/";
++    }
++    const std::string target_ctrl_path = target_ctrl_dir + new_iface;
++    for (int attempt = 1; attempt <= MLD_ADD_TARGET_READY_MAX_RETRIES; ++attempt) {
++        if (if_nametoindex(new_iface.c_str()) != 0 &&
++            beerocks::os_utils::wpa_ctrl_skt_exists(target_ctrl_path)) {
++            // Re-register here so a socket initially registered against global is rebound
++            // to the dedicated interface socket once hostapd has created it.
++            if (base_wlan_hal_nl80211::add_interface(new_iface) >= 0) {
++                parsed_obj_map_t status;
++                if (wpa_ctrl_send_msg("STATUS", status, new_iface)) {
++                    auto state_it = status.find("state");
++                    target_ready = state_it != status.end() && state_it->second == "ENABLED";
++                }
++            }
++        }
++
++        if (target_ready) {
++            break;
++        }
++
++        if (attempt < MLD_ADD_TARGET_READY_MAX_RETRIES) {
++            std::this_thread::sleep_for(MLD_ADD_TARGET_READY_RETRY_DELAY);
++        }
++    }
++
++    if (!target_ready) {
++        LOG(WARNING) << "MLD target " << new_iface
++                     << " did not reach hostapd ENABLED state after "
++                     << MLD_ADD_TARGET_READY_MAX_RETRIES
++                     << " attempts";
++        // If this call created the target mapping, release it before returning.
++        // Otherwise every failed cross-radio readiness attempt retains a pair
++        // of control sockets and the next retry eventually exhausts FDs. Keep
++        // a mapping owned by the caller intact.
++        if (!target_ctrl_was_registered && is_wpa_ctrl_interface_registered(new_iface)) {
++            remove_interface(new_iface);
++        }
+         return false;
++    } else {
++        LOG(INFO) << "MLD target " << new_iface << " is ready for MLD_ADD_LINK";
+     }
+ 
+-    // add_interface() above only proves new_iface's ctrl_iface socket *file* exists (it is
+-    // created early). When new_iface is the MLD primary owned by a *different* radio's
+-    // fronthaul manager process, that process may still be mid-way through bringing it up
+-    // (writing hostapd.conf, ADD_MLD_ENTRIES, etc.) and not yet actively bound/listening on
+-    // the socket, so an MLD_ADD_LINK sent now can fail at the transport layer before hostapd
+-    // ever sees it. Wait for the socket to actually answer a PING before proceeding, instead
+-    // of relying on the short fixed retry budget below to also cover this readiness gap.
++    int fd_link = beerocks::net::FileDescriptor::invalid_descriptor;
++    std::string new_bss_link = new_iface;
+     {
+-        constexpr int kCtrlReadyMaxRetries = 25;
+-        constexpr std::chrono::milliseconds kCtrlReadyRetryDelay(200);
+-        bool ctrl_ready = wpa_ctrl_send_msg("PING", new_iface);
+-        for (int attempt = 1; !ctrl_ready && attempt < kCtrlReadyMaxRetries; ++attempt) {
+-            std::this_thread::sleep_for(kCtrlReadyRetryDelay);
+-            // A failed PING can leave the connected AF_UNIX datagram socket poisoned (e.g.
+-            // ECONNREFUSED while hostapd was transiently unavailable/busy servicing another
+-            // radio's concurrent MLD_ADD_LINK) - resending on the same fd keeps failing
+-            // identically even once hostapd recovers, so reopen the socket before retrying.
+-            reconnect_wpa_ctrl_cmd_socket(new_iface);
+-            ctrl_ready = wpa_ctrl_send_msg("PING", new_iface);
+-        }
+-        if (!ctrl_ready) {
+-            LOG(WARNING) << "Control socket for " << new_iface << " did not answer PING after "
+-                         << kCtrlReadyMaxRetries << " attempts - proceeding with MLD_ADD_LINK anyway";
+-        }
+-    }
+-
+-    //Disable the previous interface if a BSS name change is detected
+-    if (!prev_iface.empty()) {
+-        std::string base_iface;
+-        std::stringstream remove_cmd;
+-        extractLinkBaseInterface(prev_iface, base_iface);
++        ScopedMldReconfigLock add_lock(new_iface, "MLD_ADD_LINK");
+ 
+-        remove_cmd << "REMOVE " << base_iface;
++        //Disable the previous interface if a BSS name change is detected
++        if (!prev_iface.empty()) {
++            std::string base_iface;
++            std::stringstream remove_cmd;
++            extractLinkBaseInterface(prev_iface, base_iface);
+ 
+-        if (!wpa_ctrl_send_msg(remove_cmd.str(), global_iface)) {
+-            LOG(ERROR) << "Failed to remove iface: " << base_iface;
+-            return false;
+-        }
++            remove_cmd << "REMOVE " << base_iface;
+ 
+-        if (prev_iface != m_radio_info.iface_name) {
+-            if (!m_nl80211_client->remove_vap_interface(base_iface)) {
+-                LOG(ERROR) << "Failed to remove vap iface: " << base_iface;
+-            } 
+-        }
+-    } 
++            if (!wpa_ctrl_send_msg(remove_cmd.str(), global_iface)) {
++                LOG(ERROR) << "Failed to remove iface: " << base_iface;
++                return false;
++            }
+ 
+-    parsed_obj_map_t reply;
++            if (prev_iface != m_radio_info.iface_name) {
++                if (!m_nl80211_client->remove_vap_interface(base_iface)) {
++                    LOG(ERROR) << "Failed to remove vap iface: " << base_iface;
++                }
++            }
++        }
+ 
+-    // Do not retry MLD_ADD_LINK on failure: a failed attempt can leave a stale kernel
+-    // debugfs link-<id> entry for this MLD (observed via hostapd's own log: "MLD: Failed
+-    // to add link 1 in MLD wlan2_1" followed by "debugfs: Directory 'link-1' ... already
+-    // present!" on the next attempt), which then blocks every subsequent identical retry
+-    // with the same failure — retrying only compounds the problem instead of resolving it.
+-    cmd << "MLD_ADD_LINK bss_config=" <<m_radio_info.phy_name<< ":" <<conf_path;
+-    if (!wpa_ctrl_send_msg(cmd.str(), new_iface)) {
+-        LOG(ERROR) << "Failed to add link to the BSS: " << new_iface;
+-        return false;
+-    }
++        // Do not retry MLD_ADD_LINK on failure: a failed attempt can leave a stale kernel
++        // debugfs link-<id> entry for this MLD (observed via hostapd's own log: "MLD: Failed
++        // to add link 1 in MLD wlan2_1" followed by "debugfs: Directory 'link-1' ... already
++        // present!" on the next attempt), which then blocks every subsequent identical retry
++        // with the same failure — retrying only compounds the problem instead of resolving it.
++        cmd << "MLD_ADD_LINK bss_config=" <<m_radio_info.phy_name<< ":" <<conf_path;
++        if (!wpa_ctrl_send_msg(cmd.str(), new_iface)) {
++            LOG(ERROR) << "Failed to add link to the BSS: " << new_iface;
++            return false;
++        }
+ 
+-    std::string new_bss_link = new_iface;
+-    std::string bssid = tlvf::mac_to_string(bss_conf.bssid);
+-    int8_t link_id = 0;
++        std::string bssid = tlvf::mac_to_string(bss_conf.bssid);
++        int8_t link_id = 0;
+ 
+-    if (!m_nl80211_client->get_bss_link_id(new_bss_link,bssid,link_id)) {
+-            LOG(ERROR) << " get_bss_link_id failed " ;
+-    }
++        if (!m_nl80211_client->get_bss_link_id(new_bss_link,bssid,link_id)) {
++                LOG(ERROR) << " get_bss_link_id failed " ;
++        }
+ 
+-    LOG(INFO) << "link_id updated to: " << link_id;
+-    LOG(INFO) << "bss updated to: " << new_bss_link;
+-    fd = base_wlan_hal_nl80211::add_interface(new_bss_link);
+-    if (fd < 0) {
+-        LOG(ERROR) << "Failed to register and connect the Link of new BSS interface!";
++        LOG(INFO) << "link_id updated to: " << link_id;
++        LOG(INFO) << "bss updated to: " << new_bss_link;
++        fd_link = base_wlan_hal_nl80211::add_interface(new_bss_link);
++        if (fd_link < 0) {
++            LOG(ERROR) << "Failed to register and connect the Link of new BSS interface!";
++            // Do not report MLD_ADD_LINK as successful when the resulting link
++            // cannot be observed by the HAL. Returning success here leaves the
++            // VAP in the database as an MLD member although its control socket
++            // and ifindex were never registered, which prevents the next
++            // 2.4/5 GHz update from repairing the link.
++            return false;
++        }
+     }
+ 
+     if (prev_iface == m_radio_info.iface_name) {
+@@ -10320,13 +10472,16 @@ bool ap_wlan_hal_nl80211::handle_mld_reconfig(std::string target_ssid, int8_t ml
+                 return false;
+             }
+             
+-            std::stringstream remove_cmd;
+-            remove_cmd << "LINK_REMOVE " << HOST_MIN_ML_RECONF_COUNT;
++            {
++                ScopedMldReconfigLock remove_lock(vap_info.bss, "LINK_REMOVE");
++                std::stringstream remove_cmd;
++                remove_cmd << "LINK_REMOVE " << HOST_MIN_ML_RECONF_COUNT;
+ 
+-            LOG(DEBUG) << "CMD framed : " << remove_cmd.str();
+-            if (!wpa_ctrl_send_msg(remove_cmd.str(), vap_info.bss)) {
+-                LOG(ERROR) << "Failed to remove link of " << vap_info.bss;
+-                return false;
++                LOG(DEBUG) << "CMD framed : " << remove_cmd.str();
++                if (!wpa_ctrl_send_msg(remove_cmd.str(), vap_info.bss)) {
++                    LOG(ERROR) << "Failed to remove link of " << vap_info.bss;
++                    return false;
++                }
+             }
+ 
+             auto &vap_id = base_conf.get_vap_by_bssid(vap_info.mac);
+@@ -10502,26 +10657,30 @@ bool ap_wlan_hal_nl80211::handle_mld_reconfig(std::string target_ssid, int8_t ml
+                      }
+ 
+                 }
+-                std::stringstream cmd;
+-                cmd << "ADD bss_config=" <<m_radio_info.phy_name<< ":" <<conf_path;
+-                if (!wpa_ctrl_send_msg(cmd.str(), global_iface)) {
+-                    LOG(WARNING) << "Failed to create the new BSS: " << new_vap_name
+-                                 << ", retrying once after clearing any stale hostapd/kernel"
+-                                    " state left over from a previous cycle";
+-                    clear_stale_hostapd_iface(new_vap_name);
++                {
++                    ScopedMldReconfigLock add_lock(new_vap_name, "ADD");
++
++                    std::stringstream cmd;
++                    cmd << "ADD bss_config=" <<m_radio_info.phy_name<< ":" <<conf_path;
+                     if (!wpa_ctrl_send_msg(cmd.str(), global_iface)) {
+-                        LOG(ERROR) << "Failed to create the new BSS: " << new_vap_name
+-                                   << " (after retry)";
+-                        return false;
++                        LOG(WARNING) << "Failed to create the new BSS: " << new_vap_name
++                                     << ", retrying once after clearing any stale hostapd/kernel"
++                                        " state left over from a previous cycle";
++                        clear_stale_hostapd_iface(new_vap_name);
++                        if (!wpa_ctrl_send_msg(cmd.str(), global_iface)) {
++                            LOG(ERROR) << "Failed to create the new BSS: " << new_vap_name
++                                       << " (after retry)";
++                            return false;
++                        }
++                        LOG(INFO) << "ADD BSS succeeded for " << new_vap_name
++                                  << " after clearing stale state";
+                     }
+-                    LOG(INFO) << "ADD BSS succeeded for " << new_vap_name
+-                              << " after clearing stale state";
+-                }
+ 
+-                int fd = base_wlan_hal_nl80211::add_interface(new_vap_name);
+-                if (fd < 0) {
+-                    LOG(DEBUG) << "Failed to register and connect the new BSS interface!";
+-                    return false;
++                    int fd = base_wlan_hal_nl80211::add_interface(new_vap_name);
++                    if (fd < 0) {
++                        LOG(DEBUG) << "Failed to register and connect the new BSS interface!";
++                        return false;
++                    }
+                 }
+                 prplmesh::hostapd::Configuration updated_base_conf = load_hostapd_config(m_radio_info.iface_name,"");
+                 // Add new bss configuration to default hostapd_config file
+@@ -10588,23 +10747,25 @@ bool ap_wlan_hal_nl80211::handle_mld_reconfig(std::string target_ssid, int8_t ml
+                 return false;
+             }
+ 
+-            std::stringstream remove_cmd;
+             std::string base_iface;
+             extractLinkBaseInterface(vap_info.bss, base_iface);
+-        
+-            remove_cmd << "REMOVE " << base_iface;
++            {
++                ScopedMldReconfigLock remove_lock(base_iface, "REMOVE");
++                std::stringstream remove_cmd;
++                remove_cmd << "REMOVE " << base_iface;
+ 
+-            if (!wpa_ctrl_send_msg(remove_cmd.str(), global_iface)) {
+-                LOG(ERROR) << "Failed to remove iface: " << base_iface;
+-                return false;
++                if (!wpa_ctrl_send_msg(remove_cmd.str(), global_iface)) {
++                    LOG(ERROR) << "Failed to remove iface: " << base_iface;
++                    return false;
++                }
++                // remove the fd for this link iface
++                base_wlan_hal_nl80211::remove_interface(vap_info.bss);
++
++                // Delete SLO interface
++                if (!m_nl80211_client->remove_vap_interface(base_iface)) {
++                    LOG(ERROR) << "Failed to remove vap iface: " << base_iface;
++                }
+             }
+-            // remove the fd for this link iface
+-            base_wlan_hal_nl80211::remove_interface(vap_info.bss);
+-            
+-            // Delete SLO interface
+-            if (!m_nl80211_client->remove_vap_interface(base_iface)) {
+-	        LOG(ERROR) << "Failed to remove vap iface: " << base_iface;
+-            } 
+             m_radio_info.bssid_pool[vap_info.mac] = false;
+         }
+ 
+@@ -10695,30 +10856,49 @@ bool ap_wlan_hal_nl80211::handle_mld_reconfig(std::string target_ssid, int8_t ml
+                 LOG(ERROR) << "Failed to register and connect the new BSS interface!";
+                 return false;
+             }
+-            std::stringstream cmd;
+-            // Do not retry on failure — see add_mld_link() for why: a failed MLD_ADD_LINK
+-            // can leave a stale kernel debugfs link-<id> entry that blocks every
+-            // subsequent identical retry.
+-            cmd << "MLD_ADD_LINK bss_config=" <<m_radio_info.phy_name<< ":" <<conf_path;
+-            if (!wpa_ctrl_send_msg(cmd.str(), mld_iface)) {
+-                LOG(ERROR) << "Failed to add link to the BSS: " << mld_iface;
+-                return false;
++            {
++                bool ctrl_ready = wpa_ctrl_send_msg("PING", mld_iface);
++                for (int attempt = 1; !ctrl_ready && attempt < MLD_ADD_CTRL_READY_MAX_RETRIES;
++                     ++attempt) {
++                    std::this_thread::sleep_for(MLD_ADD_CTRL_READY_RETRY_DELAY);
++                    reconnect_wpa_ctrl_cmd_socket(mld_iface);
++                    ctrl_ready = wpa_ctrl_send_msg("PING", mld_iface);
++                }
++                if (!ctrl_ready) {
++                    LOG(WARNING) << "Control socket for " << mld_iface
++                                 << " did not answer PING after "
++                                 << MLD_ADD_CTRL_READY_MAX_RETRIES
++                                 << " attempts - proceeding with MLD_ADD_LINK anyway";
++                }
+             }
++            {
++                ScopedMldReconfigLock add_lock(mld_iface, "MLD_ADD_LINK");
+ 
+-            std::string new_bss_link = mld_iface;
+-            std::string bssid = tlvf::mac_to_string(new_bssid);
+-            int8_t link_id = 0;
++                std::stringstream cmd;
++                // Do not retry on failure — see add_mld_link() for why: a failed MLD_ADD_LINK
++                // can leave a stale kernel debugfs link-<id> entry that blocks every
++                // subsequent identical retry.
++                cmd << "MLD_ADD_LINK bss_config=" <<m_radio_info.phy_name<< ":" <<conf_path;
++                if (!wpa_ctrl_send_msg(cmd.str(), mld_iface)) {
++                    LOG(ERROR) << "Failed to add link to the BSS: " << mld_iface;
++                    return false;
++                }
+ 
+-            if (!m_nl80211_client->get_bss_link_id(new_bss_link,bssid,link_id)) {
+-                    LOG(ERROR) << " get_bss_link_id failed " ;
+-            }
++                std::string new_bss_link = mld_iface;
++                std::string bssid = tlvf::mac_to_string(new_bssid);
++                int8_t link_id = 0;
+ 
+-            LOG(INFO) << "link_id updated to: " << link_id;
+-            LOG(INFO) << "bss updated to: " << new_bss_link;
+-            fd = base_wlan_hal_nl80211::add_interface(new_bss_link);
+-            if (fd < 0) {
+-                LOG(ERROR) << "Failed to register and connect the Link of new BSS interface!";
+-                return false;
++                if (!m_nl80211_client->get_bss_link_id(new_bss_link,bssid,link_id)) {
++                        LOG(ERROR) << " get_bss_link_id failed " ;
++                }
++
++                LOG(INFO) << "link_id updated to: " << link_id;
++                LOG(INFO) << "bss updated to: " << new_bss_link;
++                fd = base_wlan_hal_nl80211::add_interface(new_bss_link);
++                if (fd < 0) {
++                    LOG(ERROR) << "Failed to register and connect the Link of new BSS interface!";
++                    return false;
++                }
+             }
+             // Add new bss configuration to default hostapd_config file
+             if (!m_radio_info.hostapd_new_bss_config.empty()) {
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index deb9631e8..bc356c43f 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -554,7 +554,19 @@ bool base_wlan_hal_nl80211::fsm_setup()
+             [&](TTransition &transition, const void *args) -> bool {
+                 // Attempt to read radio info
+                 if (!refresh_radio_info()) {
+-                    return (transition.change_destination(nl80211_fsm_state::Detach));
++                    // hostapd can expose the control socket before the radio/BSS
++                    // is ready to answer STATUS.  Detaching here destroys the
++                    // fronthaul and makes the agent restart this radio forever
++                    // (the phy00.1 loop in debug-agent.txt). Keep the HAL in
++                    // GetRadioInfo until the normal attach timeout expires so
++                    // the same socket can recover when hostapd finishes its
++                    // asynchronous MLO/VAP setup.
++                    if (std::chrono::steady_clock::now() >= m_state_timeout) {
++                        LOG(ERROR) << "Timed out waiting for hostapd radio STATUS";
++                        return (transition.change_destination(nl80211_fsm_state::Detach));
++                    }
++                    LOG(DEBUG) << "Radio STATUS is not ready; retrying GetRadioInfo";
++                    return false;
+                 }
+ 
+                 // Move to the next state
+@@ -1282,17 +1294,29 @@ bool base_wlan_hal_nl80211::get_vap_status(
+ {
+     if (!refresh_vaps_info(beerocks::IFACE_RADIO_ID)) {
+         LOG(ERROR) << "Refresh vap info failed for " << m_radio_info.iface_name;
+-        std::string interface;
+-        for (auto &fd : m_fds_ext_events) {
++        // remove_interface() erases the event fd from m_fds_ext_events. Do not
++        // iterate that vector while removing its entries: the old range-based
++        // loop invalidated its iterator and skipped entries, leaving their
++        // wpa_ctrl command/event sockets open. Repeated STATUS failures then
++        // exhausted the system file table and hostapd started returning EMFILE
++        // for otherwise valid ADD requests.
++        std::vector<std::string> interfaces_to_remove;
++        for (const auto &fd : m_fds_ext_events) {
+             if (fd > 0) {
+-                interface = m_wpa_ctrl_client.get_interface(fd);
+-                LOG(INFO) << "Removing interface " << interface << " having fd: " << fd;
+-                if (!interface.empty()) {
+-                    remove_interface(interface);
++                const auto interface = m_wpa_ctrl_client.get_interface(fd);
++                if (!interface.empty() &&
++                    std::find(interfaces_to_remove.begin(), interfaces_to_remove.end(),
++                              interface) == interfaces_to_remove.end()) {
++                    interfaces_to_remove.push_back(interface);
+                 }
+             }
+         }
+ 
++        for (const auto &interface : interfaces_to_remove) {
++            LOG(INFO) << "Removing interface " << interface;
++            remove_interface(interface);
++        }
++
+         int fd = add_interface(m_radio_info.iface_name);
+         LOG(DEBUG) << "get_vap_status: add iface fd: " << fd;
+ 
+@@ -1467,6 +1491,27 @@ bool base_wlan_hal_nl80211::refresh_vaps_info(int id)
+                    << ", SSID: " << vap_element.ssid << ", BSS: " << vap_element.bss << ", AP_MLD_MAC: " << vap_element.ap_mld_mac
+                    << ", MLD_ID: " << vap_element.mld_id;
+ 
++        // FIX_VALIDATE_4669407: on a shared wiphy this HAL instance must only report VAPs whose
++        // BSS iface belongs to THIS radio. Flag when the reported VAP BSS base-iface (before the
++        // "_link"/"." suffix) does not match this HAL's radio iface (get_iface_name()). That is the
++        // earliest injection point of the 5G/6G BSS<->radio cross-binding seen in the controller
++        // data model. Base-iface = substring up to first '.' (e.g. "wlan0_1" from "wlan0_1_link2",
++        // "phy00" from "phy00.2") — computed inline to avoid an agent-layer include in BWL.
++        {
++            const std::string fv_radio_iface = get_iface_name();
++            auto fv_base = [](const std::string &s) {
++                auto p = s.find('.');
++                return (p == std::string::npos) ? s : s.substr(0, p);
++            };
++            const std::string fv_vap_base   = fv_base(vap_element.bss);
++            const std::string fv_radio_base = fv_base(fv_radio_iface);
++            const bool fv_mismatch = !fv_vap_base.empty() && !fv_radio_base.empty() &&
++                                     fv_vap_base != fv_radio_base;
++            LOG(DEBUG) << "FIX_VALIDATE_4669407: HAL refresh_vaps radio_iface=" << fv_radio_iface
++                       << " vap_id=" << vap_id << " vap_bss=" << vap_element.bss
++                       << " vap_mac=" << vap_element.mac << (fv_mismatch ? "  <<< MISMATCH" : "");
++        }
++
+         // Since some of the required information is not exist on the "STATUS" command reply, it
+         // was pre-inserted when configured the BSSs. Therefore, not overriding the whole struct at
+         // the mapped value of "available_vaps[vap_id]", instead copy the struct members one by one,
+@@ -1951,29 +1996,32 @@ bool base_wlan_hal_nl80211::register_wpa_ctrl_interface(const std::string &inter
+     // would keep failing even though hostapd is actually up and serving a dedicated
+     // socket for it, same as it does for every secondary BSS.
+     //
+-    // An empty get_iface_name() means no VAP exists yet on this radio (e.g.
+-    // re-enabling from a full teardown) - the interface being registered is about to
+-    // become the primary, so use the global socket path directly (matching how the
+-    // "ADD bss_config=..." command itself is dispatched over the global control
+-    // interface) instead of requiring its own dedicated socket file to already exist.
+-    if (!get_iface_name().empty()) {
+-        bool is_secondary_bss = (interface.compare(get_iface_name()) != 0);
+-
+-        // Get wpa_ctrl socket directory:
+-        // including all socket files.
++    // Prefer a dedicated socket whenever it already exists, even if this HAL has
++    // no local primary VAP yet. This matters for MLO: the 2.4/5 GHz HAL may add a
++    // link to an MLD primary created by the 6 GHz HAL, so `interface` can be a
++    // foreign MLD name while get_iface_name() is still empty. Registering that
++    // target on global makes STATUS return FAIL and the MLD readiness loop can
++    // never reach MLD_ADD_LINK.
++    //
++    // If the dedicated socket does not exist yet, retain the global fallback for
++    // the first local BSS: ADD is dispatched through global and hostapd creates
++    // the dedicated socket only after the netdev/BSS comes up. A later call will
++    // rebind the logical interface to that dedicated socket.
++    {
++        bool is_secondary_bss = !get_iface_name().empty() &&
++                                (interface.compare(get_iface_name()) != 0);
++
++        // Get wpa_ctrl socket directory, including all socket files.
+         auto pos = wpa_ctrl_path.find_last_of("/");
+         if (pos != std::string::npos) {
+             pos += 1;
+         }
+         auto dedicated_path = wpa_ctrl_path.substr(0, pos) + interface;
+ 
+-        // Secondary BSSs must have their own dedicated socket, so retry for up to
+-        // 500 milliseconds as before. The primary VAP is allowed to fall back to
+-        // "global" for this attempt if its dedicated socket isn't there yet (e.g.
+-        // right after the zero-VAP ADD) - a later re-registration attempt (e.g. from
+-        // get_vap_status()'s failure-recovery path) will pick up the dedicated socket
+-        // once hostapd creates it.
+-        int retry_count = is_secondary_bss ? 6 : 1; //count intialized to retry for 500 milliseconds max
++        // Secondary BSSs must have their own socket, so retry for up to 500 ms.
++        // A local primary or a foreign MLD target may fall back to global for one
++        // attempt if hostapd has not created the dedicated socket yet.
++        int retry_count = is_secondary_bss ? 6 : 1;
+ 
+         do {
+             retry_count--;
+@@ -2369,16 +2417,23 @@ int base_wlan_hal_nl80211::add_interface(const std::string &interface)
+         return beerocks::net::FileDescriptor::invalid_descriptor;
+     }
+ 
++    const auto unregister_failed_interface = [this, &interface]() {
++        m_wpa_ctrl_client.del_interface(interface);
++        auto &active_BSSs = m_radio_info.active_BSSs;
++        active_BSSs.erase(std::remove(active_BSSs.begin(), active_BSSs.end(), interface),
++                          active_BSSs.end());
++    };
++
+     if (!m_wpa_ctrl_client.get_socket_cmd(interface)->connect()) {
+         LOG(ERROR) << "Failed to connect cmd socket for interface " << interface;
+-        m_wpa_ctrl_client.del_interface(interface);
++        unregister_failed_interface();
+         return beerocks::net::FileDescriptor::invalid_descriptor;
+     }
+ 
+     auto event_socket = m_wpa_ctrl_client.get_socket_event(interface);
+     if (!event_socket->connect()) {
+         LOG(ERROR) << "Failed to connect event socket for interface " << interface;
+-        m_wpa_ctrl_client.del_interface(interface);
++        unregister_failed_interface();
+         return beerocks::net::FileDescriptor::invalid_descriptor;
+     }
+ 
+@@ -2406,6 +2461,11 @@ int base_wlan_hal_nl80211::add_interface(const std::string &interface)
+         if (iface_index == 0) {
+             LOG(ERROR) << "Failed reading the index of interface " << base_iface_name  << ": "
+                        << strerror(errno);
++            // register_wpa_ctrl_interface() adds the interface to both the
++            // control-socket map and active_BSSs before the netdev exists. If
++            // the netdev never appears, release both sockets immediately;
++            // otherwise every failed ADD/MLD readiness probe leaks two FDs.
++            unregister_failed_interface();
+             return beerocks::net::FileDescriptor::invalid_descriptor;
+         }
+         m_iface_index.emplace(base_iface_name, iface_index);
+@@ -2421,7 +2481,22 @@ bool base_wlan_hal_nl80211::remove_interface(const std::string &interface)
+         return false;
+     }
+ 
++    // The global control socket is owned by hostapd for its whole lifetime; it
++    // is intentionally not removed when this HAL mapping is torn down. Waiting
++    // for /var/run/hostapd/global to disappear only adds 800 ms to every
++    // recovery cycle and produces a false timeout.
++    if (interface == global_iface) {
++        auto &active_BSSs = m_radio_info.active_BSSs;
++        active_BSSs.erase(std::remove(active_BSSs.begin(), active_BSSs.end(), interface),
++                          active_BSSs.end());
++        std::string base_iface_name;
++        extractLinkBaseInterface(interface, base_iface_name);
++        m_iface_index.erase(base_iface_name);
++        return true;
++    }
++
+     int retry_count = 8; // e.g., retry for 0.8 seconds (8 * 100ms)
++    bool socket_removed = true;
+     std::string socket_path = "/var/run/hostapd/" + interface;
+     
+     auto start_time = std::chrono::steady_clock::now();
+@@ -2439,7 +2514,12 @@ bool base_wlan_hal_nl80211::remove_interface(const std::string &interface)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (retry_count <= 0) {
+                LOG(ERROR) << "Timeout waiting for socket removal!";
+-               return false;
++               // The local wpa_ctrl mapping was already erased above. Do not
++               // return before removing the corresponding active-BSS and
++               // cached-ifindex entries; otherwise a foreign MLD target whose
++               // hostapd socket remains alive is left as a stale local entry.
++               socket_removed = false;
++               break;
+            }
+        }
+    } while (retry_count > 0);
+@@ -2465,7 +2545,7 @@ bool base_wlan_hal_nl80211::remove_interface(const std::string &interface)
+    extractLinkBaseInterface(interface, base_iface_name);
+    m_iface_index.erase(base_iface_name);
+ 
+-   return true;
++   return socket_removed;
+ }
+ 
+ void base_wlan_hal_nl80211::update_default_iface_name(const std::string &new_iface_name)
+diff --git a/common/beerocks/scripts/prplmesh_utils.sh.in b/common/beerocks/scripts/prplmesh_utils.sh.in
+index 865f7a414..5ce62c6a5 100755
+--- a/common/beerocks/scripts/prplmesh_utils.sh.in
++++ b/common/beerocks/scripts/prplmesh_utils.sh.in
+@@ -123,8 +123,43 @@ prplmesh_framework_init() {
+         exit 1
+     }
+ 
++    # The agent init script can start the transport when it is launched
++    # independently during boot.  Do not start a second transport here: each
++    # instance owns a separate broker and clients connected to different
++    # brokers cannot exchange controller/agent CMDUs.
++    # Use the full command line because Linux process names can be truncated
++    # to 15 characters, while ieee1905_transport is longer than that.
++    if pgrep -f '[/]ieee1905_transport' >/dev/null 2>&1; then
++        echo "prplmesh_framework_init - ieee1905_transport is already running, reusing it"
++
++        # If the existing process is still completing its startup, wait for
++        # the broker socket before starting clients which need it.
++        count=1
++        while [ "$count" -le 30 ] && [ ! -S /tmp/beerocks/uds_broker ]; do
++            sleep 1
++            count=$((count + 1))
++        done
++
++        if [ ! -S /tmp/beerocks/uds_broker ]; then
++            echo "prplmesh_framework_init - existing ieee1905_transport broker is not ready" >&2
++            return 1
++        fi
++        return 0
++    fi
++
+     echo "prplmesh_framework_init - starting ieee1905_transport process..."
+     "$PRPLMESH_DIR/bin/ieee1905_transport" &
++
++    count=1
++    while [ "$count" -le 30 ] && [ ! -S /tmp/beerocks/uds_broker ]; do
++        sleep 1
++        count=$((count + 1))
++    done
++
++    if [ ! -S /tmp/beerocks/uds_broker ]; then
++        echo "prplmesh_framework_init - ieee1905_transport broker is not ready" >&2
++        return 1
++    fi
+ }
+ 
+ prplmesh_framework_deinit() {
+@@ -148,6 +183,22 @@ prplmesh_agent_start() {
+     "$PRPLMESH_DIR/bin/beerocks_agent" &
+ }
+ 
++# prplmesh-agent is a procd-managed helper, not an independently bootable
++# service.  Mark the intentional request before invoking it so an old/enabled
++# rc.d entry cannot start a no-radio agent concurrently during boot.
++prplmesh_agent_service_start() {
++    # Clear an instance left by an older package version before requesting the
++    # new procd instance. This is especially important during opkg upgrades,
++    # where the old service process can outlive the replaced init script.
++    /etc/init.d/prplmesh-agent stop >/dev/null 2>&1 || true
++    mkdir -p /tmp/beerocks
++    : > /tmp/beerocks/prplmesh-agent.start
++    /etc/init.d/prplmesh-agent start
++    status=$?
++    rm -f /tmp/beerocks/prplmesh-agent.start
++    return $status
++}
++
+ prplmesh_agent_stop() {
+     echo "prplmesh_agent_stop - stopping beerocks_agent process..."
+     killall_program beerocks_fronthaul
+@@ -335,28 +386,31 @@ start_function() {
+ 
+     # shellcheck disable=SC2050
+     [ "@BWL_TYPE@" = "DUMMY" ] && [ "$PLATFORM_INIT" = "true" ] && platform_init
+-    prplmesh_framework_init
++    prplmesh_framework_init || {
++        err "ieee1905_transport is not ready, aborting start"
++        return 1
++    }
+     case "$PRPLMESH_MODE" in
+         CA | ca)
+             prplmesh_platform_db_init "Multi-AP-Controller-and-Agent"
+             prplmesh_controller_start
+-            /etc/init.d/prplmesh-agent start
++            prplmesh_agent_service_start
+             prplmesh_vendor_message_start
+             ;;
+         NA | na)
+             prplmesh_platform_db_init "Non-Prpl-Controller-and-Agent"
+-            /etc/init.d/prplmesh-agent start
++            prplmesh_agent_service_start
+             prplmesh_vendor_message_start
+             ;;
+         C | c)
+             prplmesh_platform_db_init "Multi-AP-Controller"
+             prplmesh_controller_start
+             # Dummy agent configures transport layer
+-            /etc/init.d/prplmesh-agent start
++            prplmesh_agent_service_start
+             ;;
+         A | a)
+             prplmesh_platform_db_init "Multi-AP-Agent" "WDS-Repeater"
+-            /etc/init.d/prplmesh-agent start
++            prplmesh_agent_service_start
+             prplmesh_vendor_message_start
+             ;;
+         * ) err "unsupported mode: $PRPLMESH_MODE"; usage; exit 1 ;;
+diff --git a/controller/config/beerocks_controller.conf.in b/controller/config/beerocks_controller.conf.in
+index 21b7a09d5..b3a26c93b 100644
+--- a/controller/config/beerocks_controller.conf.in
++++ b/controller/config/beerocks_controller.conf.in
+@@ -48,6 +48,9 @@ load_service_fairness=0
+ #    Enable Unicast Renew
+ enable_unicast_renew=0 # 0 - disabled, 1 - enabled
+ 
++#    Enable unicast-first ordering for trigger_ap_config_renew
++unicast_enable_on_cli_renew=1 # 0 - disabled, 1 - enabled
++
+ # Config Parameters
+ ire_rssi_report_rate_sec=30
+ global_restricted_channels=
+diff --git a/controller/src/beerocks/master/beerocks_master_main.cpp b/controller/src/beerocks/master/beerocks_master_main.cpp
+index 985e5576b..208010f9e 100644
+--- a/controller/src/beerocks/master/beerocks_master_main.cpp
++++ b/controller/src/beerocks/master/beerocks_master_main.cpp
+@@ -232,6 +232,8 @@ static void fill_master_config(son::db::sDbMasterConfig &master_conf,
+     master_conf.enable_cotdma              = (main_master_conf.enable_cotdma == "1");
+ 
+     master_conf.enable_unicast_renew = (main_master_conf.enable_unicast_renew == "1");
++    master_conf.unicast_enable_on_cli_renew =
++        (main_master_conf.unicast_enable_on_cli_renew == "1");
+ 
+     master_conf.load_backhaul_measurements = (main_master_conf.load_backhaul_measurements == "1");
+     master_conf.load_front_measurements    = (main_master_conf.load_front_measurements == "1");
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 453e93f94..d346bc6fa 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -5535,6 +5535,15 @@ bool Controller::handle_cmdu_control_message(
+              vap_id++) {
+             auto vap_mac = tlvf::mac_to_string(notification->params().vaps[vap_id].mac);
+             if (vap_mac != beerocks::net::network_utils::ZERO_MAC_STRING) {
++                // FIX_VALIDATE_4669407: this whole batch is bound to the radio resolved from the
++                // action-header radio_mac. Each vap also carries its own iface_name. Log the header
++                // radio (radio_mac / radio->radio_uid) against each vap's iface_name+mac BEFORE
++                // add_bss so we can see if a 5G vap is about to be filed under the 6G radio in the
++                // controller data model (the observed BSS<->radio cross-bind).
++                LOG(DEBUG) << "FIX_VALIDATE_4669407: ctrl VAPS_LIST header_radio_mac=" << radio_mac
++                           << " radio_uid=" << radio->radio_uid << " vap_id=" << int(vap_id)
++                           << " vap_iface=" << (char *)notification->params().vaps[vap_id].iface_name
++                           << " vap_mac=" << vap_mac;
+                 auto bss = database.add_bss(
+                     *radio, notification->params().vaps[vap_id].mac,
+                     std::string((char *)notification->params().vaps[vap_id].ssid), vap_id);
+diff --git a/controller/src/beerocks/master/db/db.h b/controller/src/beerocks/master/db/db.h
+index 3850053ee..02659ca6f 100644
+--- a/controller/src/beerocks/master/db/db.h
++++ b/controller/src/beerocks/master/db/db.h
+@@ -246,6 +246,7 @@ public:
+         unsigned int channel_utilization_threshold;
+         unsigned int rcpi_steering_threshold;
+         bool enable_unicast_renew;
++        bool unicast_enable_on_cli_renew = true;
+ 
+         //Health monitoring task configuration
+         bool health_monitoring_enabled = false;
+diff --git a/controller/src/beerocks/master/son_management.cpp b/controller/src/beerocks/master/son_management.cpp
+index 94a8d7978..5fa618ab9 100644
+--- a/controller/src/beerocks/master/son_management.cpp
++++ b/controller/src/beerocks/master/son_management.cpp
+@@ -867,7 +867,8 @@ void son_management::handle_cli_message(int sd, std::shared_ptr<beerocks_header>
+             ok = false;
+         } else {
+             auto renew_task =
+-                std::make_shared<son::ap_config_renew_sequencer_task>(database, cmdu_tx, tasks);
++                std::make_shared<son::ap_config_renew_sequencer_task>(
++                    database, cmdu_tx, tasks, database.config.unicast_enable_on_cli_renew);
+             database.assign_ap_config_renew_sequencer_task_id(renew_task->id);
+             if (!tasks.add_task(renew_task)) {
+                 LOG(ERROR) << "Failed adding ap_config_renew_sequencer_task!";
+diff --git a/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.cpp b/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.cpp
+index 3ba62fb0d..1598d9f05 100644
+--- a/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.cpp
++++ b/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.cpp
+@@ -14,8 +14,10 @@ using namespace son;
+ ap_config_renew_sequencer_task::ap_config_renew_sequencer_task(db &database_,
+                                                                 ieee1905_1::CmduMessageTx &cmdu_tx_,
+                                                                 task_pool &tasks_,
++                                                                bool unicast_enable_on_cli_renew_,
+                                                                 const std::string &task_name_)
+-    : task(task_name_), database(database_), cmdu_tx(cmdu_tx_), tasks(tasks_)
++    : task(task_name_), database(database_), cmdu_tx(cmdu_tx_), tasks(tasks_),
++      unicast_enable_on_cli_renew(unicast_enable_on_cli_renew_)
+ {
+     agents = son_actions::get_agents_farthest_to_nearest(database);
+ }
+@@ -35,7 +37,7 @@ void ap_config_renew_sequencer_task::work()
+         agent_awaiting_m2 = agents[next_agent_idx];
+         ++next_agent_idx;
+ 
+-        if (!database.config.enable_unicast_renew ||
++        if (!unicast_enable_on_cli_renew ||
+             !son_actions::send_single_ap_config_renew_msg(cmdu_tx, database, agent_awaiting_m2,
+                                                           false)) {
+             TASK_LOG(ERROR) << "Failed to send unicast AP-Config Renew to " << agent_awaiting_m2;
+diff --git a/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.h b/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.h
+index 83fd6f472..f8e521421 100644
+--- a/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.h
++++ b/controller/src/beerocks/master/tasks/ap_config_renew_sequencer_task.h
+@@ -13,19 +13,21 @@
+ namespace son {
+ 
+ /**
+- * @brief Paces out the CLI "trigger_ap_config_renew" sequence: unicasts the
+- *        AP-Configuration Renew to remote agents one at a time, farthest-from-controller
+- *        first, giving each up to AGENT_M2_TIMEOUT_MS to complete its M1/M2 exchange before
+- *        moving to the next-nearest agent. Once every remote agent has been unicast to, it
+- *        waits RENEW_STAGE_GAP_MS, sends the multicast Renew as a reliability backstop, waits
+- *        the same RENEW_STAGE_GAP_MS, and only then unicasts the Renew to the local/co-located
+- *        agent (database.get_local_bridge_mac()) - deliberately last, so the local agent
+- *        reconfigures only after every other agent in the topology already has.
++ * @brief Paces out the CLI "trigger_ap_config_renew" sequence. When enabled by
++ *        unicast_enable_on_cli_renew, it unicasts the AP-Configuration Renew to remote agents
++ *        one at a time, farthest-from-controller first, giving each up to
++ *        AGENT_M2_TIMEOUT_MS to complete its M1/M2 exchange before moving to the next-nearest
++ *        agent. Once remote processing is complete, it waits RENEW_STAGE_GAP_MS, sends the
++ *        multicast Renew as a reliability backstop, waits the same RENEW_STAGE_GAP_MS, and only
++ *        then unicasts the Renew to the local/co-located agent
++ *        (database.get_local_bridge_mac()) - deliberately last, so the local agent reconfigures
++ *        only after every other agent in the topology already has.
+  */
+ class ap_config_renew_sequencer_task : public task {
+ public:
+     ap_config_renew_sequencer_task(
+         db &database_, ieee1905_1::CmduMessageTx &cmdu_tx_, task_pool &tasks_,
++        bool unicast_enable_on_cli_renew_,
+         const std::string &task_name_ = std::string("ap_config_renew_sequencer_task"));
+     virtual ~ap_config_renew_sequencer_task() {}
+ 
+@@ -56,6 +58,7 @@ private:
+     db &database;
+     ieee1905_1::CmduMessageTx &cmdu_tx;
+     task_pool &tasks;
++    bool unicast_enable_on_cli_renew;
+ 
+     int state = SEND_NEXT_UNICAST;
+ 
+diff --git a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+index eb3082dab..89b6a01db 100644
+--- a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+@@ -9,6 +9,8 @@
+ #include "../common/utils/utils.h"
+ #include "../common/utils/utils_net.h"
+ 
++#include <algorithm>
++
+ #include <bcl/beerocks_string_utils.h>
+ #include <bpl/bpl_cfg.h>
+ #include <bpl/bpl_running_mode.h>
+@@ -756,10 +758,35 @@ bool bpl_cfg_get_bandwidth_by_phy(const std::string & /*phy_name*/,
+     return false;
+ }
+ 
+-bool bpl_cfg_get_radio_htmode(const std::string & /*iface*/, std::string & /*htmode*/)
++bool bpl_cfg_get_radio_htmode(const std::string &iface, std::string &htmode)
+ {
+-    LOG(DEBUG) << "bpl_cfg_get_radio_htmode: not implemented for DM platform";
+-    return false;
++    htmode.clear();
++
++    auto radio_obj = bpl_cfg_get_wifi_radio_object(iface);
++    if (!radio_obj) {
++        LOG(DEBUG) << "bpl_cfg_get_radio_htmode: no radio object for iface=" << iface;
++        return false;
++    }
++
++    std::string operating_standards;
++    if (!radio_obj->read_child(operating_standards, "OperatingStandards")) {
++        LOG(DEBUG) << "bpl_cfg_get_radio_htmode: cannot read OperatingStandards for iface="
++                   << iface;
++        return false;
++    }
++
++    // pwhm reports the radio's active 802.11 standards as a comma-separated list of IEEE
++    // short names (e.g. "a,n,ac,ax,be,bn"). "bn" is 802.11bn / Wi-Fi 8 (UHR PHY mode) - see
++    // tlvAirtiesRadioCapability::sStandards::s_80211bn for the same naming convention.
++    auto standards = string_utils::str_split(operating_standards, ',');
++    if (std::find(standards.begin(), standards.end(), "bn") == standards.end()) {
++        LOG(DEBUG) << "bpl_cfg_get_radio_htmode: iface=" << iface
++                   << " OperatingStandards=" << operating_standards << " (no 802.11bn/UHR)";
++        return false;
++    }
++
++    htmode = "UHR";
++    return true;
+ }
+ 
+ bool bpl_cfg_get_radio_disable_by_phy(const std::string & /*phy_name*/, bool & /*radio_disable*/)
+-- 
+2.34.1
+
