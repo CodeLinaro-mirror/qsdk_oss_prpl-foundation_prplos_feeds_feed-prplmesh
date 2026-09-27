@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Petr Štetiar <petr.stetiar@prplfoundation.org>
-Date: Sat, 26 Sep 2026 20:00:00 +0000
-Subject: [PATCH] nl80211: retry removal while a local BSS initializes
+Date: Sun, 27 Sep 2026 06:30:00 +0000
+Subject: [PATCH v2] nl80211: retry removal while a local BSS initializes
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -24,29 +24,50 @@ Reserve NOT_AVAILABLE for this no-mutation result; failures after SET
 retain the abort path, and CONTINUE still means REMOVE was accepted.
 
 Keep the removal action pending on the existing radio FSM timer for at
-most three one-second waits. Rebuild the fresh snapshot on each attempt,
+most six one-second waits. Rebuild the fresh snapshot on each attempt,
 and do not reset MLD links or advance to ADD while waiting. Fall back to
 the existing restart path on exhaustion or any hard failure. Preserve
 the retry count across dependency restarts; clear it when the action
 completes or is skipped. No separate timer survives radio cleanup.
 
+Six waits, not three: a cold-started iface sits in COUNTRY_UPDATE for
+hostapd's full five-second channel_list_update_timeout (setup_interface()
+in src/ap/hostapd.c of the hostapd tree) when no regulatory event ends
+it earlier, and a removal can start at the beginning of that window.
+Three waits only cover a removal that starts late in it, as in run-47d
+F108 where about three seconds had elapsed before the first preflight.
+Six waits put the last preflight one polling interval after the full
+timeout. Setup that completes earlier is acted on at the next poll, so
+the larger maximum does not lengthen the common case.
+
 Signed-off-by: Petr Štetiar <petr.stetiar@prplfoundation.org>
 ---
+ include/wld/wld.h                       |  1 +
+ include/wld/wld_rad_hostapd_api.h       |  3 +++
+ include_priv/nl80211/wld_hostapd_sock.h |  2 ++
+ src/Plugin/wifiGen_fsm.c                | 32 +++++++++++++++++++++++--
+ src/nl80211/wld_hostapd_sock.c          | 19 +++++++++++++--
+ src/nl80211/wld_rad_hostapd_api.c       | 27 ++++++++++++++++-----
+ 6 files changed, 74 insertions(+), 10 deletions(-)
+
 diff --git a/include/wld/wld.h b/include/wld/wld.h
-index 234923daad9c..82a3fdd5fea4 100644
+index 258d01c44adf..88f606aaddfc 100644
 --- a/include/wld/wld.h
 +++ b/include/wld/wld.h
-@@ -1703,4 +1703,5 @@ struct WLD_RADIO {
+@@ -1702,6 +1702,7 @@ struct WLD_RADIO {
+     T_FSM fsmRad;                                                           /* Global Radio FSM state */
      wld_fsmStats_t fsmStats;                                                /* Statistics on FSM usage */
      int fsmTO;
 +    unsigned int hapdRemoveRetries;                         /* Preserved across dependency restarts until removal completes. */
  
      bool stationMonitorEnabled;
+     bool stationMonitorOffChannelSupported;
 diff --git a/include/wld/wld_rad_hostapd_api.h b/include/wld/wld_rad_hostapd_api.h
 index 30065a86cad5..4f7083804e2c 100644
 --- a/include/wld/wld_rad_hostapd_api.h
 +++ b/include/wld/wld_rad_hostapd_api.h
-@@ -76,4 +76,7 @@ swl_rc_ne wld_rad_hostapd_enable(T_Radio* pR);
+@@ -75,6 +75,9 @@ swl_rc_ne wld_rad_hostapd_reconfigure(T_Radio* pR);
+ swl_rc_ne wld_rad_hostapd_enable(T_Radio* pR);
  swl_rc_ne wld_rad_hostapd_disable(T_Radio* pR);
  swl_rc_ne wld_rad_hostapd_addConf(T_Radio* pR);
 +/* SWL_RC_NOT_AVAILABLE: initializing local BSS; no mutation performed.
@@ -54,32 +75,38 @@ index 30065a86cad5..4f7083804e2c 100644
 + */
  swl_rc_ne wld_rad_hostapd_removeConf(T_Radio* pR);
  swl_trl_e wld_rad_hostapd_getCfgParamSupp(T_Radio* pRad, const char* param);
+ T_AccessPoint* wld_rad_hostapd_getFirstConnectedVap(T_Radio* pRad);
 diff --git a/include_priv/nl80211/wld_hostapd_sock.h b/include_priv/nl80211/wld_hostapd_sock.h
-index 4e2e3ae195ea..5ec532c0b5a9 100644
+index 3653826054bf..3eb294969fa9 100644
 --- a/include_priv/nl80211/wld_hostapd_sock.h
 +++ b/include_priv/nl80211/wld_hostapd_sock.h
-@@ -80,4 +80,6 @@ typedef struct wld_hostapd_sock {
+@@ -79,6 +79,8 @@ typedef struct wld_hostapd_sock {
+     bool enabled;
      bool resolved;
      bool nonBss;
 +    bool initializing;                 /* Stable self-listed zero/zero BSS in setup; never resolved. */
 +    char state[32];
      char phy[128];
      swl_chanspec_t chspec;
+     bool hasBand;
 diff --git a/src/Plugin/wifiGen_fsm.c b/src/Plugin/wifiGen_fsm.c
-index 08356dd5f36f..8951c3b116b2 100644
+index 140246ca6418..54811430d02f 100644
 --- a/src/Plugin/wifiGen_fsm.c
 +++ b/src/Plugin/wifiGen_fsm.c
-@@ -1428,5 +1428,8 @@ static bool s_doRecoverHostapd(T_Radio* pRad) {
+@@ -1489,7 +1489,10 @@ static bool s_doRecoverHostapd(T_Radio* pRad) {
+  * @param bool true when action is handled
   *             false when action is not handled and needs to be retried later
   */
 -static bool s_doRemoveHostapd(T_Radio* pRad) {
-+#define HAPD_REMOVE_RETRIES 3
++#define HAPD_REMOVE_RETRIES 6
 +#define HAPD_REMOVE_RETRY_MS 1000
 +
 +static bool s_tryRemoveHostapd(T_Radio* pRad) {
      ASSERTS_TRUE(wifiGen_hapd_isRunning(pRad), true, ME, "%s: hostapd stopped", pRad->Name);
      if(wld_secDmn_isGrpRestarting(pRad->hostapd)) {
-@@ -1439,5 +1442,19 @@ static bool s_doRemoveHostapd(T_Radio* pRad) {
+         SAH_TRACEZ_WARNING(ME, "%s: hostapd group is restarting: skip immediate adding conf", pRad->Name);
+@@ -1500,7 +1503,21 @@ static bool s_doRemoveHostapd(T_Radio* pRad) {
+     wld_wpaCtrlMngr_t* pMgr = wld_secDmn_getWpaCtrlMgr(pRad->hostapd);
      ASSERTI_NOT_NULL(wld_wpaCtrlMngr_getFirstAvailableInterface(pMgr), true, ME, "%s: no conf has been added yet", pRad->Name);
      SAH_TRACEZ_INFO(ME, "%s: remove config from hostapd", pRad->Name);
 -    if(wld_rad_hostapd_removeConf(pRad) < 0) {
@@ -100,7 +127,9 @@ index 08356dd5f36f..8951c3b116b2 100644
 +    if(rc < 0) {
          SAH_TRACEZ_ERROR(ME, "%s: warm apply failed to remove iface conf => restart to recover", pRad->Name);
          s_schedNextAction(SECDMN_ACTION_OK_NEED_RESTART, NULL, pRad);
-@@ -1449,4 +1466,15 @@ static bool s_doRemoveHostapd(T_Radio* pRad) {
+         return true;
+@@ -1510,6 +1527,17 @@ static bool s_doRemoveHostapd(T_Radio* pRad) {
+     return true;
  }
  
 +static bool s_doRemoveHostapd(T_Radio* pRad) {
@@ -116,18 +145,22 @@ index 08356dd5f36f..8951c3b116b2 100644
 +
  static bool s_doDisableHostapd(T_Radio* pRad) {
      ASSERTS_TRUE(wifiGen_hapd_isRunning(pRad), true, ME, "%s: hostapd stopped", pRad->Name);
+     ASSERTI_FALSE(s_checkHapdDown(pRad), true, ME, "%s: hapd iface already disabled", pRad->Name);
 diff --git a/src/nl80211/wld_hostapd_sock.c b/src/nl80211/wld_hostapd_sock.c
-index 43734e84ae16..a4a6cd388247 100644
+index 1b8cae2362f1..e7bb41948fda 100644
 --- a/src/nl80211/wld_hostapd_sock.c
 +++ b/src/nl80211/wld_hostapd_sock.c
-@@ -202,5 +202,5 @@ static swl_rc_ne s_resolveSock(const char* dir, const char* name, wld_hostapd_so
+@@ -201,7 +201,7 @@ static swl_rc_ne s_resolveSock(const char* dir, const char* name, wld_hostapd_so
+     swl_rc_ne rc = s_identityQuery(dir, name, "GET_CONFIG", reply, sizeof(reply), stats);
      bool configFailed = swl_rc_isOk(rc) && swl_str_matches(reply, "FAIL");
      bool hasBssid = swl_rc_isOk(rc) && s_value(reply, "bssid", value, sizeof(value)) &&
 -                    swl_typeMacBin_fromChar(&pSock->bssid, value) && !swl_mac_binIsNull(&pSock->bssid);
 +                    swl_typeMacBin_fromChar(&pSock->bssid, value);
      /* STATUS can still identify a local candidate if GET_CONFIG timed out. */
      memset(reply, 0, sizeof(reply));
-@@ -230,5 +230,6 @@ static swl_rc_ne s_resolveSock(const char* dir, const char* name, wld_hostapd_so
+     rc = s_identityQuery(dir, name, "STATUS", reply, sizeof(reply), stats);
+@@ -229,7 +229,8 @@ static swl_rc_ne s_resolveSock(const char* dir, const char* name, wld_hostapd_so
+         /* A confirmed MLD endpoint still has no resolved BSS identity. */
          return SWL_RC_ERROR;
      }
 -    pSock->enabled = s_value(reply, "state", value, sizeof(value)) && swl_str_matches(value, "ENABLED");
@@ -135,7 +168,9 @@ index 43734e84ae16..a4a6cd388247 100644
 +    pSock->enabled = swl_str_matches(pSock->state, "ENABLED");
      s_value(reply, "phy", pSock->phy, sizeof(pSock->phy));
      pSock->hasBand = s_value(reply, "freq", value, sizeof(value)) && (atoi(value) > 0) &&
-@@ -255,4 +256,18 @@ static swl_rc_ne s_resolveSock(const char* dir, const char* name, wld_hostapd_so
+                      swl_rc_isOk(swl_chanspec_channelFromMHz(&pSock->chspec, atoi(value)));
+@@ -254,6 +255,20 @@ static swl_rc_ne s_resolveSock(const char* dir, const char* name, wld_hostapd_so
+         ASSERTI_FALSE(self, SWL_RC_ERROR, ME, "duplicate self entry: %s", name);
          self = true;
      }
 +    if(self && swl_mac_binIsNull(&pSock->bssid)) {
@@ -154,11 +189,13 @@ index 43734e84ae16..a4a6cd388247 100644
 +    }
      /* Positive STATUS evidence, never directory sort order, identifies redirects. */
      pSock->nonBss = !self && redirect;
+     ASSERTI_TRUE(self, SWL_RC_ERROR, ME, "not a BSS socket: %s", name);
 diff --git a/src/nl80211/wld_rad_hostapd_api.c b/src/nl80211/wld_rad_hostapd_api.c
 index d55bb0917c16..20705fb8a9c7 100644
 --- a/src/nl80211/wld_rad_hostapd_api.c
 +++ b/src/nl80211/wld_rad_hostapd_api.c
-@@ -618,14 +618,19 @@ swl_rc_ne wld_rad_hostapd_removeConf(T_Radio* pR) {
+@@ -617,16 +617,21 @@ swl_rc_ne wld_rad_hostapd_removeConf(T_Radio* pR) {
+     wld_wpaCtrlInterface_t* pDefault = wld_wpaCtrlMngr_getDefaultInterface(mgr);
      const char* defaultName = pDefault ? wld_wpaCtrlInterface_getConnectionSockName(pDefault) : NULL;
      wld_hostapd_sock_t* last = NULL;
 +    bool retry = false;
@@ -182,14 +219,18 @@ index d55bb0917c16..20705fb8a9c7 100644
 +        } else if(bss->ap->pRadio != pR) {
              continue;
          }
-@@ -637,5 +642,5 @@ swl_rc_ne wld_rad_hostapd_removeConf(T_Radio* pR) {
+         wld_hostapd_sock_t* owner = socks;
+@@ -636,7 +641,7 @@ swl_rc_ne wld_rad_hostapd_removeConf(T_Radio* pR) {
+         /* Preserve 0004's radio-local owner and self-membership guard. */
          if((owner == NULL) || !owner->resolved || (owner->ap->pRadio != pR) || !swl_str_matches(owner->name, owner->owner)) {
              SAH_TRACEZ_ERROR(ME, "%s: bss %s (%s) is held by iface of unknown bss %s, abort radio removal",
 -                            pR->Name, bss->ap->alias, bss->name, bss->owner);
 +                            pR->Name, bss->ap ? bss->ap->alias : bss->name, bss->name, bss->owner);
              rc = SWL_RC_ERROR;
              goto out;
-@@ -645,4 +650,11 @@ swl_rc_ne wld_rad_hostapd_removeConf(T_Radio* pR) {
+         }
+@@ -644,6 +649,13 @@ swl_rc_ne wld_rad_hostapd_removeConf(T_Radio* pR) {
+             last = owner;
          }
      }
 +    /* Hard failures anywhere in the snapshot take precedence over setup.
@@ -201,7 +242,9 @@ index d55bb0917c16..20705fb8a9c7 100644
 +    }
      /* Unresolved foreign sockets do not prevent a valid empty local set. */
      for(wld_hostapd_sock_t* bss = socks; bss != NULL; bss = bss->next) {
-@@ -660,5 +672,8 @@ swl_rc_ne wld_rad_hostapd_removeConf(T_Radio* pR) {
+         if(!bss->resolved || (bss->ap->pRadio != pR) || (bss == last) || !swl_str_matches(bss->name, bss->owner)) {
+@@ -659,7 +671,10 @@ swl_rc_ne wld_rad_hostapd_removeConf(T_Radio* pR) {
+     }
  out:
      wld_hostapd_freeSnapshot(&socks);
 -    return rc;
@@ -211,5 +254,4 @@ index d55bb0917c16..20705fb8a9c7 100644
 +    return (rc == SWL_RC_NOT_AVAILABLE) ? SWL_RC_ERROR : rc;
  }
  
--- 
-2.55.0
+ swl_trl_e wld_rad_hostapd_getCfgParamSupp(T_Radio* pRad, const char* param) {
