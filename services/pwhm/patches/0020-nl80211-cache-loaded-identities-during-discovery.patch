@@ -1,0 +1,572 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Petr=20=C5=A0tetiar?= <petr.stetiar@prplfoundation.org>
+Date: Sat, 26 Sep 2026 15:00:00 +0000
+Subject: [PATCH] nl80211: cache loaded identities during discovery
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Each reconnect scan resolves every socket in the shared hostapd
+directory with GET_CONFIG and STATUS. Three managers repeat this at 500
+ms intervals while connecting. Build-18 logs include seven one-second
+query timeouts in one boot, including:
+
+  wlan0.1: cmd(GET_CONFIG) timed out
+  wlan0.1: cmd(STATUS) timed out
+
+Share a bounded discovery cache keyed by full socket path, device,
+inode, ctime and daemon PID/restart/last-failure hints. Reuse only
+resolved BSS evidence with a matching ready event client, and rematch it
+against current APs on every hit. Keep no AP, manager or process
+pointers in the cache. Expire entries after five seconds without
+extending their life on a hit, to bound discovery staleness after missed
+events or external changes.
+
+Advance a generic connection-layer control epoch before event callbacks,
+including TERMINATING, before commands outside an exact read/attachment
+allowlist, and on transport failure. Evict only the failing socket path
+when GET_CONFIG, STATUS, PING or LINKID 0 PING returns FAIL, an unsupported
+command reply or a checked-response mismatch. A previously enabled BSS
+must not survive a rejected read in the cache, while zero-link MLD
+endpoints must not evict unrelated BSSes on every scan. Keep attachment
+and mutating-command failures global. Reject changed inodes and generations. Cache only after a
+successful resolution with an unchanged inode/ctime and control epoch.
+
+Emit one WARNING summary when a discovery scan freshly queries more than
+three sockets and an individual identity query takes over 200 ms.
+Include fresh/cached socket counts and the slowest query in milliseconds
+so saved logs can measure cache usefulness during slow scans.
+
+Keep removal snapshots, owner re-resolution and the post-SET identity
+check fresh. Leave unresolved sockets and MLD endpoints uncached, so the
+zero-link LINKID discriminator and unknown-local/foreign-owner removal
+guards retain their existing behaviour. A cold or changing socket still
+uses the original synchronous transport and timeout.
+
+Signed-off-by: Petr Štetiar <petr.stetiar@prplfoundation.org>
+---
+ include_priv/nl80211/wld_hostapd_sock.h           |    4
+ include_priv/nl80211/wld_wpaCtrlConnection_priv.h |    6 +
+ src/nl80211/wld_hostapd_sock.c                    |  229 ++++++++++++++++++---
+ src/nl80211/wld_wpaCtrlConnection.c               |   89 ++++++++
+ src/nl80211/wld_wpaCtrlMngr.c                     |    2
+ src/nl80211/wld_wpaCtrl_events.c                  |    7 +
+ 6 files changed, 296 insertions(+), 41 deletions(-)
+
+diff --git a/include_priv/nl80211/wld_hostapd_sock.h b/include_priv/nl80211/wld_hostapd_sock.h
+--- a/include_priv/nl80211/wld_hostapd_sock.h
++++ b/include_priv/nl80211/wld_hostapd_sock.h
+@@ -87,6 +87,10 @@
+ /* Read-only: neither desired MLD metadata nor saved associations are changed. */
+ swl_rc_ne wld_hostapd_resolveSock(const char* dir, const char* name, wld_hostapd_sock_t* sock);
+ swl_rc_ne wld_hostapd_snapshot(wld_wpaCtrlMngr_t* mgr, wld_hostapd_sock_t** socks);
++/* Discovery only; removal must continue to use the fresh snapshot above. */
++swl_rc_ne wld_hostapd_discoverySnapshot(wld_wpaCtrlMngr_t* mgr, wld_hostapd_sock_t** socks);
++/* Reject only this path after a read reply failure; preserve other sockets. */
++void wld_hostapd_invalidateSockPath(const char* path);
+ void wld_hostapd_freeSnapshot(wld_hostapd_sock_t** socks);
+ swl_rc_ne wld_hostapd_reconcile(wld_wpaCtrlMngr_t* mgr, wld_hostapd_sock_t* socks);
+ bool wld_hostapd_mayBelongToRadio(const wld_hostapd_sock_t* sock, T_Radio* rad);
+diff --git a/include_priv/nl80211/wld_wpaCtrlConnection_priv.h b/include_priv/nl80211/wld_wpaCtrlConnection_priv.h
+--- a/include_priv/nl80211/wld_wpaCtrlConnection_priv.h
++++ b/include_priv/nl80211/wld_wpaCtrlConnection_priv.h
+@@ -85,6 +85,12 @@
+     char* srvDirPath;
+ } wpaCtrlConnection_t;
+ 
++/* Serialized control traffic: events, mutations and transport failures advance
++ * this shared epoch. Read reply failures invalidate only their socket path.
++ */
++uint64_t wld_wpaCtrlConnection_getControlEpoch(void);
++void wld_wpaCtrlConnection_advanceControlEpoch(void);
++
+ swl_rc_ne wld_wpaCtrlConnection_init(wpaCtrlConnection_t** ppConn, uint32_t connId, const char* serverPath, const char* sockName);
+ swl_rc_ne wld_wpaCtrlConnection_setEvtHandlers(wpaCtrlConnection_t* pConn, void* userData, wld_wpaCtrlConnection_evtHandlers_cb* pEvtHdlrs);
+ swl_rc_ne wld_wpaCtrlConnection_open(wpaCtrlConnection_t* pConn);
+diff --git a/src/nl80211/wld_hostapd_sock.c b/src/nl80211/wld_hostapd_sock.c
+--- a/src/nl80211/wld_hostapd_sock.c
++++ b/src/nl80211/wld_hostapd_sock.c
+@@ -62,7 +62,10 @@
+ 
+ #include <dirent.h>
+ #include <sys/stat.h>
++#include <sys/un.h>
++#include <time.h>
+ #include "wld_hostapd_sock.h"
++#include "wld_wpaCtrlConnection_priv.h"
+ #include "wld_radio.h"
+ #include "wld_accesspoint.h"
+ #include "wld_wpaCtrl_api.h"
+@@ -123,11 +126,69 @@
+            (label || pSock->hasBand || (wld_rad_countWiphyRads(pRad->wiphy) == 1));
+ }
+ 
++/* Re-evaluate current/remembered BSSIDs on every hit; retain no AP pointers. */
++static swl_rc_ne s_matchAP(const char* dir, wld_hostapd_sock_t* pSock) {
++    pSock->ap = NULL;
++    pSock->resolved = false;
++    T_AccessPoint* pCurrent = NULL;
++    T_AccessPoint* pOld = NULL;
++    unsigned int currentCount = 0, oldCount = 0;
++    T_Radio* pRad = NULL;
++    wld_for_eachRad(pRad) {
++        if((pRad->hostapd == NULL) || !s_radioMatches(pSock, pRad) ||
++           !swl_str_matches(dir, wld_wpaCtrlMngr_getCtrlIfaceDirPath(wld_secDmn_getWpaCtrlMgr(pRad->hostapd)))) {
++            continue;
++        }
++        T_AccessPoint* pAP = NULL;
++        wld_rad_forEachAp(pAP, pRad) {
++            if((pAP->pSSID == NULL) || (pAP->wpaCtrlInterface == NULL)) {
++                continue;
++            }
++            if(!memcmp(pAP->pSSID->BSSID, &pSock->bssid, 6)) {
++                pCurrent = pAP;
++                currentCount++;
++            } else if(!memcmp(pAP->wpaCtrlInterface->loadedBssid, &pSock->bssid, 6)) {
++                pOld = pAP;
++                oldCount++;
++            }
++        }
++    }
++    ASSERTI_TRUE((currentCount == 1) || ((currentCount == 0) && (oldCount == 1)),
++                 SWL_RC_ERROR, ME, "unknown or ambiguous AP: %s", pSock->name);
++    pSock->ap = currentCount ? pCurrent : pOld;
++    pSock->resolved = true;
++    return SWL_RC_OK;
++}
++
++typedef struct {
++    unsigned int fresh;
++    unsigned int cached;
++    uint64_t slowestMs;
++} hostapdDiscoveryStats_t;
++
++/* Time individual identity requests, including failed queries, only for
++ * discovery. Fresh counts attempted socket resolutions, cached counts hits.
++ */
++static swl_rc_ne s_identityQuery(const char* dir, const char* name, const char* cmd,
++                                 char* reply, size_t len, hostapdDiscoveryStats_t* stats) {
++    struct timespec before, after;
++    bool timed = stats && (clock_gettime(CLOCK_MONOTONIC, &before) == 0);
++    swl_rc_ne rc = wld_wpaCtrl_queryToSock(dir, name, cmd, reply, len);
++    if(timed && (clock_gettime(CLOCK_MONOTONIC, &after) == 0)) {
++        int64_t ns = ((int64_t) after.tv_sec - before.tv_sec) * 1000000000 + after.tv_nsec - before.tv_nsec;
++        uint64_t ms = (ns > 0) ? (uint64_t) ns / 1000000 : 0;
++        if(ms > stats->slowestMs) {
++            stats->slowestMs = ms;
++        }
++    }
++    return rc;
++}
++
+ /**
+  * @brief Resolve one loaded BSS without adopting desired MLD metadata.
+  * Keep partial evidence on failure for radio-local removal preflight.
+  */
+-swl_rc_ne wld_hostapd_resolveSock(const char* dir, const char* name, wld_hostapd_sock_t* pSock) {
++static swl_rc_ne s_resolveSock(const char* dir, const char* name, wld_hostapd_sock_t* pSock, hostapdDiscoveryStats_t* stats) {
+     ASSERT_NOT_NULL(pSock, SWL_RC_INVALID_PARAM, ME, "NULL");
+     memset(pSock, 0, sizeof(*pSock));
+     ASSERTI_TRUE(swl_str_len(name) < sizeof(pSock->name), SWL_RC_ERROR, ME, "long socket name %s", name);
+@@ -137,13 +198,13 @@
+     char reply[wld_wpaCtrl_getMaxMsgLen()];
+     char value[128] = {0};
+     memset(reply, 0, sizeof(reply));
+-    swl_rc_ne rc = wld_wpaCtrl_queryToSock(dir, name, "GET_CONFIG", reply, sizeof(reply));
++    swl_rc_ne rc = s_identityQuery(dir, name, "GET_CONFIG", reply, sizeof(reply), stats);
+     bool configFailed = swl_rc_isOk(rc) && swl_str_matches(reply, "FAIL");
+     bool hasBssid = swl_rc_isOk(rc) && s_value(reply, "bssid", value, sizeof(value)) &&
+                     swl_typeMacBin_fromChar(&pSock->bssid, value) && !swl_mac_binIsNull(&pSock->bssid);
+     /* STATUS can still identify a local candidate if GET_CONFIG timed out. */
+     memset(reply, 0, sizeof(reply));
+-    rc = wld_wpaCtrl_queryToSock(dir, name, "STATUS", reply, sizeof(reply));
++    rc = s_identityQuery(dir, name, "STATUS", reply, sizeof(reply), stats);
+     ASSERTI_TRUE(swl_rc_isOk(rc), SWL_RC_ERROR, ME, "STATUS unavailable: %s", name);
+     if(configFailed && swl_str_matches(reply, "FAIL")) {
+         /*
+@@ -156,7 +217,7 @@
+          * never exempt a socket.
+          */
+         memset(reply, 0, sizeof(reply));
+-        rc = wld_wpaCtrl_queryToSock(dir, name, "LINKID 0 PING", reply, sizeof(reply));
++        rc = s_identityQuery(dir, name, "LINKID 0 PING", reply, sizeof(reply), stats);
+         bool sameInode = (pSock->inode == s_inode(dir, name));
+         pSock->nonBss = swl_rc_isOk(rc) && swl_str_matches(reply, "NO LINKS ACTIVE") && sameInode;
+         if(pSock->nonBss) {
+@@ -196,35 +257,12 @@
+     /* Positive STATUS evidence, never directory sort order, identifies redirects. */
+     pSock->nonBss = !self && redirect;
+     ASSERTI_TRUE(self, SWL_RC_ERROR, ME, "not a BSS socket: %s", name);
+-    T_AccessPoint* pCurrent = NULL;
+-    T_AccessPoint* pOld = NULL;
+-    unsigned int currentCount = 0, oldCount = 0;
+-    T_Radio* pRad = NULL;
+-    wld_for_eachRad(pRad) {
+-        if((pRad->hostapd == NULL) || !s_radioMatches(pSock, pRad) ||
+-           !swl_str_matches(dir, wld_wpaCtrlMngr_getCtrlIfaceDirPath(wld_secDmn_getWpaCtrlMgr(pRad->hostapd)))) {
+-            continue;
+-        }
+-        T_AccessPoint* pAP = NULL;
+-        wld_rad_forEachAp(pAP, pRad) {
+-            if((pAP->pSSID == NULL) || (pAP->wpaCtrlInterface == NULL)) {
+-                continue;
+-            }
+-            if(!memcmp(pAP->pSSID->BSSID, &pSock->bssid, 6)) {
+-                pCurrent = pAP;
+-                currentCount++;
+-            } else if(!memcmp(pAP->wpaCtrlInterface->loadedBssid, &pSock->bssid, 6)) {
+-                pOld = pAP;
+-                oldCount++;
+-            }
+-        }
+-    }
+-    ASSERTI_TRUE((currentCount == 1) || ((currentCount == 0) && (oldCount == 1)),
+-                 SWL_RC_ERROR, ME, "unknown or ambiguous AP: %s", name);
+     ASSERTI_TRUE(pSock->inode == s_inode(dir, name), SWL_RC_ERROR, ME, "socket replaced: %s", name);
+-    pSock->ap = currentCount ? pCurrent : pOld;
+-    pSock->resolved = true;
+-    return SWL_RC_OK;
++    return s_matchAP(dir, pSock);
++}
++
++swl_rc_ne wld_hostapd_resolveSock(const char* dir, const char* name, wld_hostapd_sock_t* pSock) {
++    return s_resolveSock(dir, name, pSock, NULL);
+ }
+ 
+ /** @brief Does an unresolved socket carry evidence requiring the 0004 guard? */
+@@ -270,8 +308,118 @@
+     return entry->d_name[0] != '.';
+ }
+ 
++/* Bounded, shared by the managers of a grouped daemon. No retained FDs or
++ * pointers to AP/manager/process objects. Unresolved and MLD endpoints are
++ * deliberately not cached: the 0018 discriminator must remain positive.
++ */
++#define HAPD_IDENTITY_CACHE_SIZE 64
++/* Non-sliding upper bound for missed events or out-of-band reconfiguration.
++ * Destructive decisions always bypass this discovery cache.
++ */
++#define HAPD_IDENTITY_CACHE_MS 5000
++
++typedef struct {
++    char path[sizeof(((struct sockaddr_un*) 0)->sun_path)];
++    struct stat st;
++    pid_t pid;
++    uint32_t restarts;
++    time_t failHint; /* failDate tracks initialization/last failure, not start time. */
++    uint64_t expires;
++    wld_hostapd_sock_t sock;
++} hostapdIdentityCache_t;
++
++static hostapdIdentityCache_t s_identityCache[HAPD_IDENTITY_CACHE_SIZE];
++static unsigned int s_cacheSlot;
++static uint64_t s_cacheEpoch;
++
++static void s_invalidateCache(void) {
++    memset(s_identityCache, 0, sizeof(s_identityCache));
++    s_cacheEpoch = wld_wpaCtrlConnection_getControlEpoch();
++}
++
++void wld_hostapd_invalidateSockPath(const char* path) {
++    for(size_t i = 0; i < HAPD_IDENTITY_CACHE_SIZE; i++) {
++        if(swl_str_matches(path, s_identityCache[i].path)) {
++            memset(&s_identityCache[i], 0, sizeof(s_identityCache[i]));
++        }
++    }
++}
++
++static bool s_sameSocket(const struct stat* a, const struct stat* b) {
++    return S_ISSOCK(b->st_mode) && (a->st_dev == b->st_dev) && (a->st_ino == b->st_ino) &&
++           (a->st_ctim.tv_sec == b->st_ctim.tv_sec) && (a->st_ctim.tv_nsec == b->st_ctim.tv_nsec);
++}
++
++static bool s_hasIdentityEvents(const char* dir, const wld_hostapd_sock_t* pSock) {
++    wld_wpaCtrlInterface_t* iface = pSock->ap->wpaCtrlInterface;
++    return wld_wpaCtrlInterface_isReady(iface) && (iface->serverInode == pSock->inode) &&
++           swl_str_matches(pSock->name, wld_wpaCtrlInterface_getConnectionSockName(iface)) &&
++           swl_str_matches(dir, wld_wpaCtrlInterface_getConnectionDirPath(iface));
++}
++
++static swl_rc_ne s_cachedSock(wld_wpaCtrlMngr_t* pMgr, const char* name, wld_hostapd_sock_t* pSock, hostapdDiscoveryStats_t* stats) {
++    if(s_cacheEpoch != wld_wpaCtrlConnection_getControlEpoch()) {
++        s_invalidateCache();
++    }
++    /* The directory also contains other managers' sockets. The scanning
++     * manager supplies a conservative generation hint; live AP matching and
++     * the matched AP's event client must vouch for every stored/hit identity.
++     */
++    const char* dir = wld_wpaCtrlMngr_getCtrlIfaceDirPath(pMgr);
++    wld_process_t* proc = pMgr->pSecDmn ? pMgr->pSecDmn->dmnProcess : NULL;
++    pid_t pid = (proc && proc->process) ? amxp_subproc_get_pid(proc->process->proc) : 0;
++    char path[sizeof(s_identityCache[0].path)];
++    struct stat before, after;
++    struct timespec ts;
++    int len = snprintf(path, sizeof(path), "%s/%s", dir, name);
++    if((pid <= 0) || (len < 0) || ((size_t) len >= sizeof(path)) ||
++       (stat(path, &before) != 0) || !S_ISSOCK(before.st_mode) ||
++       (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)) {
++        s_invalidateCache();
++        stats->fresh++;
++        return s_resolveSock(dir, name, pSock, stats);
++    }
++    uint64_t now = ((uint64_t) ts.tv_sec * 1000) + ts.tv_nsec / 1000000;
++    for(size_t i = 0; i < HAPD_IDENTITY_CACHE_SIZE; i++) {
++        hostapdIdentityCache_t* entry = &s_identityCache[i];
++        if(!swl_str_matches(path, entry->path)) {
++            continue;
++        }
++        if((entry->pid == pid) && (entry->restarts == proc->totalRestarts) &&
++           (entry->failHint == proc->failDate) && (now < entry->expires) &&
++           s_sameSocket(&entry->st, &before)) {
++            *pSock = entry->sock;
++            /* A disconnected event client cannot vouch for cached state. */
++            if(swl_rc_isOk(s_matchAP(dir, pSock)) && s_hasIdentityEvents(dir, pSock)) {
++                stats->cached++;
++                return SWL_RC_OK;
++            }
++        }
++        memset(entry, 0, sizeof(*entry));
++    }
++    uint64_t epoch = wld_wpaCtrlConnection_getControlEpoch();
++    stats->fresh++;
++    swl_rc_ne rc = s_resolveSock(dir, name, pSock, stats);
++    if(swl_rc_isOk(rc) && s_hasIdentityEvents(dir, pSock) && (epoch == wld_wpaCtrlConnection_getControlEpoch()) &&
++       (stat(path, &after) == 0) && s_sameSocket(&before, &after)) {
++        hostapdIdentityCache_t* entry = &s_identityCache[s_cacheSlot++ % HAPD_IDENTITY_CACHE_SIZE];
++        memset(entry, 0, sizeof(*entry));
++        swl_str_copy(entry->path, sizeof(entry->path), path);
++        entry->st = after;
++        entry->pid = pid;
++        entry->restarts = proc->totalRestarts;
++        entry->failHint = proc->failDate;
++        entry->expires = now + HAPD_IDENTITY_CACHE_MS;
++        entry->sock = *pSock;
++        entry->sock.ap = NULL;
++        entry->sock.next = NULL;
++    }
++    return rc;
++}
++
+ /** @brief Collect independent results, including unresolved local evidence. */
+-swl_rc_ne wld_hostapd_snapshot(wld_wpaCtrlMngr_t* pMgr, wld_hostapd_sock_t** socks) {
++static swl_rc_ne s_snapshot(wld_wpaCtrlMngr_t* pMgr, wld_hostapd_sock_t** socks, bool cached) {
++    hostapdDiscoveryStats_t stats = {0};
+     *socks = NULL;
+     const char* dir = wld_wpaCtrlMngr_getCtrlIfaceDirPath(pMgr);
+     struct dirent** names = NULL;
+@@ -288,7 +436,7 @@
+             rc = SWL_RC_ERROR;
+             break;
+         }
+-        if(!swl_rc_isOk(wld_hostapd_resolveSock(dir, name, pSock))) {
++        if(!swl_rc_isOk(cached ? s_cachedSock(pMgr, name, pSock, &stats) : wld_hostapd_resolveSock(dir, name, pSock))) {
+             SAH_TRACEZ_INFO(ME, "exclude unresolved BSS socket %s", name);
+         }
+         pSock->next = *socks;
+@@ -301,7 +449,20 @@
+     if(!swl_rc_isOk(rc)) {
+         wld_hostapd_freeSnapshot(socks);
+     }
++    /* Keep ordinary warm/small scans quiet at the saved WARNING log level. */
++    if(cached && (stats.fresh > 3) && (stats.slowestMs > 200)) {
++        SAH_TRACEZ_WARNING(ME, "discovery %s: fresh=%u cached=%u slowest=%llu ms",
++                           dir, stats.fresh, stats.cached, (unsigned long long) stats.slowestMs);
++    }
+     return rc;
++}
++
++swl_rc_ne wld_hostapd_snapshot(wld_wpaCtrlMngr_t* pMgr, wld_hostapd_sock_t** socks) {
++    return s_snapshot(pMgr, socks, false);
++}
++
++swl_rc_ne wld_hostapd_discoverySnapshot(wld_wpaCtrlMngr_t* pMgr, wld_hostapd_sock_t** socks) {
++    return s_snapshot(pMgr, socks, true);
+ }
+ 
+ /** @brief Reuse this scan's result in the plugin metadata-adoption callback. */
+diff --git a/src/nl80211/wld_wpaCtrlConnection.c b/src/nl80211/wld_wpaCtrlConnection.c
+--- a/src/nl80211/wld_wpaCtrlConnection.c
++++ b/src/nl80211/wld_wpaCtrlConnection.c
+@@ -67,6 +67,7 @@
+ #include <unistd.h>
+ #include "wld.h"
+ #include "wld_wpaCtrlConnection_priv.h"
++#include "wld_hostapd_sock.h"
+ #include <swl/fileOps/swl_fileUtils.h>
+ 
+ #define ME "wpaCtrl"
+@@ -247,15 +248,65 @@
+     return SWL_RC_OK;
+ }
+ 
++/* Shared control-traffic generation; consumers discard observations when it
++ * changes. Events and transport failures affect all daemon managers.
++ */
++static uint64_t s_controlEpoch;
++
++uint64_t wld_wpaCtrlConnection_getControlEpoch(void) {
++    return s_controlEpoch;
++}
++
++void wld_wpaCtrlConnection_advanceControlEpoch(void) {
++    s_controlEpoch++;
++}
++
++static bool s_isReadOnly(const char* cmd) {
++    static const char* const reads[] = {"GET_CONFIG", "STATUS", "PING", "LINKID 0 PING"};
++    for(size_t i = 0; i < sizeof(reads) / sizeof(reads[0]); i++) {
++        if(swl_str_matches(cmd, reads[i])) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static void s_noteCommand(const char* cmd) {
++    /* Attachment success cannot change identity; attachment failures still
++     * advance the epoch. Unknown/vendor commands are potential mutations.
++     */
++    if(!s_isReadOnly(cmd) && !swl_str_matches(cmd, "ATTACH") && !swl_str_matches(cmd, "DETACH")) {
++        wld_wpaCtrlConnection_advanceControlEpoch();
++    }
++}
++
++static void s_noteReplyFailure(wpaCtrlConnection_t* pConn, const char* cmd) {
++    /* Even a read rejection can invalidate a previously enabled BSS. Bare
++     * MLD endpoints reject reads too, without affecting unrelated sockets.
++     */
++    if(s_isReadOnly(cmd)) {
++        wld_hostapd_invalidateSockPath(s_getConnSrvPath(pConn));
++    } else {
++        wld_wpaCtrlConnection_advanceControlEpoch();
++    }
++}
++
+ swl_rc_ne wld_wpaCtrlConnection_sendCmd(wpaCtrlConnection_t* pConn, const char* cmd) {
+     ASSERTS_NOT_NULL(pConn, SWL_RC_INVALID_PARAM, ME, "NULL");
++    s_noteCommand(cmd);
+     int fd = pConn->wpaPeer;
++    if(fd <= 0) {
++        wld_wpaCtrlConnection_advanceControlEpoch();
++    }
+     ASSERTS_TRUE(fd > 0, SWL_RC_INVALID_STATE, ME, "fd <= 0");
+ 
+     const char* srvPath = s_getConnSrvPath(pConn);
+     size_t len = strlen(cmd);
+     ssize_t ret = send(fd, cmd, len, 0);
+     SAH_TRACEZ_INFO(ME, "send cmd (%s) to (%s)", cmd, srvPath);
++    if(ret != (ssize_t) len) {
++        wld_wpaCtrlConnection_advanceControlEpoch();
++    }
+     ASSERT_EQUALS(ret, (ssize_t) len, SWL_RC_ERROR, ME, "Failed to send cmd (%s) to (%s): ret(%d), err(%d:%s)",
+                   cmd, srvPath,
+                   (int32_t) ret, errno, strerror(errno));
+@@ -263,7 +314,7 @@
+     return SWL_RC_OK;
+ }
+ 
+-swl_rc_ne wld_wpaCtrlConnection_sendCmdSyncedExt(wpaCtrlConnection_t* pConn, const char* cmd, char* reply, size_t replyLen, uint32_t tmOutMSec) {
++static swl_rc_ne s_sendCmdSyncedExt(wpaCtrlConnection_t* pConn, const char* cmd, char* reply, size_t replyLen, uint32_t tmOutMSec) {
+     SAH_TRACEZ_IN(ME);
+     ASSERT_NOT_NULL(reply, SWL_RC_INVALID_PARAM, ME, "empty reply buf");
+     ASSERT_TRUE(replyLen > 0, SWL_RC_INVALID_PARAM, ME, "null reply buf len");
+@@ -321,10 +372,26 @@
+     } while(1);
+ 
+     SAH_TRACEZ_OUT(ME);
+-    if(swl_str_startsWith(reply, "UNKNOWN COMMAND")) {
+-        return SWL_RC_NOT_IMPLEMENTED;
+-    }
+-    return SWL_RC_OK;
++    return SWL_RC_OK;
++}
++
++/* Transport failures remain global. Completed protocol rejections of exact
++ * reads evict their path, including on temporary query connections.
++ */
++swl_rc_ne wld_wpaCtrlConnection_sendCmdSyncedExt(wpaCtrlConnection_t* pConn, const char* cmd, char* reply, size_t replyLen, uint32_t tmOutMSec) {
++    swl_rc_ne rc = s_sendCmdSyncedExt(pConn, cmd, reply, replyLen, tmOutMSec);
++    if(!swl_rc_isOk(rc)) {
++        wld_wpaCtrlConnection_advanceControlEpoch();
++    } else if((rc == SWL_RC_OK) && reply && (replyLen > 0)) {
++        bool unsupported = swl_str_startsWith(reply, "UNKNOWN COMMAND");
++        if(unsupported || swl_str_startsWith(reply, "FAIL")) {
++            s_noteReplyFailure(pConn, cmd);
++        }
++        if(unsupported) {
++            return SWL_RC_NOT_IMPLEMENTED;
++        }
++    }
++    return rc;
+ }
+ 
+ swl_rc_ne wld_wpaCtrlConnection_sendCmdSynced(wpaCtrlConnection_t* pConn, const char* cmd, char* reply, size_t replyLen) {
+@@ -342,6 +409,9 @@
+     ASSERTS_TRUE(swl_rc_isOk(rc), rc, ME, "sending cmd %s failed", cmd);
+     if(rc != SWL_RC_CONTINUE) {
+         // check the response
++        if(!swl_str_matches(reply, expectedResponse)) {
++            s_noteReplyFailure(pConn, cmd);
++        }
+         ASSERT_TRUE(swl_str_matches(reply, expectedResponse), SWL_RC_ERROR, ME, "cmd(%s) reply(%s): unmatch expect(%s)", cmd, reply, expectedResponse);
+     }
+ 
+@@ -363,12 +433,19 @@
+     swl_str_copy(sockPath, sizeof(sockPath), serverPath);
+     swl_str_cat(sockPath, sizeof(sockPath), "/");
+     swl_str_cat(sockPath, sizeof(sockPath), sockName);
+-    ASSERT_TRUE(wld_wpaCtrl_checkSockPath(sockPath), SWL_RC_INVALID_PARAM, ME, "wrong socket path (%s)", sockPath);
++    bool exists = wld_wpaCtrl_checkSockPath(sockPath);
++    if(!exists) {
++        wld_wpaCtrlConnection_advanceControlEpoch();
++    }
++    ASSERT_TRUE(exists, SWL_RC_INVALID_PARAM, ME, "wrong socket path (%s)", sockPath);
+     wpaCtrlConnection_t* pConn = NULL;
+     swl_rc_ne rc;
+     if(((rc = wld_wpaCtrlConnection_init(&pConn, -1, serverPath, sockName)) >= SWL_RC_OK) &&
+        ((rc = wld_wpaCtrlConnection_open(pConn)) >= SWL_RC_OK)) {
+         rc = wld_wpaCtrlConnection_sendCmdSyncedExt(pConn, cmd, reply, replyLen, tmOutMSec);
++    } else {
++        /* Completion already handles reply failures; only setup is global. */
++        wld_wpaCtrlConnection_advanceControlEpoch();
+     }
+     wld_wpaCtrlConnection_cleanup(&pConn);
+     return rc;
+diff --git a/src/nl80211/wld_wpaCtrlMngr.c b/src/nl80211/wld_wpaCtrlMngr.c
+--- a/src/nl80211/wld_wpaCtrlMngr.c
++++ b/src/nl80211/wld_wpaCtrlMngr.c
+@@ -152,7 +152,7 @@
+     bool isHostapd = (ref != NULL) && (wld_vap_from_name(ref) != NULL);
+     wld_hostapd_sock_t* socks = NULL;
+     if(isHostapd) {
+-        swl_rc_ne rc = wld_hostapd_snapshot(pMgr, &socks);
++        swl_rc_ne rc = wld_hostapd_discoverySnapshot(pMgr, &socks);
+         if(swl_rc_isOk(rc)) {
+             rc = wld_hostapd_reconcile(pMgr, socks);
+         }
+diff --git a/src/nl80211/wld_wpaCtrl_events.c b/src/nl80211/wld_wpaCtrl_events.c
+--- a/src/nl80211/wld_wpaCtrl_events.c
++++ b/src/nl80211/wld_wpaCtrl_events.c
+@@ -71,6 +71,8 @@
+ #include "wld_wpaSupp_parser.h"
+ #include "wld_util.h"
+ 
++#include "wld_wpaCtrlConnection_priv.h"
++
+ #define ME "wpaCtrl"
+ 
+ static int s_getValueStr(const char* pData, const char* pKey, char* pValue, int* length) {
+@@ -1089,6 +1091,11 @@
+     ASSERTS_TRUE(len > 0, , ME, "null length");
+     SAH_TRACEZ_NOTICE(ME, "%s: receive event len: %zu (%s)", wld_wpaCtrlInterface_getName(pInterface), len, msgData);
+ 
++    /* Before any callback can scan, including TERMINATING/reset and global
++     * event redirection. Also refresh enabled/band/owner state after events.
++     */
++    wld_wpaCtrlConnection_advanceControlEpoch();
++
+     // 1) prepare custom msg for processing: target interface, msg content
+     char* newIfName = NULL;
+     char* newMsgData = NULL;
+-- 
+2.55.0
