@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Petr Štetiar <petr.stetiar@prplfoundation.org>
+Date: Sat, 26 Sep 2026 15:50:20 +0000
+Subject: [PATCH v2] Plugin: avoid toggling a radio during hostapd activation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A dependency pass during hostapd setup can see the radio as Down even
+though its loaded interface is already being enabled. In run-46b batch-02,
+pending beacon work re-enters dependency after ADD, while the new main
+BSS is in HT_SCAN:
+
+  wlan1: setEnable curr 0 , tgt 1 (fth 1 / bkh 0) , dm 1, status Down
+  wlan1: Stop hostapd
+
+The inferred ENABLE_RAD expands to STOP/START and removes the interface
+that was still initializing. With the bounded removal retry this can
+wait for setup only to tear the newly enabled interface down again.
+
+Treat a positively resolved loaded main BSS in HT_SCAN, COUNTRY_UPDATE
+or ENABLED as current enable when fronthaul is requested and the hostapd
+member is started with its process running. Use a fresh socket snapshot,
+require one radio-local self-listed owner, then recheck its identity,
+inode and state. This works before the manager default is rebound and
+while secondary identities are still unresolved. Discovery-cache entries
+are not activation evidence.
+
+Only change the inferred current-enable value. Keep explicit actions,
+configuration dependencies, error handling and failed/absent identity
+recovery intact. Do not change radio/AP readiness, reconcile clients,
+adopt MLD metadata or send hostapd mutations. A permanently positive
+setup state still requires an explicit repair; a setup deadline is a
+separate lifecycle change.
+
+Signed-off-by: Petr Štetiar <petr.stetiar@prplfoundation.org>
+---
+ src/Plugin/wifiGen_fsm.c |   57 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 57 insertions(+)
+
+diff --git a/src/Plugin/wifiGen_fsm.c b/src/Plugin/wifiGen_fsm.c
+index 1a0ff966b50e..9b24cecc54ea 100644
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -76,6 +76,7 @@
+ #include "wld/wld_wpaCtrlGSock.h"
+ #include "wld/wld_secDmn.h"
+ #include "wld/wld_bStaMld.h"
++#include "nl80211/wld_hostapd_sock.h"
+ 
+ #include "wifiGen_fsm.h"
+ 
+@@ -2321,6 +2322,59 @@ static bool s_doReloadHostapd(T_Radio* pRad) {
+     return true;
+ }
+ 
++/* A loaded main BSS can be activating before the radio state catches up.
++ * Resolve fresh loaded identities, independently of manager readiness or the
++ * desired first AP. An unresolved secondary is not proof of a failed main BSS.
++ * This observation must neither reconcile clients nor adopt MLD metadata.
++ */
++static bool s_isHapdActivationInProgress(T_Radio* pRad) {
++    if(!wifiGen_hapd_isStarted(pRad) || !wifiGen_hapd_isRunning(pRad)) {
++        return false;
++    }
++    wld_wpaCtrlMngr_t* mgr = wld_secDmn_getWpaCtrlMgr(pRad->hostapd);
++    ASSERTS_NOT_NULL(mgr, false, ME, "NULL");
++    wld_hostapd_sock_t* socks = NULL;
++    if(!swl_rc_isOk(wld_hostapd_snapshot(mgr, &socks))) {
++        return false;
++    }
++    bool activating = false;
++    wld_hostapd_sock_t* owner = NULL;
++    for(wld_hostapd_sock_t* sock = socks; sock != NULL; sock = sock->next) {
++        if(!sock->resolved || (sock->ap->pRadio != pRad) || !swl_str_matches(sock->name, sock->owner)) {
++            continue;
++        }
++        /* Old/new loaded overlap is ambiguous: keep normal recovery. */
++        if(owner != NULL) {
++            goto out;
++        }
++        owner = sock;
++    }
++    if(owner != NULL) {
++        /* The snapshot may query other sockets after this owner. Recheck it
++         * before using its state, including identity and inode continuity.
++         */
++        wld_hostapd_sock_t now;
++        const char* dir = wld_wpaCtrlMngr_getCtrlIfaceDirPath(mgr);
++        if(swl_rc_isOk(wld_hostapd_resolveSock(dir, owner->name, &now)) &&
++           (now.ap == owner->ap) && (now.inode == owner->inode) &&
++           !memcmp(&now.bssid, &owner->bssid, sizeof(now.bssid)) &&
++           swl_str_matches(now.name, now.owner)) {
++            activating = swl_str_matches(now.state, "HT_SCAN") ||
++                         swl_str_matches(now.state, "COUNTRY_UPDATE") ||
++                         (swl_str_matches(now.state, "ENABLED") &&
++                          (wld_wpaCtrlMngr_isConnecting(mgr) ||
++                           wld_wpaCtrlInterface_isReady(now.ap->wpaCtrlInterface)));
++            if(activating) {
++                SAH_TRACEZ_WARNING(ME, "%s: loaded owner %s state %s: activation in progress",
++                                   pRad->Name, now.name, now.state);
++            }
++        }
++    }
++out:
++    wld_hostapd_freeSnapshot(&socks);
++    return activating;
++}
++
+ /*
+  * Check if we need to do radio up down actions. Need to happen if it's first interface that goes up.
+  */
+@@ -2342,6 +2396,9 @@ static void s_checkPreRadDependency(T_Radio* pRad _UNUSED) {
+     bool targetBkhEnable = (pRad->enable && wld_rad_hasEnabledEp(pRad));
+     bool targetEnable = (targetFthEnable || targetBkhEnable);
+     bool currentEnable = wld_rad_isUpExt(pRad) || (wld_rad_hasActiveEp(pRad) && (!wld_rad_hasActiveVap(pRad)));
++    if(!currentEnable && targetFthEnable) {
++        currentEnable = s_isHapdActivationInProgress(pRad);
++    }
+     SAH_TRACEZ_WARNING(ME, "%s: setEnable curr %u , tgt %u (fth %u / bkh %u) , dm %u, status %s", pRad->Name,
+                        currentEnable, targetEnable,
+                        targetFthEnable, targetBkhEnable,
+-- 
+2.51.0
