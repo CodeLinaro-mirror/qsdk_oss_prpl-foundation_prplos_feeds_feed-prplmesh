@@ -1,0 +1,678 @@
+From b55a803803415a52a6f871bd0e93edaabbc0a288 Mon Sep 17 00:00:00 2001
+From: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+Date: Thu, 1 Oct 2026 12:48:22 +0530
+Subject: [PATCH] reload config optimization
+
+Signed-off-by: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 |  58 ++++-
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  48 +++++
+ .../bcl/include/bcl/beerocks_defines.h        |  11 +
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 198 ++++++++++++------
+ .../bwl/nl80211/ap_wlan_hal_nl80211.h         |  46 +++-
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     |  15 +-
+ .../bwl/nl80211/base_wlan_hal_nl80211.h       |  11 +
+ .../beerocks/bwl/nl80211/wpa_ctrl_client.cpp  |  14 +-
+ common/beerocks/bwl/nl80211/wpa_ctrl_client.h |   6 +-
+ .../tlvf/beerocks_message_apmanager.yaml      |   1 +
+ 10 files changed, 327 insertions(+), 81 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 40983a910..1faa1f2b3 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -2791,9 +2791,36 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+                 ap_wlan_hal->backup_reference_hostapd_config();
+             }
+ 
+-            const bool credentials_update_ok = ap_wlan_hal->update_vap_credentials(
++            const auto update_start = std::chrono::steady_clock::now();
++            const bool update_ok = ap_wlan_hal->update_vap_credentials(
+                 bss_info_conf_list, backhaul_wps_ssid, backhaul_wps_passphrase, bridge_name);
+-            if (!credentials_update_ok) {
++            const auto update_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                std::chrono::steady_clock::now() - update_start);
++            LOG(DEBUG) << "RECONSTRA update_vap_credentials result="
++                       << (update_ok ? "SUCCESS" : "FAILURE_OR_UNKNOWN")
++                       << " radio=" << m_iface
++                       << " requested_bss_count=" << bss_info_conf_list.size()
++                       << " duration_ms=" << update_duration_ms.count() << " RECONSTRA";
++
++            auto send_credentials_update_failure_response = [&]() {
++                auto response = message_com::create_vs_message<
++                    beerocks_message::cACTION_APMANAGER_WIFI_CREDENTIALS_UPDATE_RESPONSE>(cmdu_tx);
++                if (!response) {
++                    LOG(ERROR) << "Failed building WIFI_CREDENTIALS_UPDATE_RESPONSE RECONSTRA";
++                    return;
++                }
++
++                const auto &radio_vaps = ap_wlan_hal->get_radio_info().available_vaps;
++                response->number_of_bss_available() = radio_vaps.size();
++                response->status() = static_cast<uint8_t>(
++                    beerocks::eWifiCredentialsUpdateStatus::FAILURE);
++                LOG(DEBUG) << "RECONSTRA sending WIFI_CREDENTIALS_UPDATE_RESPONSE status="
++                           << static_cast<int>(response->status())
++                           << " available_bss_count=" << radio_vaps.size()
++                           << " radio=" << m_iface << " RECONSTRA";
++                send_cmdu(cmdu_tx);
++            };
++            if (!update_ok) {
+                 LOG(ERROR) << "VAP credentials update failed for " << m_iface
+                            << "; not waiting for VAP/MLD completion";
+ #ifdef USE_PRPLMESH_NLHAL
+@@ -2812,12 +2839,11 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+                     }
+                 }
+ #endif
+-                auto response = message_com::create_vs_message<
+-                    beerocks_message::cACTION_APMANAGER_WIFI_CREDENTIALS_UPDATE_RESPONSE>(cmdu_tx);
+-                if (response) {
+-                    response->number_of_bss_available() = 0;
+-                    send_cmdu(cmdu_tx);
+-                }
++                const bool refresh_ok = ap_wlan_hal->refresh_radio_info();
++                LOG(DEBUG) << "RECONSTRA post-failure radio refresh result="
++                           << (refresh_ok ? "SUCCESS" : "FAILURE")
++                           << " radio=" << m_iface << " RECONSTRA";
++                send_credentials_update_failure_response();
+                 return;
+             }
+ 
+@@ -2867,6 +2893,22 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+             }
+ #endif
+ 
++            if (!update_ok) {
++                // update_vap_credentials() can modify hostapd configuration and interfaces
++                // before a batched reload failure is detected. Refresh the HAL inventory and
++                // notify the monitor, but do not interpret the observed state as a successful
++                // credentials update.
++                const bool refresh_ok = ap_wlan_hal->refresh_radio_info();
++                LOG(DEBUG) << "RECONSTRA post-failure radio refresh result="
++                           << (refresh_ok ? "SUCCESS" : "FAILURE")
++                           << " radio=" << m_iface << " RECONSTRA";
++                LOG(ERROR) << "update_vap_credentials failed or has unknown outcome for radio "
++                           << m_iface << "; skipping normal VAP/MLD completion, CSA, and radio "
++                              "success-state handling RECONSTRA";
++                send_credentials_update_failure_response();
++                return;
++            }
++
+             auto vap_timeout = std::chrono::steady_clock::now() + wait_for_vaps_enable_timeout_sec;
+             bool all_vaps_enabled = false, all_mld_updated = false;
+             while (std::chrono::steady_clock::now() < vap_timeout) {
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index f4e2b1212..897f90176 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -18,6 +18,7 @@
+ #include "../tlvf_utils.h"
+ #include "multi_vendor.h"
+ #include <bcl/beerocks_config_file.h>
++#include <bcl/beerocks_defines.h>
+ #include <bcl/beerocks_string_utils.h>
+ 
+ #include <bcl/beerocks_utils.h>
+@@ -5667,6 +5668,53 @@ void ApAutoConfigurationTask::handle_vs_wifi_credentials_update_response(
+     LOG(TRACE) << "received ACTION_APMANAGER_WIFI_CREDENTIALS_UPDATE_RESPONSE from "
+                << radio->front.iface_name;
+ 
++    const auto update_status = response->status();
++    LOG(DEBUG) << "RECONSTRA received WIFI_CREDENTIALS_UPDATE_RESPONSE status="
++               << static_cast<int>(update_status)
++               << " radio=" << radio_iface << " RECONSTRA";
++
++    if (update_status != static_cast<uint8_t>(beerocks::eWifiCredentialsUpdateStatus::SUCCESS)) {
++        LOG(ERROR) << "WIFI_CREDENTIALS_UPDATE_RESPONSE reports failed or unknown VAP "
++                      "credentials update for "
++                   << radio_iface << " RECONSTRA";
++
++        // Do not consume number_of_bss_available or update radio_disable on an unconfirmed
++        // transaction. Reset only this radio's completion bookkeeping so the existing per-radio
++        // retry path can run without changing the other radios' state.
++        radio_conf_params.num_of_bss_available     = 0;
++        radio_conf_params.enabled_bssids.clear();
++        radio_conf_params.sent_vaps_list_update     = false;
++        radio_conf_params.received_vaps_list_update = false;
++
++        auto db = AgentDB::get();
++        if (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP) {
++            // DPP skips WSC M1. Requeue the last per-radio configuration through the existing
++            // staggered sender so a failed radio is retried without changing other radios.
++            auto last_infos_it = m_last_bss_infos.find(radio_iface);
++            if (last_infos_it != m_last_bss_infos.end() && !last_infos_it->second.empty()) {
++                if (m_pending_bss_config_sends.find(radio_iface) ==
++                    m_pending_bss_config_sends.end()) {
++                    m_pending_bss_config_send_order.push_back(radio_iface);
++                    m_pending_bss_config_sends[radio_iface] = last_infos_it->second;
++                    LOG(DEBUG) << "RECONSTRA requeued failed DPP credentials update for radio="
++                               << radio_iface << " bss_count=" << last_infos_it->second.size()
++                               << " RECONSTRA";
++                }
++                m_task_is_active = true;
++            } else {
++                LOG(ERROR) << "No cached DPP BSS configuration available for failed radio "
++                           << radio_iface << " RECONSTRA";
++            }
++        } else {
++            // WSC uses the existing per-radio M1 retry FSM.
++            FSM_MOVE_STATE(radio_iface, eState::SEND_AP_AUTOCONFIGURATION_WSC_M1);
++            m_task_is_active = true;
++            LOG(DEBUG) << "RECONSTRA scheduled WSC retry for failed radio=" << radio_iface
++                       << " RECONSTRA";
++        }
++        return;
++    }
++
+     // ap_manager already persisted this transition to UCI (this response carries the
+     // post-update VAP count, which is ap_manager's own signal for an implicit
+     // enable/disable on non-AT controllers that never send a Service-Status TLV) - mirror it
+diff --git a/common/beerocks/bcl/include/bcl/beerocks_defines.h b/common/beerocks/bcl/include/bcl/beerocks_defines.h
+index bfe34011b..6e514283a 100644
+--- a/common/beerocks/bcl/include/bcl/beerocks_defines.h
++++ b/common/beerocks/bcl/include/bcl/beerocks_defines.h
+@@ -508,6 +508,17 @@ enum eSlaveJoinResponseErrCode {
+     JOIN_RESP_REJECT,
+ };
+ 
++/**
++ * Result reported by ap_manager after applying AP VAP credentials.
++ *
++ * FAILURE means that the HAL did not confirm completion. The underlying hostapd/interface
++ * changes may still have been partially applied and therefore require reconciliation.
++ */
++enum class eWifiCredentialsUpdateStatus : uint8_t {
++    SUCCESS = 0,
++    FAILURE = 1,
++};
++
+ enum eApActiveMode : uint8_t { AP_IDLE_MODE = 0, AP_ACTIVE_MODE, AP_INVALID_MODE };
+ 
+ enum eBssType {
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 845b024ae..c9cc1fa64 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -3872,6 +3872,19 @@ bool ap_wlan_hal_nl80211::update_bss_rsn_override(const sMacAddr &bssid,
+ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+     const son::wireless_utils::sBssInfoConf &bss_conf, bool &conversion_performed,
+     bool &prpl_config_update)
++{
++    PendingHostapdReload pending_reload;
++    if (!handle_wifi_compat_mode(bss_conf, conversion_performed, prpl_config_update,
++                                 pending_reload)) {
++        return false;
++    }
++
++    return apply_pending_hostapd_reload(pending_reload);
++}
++
++bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
++    const son::wireless_utils::sBssInfoConf &bss_conf, bool &conversion_performed,
++    bool &prpl_config_update, PendingHostapdReload &pending_reload)
+ {
+     conversion_performed = false;
+ 
+@@ -3954,6 +3967,15 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+         return false;
+     }
+ 
++    const auto queue_compat_mode_uci_update = [this, &pending_reload, bss_conf, bss_iface]() {
++        pending_reload.add_success_callback([this, bss_conf, bss_iface]() {
++            std::string base_iface;
++            extractLinkBaseInterface(bss_iface, base_iface);
++            set_wifi_compat_mode_from_vap(bss_conf, base_iface, base_iface,
++                                          m_radio_info.radio_id);
++        });
++    };
++
+     LOG(INFO) << "handle_wifi_compat_mode: bssid=" << bssid_str
+               << " bss_iface=" << bss_iface
+               << " wifi_compat_mode=" << bss_conf.wifi_compat_mode;
+@@ -4349,22 +4371,13 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+                 return false;
+             }
+ 
+-            // Trigger RELOAD_CONFIG so hostapd picks up the cleared disable_11ax.
+-            const std::string reload_cmd("RELOAD_CONFIG");
+-            if (!wpa_ctrl_send_msg(reload_cmd, bss_iface)) {
+-                LOG(ERROR) << "handle_wifi_compat_mode: RELOAD_CONFIG failed for "
+-                           << bss_iface;
+-            } else {
+-                LOG(INFO) << "handle_wifi_compat_mode: RELOAD_CONFIG sent for"
+-                          << " 11AX AC->AX (disable_11ax cleared) on " << bss_iface;
+-                // Update UCI wireless to clear disable_11ax.
+-                // set_wifi_compat_mode_from_vap() calls bpl_cfg_set_wifi_compat_mode_uci()
+-                // which handles WIFI_COMPAT_MODE_11AX by clearing disable_11ax.
+-                std::string base_iface;
+-                extractLinkBaseInterface(bss_iface, base_iface);
+-                set_wifi_compat_mode_from_vap(bss_conf, base_iface, base_iface,
+-                                              m_radio_info.radio_id);
+-            }
++            // RELOAD_CONFIG is hostapd-interface scoped. Queue it with the surrounding
++            // autoconfiguration transaction so other BSS updates are applied by the same
++            // reload. The UCI update is committed only after the batched reload succeeds.
++            pending_reload.request(bss_iface);
++            queue_compat_mode_uci_update();
++            LOG(DEBUG) << "handle_wifi_compat_mode: queued 11AX AC->AX reload for "
++                       << bss_iface << " RECONSTRA";
+ 
+             conversion_performed = true;
+             return true;
+@@ -4791,22 +4804,12 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+                     return false;
+                 }
+ 
+-                // Trigger RELOAD_CONFIG so hostapd picks up the new disable_11bn=1.
+-                const std::string reload_cmd("RELOAD_CONFIG");
+-                if (!wpa_ctrl_send_msg(reload_cmd, bss_iface)) {
+-                    LOG(ERROR) << "handle_wifi_compat_mode: RELOAD_CONFIG failed for "
+-                               << bss_iface;
+-                } else {
+-                    LOG(INFO) << "handle_wifi_compat_mode: RELOAD_CONFIG sent for"
+-                              << " disable_11bn=1 on " << bss_iface;
+-                    // Update UCI wireless disable_11bn=1 after RELOAD_CONFIG.
+-                    // set_wifi_compat_mode_from_vap() calls bpl_cfg_set_wifi_compat_mode_uci()
+-                    // which sets disable_11bn=1 for WIFI_COMPAT_MODE_11BE.
+-                    std::string base_iface;
+-                    extractLinkBaseInterface(bss_iface, base_iface);
+-                    set_wifi_compat_mode_from_vap(bss_conf, base_iface, base_iface,
+-                                                  m_radio_info.radio_id);
+-                }
++                // RELOAD_CONFIG is hostapd-interface scoped. Queue the reload and defer the
++                // UCI update until the surrounding transaction has been applied successfully.
++                pending_reload.request(bss_iface);
++                queue_compat_mode_uci_update();
++                LOG(DEBUG) << "handle_wifi_compat_mode: queued 11BE in-place reload for "
++                           << bss_iface << " RECONSTRA";
+ 
+                 conversion_performed = true;
+                 return true;
+@@ -5163,21 +5166,12 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+             return false;
+         }
+ 
+-        // Trigger RELOAD_CONFIG so hostapd picks up the cleared disable_11be/disable_11bn.
+-        const std::string reload_cmd("RELOAD_CONFIG");
+-        if (!wpa_ctrl_send_msg(reload_cmd, bss_iface)) {
+-            LOG(ERROR) << "handle_wifi_compat_mode: RELOAD_CONFIG failed for " << bss_iface;
+-        } else {
+-            LOG(INFO) << "handle_wifi_compat_mode: RELOAD_CONFIG sent for"
+-                      << " 11BN (disable_11be and disable_11bn cleared) on " << bss_iface;
+-            // Update UCI wireless to clear disable_11be and disable_11bn.
+-            // set_wifi_compat_mode_from_vap() calls bpl_cfg_set_wifi_compat_mode_uci()
+-            // which handles WIFI_COMPAT_MODE_11BN by clearing both options.
+-            std::string base_iface;
+-                    extractLinkBaseInterface(bss_iface, base_iface);
+-            set_wifi_compat_mode_from_vap(bss_conf, base_iface, base_iface,
+-                                          m_radio_info.radio_id);
+-        }
++        // RELOAD_CONFIG is hostapd-interface scoped. Queue the reload and defer the UCI
++        // update until the surrounding transaction has been applied successfully.
++        pending_reload.request(bss_iface);
++        queue_compat_mode_uci_update();
++        LOG(DEBUG) << "handle_wifi_compat_mode: queued 11BN reload for "
++                   << bss_iface << " RECONSTRA";
+ 
+         conversion_performed = true;
+         return true;
+@@ -5208,19 +5202,12 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+             return false;
+         }
+ 
+-        // Trigger RELOAD_CONFIG so hostapd picks up the new disable_11ax=1.
+-        const std::string reload_cmd("RELOAD_CONFIG");
+-        if (!wpa_ctrl_send_msg(reload_cmd, bss_iface)) {
+-            LOG(ERROR) << "handle_wifi_compat_mode: RELOAD_CONFIG failed for " << bss_iface;
+-        } else {
+-            LOG(INFO) << "handle_wifi_compat_mode: RELOAD_CONFIG sent for"
+-                      << " 11AC (disable_11ax=1) on " << bss_iface;
+-            // Update UCI wireless disable_11ax=1 after RELOAD_CONFIG.
+-            std::string base_iface;
+-            extractLinkBaseInterface(bss_iface, base_iface);
+-            set_wifi_compat_mode_from_vap(bss_conf, base_iface, base_iface,
+-                                          m_radio_info.radio_id);
+-        }
++        // RELOAD_CONFIG is hostapd-interface scoped. Queue the reload and defer the UCI
++        // update until the surrounding transaction has been applied successfully.
++        pending_reload.request(bss_iface);
++        queue_compat_mode_uci_update();
++        LOG(DEBUG) << "handle_wifi_compat_mode: queued 11AC reload for "
++                   << bss_iface << " RECONSTRA";
+ 
+         conversion_performed = true;
+         return true;
+@@ -5233,6 +5220,74 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+     return true;
+ }
+ 
++bool ap_wlan_hal_nl80211::apply_pending_hostapd_reload(
++    PendingHostapdReload &pending_reload)
++{
++    if (!pending_reload.required) {
++        LOG(DEBUG) << "RECONSTRA no hostapd reload queued for this VAP transaction RECONSTRA";
++        return true;
++    }
++
++    const auto reload_start = std::chrono::steady_clock::now();
++    int reload_attempts       = 1;
++
++    LOG(DEBUG) << "RECONSTRA batched hostapd reload start: changed_bss_count="
++               << pending_reload.changed_bss.size()
++               << " control_iface=" << pending_reload.control_iface
++               << " RECONSTRA";
++
++    // RELOAD_CONFIG is hostapd-interface scoped. Do not use the generic ten-attempt
++    // control-client retry loop here: if hostapd accepted a request but its reply timed
++    // out, replaying the command queues another complete interface/MLO reload.
++    bool reload_timed_out = false;
++    if (!wpa_ctrl_send_msg("RELOAD_CONFIG", pending_reload.control_iface, 1,
++                           &reload_timed_out)) {
++        if (!reload_timed_out) {
++            LOG(ERROR) << "batched hostapd reload failed without timeout; no recovery reload "
++                       << "sent RECONSTRA";
++            return false;
++        }
++
++        LOG(DEBUG) << "RECONSTRA batched hostapd reload request did not complete; "
++                      "checking hostapd readiness before one recovery attempt RECONSTRA";
++
++        // A STATUS response confirms that the control endpoint is responsive again. The
++        // first RELOAD_CONFIG may already have completed, so this is deliberately bounded
++        // to one recovery request rather than using the generic retry count.
++        std::this_thread::sleep_for(std::chrono::milliseconds(250));
++        LOG(DEBUG) << "RECONSTRA reconnecting hostapd control socket before readiness check for "
++                   << pending_reload.control_iface << " RECONSTRA";
++        if (!reconnect_wpa_ctrl_cmd_socket(pending_reload.control_iface)) {
++            LOG(ERROR) << "hostapd control socket reconnect failed after batched reload "
++                       << "RECONSTRA";
++            return false;
++        }
++        if (!wpa_ctrl_send_msg("STATUS", pending_reload.control_iface, 1)) {
++            LOG(ERROR) << "hostapd readiness check failed after batched reload RECONSTRA";
++            return false;
++        }
++
++        LOG(DEBUG) << "RECONSTRA hostapd readiness check succeeded; "
++                      "sending one batched reload recovery request RECONSTRA";
++        reload_attempts++;
++        if (!wpa_ctrl_send_msg("RELOAD_CONFIG", pending_reload.control_iface, 1)) {
++            LOG(ERROR) << "batched hostapd reload recovery failed RECONSTRA";
++            return false;
++        }
++    }
++
++    for (auto &callback : pending_reload.on_success) {
++        callback();
++    }
++
++    const auto reload_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++        std::chrono::steady_clock::now() - reload_start);
++    LOG(DEBUG) << "RECONSTRA batched hostapd reload complete: changed_bss_count="
++               << pending_reload.changed_bss.size() << " attempts=" << reload_attempts
++               << " duration_ms=" << reload_duration_ms.count() << " RECONSTRA";
++    return true;
++}
++
+ bool ap_wlan_hal_nl80211::update_vap_credentials(
+     std::list<son::wireless_utils::sBssInfoConf> &bss_info_conf_list,
+     const std::string &backhaul_wps_ssid, const std::string &backhaul_wps_passphrase,
+@@ -5356,6 +5411,10 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+ 
+     LOG(INFO) << "Available vap count: " << new_vap_index;
+ 
++    PendingHostapdReload pending_reload;
++    LOG(DEBUG) << "RECONSTRA starting VAP configuration transaction: requested_bss_count="
++               << bss_info_conf_list.size() << " RECONSTRA";
++
+     // Non-AT controllers never send a Service-Status TLV, so radio_state/disable()/enable()
+     // are never driven for them - the M2 content itself is the only signal that the radio is
+     // being implicitly disabled. If every BSS in this update is flagged for teardown (or the
+@@ -5670,7 +5729,8 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                            << " for bssid=" << tlvf::mac_to_string(bss_it.bssid)
+                            << " wifi_compat_mode=" << bss_it.wifi_compat_mode;
+                 bool compat_mode_converted = false;
+-                handle_wifi_compat_mode(bss_it, compat_mode_converted, prpl_config_update);
++                handle_wifi_compat_mode(bss_it, compat_mode_converted, prpl_config_update,
++                                        pending_reload);
+                 if (compat_mode_converted) {
+                     // The BSS was torn down and recreated (11AX↔11BE transition).
+                     // The new BSS has a different interface name / BSSID; skip the
+@@ -6319,12 +6379,12 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                                 close(lr_lock_fd);
+                             }
+                         } else {
+-                            const std::string cmd("RELOAD_CONFIG");
+-                            if (!wpa_ctrl_send_msg(cmd,vap_info.bss)) {
+-                                LOG(ERROR) << "Autoconfiguration: \"" << cmd << "\" command to hostapd has failed for " << vap_info.bss;
+-                                continue;
+-                            }
+-                            LOG(INFO) << "RELOAD_CONFIG successful for " << vap_info.bss;
++                            pending_reload.request(vap_info.bss);
++                            LOG(DEBUG) << "RECONSTRA queued VAP configuration reload for "
++                                       << vap_info.bss
++                                       << " queued_bss_count="
++                                       << pending_reload.changed_bss.size()
++                                       << " RECONSTRA";
+                         }
+                    }
+                 }
+@@ -6340,6 +6400,10 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+ 
+     }
+ 
++    if (!apply_pending_hostapd_reload(pending_reload)) {
++        abort = true;
++    }
++
+     if (new_radio_iface_name_update_req != 0 && !new_radio_iface_name.empty() && (prpl_config_update != true)) {
+ 	    // Extract the suffix from the original iface name
+ 
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+index 6f60f7c77..e43e82bcb 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+@@ -13,6 +13,11 @@
+ #include <bwl/ap_wlan_hal.h>
+ #include <bpl/bpl_cfg.h>
+ #include <hostapd/configuration.h>
++#include <functional>
++#include <set>
++#include <string>
++#include <utility>
++#include <vector>
+ 
+ namespace bwl {
+ namespace nl80211 {
+@@ -22,6 +27,31 @@ namespace nl80211 {
+  */
+ class ap_wlan_hal_nl80211 : public base_wlan_hal_nl80211, public ap_wlan_hal {
+ 
++    struct PendingHostapdReload {
++        bool required = false;
++        std::string control_iface;
++        std::set<std::string> changed_bss;
++        std::vector<std::function<void()>> on_success;
++
++        void request(const std::string &bss_iface)
++        {
++            if (bss_iface.empty()) {
++                return;
++            }
++
++            required = true;
++            changed_bss.insert(bss_iface);
++            if (control_iface.empty()) {
++                control_iface = bss_iface;
++            }
++        }
++
++        void add_success_callback(std::function<void()> callback)
++        {
++            on_success.emplace_back(std::move(callback));
++        }
++    };
++
+     // Public methods
+ public:
+     /*!
+@@ -221,8 +251,10 @@ public:
+      *
+      * The function loads the hostapd config for the radio, locates the VAP by
+      * BSSID, writes disable_11be, stores the config (only when the value
+-     * actually changed), and sends RELOAD_CONFIG to the BSS interface resolved
+-     * internally from m_radio_info.available_vaps using bss_conf.bssid.
++     * actually changed), and applies RELOAD_CONFIG. When called by
++     * update_vap_credentials(), the transaction-aware overload queues the
++     * reload instead. Structural MLO/SLO transitions continue to use their
++     * immediate ADD/REMOVE commands.
+      *
+      * @param bss_conf  BSS configuration containing wifi_compat_mode and bssid.
+      * @return true on success or when no action is needed; false on error.
+@@ -261,6 +293,16 @@ protected:
+     }
+ 
+ private:
++    // Transaction-aware overload used by update_vap_credentials(). In-place compatibility
++    // changes queue their reload here and commit their UCI update after the batched hostapd
++    // reload succeeds.
++    bool handle_wifi_compat_mode(const son::wireless_utils::sBssInfoConf &bss_conf,
++                                 bool &conversion_performed,
++                                 bool &prpl_config_update,
++                                 PendingHostapdReload &pending_reload);
++
++    bool apply_pending_hostapd_reload(PendingHostapdReload &pending_reload);
++
+     bool set_wsi_bypass_device(bool enable);
+ 
+     bool m_powersave_enabled = false;
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index bc356c43f..4ec1f623e 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -772,6 +772,17 @@ bool base_wlan_hal_nl80211::reassociate() { return true;}
+ 
+ bool base_wlan_hal_nl80211::wpa_ctrl_send_msg(const std::string &cmd, const std::string &ifname)
+ {
++    return wpa_ctrl_send_msg(cmd, ifname, -1, nullptr);
++}
++
++bool base_wlan_hal_nl80211::wpa_ctrl_send_msg(const std::string &cmd,
++                                              const std::string &ifname, int retry_max,
++                                              bool *timed_out)
++{
++    if (timed_out) {
++        *timed_out = false;
++    }
++
+     LOG(TRACE) << __func__ << " cmd: " << cmd << " iface: " << ifname;
+     std::string iface_name = ifname;
+     if (ifname.empty()) {
+@@ -786,7 +797,9 @@ bool base_wlan_hal_nl80211::wpa_ctrl_send_msg(const std::string &cmd, const std:
+ 
+     auto buffer = m_wpa_ctrl_buffer.get();
+ 
+-    if (!wpa_ctrl_cmd->request(cmd, buffer, m_wpa_ctrl_buffer_size)) {
++    const bool request_ok =
++        wpa_ctrl_cmd->request(cmd, buffer, m_wpa_ctrl_buffer_size, retry_max, timed_out);
++    if (!request_ok) {
+         LOG(ERROR) << "can't send wpa_ctrl_request";
+         LOG(ERROR) << "failed cmd: " << cmd;
+         return false;
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
+index 16a0003fd..cad0218a5 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
+@@ -137,6 +137,17 @@ protected:
+                                    const std::string &ifname = {});
+     bool wpa_ctrl_send_msg(const std::string &cmd, const std::string &ifname = {});
+ 
++    /**
++     * @brief Send a WPA control command with a caller-selected request retry limit.
++     *
++     * A retry limit of one sends the command once. This is used for commands such as
++     * RELOAD_CONFIG where replaying a timed-out request can enqueue another expensive
++     * hostapd-wide reload even when the first request was already accepted.
++     * @param[out] timed_out Set to true only when the request failed after timing out.
++     */
++    bool wpa_ctrl_send_msg(const std::string &cmd, const std::string &ifname,
++                           int retry_max, bool *timed_out = nullptr);
++
+     /**
+      * @brief Force-close and reopen the cmd wpa_ctrl socket for a registered interface.
+      *
+diff --git a/common/beerocks/bwl/nl80211/wpa_ctrl_client.cpp b/common/beerocks/bwl/nl80211/wpa_ctrl_client.cpp
+index 3858dc165..255bccbc5 100644
+--- a/common/beerocks/bwl/nl80211/wpa_ctrl_client.cpp
++++ b/common/beerocks/bwl/nl80211/wpa_ctrl_client.cpp
+@@ -64,8 +64,13 @@ bool wpa_ctrl_socket_cmd::disconnect(bool force)
+     return true;
+ }
+ 
+-bool wpa_ctrl_socket_cmd::request(const std::string &cmd, char *buffer, size_t buff_size)
++bool wpa_ctrl_socket_cmd::request(const std::string &cmd, char *buffer, size_t buff_size,
++                                  int retry_max, bool *timed_out)
+ {
++    if (timed_out) {
++        *timed_out = false;
++    }
++
+     if (!m_ctx) {
+         LOG(ERROR) << "Control socket not available!";
+         return false;
+@@ -73,10 +78,15 @@ bool wpa_ctrl_socket_cmd::request(const std::string &cmd, char *buffer, size_t b
+ 
+     int result;
+     int try_cnt         = 0;
++    const int request_attempts = retry_max < 0 ? WPA_CTRL_READ_RETRY_MAX : retry_max;
+     auto buff_size_copy = buff_size;
+     do {
+         result = wpa_ctrl_request(m_ctx, cmd.c_str(), cmd.size(), buffer, &buff_size_copy, NULL);
+-    } while (result == -2 && ++try_cnt < WPA_CTRL_READ_RETRY_MAX);
++    } while (result == -2 && ++try_cnt < request_attempts);
++
++    if (timed_out) {
++        *timed_out = (result == -2);
++    }
+ 
+     if (try_cnt > 0) {
+         LOG(WARNING) << "wpa_ctrl_request cmd: " << cmd << " retried " << try_cnt << " time(s)";
+diff --git a/common/beerocks/bwl/nl80211/wpa_ctrl_client.h b/common/beerocks/bwl/nl80211/wpa_ctrl_client.h
+index 4dc628c38..773f620c9 100644
+--- a/common/beerocks/bwl/nl80211/wpa_ctrl_client.h
++++ b/common/beerocks/bwl/nl80211/wpa_ctrl_client.h
+@@ -164,6 +164,9 @@ public:
+      * @param[in] cmd String to be sent over the opened socket.
+      * @param[in/out] buffer Buffer data to be filled with received answer.
+      * @param[in] buff_size Maximum data size to be saved in the buffer.
++     * @param[in] retry_max Maximum number of total request attempts. The default preserves
++     *                      the existing retry policy; one sends the request only once.
++     * @param[out] timed_out Set to true when all attempts ended with a request timeout.
+      *
+      * @return True on success and false if:
+      * - socket is not opened
+@@ -171,7 +174,8 @@ public:
+      * - or time outed while waiting for reply
+      * - or received data size exceeds the buffer size
+      */
+-    bool request(const std::string &cmd, char *buffer, size_t buff_size);
++    bool request(const std::string &cmd, char *buffer, size_t buff_size,
++                 int retry_max = WPA_CTRL_READ_RETRY_MAX, bool *timed_out = nullptr);
+ };
+ 
+ /**
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+index 296e61ec8..499af1acf 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+@@ -362,6 +362,7 @@ cACTION_APMANAGER_WIFI_CREDENTIALS_UPDATE_REQUEST:
+ cACTION_APMANAGER_WIFI_CREDENTIALS_UPDATE_RESPONSE:
+   _type: class
+   number_of_bss_available: uint8_t
++  status: uint8_t # 0 = success, 1 = update failure/unknown outcome
+ 
+ cACTION_APMANAGER_START_WPS_PBC_REQUEST:
+   _type: class
+-- 
+2.34.1
+
