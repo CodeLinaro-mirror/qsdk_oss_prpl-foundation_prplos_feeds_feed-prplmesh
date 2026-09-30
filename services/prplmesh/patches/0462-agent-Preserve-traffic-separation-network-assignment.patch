@@ -1,0 +1,818 @@
+From 0886cfb6e08ec172e842e86ea78c91eed90dd904 Mon Sep 17 00:00:00 2001
+From: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+Date: Sat, 26 Sep 2026 15:18:48 +0530
+Subject: [PATCH] agent: Preserve traffic-separation network assignments across
+ reboot
+
+Traffic-separation cleanup was removing persisted network assignments during normal reset and manager destruction, causing VAP and guest VLAN bridge configuration to be lost across reboot or reload.
+
+Separate runtime policy cleanup from explicit persistent VLAN removal. Resolve per-BSS private and guest bridges dynamically, preserve existing UCI network assignments when classification is temporarily unavailable, and persist the resolved network during Wi-Fi credential updates.
+
+Signed-off-by: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 | 60 +++++++++++-
+ .../slave/tasks/traffic_separation_task.cpp   | 10 +-
+ .../slave/tasks/traffic_separation_task.h     |  9 +-
+ .../traffic_separation_manager.cpp            | 92 ++++---------------
+ .../traffic_separation_manager.h              | 16 ++--
+ .../traffic_separation_utils.h                | 27 ++++++
+ .../bcl/include/bcl/son/son_wireless_utils.h  |  3 +
+ .../beerocks/bwl/dwpal/ap_wlan_hal_dwpal.cpp  |  7 +-
+ .../bwl/dwpald/ap_wlan_hal_dwpald.cpp         |  7 +-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 70 ++++++++++++--
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   | 11 ++-
+ framework/platform/bpl/cfg/rdk/bpl_cfg.cpp    | 10 ++
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     | 89 +++++++++++++++++-
+ 13 files changed, 300 insertions(+), 111 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index d76a43b81..94f19724c 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -14,6 +14,7 @@
+ 
+ #include <bwl/base_wlan_hal_types.h>
+ #include "../../slave/agent_db.h"
++#include <bcl/beerocks_defines.h>
+ #include <bcl/beerocks_os_utils.h>
+ #include <bcl/beerocks_qos_utils.h>
+ #include <bcl/beerocks_string_utils.h>
+@@ -24,6 +25,8 @@
+ #include <bpl/bpl_cfg.h>
+ #include <easylogging++.h>
+ 
++#include "../../slave/traffic_separation/traffic_separation_utils.h"
++
+ #include <beerocks/tlvf/beerocks_message.h>
+ #include <beerocks/tlvf/beerocks_message_apmanager.h>
+ #include <beerocks/tlvf/structs/sSmdPolicyConfig.h>
+@@ -982,7 +985,9 @@ void ApManager::handle_virtual_bss_request(ieee1905_1::CmduMessageRx &cmdu_rx)
+     if (virtual_bss_creation_tlv) {
+ 
+         std::string ifname = get_vbss_interface_name(virtual_bss_creation_tlv->bssid());
+-        std::string bridge = "br-lan";
++        // Virtual BSS has no guest-role information in its TLV, so keep it on
++        // the configured private bridge instead of hard-coding br-lan.
++        std::string bridge = AgentDB::get()->bridge.iface_name;
+ 
+         // TODO: PPM-2348 add the bridge name to BPL
+ 
+@@ -2559,6 +2564,22 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+             bss_info_conf.vap_label        = config_data.vap_label_str();
+             bss_info_conf.wifi_compat_mode = config_data.wifi_compat_mode();
+ 
++            // Some initial configurations do not yet have the traffic-separation
++            // SSID-to-VLAN mapping populated. Prefer the local UCI custom_alias when
++            // the controller did not provide a VAP type, so guest VAPs are still
++            // assigned to the correct bridge during the first configuration pass.
++            if (bss_info_conf.vap_type == eVapType::OTHER && !bss_info_conf.ssid.empty()) {
++                son::wireless_utils::sBssInfoConf uci_bss;
++                if (beerocks::bpl::bpl_cfg_get_wifi_credentials_by_ssid(
++                        bss_info_conf.ssid, uci_bss) &&
++                    uci_bss.vap_type != eVapType::OTHER) {
++                    bss_info_conf.vap_type  = uci_bss.vap_type;
++                    bss_info_conf.vap_label = uci_bss.vap_label;
++                    LOG(DEBUG) << "Resolved vap_type=" << eVapType_str(bss_info_conf.vap_type)
++                               << " from UCI for SSID " << bss_info_conf.ssid;
++                }
++            }
++
+             // 802.11bi: opaque pass-through strings, echoed verbatim into hostapd by
+             // ap_wlan_hal_nl80211 (sae_groups=/pasn_groups= and security_profiles=).
+             bss_info_conf.enabled_ecp_groups = config_data.enabled_ecp_groups_str();
+@@ -2631,6 +2652,43 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+             bss_info_conf_list.push_back(bss_info_conf);
+         }
+ 
++        // Resolve the hostapd bridge per BSS. An empty effective_bridge means that
++        // classification is still unknown; existing hostapd configuration should then
++        // be preserved, while new BSS creation will use bridge_name as a safe fallback.
++        auto db = AgentDB::get();
++        std::string guest_bridge;
++        const bool have_guest_bridge =
++            beerocks::bpl::cfg_get_guest_bridge_iface(guest_bridge) && !guest_bridge.empty();
++
++        for (auto &bss : bss_info_conf_list) {
++            if (bss.teardown) {
++                continue;
++            }
++
++            const bool guest = beerocks::is_guest_bss(bss, db->traffic_separation);
++            const bool mapping_known =
++                bss.vap_type != eVapType::OTHER || bss.backhaul ||
++                db->traffic_separation.ssid_vid_mapping.find(bss.ssid) !=
++                    db->traffic_separation.ssid_vid_mapping.end();
++
++            if (guest && have_guest_bridge) {
++                bss.effective_bridge = guest_bridge;
++            } else if (mapping_known) {
++                bss.effective_bridge = bridge_name;
++            } else {
++                // Do not overwrite an existing per-BSS hostapd bridge while the
++                // traffic-separation mapping is not available yet.
++                bss.effective_bridge.clear();
++                LOG(DEBUG) << "Bridge classification pending for SSID " << bss.ssid
++                           << "; preserving existing hostapd bridge configuration";
++            }
++
++            LOG(DEBUG) << "BSS bridge selection: ssid=" << bss.ssid
++                       << " vap_type=" << eVapType_str(bss.vap_type)
++                       << " backhaul=" << bss.backhaul
++                       << " effective_bridge=" << bss.effective_bridge;
++        }
++
+ #ifdef USE_PRPLMESH_NLHAL
+         // A vendor-reported "disabled" radio_state (real, or via a stub like the
+         // Airties Service-Status TLV on the nl80211 HAL where enable()/disable() are
+diff --git a/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp b/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
+index bb7cbbfed..41ca345ae 100644
+--- a/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
++++ b/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
+@@ -30,11 +30,11 @@ TrafficSeparationTask::TrafficSeparationTask(slave_thread &btl_ctx)
+ {
+ }
+ 
+-bool TrafficSeparationTask::cleanup_ts_runtime_state()
++bool TrafficSeparationTask::cleanup_ts_runtime_state(bool reset_persistent_vlan_config)
+ {
+     bool success = true;
+ 
+-    if (m_mgr && !m_mgr->clear_policies()) {
++    if (m_mgr && !m_mgr->clear_policies(reset_persistent_vlan_config)) {
+         LOG(ERROR) << "manager clear_policies failed";
+         success = false;
+     }
+@@ -108,7 +108,7 @@ void TrafficSeparationTask::handle_event(uint8_t event_enum_value, const void *e
+         break;
+     }
+     case TS_CLEAR: {
+-        if (!cleanup_ts_runtime_state()) {
++        if (!cleanup_ts_runtime_state(true)) {
+             LOG(ERROR) << "cleanup_ts_runtime_state failed";
+         }
+ 
+@@ -305,7 +305,7 @@ bool TrafficSeparationTask::reset()
+     if (primary_vid == 0 || primary_vid > net::MAX_VLAN_ID) {
+         m_last_applied_valid = false;
+ 
+-        if (!cleanup_ts_runtime_state()) {
++        if (!cleanup_ts_runtime_state(primary_vid == 0)) {
+             LOG(ERROR) << "cleanup_ts_runtime_state failed (invalid/disabled primary_vlan_id)";
+             return false;
+         }
+@@ -411,7 +411,7 @@ bool TrafficSeparationTask::reset()
+     // stale missing ports and rebuild exact ports from the current DB snapshot
+     // so task recreation or crash/restart can repopulate the manager even if
+     // those exact events are not replayed.
+-    if (!m_mgr->clear_policies()) {
++    if (!m_mgr->clear_policies(false)) {
+         LOG(ERROR) << "manager clear_policies failed";
+         m_last_applied_valid = false;
+         return false;
+diff --git a/agent/src/beerocks/slave/tasks/traffic_separation_task.h b/agent/src/beerocks/slave/tasks/traffic_separation_task.h
+index 3991e6c97..c3769a99f 100644
+--- a/agent/src/beerocks/slave/tasks/traffic_separation_task.h
++++ b/agent/src/beerocks/slave/tasks/traffic_separation_task.h
+@@ -160,9 +160,12 @@ private:
+     bool retry_pending_wds_ifaces();
+ 
+     /**
+-   * @brief Clear TS state and restore transport defaults used outside TS mode.
+-   */
+-    bool cleanup_ts_runtime_state();
++     * @brief Clear TS state and restore transport defaults used outside TS mode.
++     *
++     * @param reset_persistent_vlan_config Remove TS-owned persistent Ethernet
++     *        VLAN bridge assignments when true.
++     */
++    bool cleanup_ts_runtime_state(bool reset_persistent_vlan_config = false);
+ 
+     /**
+      * @brief Configure primary VLAN in transport/broker when it changed.
+diff --git a/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.cpp b/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.cpp
+index 30aa689a1..54eee34be 100644
+--- a/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.cpp
++++ b/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.cpp
+@@ -303,7 +303,7 @@ bool TrafficSeparationManager::reapply_config(const sTrafficSeparationConfig &cf
+     return true;
+ }
+ 
+-bool TrafficSeparationManager::clear_policies()
++bool TrafficSeparationManager::clear_policies(bool reset_persistent_vlan_config)
+ {
+     bool success = true;
+ 
+@@ -345,13 +345,12 @@ bool TrafficSeparationManager::clear_policies()
+         m_state = eTsManagerState::CONFIGURED;
+     }
+ 
+-    // Reset persisted UCI bridge assignments when TS policies are cleared.
+-    // Called here so persistence is rolled back on any TS teardown path,
+-    // not only on full manager reset.
+-    {
++    // Persistent VLAN configuration is reset only for an explicit TS disable/
++    // clear. Normal re-apply and manager destruction preserve it for reboot.
++    if (reset_persistent_vlan_config) {
+         auto db = beerocks::AgentDB::get();
+         if (db->device_conf.ts_persistence_enabled) {
+-            reset_persistence();
++            reset_persistent_vlan_assignments();
+         }
+     }
+ 
+@@ -364,7 +363,7 @@ bool TrafficSeparationManager::reset()
+ {
+     bool success = true;
+ 
+-    if (!clear_policies()) {
++    if (!clear_policies(false)) {
+         LOG(ERROR) << "clear_policies failed";
+         success = false;
+     }
+@@ -383,13 +382,6 @@ bool TrafficSeparationManager::reset()
+         success = false;
+     }
+ 
+-    {
+-        auto db = beerocks::AgentDB::get();
+-        if (db->device_conf.ts_persistence_enabled) {
+-            reset_persistence();
+-        }
+-    }
+-
+     m_config = sTrafficSeparationConfig{};
+     m_state  = eTsManagerState::NO_CONFIG;
+ 
+@@ -576,52 +568,18 @@ void TrafficSeparationManager::persist_bridge_assignments()
+     }
+ }
+ 
+-void TrafficSeparationManager::reset_persistence()
++void TrafficSeparationManager::reset_persistent_vlan_assignments()
+ {
+-    if (m_config.private_bridge.empty()) {
+-        LOG(WARNING) << "reset_persistence: private_bridge is empty, skipping";
+-        return;
+-    }
+-
+-    std::string private_network_name;
+-    if (!bpl::cfg_get_network_name_for_bridge(m_config.private_bridge, private_network_name)) {
+-        LOG(WARNING) << "reset_persistence: cannot find network name for private_bridge="
+-                     << m_config.private_bridge;
++    if (m_config.guest_bridge.empty() || m_config.guest_vid == 0) {
++        LOG(WARNING) << "reset_persistent_vlan_assignments: guest configuration is empty, "
++                        "skipping";
+         return;
+     }
+ 
+-    auto db               = beerocks::AgentDB::get();
+-    bool wireless_written = false;
+-    bool network_written  = false;
+-
+-    // Reset wifi-iface 'option network' back to the private bridge for all BSS interfaces.
+-    for (const auto *radio : db->get_radios_list()) {
+-        if (!radio) {
+-            continue;
+-        }
+-
+-        for (const auto &bss : radio->front.bssids) {
+-            if (!bss.active || bss.iface_name.empty()) {
+-                continue;
+-            }
+-
+-            if (!bss.fronthaul_bss && !bss.backhaul_bss) {
+-                continue;
+-            }
+-
+-            const std::string iface_name = strip_link_suffix(bss.iface_name);
+-
+-            if (bpl::cfg_set_wifi_iface_network(iface_name, private_network_name, bss.ssid)) {
+-                LOG(DEBUG) << "reset_persistence: reset iface=" << iface_name
+-                           << " to network=" << private_network_name;
+-                wireless_written = true;
+-            }
+-        }
+-    }
+-
+     // Remove VLAN subinterface entries from /etc/config/network that were added by
+     // persist_bridge_assignments() for tagged Ethernet trunk ports only.
+     //   - Ethernet trunks only: remove <iface>.<guest_vid> from guest_bridge
++    bool network_written = false;
+     for (const auto &entry : m_trunk_ports) {
+         const sTrunkPort &tp = entry.second;
+         if (tp.is_untagged_mode || !tp.is_ethernet) {
+@@ -629,31 +587,21 @@ void TrafficSeparationManager::reset_persistence()
+         }
+ 
+         // Remove guest VLAN subinterface from guest_bridge (Ethernet trunks only)
+-        if (!m_config.guest_bridge.empty() && m_config.guest_vid != 0) {
+-            const std::string guest_vlan_iface =
+-                tp.iface_name + "." + std::to_string(m_config.guest_vid);
+-            if (bpl::cfg_remove_iface_from_bridge_config(m_config.guest_bridge,
+-                                                         guest_vlan_iface)) {
+-                LOG(DEBUG) << "reset_persistence: removed " << guest_vlan_iface
+-                           << " from bridge=" << m_config.guest_bridge;
+-                network_written = true;
+-            }
+-        }
+-    }
+-
+-    if (wireless_written) {
+-        if (!bpl::cfg_commit_wireless_config()) {
+-            LOG(WARNING) << "reset_persistence: wireless commit FAILED";
+-        } else {
+-            LOG(DEBUG) << "reset_persistence: wireless commit SUCCESS";
++        const std::string guest_vlan_iface =
++            tp.iface_name + "." + std::to_string(m_config.guest_vid);
++        if (bpl::cfg_remove_iface_from_bridge_config(m_config.guest_bridge,
++                                                     guest_vlan_iface)) {
++            LOG(DEBUG) << "reset_persistent_vlan_assignments: removed " << guest_vlan_iface
++                       << " from bridge=" << m_config.guest_bridge;
++            network_written = true;
+         }
+     }
+ 
+     if (network_written) {
+         if (!bpl::cfg_commit_network_config()) {
+-            LOG(WARNING) << "reset_persistence: network commit FAILED";
++            LOG(WARNING) << "reset_persistent_vlan_assignments: network commit FAILED";
+         } else {
+-            LOG(DEBUG) << "reset_persistence: network commit SUCCESS";
++            LOG(DEBUG) << "reset_persistent_vlan_assignments: network commit SUCCESS";
+         }
+     }
+ }
+diff --git a/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.h b/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.h
+index d784ebf3e..e75c90d64 100644
+--- a/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.h
++++ b/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.h
+@@ -28,7 +28,7 @@ namespace beerocks::net {
+ class TrafficSeparationManager {
+ public:
+     TrafficSeparationManager() = default;
+-    virtual ~TrafficSeparationManager() { clear_policies(); }
++    virtual ~TrafficSeparationManager() { clear_policies(false); }
+     TrafficSeparationManager(const TrafficSeparationManager &) = delete;
+     TrafficSeparationManager &operator=(const TrafficSeparationManager &) = delete;
+ 
+@@ -104,10 +104,12 @@ public:
+     /**
+      * @brief Rollback of the current configuration on all trunk and access ports.
+      *
++     * @param reset_persistent_vlan_config Remove TS-owned persistent Ethernet
++     *        VLAN bridge assignments when true. Runtime cleanup is always done.
+      * @return true if clear() succeeded (or there was nothing to clear) for
+      *         all ports, false otherwise.
+      */
+-    bool clear_policies();
++    bool clear_policies(bool reset_persistent_vlan_config = false);
+ 
+     /**
+      * @brief Reset the manager to its initial, unconfigured state.
+@@ -163,15 +165,11 @@ public:
+ 
+ private:
+     /**
+-     * @brief Reset persisted bridge assignments in UCI wireless config.
++     * @brief Remove persistent Ethernet VLAN bridge assignments created by TS.
+      *
+-     * For each active BSS interface, resets the wifi-iface 'option network'
+-     * back to the private bridge network so that netifd places all interfaces
+-     * in the default bridge on the next boot.
+-     *
+-     * Called from reset() when ts_persistence_enabled is true.
++     * Wireless VAP network assignments are intentionally left unchanged.
+      */
+-    void reset_persistence();
++    void reset_persistent_vlan_assignments();
+ 
+ private:
+     bool has_any_ports() const
+diff --git a/agent/src/beerocks/slave/traffic_separation/traffic_separation_utils.h b/agent/src/beerocks/slave/traffic_separation/traffic_separation_utils.h
+index 908569052..ca4828a92 100644
+--- a/agent/src/beerocks/slave/traffic_separation/traffic_separation_utils.h
++++ b/agent/src/beerocks/slave/traffic_separation/traffic_separation_utils.h
+@@ -13,6 +13,7 @@
+ #include <string>
+ 
+ #include <bcl/beerocks_defines.h>
++#include <bcl/son/son_wireless_utils.h>
+ 
+ #include "../agent_db.h"
+ 
+@@ -164,6 +165,32 @@ inline bool is_guest_bss(const AgentDB::sRadio::sFront::sBssid &bss,
+     return false;
+ }
+ 
++/**
++ * @brief Determine whether a BSS configuration belongs to the guest bridge.
++ *
++ * Backhaul BSSes always use the private bridge. For an untyped BSS, use the
++ * traffic-separation SSID-to-secondary-VLAN mapping as a fallback.
++ */
++inline bool is_guest_bss(const son::wireless_utils::sBssInfoConf &bss,
++                         const AgentDB::sTrafficSeparation &ts_db)
++{
++    if (bss.backhaul) {
++        return false;
++    }
++
++    if (bss.vap_type == eVapType::GUEST) {
++        return true;
++    }
++
++    if (bss.vap_type == eVapType::OTHER && !bss.ssid.empty()) {
++        const auto it = ts_db.ssid_vid_mapping.find(bss.ssid);
++        return it != ts_db.ssid_vid_mapping.end() &&
++               ts_db.secondary_vlans_ids.count(it->second) != 0;
++    }
++
++    return false;
++}
++
+ } // namespace beerocks
+ 
+ #endif // TRAFFIC_SEPARATION_UTILS_H
+diff --git a/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h b/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
+index 18db7bd50..e2b04df7b 100644
+--- a/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
++++ b/common/beerocks/bcl/include/bcl/son/son_wireless_utils.h
+@@ -367,6 +367,9 @@ public:
+         WSC::eWscVendorExtHiddenSsid hidden_ssid          = WSC::eWscVendorExtHiddenSsid::UNSET;
+         eVapType vap_type                                 = eVapType::OTHER;
+         std::string vap_label;
++        // Agent-local bridge selected for hostapd configuration. This field is not serialized
++        // into any controller-facing TLV.
++        std::string effective_bridge;
+         std::string mld_id              = "";
+         bool bSTA                       = false;
+         std::string backhaul_wps_ssid;
+diff --git a/common/beerocks/bwl/dwpal/ap_wlan_hal_dwpal.cpp b/common/beerocks/bwl/dwpal/ap_wlan_hal_dwpal.cpp
+index 88fd6fe43..fd5ae7c36 100644
+--- a/common/beerocks/bwl/dwpal/ap_wlan_hal_dwpal.cpp
++++ b/common/beerocks/bwl/dwpal/ap_wlan_hal_dwpal.cpp
+@@ -1458,9 +1458,10 @@ bool ap_wlan_hal_dwpal::update_vap_credentials(
+             return false;
+         }
+ 
+-        if (!bridge_ifname.empty() &&
+-            beerocks::net::network_utils::linux_iface_is_up(bridge_ifname)) {
+-            hostapd_config_set_value(hostapd_config->second, "bridge", bridge_ifname);
++        if (!bss_info_conf.effective_bridge.empty() &&
++            beerocks::net::network_utils::linux_iface_is_up(bss_info_conf.effective_bridge)) {
++            hostapd_config_set_value(hostapd_config->second, "bridge",
++                                     bss_info_conf.effective_bridge);
+         }
+ 
+         LOG(DEBUG) << "Autoconfiguration for ssid: " << bss_info_conf.ssid
+diff --git a/common/beerocks/bwl/dwpald/ap_wlan_hal_dwpald.cpp b/common/beerocks/bwl/dwpald/ap_wlan_hal_dwpald.cpp
+index 17f0bd0b6..938496394 100644
+--- a/common/beerocks/bwl/dwpald/ap_wlan_hal_dwpald.cpp
++++ b/common/beerocks/bwl/dwpald/ap_wlan_hal_dwpald.cpp
+@@ -1451,9 +1451,10 @@ bool ap_wlan_hal_dwpal::update_vap_credentials(
+             return false;
+         }
+ 
+-        if (!bridge_ifname.empty() &&
+-            beerocks::net::network_utils::linux_iface_is_up(bridge_ifname)) {
+-            hostapd_config_set_value(hostapd_config->second, "bridge", bridge_ifname);
++        if (!bss_info_conf.effective_bridge.empty() &&
++            beerocks::net::network_utils::linux_iface_is_up(bss_info_conf.effective_bridge)) {
++            hostapd_config_set_value(hostapd_config->second, "bridge",
++                                     bss_info_conf.effective_bridge);
+         }
+ 
+         if (bss_info_conf.teardown) {
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index b20e02d9d..2640a2aa0 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -139,6 +139,24 @@ struct SRadioCapabilitiesStrings {
+ /////////////////////////// Local Module Functions ///////////////////////////
+ //////////////////////////////////////////////////////////////////////////////
+ 
++static void resolve_guest_effective_bridge(
++    son::wireless_utils::sBssInfoConf &bss_conf)
++{
++    if (bss_conf.backhaul || bss_conf.vap_type != eVapType::GUEST ||
++        !bss_conf.effective_bridge.empty()) {
++        return;
++    }
++
++    std::string guest_bridge;
++    if (beerocks::bpl::cfg_get_guest_bridge_iface(guest_bridge) &&
++        !guest_bridge.empty()) {
++        bss_conf.effective_bridge = guest_bridge;
++        LOG(INFO) << "Resolved guest VAP bridge=" << guest_bridge;
++    } else {
++        LOG(WARNING) << "Unable to resolve bridge for guest VAP";
++    }
++}
++
+ static ap_wlan_hal::Event nl80211_to_bwl_event(const std::string &opcode)
+ {
+     if (opcode == "AP-ENABLED") {
+@@ -4752,6 +4770,9 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+ 
+                 // Get bridge value from the hostapd config section of the current BSS.
+                 std::string bridge_val = conf.get_vap_value(vap_id, "bridge");
++                if (!bss_conf.effective_bridge.empty()) {
++                    bridge_val = bss_conf.effective_bridge;
++                }
+                 LOG(INFO) << "handle_wifi_compat_mode: 11BE - bridge=" << bridge_val
+                           << " for VAP=" << vap_id;
+ 
+@@ -4873,6 +4894,9 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+                 }
+                 m_radio_info.hostapd_new_bss_config.clear();
+                 std::string bridge_val_fp = conf.get_vap_value(vap_id, "bridge");
++                if (!bss_conf.effective_bridge.empty()) {
++                    bridge_val_fp = bss_conf.effective_bridge;
++                }
+                 conf.remove_bss_config(vap_id);
+                 promote_primary_bss();
+                 if (!conf.store(vap_id)) {
+@@ -4949,6 +4973,9 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+             m_radio_info.hostapd_new_bss_config.clear();
+             // Get bridge value from the hostapd config section of the current BSS.
+             std::string bridge_val = conf.get_vap_value(vap_id, "bridge");
++            if (!bss_conf.effective_bridge.empty()) {
++                bridge_val = bss_conf.effective_bridge;
++            }
+ 
+             conf.remove_bss_config(vap_id);
+ 
+@@ -5454,9 +5481,18 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                 }
+             }
+ 
++            // The interface/SSID lookup above can resolve a guest VAP after the
++            // AP-manager bridge decision was made. Refresh the per-BSS bridge in
++            // that case so newly-created guest VAPs and MLO links do not fall back
++            // to the private bridge.
++            resolve_guest_effective_bridge(bss_it);
++
+             if ((mld_id_val >=0) && bss_name_changed) {
+                 std::string prev_iface = "";
+-                if (!add_mld_link(new_vap_name,prev_iface,bss_it,bridge_ifname)) {
++                std::string bss_bridge = bss_it.effective_bridge.empty()
++                                             ? bridge_ifname
++                                             : bss_it.effective_bridge;
++                if (!add_mld_link(new_vap_name,prev_iface,bss_it,bss_bridge)) {
+                     LOG(ERROR) << " add_mld_link failed for " << new_vap_name ;
+                     // mark bssid usage as false
+                     m_radio_info.bssid_pool[bss_mac_string] = false;
+@@ -5464,8 +5500,10 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                 }
+                 LOG(INFO) << "add_mld_link success:  " << " bss: " << new_vap_name << " bssid: " <<new_bssid;
+             } else {
+-                std::string bridge_ifname_copy = bridge_ifname;
+-                if (!add_bss(new_vap_name,bss_it,bridge_ifname_copy,false)) {
++                std::string bss_bridge = bss_it.effective_bridge.empty()
++                                             ? bridge_ifname
++                                             : bss_it.effective_bridge;
++                if (!add_bss(new_vap_name,bss_it,bss_bridge,false)) {
+                     LOG(ERROR) << " Add bss failed for " << new_vap_name ;
+                     // mark bssid usage as false
+                     m_radio_info.bssid_pool[bss_mac_string] = false;
+@@ -5615,15 +5653,21 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                 // from UCI) to write ignore_broadcast_ssid a few lines below.
+                 preload_mrsno_from_uci(bss_it, bss);
+ 
++                resolve_guest_effective_bridge(bss_it);
++
+                 if (!assign_auth_encr_parameters(conf, vap_id, bss_it)) {
+                     LOG(ERROR) << "Failed to set the authentication/encryption parameters!";
+                     abort = true;
+                     break;
+                 }
+ 
+-                if (!bridge_ifname.empty() &&
+-                    beerocks::net::network_utils::linux_iface_is_up(bridge_ifname)) {
+-                    conf.set_create_vap_value(vap_id, "bridge", bridge_ifname);
++                // An unclassified existing BSS may still have a platform-specific
++                // bridge in hostapd.conf. Preserve it until traffic-separation
++                // classification becomes available instead of overwriting it with
++                // the agent's private bridge.
++                if (!bss_it.effective_bridge.empty() &&
++                    beerocks::net::network_utils::linux_iface_is_up(bss_it.effective_bridge)) {
++                    conf.set_create_vap_value(vap_id, "bridge", bss_it.effective_bridge);
+                 }
+ 
+ 
+@@ -6030,7 +6074,10 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                     }
+ 
+                     if (bss_name_changed == true) {
+-                        if (!add_mld_link(bss,vap_info.bss,bss_it,bridge_ifname)) {
++                        std::string bss_bridge = bss_it.effective_bridge.empty()
++                                                     ? bridge_ifname
++                                                     : bss_it.effective_bridge;
++                        if (!add_mld_link(bss,vap_info.bss,bss_it,bss_bridge)) {
+                             LOG(ERROR) << "add_mld_link failed for bss=" << bss;
+                         }
+                     } else {
+@@ -10063,6 +10110,15 @@ bool ap_wlan_hal_nl80211::create_new_hostapd_conf_file(std::string &ifname, son:
+                   << " -> setting disable_11bn=1 for vap_id=" << vap_id;
+     }
+ 
++    resolve_guest_effective_bridge(bss_conf);
++
++    if (!bss_conf.backhaul && bss_conf.vap_type == eVapType::GUEST &&
++        !bss_conf.effective_bridge.empty()) {
++        bridge = bss_conf.effective_bridge;
++    } else if (bridge.empty() && !bss_conf.effective_bridge.empty()) {
++        bridge = bss_conf.effective_bridge;
++    }
++
+     if (!bridge.empty()) {
+         conf.set_create_vap_value(vap_id,"bridge", bridge);
+     }
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index 218e4c62b..cf7ac84e8 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -843,10 +843,13 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+             LOG(INFO) << "added new instances " << wifi_ssid_path << " " << wifi_vap_path;
+ 
+             args.set_type(AMXC_VAR_ID_HTABLE);
+-            const std::string effective_bridge =
+-                (bss_info_conf.vap_type == eVapType::GUEST)
+-                    ? bpl::DEFAULT_GUEST_BRIDGE_IFACE
+-                    : bridge_ifname;
++            std::string effective_bridge = bss_info_conf.effective_bridge;
++            if (effective_bridge.empty() && bss_info_conf.vap_type == eVapType::GUEST) {
++                bpl::cfg_get_guest_bridge_iface(effective_bridge);
++            }
++            if (effective_bridge.empty()) {
++                effective_bridge = bridge_ifname;
++            }
+             args.add_child("BridgeInterface", effective_bridge);
+             args.add_child("IEEE80211kEnabled", 1);
+             args.add_child("WDSEnable", 1);
+diff --git a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+index 31c870dac..8035f2fe8 100644
+--- a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+@@ -1007,6 +1007,16 @@ bool bpl_cfg_get_wifi_credentials(const std::string &iface,
+     return !configuration.ssid.empty();
+ }
+ 
++bool bpl_cfg_get_wifi_credentials_by_ssid(
++    const std::string & /*ssid*/, son::wireless_utils::sBssInfoConf & /*configuration*/)
++{
++    // RDKB currently exposes only the primary wireless credentials through its
++    // qmesh.json-backed BPL implementation. It has no per-SSID lookup here.
++    // Returning false allows callers to retain the controller-provided BSS
++    // classification instead of treating an unpopulated configuration as valid.
++    return false;
++}
++
+ bool cfg_get_link_metrics_request_interval(std::chrono::seconds &link_metrics_request_interval_sec)
+ {
+     return true;
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index c3a795566..f1039817a 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -400,6 +400,83 @@ static std::string mrsno_encryption_for_band(const std::vector<uint8_t> &securit
+ 
+ } // anonymous namespace
+ 
++namespace {
++
++/**
++ * Resolve the persistent UCI network for a VAP without making an
++ * unclassified VAP fall back to the primary network when an existing
++ * assignment is already available.
++ *
++ * The order is intentional:
++ *   1. effective_bridge, when traffic-separation/AP-manager already resolved it
++ *   2. explicit guest VAP classification
++ *   3. existing UCI assignment for an unclassified VAP
++ *   4. private network for known non-guest/backhaul VAPs
++ */
++static bool resolve_wifi_network(const std::string &section_name,
++                                 const son::wireless_utils::sBssInfoConf &configuration,
++                                 std::string &network_name)
++{
++    const auto network_from_bridge = [&](const std::string &bridge_name) {
++        return !bridge_name.empty() &&
++               cfg_get_network_name_for_bridge(bridge_name, network_name);
++    };
++
++    if (network_from_bridge(configuration.effective_bridge)) {
++        return true;
++    }
++
++    if (!configuration.backhaul && configuration.vap_type == eVapType::GUEST) {
++        std::string guest_bridge;
++        if (cfg_get_guest_bridge_iface(guest_bridge) &&
++            network_from_bridge(guest_bridge)) {
++            return true;
++        }
++
++        LOG(WARNING) << "Unable to resolve guest network for wireless section "
++                     << section_name;
++        return false;
++    }
++
++    // During initial configuration the traffic-separation database may not yet
++    // contain ssid_vlan_mapping. Preserve an existing assignment in that case.
++    if (configuration.vap_type == eVapType::OTHER) {
++        std::string existing_network;
++        if (uci_get_option("wireless", "wifi-iface", section_name, "network",
++                           existing_network) &&
++            !existing_network.empty()) {
++            network_name = existing_network;
++            return true;
++        }
++    }
++
++    std::string private_bridge;
++    if (cfg_get_private_bridge_iface(private_bridge) &&
++        network_from_bridge(private_bridge)) {
++        return true;
++    }
++
++    LOG(WARNING) << "Unable to resolve private network for wireless section "
++                 << section_name;
++    return false;
++}
++
++static void add_resolved_network_option(
++    const std::string &section_name,
++    const son::wireless_utils::sBssInfoConf &configuration,
++    OptionsUnorderedMap &options)
++{
++    std::string network_name;
++    if (resolve_wifi_network(section_name, configuration, network_name)) {
++        options["network"] = network_name;
++    } else {
++        // Do not overwrite an existing network with a guessed value.
++        options.erase("network");
++    }
++}
++
++} // anonymous namespace
++
+ static bool bpl_cfg_get_bss_configuration(const std::string &section_name,
+                                           son::wireless_utils::sBssInfoConf &configuration)
+ {
+@@ -1306,7 +1383,7 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+ 	    options["key"] = configuration.network_key;
+     	    options["ifname"] = iface;
+     	    options["mode"] = "ap";
+-    	    options["network"] = "lan";
++            add_resolved_network_option(section_name, configuration, options);
+ 
+ 	    // Persist DPP onboarding state so it survives a UCI-driven hostapd.conf
+ 	    // regeneration / reboot (mirrors dpp_controller/dpp_configurator_connectivity
+@@ -1536,7 +1613,7 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+                             "rsn_override_key_mgmt", "rsn_override_pairwise", "rsn_override_mfp",
+                             "rsn_override_key_mgmt_2", "rsn_override_pairwise_2", "rsn_override_mfp_2",
+                             "dpp", "dpp_controller", "dpp_configurator_connectivity",
+-                            "dpp_connector", "dpp_csign", "dpp_netaccesskey",
++                            "dpp_connector", "dpp_csign", "dpp_netaccesskey", "network",
+                             "eppk", "assoc_frame_encryption", "pmksa_caching_privacy",
+                             "security_profiles", "sae_groups", "pasn_groups",
+                             "rsnxe_capab_mask",
+@@ -1711,7 +1788,6 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+ 
+             options["mode"] = "ap";
+             options["mld"] = "mld" + std::to_string(conf_mld_id_val);
+-            options["network"] = "lan";
+ 
+             if (!config.multi_ap.empty()) {
+                 options["multi_ap"] = config.multi_ap;
+@@ -2026,6 +2102,9 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+         bool mld_section_exists = uci_section_exists(package_name, mld_section_type, mld_section_name);
+ 
+         OptionsUnorderedMap options = build_map_options(iface, configuration);
++        if (section_found) {
++            add_resolved_network_option(target_section, configuration, options);
++        }
+         if (section_found && mld_section_exists) {
+             static const char * const cred_keys[] = {
+                 "ssid", "encryption", "key", "multi_ap",
+@@ -2033,7 +2112,7 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+                 "rsn_override_key_mgmt", "rsn_override_pairwise", "rsn_override_mfp",
+                 "rsn_override_key_mgmt_2", "rsn_override_pairwise_2", "rsn_override_mfp_2",
+                 "dpp", "dpp_controller", "dpp_configurator_connectivity",
+-                "dpp_connector", "dpp_csign", "dpp_netaccesskey",
++                "dpp_connector", "dpp_csign", "dpp_netaccesskey", "network",
+                 "eppk", "assoc_frame_encryption", "pmksa_caching_privacy",
+                 "security_profiles", "sae_groups", "pasn_groups", "rsnxe_capab_mask",
+                 "disabled", nullptr
+@@ -2141,6 +2220,8 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+                 return false;
+             }
+             LOG(INFO) << "Created new section: " << target_section << " for device: " << device_section;
++
++            add_resolved_network_option(target_section, configuration, options);
+         }
+ 
+         if (!uci_set_section(package_name, section_type, target_section, options, true)) {
+-- 
+2.34.1
+
