@@ -1,0 +1,662 @@
+From dfaa21ae33137497d5595c632cb8c0ad9d256ac6 Mon Sep 17 00:00:00 2001
+From: Anurag Sethi <anurseth@qti.qualcomm.com>
+Date: Tue, 29 Sep 2026 15:31:43 -0700
+Subject: [PATCH] MAPC peer set up on topology update
+
+Signed-off-by: Anurag Sethi <anurseth@qti.qualcomm.com>
+---
+ .../master/tasks/coordinated_tdma_task.cpp    | 374 ++++++++++++------
+ .../master/tasks/coordinated_tdma_task.h      | 119 ++++++
+ .../beerocks/master/tasks/topology_task.cpp   |  25 ++
+ 3 files changed, 396 insertions(+), 122 deletions(-)
+
+diff --git a/controller/src/beerocks/master/tasks/coordinated_tdma_task.cpp b/controller/src/beerocks/master/tasks/coordinated_tdma_task.cpp
+index 6a264b26c..1d43af506 100644
+--- a/controller/src/beerocks/master/tasks/coordinated_tdma_task.cpp
++++ b/controller/src/beerocks/master/tasks/coordinated_tdma_task.cpp
+@@ -25,6 +25,7 @@
+ namespace son {
+ 
+ constexpr std::chrono::seconds coordinated_tdma_task::COTDMA_NEGOTIATION_PENDING_TIMEOUT;
++constexpr std::chrono::seconds coordinated_tdma_task::PENDING_MAPC_REPORT_TIMEOUT;
+ 
+ coordinated_tdma_task::coordinated_tdma_task(db &database, ieee1905_1::CmduMessageTx &cmdu_tx,
+                                              task_pool &tasks_)
+@@ -39,11 +40,14 @@ coordinated_tdma_task::coordinated_tdma_task(db &database, ieee1905_1::CmduMessa
+ 
+ void coordinated_tdma_task::work()
+ {
+-    // Event-driven task; the only periodic duty is reverting any Co-TDMA negotiation that
+-    // has been stuck in a "pending" state (ESTABLISH_PENDING / TEARDOWN_PENDING) for too
+-    // long, in case the lower layer failed to deliver the corresponding MAPC Negotiation
+-    // Status update.
++    // Event-driven task; the only periodic duties are:
++    //  - reverting any Co-TDMA negotiation that has been stuck in a "pending" state
++    //    (ESTABLISH_PENDING / TEARDOWN_PENDING) for too long, in case the lower layer
++    //    failed to deliver the corresponding MAPC Negotiation Status update.
++    //  - dropping any deferred MAPC Capability Update peer BSSID entry that has been
++    //    pending BSSID resolution for too long (see m_pending_mapc_capability_updates).
+     check_negotiation_pending_timeouts();
++    check_pending_mapc_report_timeouts();
+ 
+     // Otherwise entirely event-driven:
+     //   - MAPC Capability Report from Agent - Update Cooridnating APs DB and send policy config is any changes.
+@@ -63,6 +67,14 @@ void coordinated_tdma_task::handle_event(int event_type, void *obj)
+         // unique_ptr destructor frees memory automatically at end of scope
+         break;
+     }
++    case eEvent::AGENT_BSS_LEARNED: {
++        std::unique_ptr<sAgentBssLearnedEvent> ev(static_cast<sAgentBssLearnedEvent *>(obj));
++        if (ev) {
++            retry_pending_mapc_reports_for_bssid(ev->bssid);
++        }
++        // unique_ptr destructor frees memory automatically at end of scope
++        break;
++    }
+     default:
+         TASK_LOG(WARNING) << "Unhandled event_type " << event_type;
+         break;
+@@ -400,7 +412,9 @@ void coordinated_tdma_task::handle_mapc_capability_update(
+     }
+ 
+     // Sanity + apply: bssid in peer_bss_capabilities must be present on any OTHER Agent.
+-    // If not found on any Agent, discard that peer_bss_capabilities entry.
++    // If not found on any Agent (yet), defer the entry rather than discarding it - it may
++    // become resolvable once that Agent completes topology discovery with the Controller
++    // (see retry_pending_mapc_reports_for_bssid(), triggered via AGENT_BSS_LEARNED).
+     bool shared_bssid_list_changed = false;
+ 
+     // Newly-added shared BSSIDs (for this sharing BSSID) that have the CO_TDMA capability
+@@ -422,136 +436,179 @@ void coordinated_tdma_task::handle_mapc_capability_update(
+         auto peer_owning_agent = database.get_bss_parent_agent(entry.bssid);
+         if (peer_owning_agent == beerocks::net::network_utils::ZERO_MAC) {
+             TASK_LOG(WARNING) << "handle_mapc_capability_update: peer BSSID " << entry.bssid
+-                              << " not found on any Agent in DB, discarding entry";
++                              << " not found on any Agent in DB yet, deferring entry "
++                                 "(sharing_bssid="
++                              << local_bssid << ") for up to "
++                              << PENDING_MAPC_REPORT_TIMEOUT.count() << "s";
++
++            // Refresh (or add) the pending entry for this exact (local_bssid, peer_bssid)
++            // pair rather than accumulating duplicates across repeated MAPC reports for the
++            // same still-unresolved peer.
++            bool updated_existing = false;
++            for (auto &pending : m_pending_mapc_capability_updates) {
++                if (pending.local_bssid == local_bssid && pending.peer_bssid == entry.bssid) {
++                    pending.src_mac                     = src_mac;
++                    pending.peer_mapc_capability_bitmap = entry.mapc_capability_bitmap;
++                    pending.received_time               = std::chrono::steady_clock::now();
++                    updated_existing                    = true;
++                    break;
++                }
++            }
++            if (!updated_existing) {
++                sPendingMapcCapabilityUpdate pending;
++                pending.src_mac                     = src_mac;
++                pending.local_bssid                 = local_bssid;
++                pending.peer_bssid                  = entry.bssid;
++                pending.peer_mapc_capability_bitmap = entry.mapc_capability_bitmap;
++                pending.received_time               = std::chrono::steady_clock::now();
++                m_pending_mapc_capability_updates.push_back(pending);
++            }
+             continue;
+         }
+ 
+-        // Resolve the reverse/symmetric mapping, if any: the BSS that owns entry.bssid may
+-        // itself hold a mapc_sharing_bss.shared_bssids entry pointing back at local_bssid
+-        // (recorded when THAT BSS's own MAPC Capability Update was processed, from either an
+-        // earlier or later report than this one - ordering between the two Agents' reports is
+-        // not guaranteed). If a negotiation for this exact pair is already in-flight or
+-        // established from that reverse direction, this direction must not trigger a second,
+-        // redundant negotiation - a single negotiation (from either side) is sufficient.
+-        using sMapcSharedBss = Agent::sRadio::sBss::sMapcSharedBss;
+-        auto reverse_bss     = database.get_bss(entry.bssid);
+-        bool reverse_negotiation_active = false;
+-        sMapcSharedBss::eNegotiationStatus reverse_status =
+-            sMapcSharedBss::eNegotiationStatus::IDLE;
+-        if (reverse_bss && reverse_bss->mapc_sharing_bss.is_valid) {
+-            auto reverse_it = reverse_bss->mapc_sharing_bss.shared_bssids.find(local_bssid);
+-            if (reverse_it != reverse_bss->mapc_sharing_bss.shared_bssids.end()) {
+-                reverse_status            = reverse_it->second.negotiation_status;
+-                reverse_negotiation_active =
+-                    (reverse_status == sMapcSharedBss::eNegotiationStatus::ESTABLISH_PENDING ||
+-                     reverse_status == sMapcSharedBss::eNegotiationStatus::ESTABLISHED ||
+-                     reverse_status == sMapcSharedBss::eNegotiationStatus::TEARDOWN_PENDING);
+-            }
++        apply_mapc_peer_bss_entry(local_bssid, sharing_entry, entry.bssid,
++                                  entry.mapc_capability_bitmap, shared_bssid_list_changed,
++                                  new_cotdma_shared_bssids);
++    }
++
++    finalize_mapc_capability_update(src_mac, local_bssid, sharing_entry, is_new_sharing_bssid,
++                                    shared_bssid_list_changed, new_cotdma_shared_bssids);
++}
++
++void coordinated_tdma_task::apply_mapc_peer_bss_entry(
++    const sMacAddr &local_bssid, Agent::sRadio::sBss::sMapcSharingBss &sharing_entry,
++    const sMacAddr &peer_bssid, uint16_t peer_mapc_capability_bitmap,
++    bool &shared_bssid_list_changed, std::vector<sMacAddr> &new_cotdma_shared_bssids)
++{
++    // Resolve the reverse/symmetric mapping, if any: the BSS that owns peer_bssid may
++    // itself hold a mapc_sharing_bss.shared_bssids entry pointing back at local_bssid
++    // (recorded when THAT BSS's own MAPC Capability Update was processed, from either an
++    // earlier or later report than this one - ordering between the two Agents' reports is
++    // not guaranteed). If a negotiation for this exact pair is already in-flight or
++    // established from that reverse direction, this direction must not trigger a second,
++    // redundant negotiation - a single negotiation (from either side) is sufficient.
++    using sMapcSharedBss = Agent::sRadio::sBss::sMapcSharedBss;
++    auto reverse_bss     = database.get_bss(peer_bssid);
++    bool reverse_negotiation_active = false;
++    sMapcSharedBss::eNegotiationStatus reverse_status = sMapcSharedBss::eNegotiationStatus::IDLE;
++    if (reverse_bss && reverse_bss->mapc_sharing_bss.is_valid) {
++        auto reverse_it = reverse_bss->mapc_sharing_bss.shared_bssids.find(local_bssid);
++        if (reverse_it != reverse_bss->mapc_sharing_bss.shared_bssids.end()) {
++            reverse_status            = reverse_it->second.negotiation_status;
++            reverse_negotiation_active =
++                (reverse_status == sMapcSharedBss::eNegotiationStatus::ESTABLISH_PENDING ||
++                 reverse_status == sMapcSharedBss::eNegotiationStatus::ESTABLISHED ||
++                 reverse_status == sMapcSharedBss::eNegotiationStatus::TEARDOWN_PENDING);
+         }
++    }
+ 
+-        auto shared_it = sharing_entry.shared_bssids.find(entry.bssid);
+-        if (shared_it == sharing_entry.shared_bssids.end()) {
+-            // Not present yet - add a new shared_bssids entry for this peer BSSID.
+-            auto &shared_entry                  = sharing_entry.shared_bssids[entry.bssid];
+-            shared_entry.mapc_capability_bitmap = entry.mapc_capability_bitmap;
+-            shared_entry.discovery_status =
+-                Agent::sRadio::sBss::sMapcSharedBss::eDiscoveryStatus::DISCOVERED;
+-            // negotiation_status defaults to IDLE, as set by sMapcSharedBss's member
+-            // initializers - overridden just below if the reverse mapping is already active.
+-            shared_bssid_list_changed = true;
+-            TASK_LOG(DEBUG) << "Added new shared BSSID " << entry.bssid << " for sharing_bssid="
+-                            << local_bssid << " (agent " << src_mac << ") bitmap=0x" << std::hex
+-                            << entry.mapc_capability_bitmap << std::dec;
+-
+-            const bool cotdma_now_enabled =
+-                (entry.mapc_capability_bitmap &
+-                 static_cast<uint16_t>(qca::eMapcCapabilityBit::CO_TDMA)) != 0;
+-
+-            if (cotdma_now_enabled) {
+-                if (reverse_negotiation_active) {
+-                    // Mirror the reverse mapping's status locally instead of (re-)sending -
+-                    // negotiation for this pair is already in-flight/established from the
+-                    // other direction.
+-                    shared_entry.negotiation_status = reverse_status;
+-                    // If the mirrored status is itself a pending state (ESTABLISH_PENDING /
+-                    // TEARDOWN_PENDING), this local entry needs its own pending-timeout timer too
+-                    if (reverse_status == sMapcSharedBss::eNegotiationStatus::ESTABLISH_PENDING) {
+-                        start_negotiation_pending_timer(
+-                            shared_entry, static_cast<uint8_t>(qca::eCoTDMAConfigMode::ADD));
+-                    } else if (reverse_status ==
+-                            sMapcSharedBss::eNegotiationStatus::TEARDOWN_PENDING) {
+-                        start_negotiation_pending_timer(
+-                            shared_entry, static_cast<uint8_t>(qca::eCoTDMAConfigMode::REMOVE));
+-                    }
+-                    TASK_LOG(DEBUG) << "New shared BSSID " << entry.bssid
+-                                    << " under sharing_bssid=" << local_bssid
+-                                    << " mirrors reverse mapping's negotiation_status "
+-                                       "(already active), skipping send";
+-                } else {
+-                    new_cotdma_shared_bssids.push_back(entry.bssid);
++    auto shared_it = sharing_entry.shared_bssids.find(peer_bssid);
++    if (shared_it == sharing_entry.shared_bssids.end()) {
++        // Not present yet - add a new shared_bssids entry for this peer BSSID.
++        auto &shared_entry                  = sharing_entry.shared_bssids[peer_bssid];
++        shared_entry.mapc_capability_bitmap = peer_mapc_capability_bitmap;
++        shared_entry.discovery_status =
++            Agent::sRadio::sBss::sMapcSharedBss::eDiscoveryStatus::DISCOVERED;
++        // negotiation_status defaults to IDLE, as set by sMapcSharedBss's member
++        // initializers - overridden just below if the reverse mapping is already active.
++        shared_bssid_list_changed = true;
++        TASK_LOG(DEBUG) << "Added new shared BSSID " << peer_bssid << " for sharing_bssid="
++                        << local_bssid << " bitmap=0x" << std::hex
++                        << peer_mapc_capability_bitmap << std::dec;
++
++        const bool cotdma_now_enabled =
++            (peer_mapc_capability_bitmap &
++             static_cast<uint16_t>(qca::eMapcCapabilityBit::CO_TDMA)) != 0;
++
++        if (cotdma_now_enabled) {
++            if (reverse_negotiation_active) {
++                // Mirror the reverse mapping's status locally instead of (re-)sending -
++                // negotiation for this pair is already in-flight/established from the
++                // other direction.
++                shared_entry.negotiation_status = reverse_status;
++                // If the mirrored status is itself a pending state (ESTABLISH_PENDING /
++                // TEARDOWN_PENDING), this local entry needs its own pending-timeout timer too
++                if (reverse_status == sMapcSharedBss::eNegotiationStatus::ESTABLISH_PENDING) {
++                    start_negotiation_pending_timer(
++                        shared_entry, static_cast<uint8_t>(qca::eCoTDMAConfigMode::ADD));
++                } else if (reverse_status ==
++                        sMapcSharedBss::eNegotiationStatus::TEARDOWN_PENDING) {
++                    start_negotiation_pending_timer(
++                        shared_entry, static_cast<uint8_t>(qca::eCoTDMAConfigMode::REMOVE));
+                 }
++                TASK_LOG(DEBUG) << "New shared BSSID " << peer_bssid
++                                << " under sharing_bssid=" << local_bssid
++                                << " mirrors reverse mapping's negotiation_status "
++                                   "(already active), skipping send";
++            } else {
++                new_cotdma_shared_bssids.push_back(peer_bssid);
+             }
+-        } else {
+-            // Already present - update the bitmap only if it changed.
+-            const bool bitmap_changed =
+-                shared_it->second.mapc_capability_bitmap != entry.mapc_capability_bitmap;
+-            const bool cotdma_was_enabled =
+-                (shared_it->second.mapc_capability_bitmap &
+-                 static_cast<uint16_t>(qca::eMapcCapabilityBit::CO_TDMA)) != 0;
+-            const bool cotdma_now_enabled =
+-                (entry.mapc_capability_bitmap &
+-                 static_cast<uint16_t>(qca::eMapcCapabilityBit::CO_TDMA)) != 0;
+-
+-            if (bitmap_changed) {
+-                shared_it->second.mapc_capability_bitmap = entry.mapc_capability_bitmap;
+-                shared_bssid_list_changed                = true;
+-                TASK_LOG(DEBUG) << "Updated mapc_capability_bitmap for shared BSSID "
+-                                << entry.bssid << " under sharing_bssid=" << local_bssid
+-                                << " (agent " << src_mac << ") bitmap=0x" << std::hex
+-                                << entry.mapc_capability_bitmap << std::dec;
+-            }
++        }
++    } else {
++        // Already present - update the bitmap only if it changed.
++        const bool bitmap_changed =
++            shared_it->second.mapc_capability_bitmap != peer_mapc_capability_bitmap;
++        const bool cotdma_was_enabled =
++            (shared_it->second.mapc_capability_bitmap &
++             static_cast<uint16_t>(qca::eMapcCapabilityBit::CO_TDMA)) != 0;
++        const bool cotdma_now_enabled =
++            (peer_mapc_capability_bitmap &
++             static_cast<uint16_t>(qca::eMapcCapabilityBit::CO_TDMA)) != 0;
++
++        if (bitmap_changed) {
++            shared_it->second.mapc_capability_bitmap = peer_mapc_capability_bitmap;
++            shared_bssid_list_changed                = true;
++            TASK_LOG(DEBUG) << "Updated mapc_capability_bitmap for shared BSSID " << peer_bssid
++                            << " under sharing_bssid=" << local_bssid << " bitmap=0x" << std::hex
++                            << peer_mapc_capability_bitmap << std::dec;
++        }
+ 
+-            // Retry negotiation for an already-known CO_TDMA-capable shared BSSID if a
+-            // previous negotiation attempt for this pair is currently IDLE (failed / never
+-            // started) or TORN (torn down) - not just when the CO_TDMA bit newly turns on.
+-            const bool negotiation_retryable =
+-                (shared_it->second.negotiation_status == sMapcSharedBss::eNegotiationStatus::IDLE ||
+-                 shared_it->second.negotiation_status == sMapcSharedBss::eNegotiationStatus::TORN);
+-
+-            if (cotdma_now_enabled && (!cotdma_was_enabled || negotiation_retryable)) {
+-                if (reverse_negotiation_active) {
+-                    // Mirror the reverse mapping's status locally instead of (re-)sending.
+-                    shared_it->second.negotiation_status = reverse_status;
+-                    // Same as above: arm this local entry's own pending-timeout timer if the
+-                    // mirrored status is itself a pending state
+-                    if (reverse_status == sMapcSharedBss::eNegotiationStatus::ESTABLISH_PENDING) {
+-                        start_negotiation_pending_timer(
+-                            shared_it->second, static_cast<uint8_t>(qca::eCoTDMAConfigMode::ADD));
+-                    } else if (reverse_status ==
+-                            sMapcSharedBss::eNegotiationStatus::TEARDOWN_PENDING) {
+-                        start_negotiation_pending_timer(
+-                            shared_it->second, static_cast<uint8_t>(qca::eCoTDMAConfigMode::REMOVE));
+-                    }
+-                    TASK_LOG(DEBUG) << "Shared BSSID " << entry.bssid
+-                                    << " under sharing_bssid=" << local_bssid
+-                                    << " mirrors reverse mapping's negotiation_status "
+-                                       "(already active), skipping (re-)send";
+-                } else {
+-                    new_cotdma_shared_bssids.push_back(entry.bssid);
+-                    TASK_LOG(DEBUG) << "(Re-)queuing Co-TDMA Sharing AP Configuration for "
+-                                       "shared BSSID "
+-                                    << entry.bssid << " under sharing_bssid=" << local_bssid
+-                                    << " cotdma_was_enabled=" << cotdma_was_enabled
+-                                    << " negotiation_retryable=" << negotiation_retryable;
++        // Retry negotiation for an already-known CO_TDMA-capable shared BSSID if a
++        // previous negotiation attempt for this pair is currently IDLE (failed / never
++        // started) or TORN (torn down) - not just when the CO_TDMA bit newly turns on.
++        const bool negotiation_retryable =
++            (shared_it->second.negotiation_status == sMapcSharedBss::eNegotiationStatus::IDLE ||
++             shared_it->second.negotiation_status == sMapcSharedBss::eNegotiationStatus::TORN);
++
++        if (cotdma_now_enabled && (!cotdma_was_enabled || negotiation_retryable)) {
++            if (reverse_negotiation_active) {
++                // Mirror the reverse mapping's status locally instead of (re-)sending.
++                shared_it->second.negotiation_status = reverse_status;
++                // Same as above: arm this local entry's own pending-timeout timer if the
++                // mirrored status is itself a pending state
++                if (reverse_status == sMapcSharedBss::eNegotiationStatus::ESTABLISH_PENDING) {
++                    start_negotiation_pending_timer(
++                        shared_it->second, static_cast<uint8_t>(qca::eCoTDMAConfigMode::ADD));
++                } else if (reverse_status ==
++                        sMapcSharedBss::eNegotiationStatus::TEARDOWN_PENDING) {
++                    start_negotiation_pending_timer(
++                        shared_it->second, static_cast<uint8_t>(qca::eCoTDMAConfigMode::REMOVE));
+                 }
++                TASK_LOG(DEBUG) << "Shared BSSID " << peer_bssid
++                                << " under sharing_bssid=" << local_bssid
++                                << " mirrors reverse mapping's negotiation_status "
++                                   "(already active), skipping (re-)send";
++            } else {
++                new_cotdma_shared_bssids.push_back(peer_bssid);
++                TASK_LOG(DEBUG) << "(Re-)queuing Co-TDMA Sharing AP Configuration for "
++                                   "shared BSSID "
++                                << peer_bssid << " under sharing_bssid=" << local_bssid
++                                << " cotdma_was_enabled=" << cotdma_was_enabled
++                                << " negotiation_retryable=" << negotiation_retryable;
+             }
+         }
+     }
++}
+ 
++void coordinated_tdma_task::finalize_mapc_capability_update(
++    const sMacAddr &src_mac, const sMacAddr &local_bssid,
++    Agent::sRadio::sBss::sMapcSharingBss &sharing_entry, bool is_new_sharing_bssid,
++    bool shared_bssid_list_changed, const std::vector<sMacAddr> &new_cotdma_shared_bssids)
++{
+     auto controller = database.get_controller_ctx();
+     if (!controller) {
+-        TASK_LOG(ERROR) << "handle_mapc_capability_update: controller context not available, "
+-                          "cannot send MAPC Configuration Policy";
++        TASK_LOG(ERROR) << "finalize_mapc_capability_update: controller context not "
++                          "available, cannot send MAPC Configuration Policy";
+         return;
+     }
+ 
+@@ -582,8 +639,8 @@ void coordinated_tdma_task::handle_mapc_capability_update(
+     //
+     // No IDLE/TORN re-check is needed here: the decision of whether a given shared_bssid
+     // belongs in new_cotdma_shared_bssids (as opposed to having its status mirrored from an
+-    // already-active reverse mapping instead) was already fully made above, in the collection
+-    // loop, and nothing mutates negotiation_status between that loop and this one.
++    // already-active reverse mapping instead) was already fully made by the caller, and
++    // nothing mutates negotiation_status between that decision and this one.
+     using sMapcSharedBss = Agent::sRadio::sBss::sMapcSharedBss;
+     for (const auto &shared_bssid : new_cotdma_shared_bssids) {
+         sCoTDMAExtendedConfig extended_config{};
+@@ -632,6 +689,79 @@ void coordinated_tdma_task::handle_mapc_capability_update(
+     }
+ }
+ 
++void coordinated_tdma_task::retry_pending_mapc_reports_for_bssid(const sMacAddr &bssid)
++{
++    for (auto it = m_pending_mapc_capability_updates.begin();
++         it != m_pending_mapc_capability_updates.end();) {
++        if (it->peer_bssid != bssid) {
++            ++it;
++            continue;
++        }
++
++        // Take a copy of the pending entry before erasing it below, since apply/finalize
++        // reference fields on it (and iterators into the vector may be invalidated by other
++        // erases in the same loop pass).
++        const sPendingMapcCapabilityUpdate pending = *it;
++
++        TASK_LOG(DEBUG) << "retry_pending_mapc_reports_for_bssid: peer_bssid=" << bssid
++                        << " now resolvable, re-applying deferred MAPC Capability Update "
++                           "entry (sharing_bssid="
++                        << pending.local_bssid << ", src_mac=" << pending.src_mac << ")";
++
++        // Re-verify the sharing BSSID (local_bssid) is still valid/fronthaul on the
++        // originally-reporting Agent - it may have been torn down in the interim.
++        auto local_bss = database.get_bss(pending.local_bssid, pending.src_mac);
++        if (!local_bss || !local_bss->fronthaul) {
++            TASK_LOG(WARNING) << "retry_pending_mapc_reports_for_bssid: sharing_bssid="
++                              << pending.local_bssid << " (agent " << pending.src_mac
++                              << ") no longer valid/fronthaul, dropping deferred entry for "
++                                 "peer_bssid="
++                              << bssid;
++            it = m_pending_mapc_capability_updates.erase(it);
++            continue;
++        }
++
++        auto &sharing_entry = local_bss->mapc_sharing_bss;
++        // The sharing BSSID must already have been marked valid when the original report
++        // was received (is_valid is set unconditionally in handle_mapc_capability_update()
++        // before any peer_bss_capabilities entry - resolvable or not - is processed), so
++        // is_new_sharing_bssid is always false here.
++        bool shared_bssid_list_changed = false;
++        std::vector<sMacAddr> new_cotdma_shared_bssids;
++
++        apply_mapc_peer_bss_entry(pending.local_bssid, sharing_entry, pending.peer_bssid,
++                                  pending.peer_mapc_capability_bitmap, shared_bssid_list_changed,
++                                  new_cotdma_shared_bssids);
++
++        finalize_mapc_capability_update(pending.src_mac, pending.local_bssid, sharing_entry,
++                                        /*is_new_sharing_bssid=*/false, shared_bssid_list_changed,
++                                        new_cotdma_shared_bssids);
++
++        it = m_pending_mapc_capability_updates.erase(it);
++    }
++}
++
++void coordinated_tdma_task::check_pending_mapc_report_timeouts()
++{
++    const auto now = std::chrono::steady_clock::now();
++
++    for (auto it = m_pending_mapc_capability_updates.begin();
++         it != m_pending_mapc_capability_updates.end();) {
++        if (now - it->received_time < PENDING_MAPC_REPORT_TIMEOUT) {
++            ++it;
++            continue;
++        }
++
++        TASK_LOG(WARNING) << "check_pending_mapc_report_timeouts: dropping deferred MAPC "
++                             "Capability Update entry (sharing_bssid="
++                          << it->local_bssid << " peer_bssid=" << it->peer_bssid << " src_mac="
++                          << it->src_mac << ") after " << PENDING_MAPC_REPORT_TIMEOUT.count()
++                          << "s without the peer BSSID becoming resolvable";
++
++        it = m_pending_mapc_capability_updates.erase(it);
++    }
++}
++
+ void coordinated_tdma_task::handle_mapc_negotiation_status(
+     const sMacAddr &src_mac, qca::tlvQcaMapcNegotiationStatus &tlv)
+ {
+diff --git a/controller/src/beerocks/master/tasks/coordinated_tdma_task.h b/controller/src/beerocks/master/tasks/coordinated_tdma_task.h
+index 70f8e41d4..979fc0d68 100644
+--- a/controller/src/beerocks/master/tasks/coordinated_tdma_task.h
++++ b/controller/src/beerocks/master/tasks/coordinated_tdma_task.h
+@@ -119,6 +119,14 @@ public:
+          *
+          */
+         SETUP_COTDMA_FOR_QOS_PATH,
++
++        /**
++         * @brief Notification that a new BSSID has become known in the Controller DB
++         * (e.g. via a Topology Response from some Agent). Used to re-check any MAPC
++         * Capability Update peer_bss_capabilities entries that were previously deferred
++         * (pending) because that BSSID was not yet resolvable to an owning Agent.
++         */
++        AGENT_BSS_LEARNED,
+     };
+ 
+     /**
+@@ -134,6 +142,13 @@ public:
+         uint16_t qmid          = 0;                                     ///< Controller-assigned QMID.
+     };
+ 
++    /**
++     * @brief Payload for AGENT_BSS_LEARNED.
++     */
++    struct sAgentBssLearnedEvent {
++        sMacAddr bssid = beerocks::net::network_utils::ZERO_MAC; ///< Newly-known BSSID.
++    };
++
+ private:
+     /**
+      * @brief Handle an event pushed via task_pool::push_event().
+@@ -203,6 +218,54 @@ private:
+     void handle_mapc_capability_update(const sMacAddr &src_mac,
+                                        qca::tlvQcaMapcCapabilityUpdate &tlv);
+ 
++    /**
++     * @brief Apply a single MAPC Capability Update peer BSSID entry to
++     * the DB
++     *
++     * Adds a new sMapcSharedBss entry to @p sharing_entry.shared_bssids (or updates the
++     * existing entry's mapc_capability_bitmap if changed), mirrors the reverse/symmetric
++     * mapping's negotiation_status if a negotiation for this exact pair is already
++     * in-flight/established from the other direction, and otherwise appends @p peer_bssid
++     * to @p new_cotdma_shared_bssids so the caller can send the initial Co-TDMA Sharing AP
++     * Configuration for it.
++     *
++     * @param local_bssid              The sharing BSSID that owns @p sharing_entry.
++     * @param sharing_entry            The sMapcSharingBss to update (local_bssid's BSS).
++     * @param peer_bssid               The (now-resolved) peer/shared BSSID being applied.
++     * @param peer_mapc_capability_bitmap  The peer's reported MAPC capability bitmap.
++     * @param shared_bssid_list_changed[in,out]  Set to true if shared_bssids changed.
++     * @param new_cotdma_shared_bssids[in,out]   Appended with @p peer_bssid if a new
++     *                                            Co-TDMA Sharing AP Configuration needs to
++     *                                            be sent for it.
++     */
++    void apply_mapc_peer_bss_entry(
++        const sMacAddr &local_bssid, Agent::sRadio::sBss::sMapcSharingBss &sharing_entry,
++        const sMacAddr &peer_bssid, uint16_t peer_mapc_capability_bitmap,
++        bool &shared_bssid_list_changed, std::vector<sMacAddr> &new_cotdma_shared_bssids);
++
++    /**
++     * @brief Send the MAPC Configuration Policy (to all Agents or just @p src_mac,
++     * depending on @p is_new_sharing_bssid) and the initial Co-TDMA Sharing AP
++     * Configuration message for each entry in @p new_cotdma_shared_bssids.
++     *
++     * @param src_mac                  AL MAC address of the Agent that reported/owns
++     *                                 @p local_bssid.
++     * @param local_bssid              The sharing BSSID.
++     * @param sharing_entry            The sMapcSharingBss for @p local_bssid's BSS.
++     * @param is_new_sharing_bssid     True if @p local_bssid was newly marked valid as a
++     *                                 sharing BSSID as part of this update - triggers a
++     *                                 policy refresh to ALL Agents rather than just
++     *                                 @p src_mac.
++     * @param shared_bssid_list_changed  True if sharing_entry.shared_bssids changed.
++     * @param new_cotdma_shared_bssids   Peer BSSIDs to send the initial Co-TDMA Sharing AP
++     *                                   Configuration message for.
++     */
++    void finalize_mapc_capability_update(const sMacAddr &src_mac, const sMacAddr &local_bssid,
++                                         Agent::sRadio::sBss::sMapcSharingBss &sharing_entry,
++                                         bool is_new_sharing_bssid,
++                                         bool shared_bssid_list_changed,
++                                         const std::vector<sMacAddr> &new_cotdma_shared_bssids);
++
+     /**
+      * @brief Process tlvQcaMapcNegotiationStatus and update the DB.
+      *
+@@ -264,6 +327,33 @@ private:
+      */
+     void check_negotiation_pending_timeouts();
+ 
++    /**
++     * @brief Re-check pending (previously-unresolvable) MAPC Capability Update peer BSSID
++     * entries against a BSSID that has just become known in the Controller DB.
++     *
++     * Called on AGENT_BSS_LEARNED, when e.g. a Topology Response causes a new BSS to be
++     * registered via db::add_bss(). Scans m_pending_mapc_capability_updates for entries
++     * whose peer_bssid == @p bssid; for each match, re-applies the update via
++     * apply_mapc_peer_bss_entry() + finalize_mapc_capability_update() exactly as it would
++     * have been applied had the peer BSSID resolved on first receipt, then removes the
++     * entry from the pending list.
++     *
++     * @param bssid  The BSSID that has just become known/resolvable.
++     */
++    void retry_pending_mapc_reports_for_bssid(const sMacAddr &bssid);
++
++    /**
++     * @brief Scan m_pending_mapc_capability_updates for entries older than
++     * PENDING_MAPC_REPORT_TIMEOUT and drop them.
++     *
++     * Called from work() on every task_pool tick, mirroring
++     * check_negotiation_pending_timeouts(). Protects against unbounded growth of the
++     * pending list when the peer BSSID never becomes known (e.g. it belongs to a
++     * neighboring, non-participating network, or the peer Agent never completes topology
++     * discovery).
++     */
++    void check_pending_mapc_report_timeouts();
++
+     /**
+      * @brief Get the set of radio UIDs on @p sharing_agent that carry the wireless backhaul
+      * link to @p shared_agent.
+@@ -421,6 +511,35 @@ private:
+      * negotiation_status_before_pending value by check_negotiation_pending_timeouts().
+      */
+     static constexpr std::chrono::seconds COTDMA_NEGOTIATION_PENDING_TIMEOUT{10};
++
++    /**
++     * @brief A single deferred (not-yet-resolvable) MAPC Capability Update peer BSSID
++     * entry, held until either the peer BSSID becomes known in the Controller DB (see
++     * retry_pending_mapc_reports_for_bssid()) or PENDING_MAPC_REPORT_TIMEOUT elapses (see
++     * check_pending_mapc_report_timeouts()).
++     *
++     * Stored instead of being immediately discarded when
++     * db::get_bss_parent_agent(peer_bssid) returns ZERO_MAC at the time the MAPC
++     * Capability Update TLV is processed - e.g. because the peer Agent has not yet
++     * completed topology discovery with the Controller.
++     */
++    struct sPendingMapcCapabilityUpdate {
++        sMacAddr src_mac;                       ///< AL-MAC of the Agent that sent the report.
++        sMacAddr local_bssid;                   ///< The (already-resolved) sharing BSSID.
++        sMacAddr peer_bssid;                    ///< The not-yet-resolvable peer/shared BSSID.
++        uint16_t peer_mapc_capability_bitmap;   ///< The peer's reported MAPC capability bitmap.
++        std::chrono::steady_clock::time_point received_time; ///< Time this entry was queued.
++    };
++
++    /** Deferred MAPC Capability Update peer BSSID entries awaiting BSSID resolution. */
++    std::vector<sPendingMapcCapabilityUpdate> m_pending_mapc_capability_updates;
++
++    /**
++     * @brief Maximum time a deferred MAPC Capability Update peer BSSID entry is kept in
++     * m_pending_mapc_capability_updates awaiting BSSID resolution, before being dropped by
++     * check_pending_mapc_report_timeouts().
++     */
++    static constexpr std::chrono::seconds PENDING_MAPC_REPORT_TIMEOUT{30};
+ };
+ 
+ } // namespace son
+diff --git a/controller/src/beerocks/master/tasks/topology_task.cpp b/controller/src/beerocks/master/tasks/topology_task.cpp
+index f8fd98c08..7429931e7 100644
+--- a/controller/src/beerocks/master/tasks/topology_task.cpp
++++ b/controller/src/beerocks/master/tasks/topology_task.cpp
+@@ -13,6 +13,7 @@
+ #include "bml_task.h"
+ #include "btm_request_task.h"
+ #include "client_steering_task.h"
++#include "coordinated_tdma_task.h"
+ #include "dhcp_task.h"
+ 
+ #include <bcl/beerocks_wifi_channel.h>
+@@ -321,9 +322,33 @@ bool topology_task::handle_topology_response(const sMacAddr &src_mac,
+                     LOG(DEBUG) << "bssid=" << vap_map_it->first << ", vap_id=" << int(vap_id);
+                 }
+ 
++                // Detect whether this BSSID is newly-known to the Controller DB (as opposed
++                // to already existing and simply being re-reported). Used below to notify
++                // coordinated_tdma_task only for genuinely new BSSIDs.
++                const bool bss_is_new = !database.get_bss(bss_entry.radio_bssid(), src_mac);
++
+                 auto bss =
+                     database.add_bss(*radio, bss_entry.radio_bssid(), bss_entry.ssid_str(), vap_id);
+                 bss->enabled = true;
++
++                if (bss_is_new && database.config.enable_cotdma) {
++                    // Notify coordinated_tdma_task that a new BSSID has become known, so it
++                    // can re-check any MAPC Capability Update peer_bss_capabilities entries
++                    // that were previously deferred because this exact BSSID was not yet
++                    // resolvable to an owning Agent (e.g. received before this Agent's own
++                    // topology discovery completed).
++                    auto coordinated_tdma_task_id = database.get_coordinated_tdma_task_id();
++                    if (coordinated_tdma_task_id != db::TASK_ID_NOT_FOUND &&
++                        tasks.is_task_running(coordinated_tdma_task_id)) {
++                        auto agent_bss_learned_event =
++                            std::make_unique<coordinated_tdma_task::sAgentBssLearnedEvent>();
++                        agent_bss_learned_event->bssid = bss_entry.radio_bssid();
++                        tasks.push_event(
++                            coordinated_tdma_task_id,
++                            static_cast<int>(coordinated_tdma_task::eEvent::AGENT_BSS_LEARNED),
++                            agent_bss_learned_event.release()); // handle_event takes ownership
++                    }
++                }
+                 // Backhaul is not reported in this message. Leave it unchanged.
+                 // TODO "backhaul" is not set in this TLV, so just assume false
+                 if (vap_id == eBeeRocksIfaceIds::IFACE_ID_INVALID) {
+-- 
+2.34.1
+
