@@ -1,0 +1,346 @@
+From 5530e856186beea0ad6adda1c118a77434c0508a Mon Sep 17 00:00:00 2001
+From: Girija P <gpandiya@qti.qualcomm.com>
+Date: Thu, 1 Oct 2026 12:30:15 +0530
+Subject: [PATCH] NLHAL: fix gateway radio-disable persistence and VAP teardown
+
+Prevent gateway mode from reading or writing radio_disable in UCI while
+preserving runtime radio state handling. Clean stale AP wifi-iface sections
+during radio teardown, preserve STA interfaces, and correctly handle MLO VAP
+names and repeated teardown operations.
+
+Signed-off-by: Girija P <gpandiya@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 | 89 ++++++++++++++++---
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 53 ++++++++---
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     | 17 +++-
+ framework/platform/bpl/include/bpl/bpl_cfg.h  | 10 +--
+ 4 files changed, 136 insertions(+), 33 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index d7690e35b..378061b95 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -55,6 +55,7 @@
+ 
+ #include <iterator>
+ #include <numeric>
++#include <set>
+ #include <type_traits>
+ 
+ //////////////////////////////////////////////////////////////////////////////
+@@ -521,8 +522,15 @@ bool ApManager::create_ap_wlan_hal()
+     // Always pass the phy_id so m_radio_info.phy_name is populated even when no VAP is active.
+     hal_conf.phy_name = m_iface;
+ 
+-    if (!beerocks::bpl::bpl_cfg_get_radio_disable_by_phy(hal_conf.phy_name, m_radio_disable)) {
+-        LOG(DEBUG) << "Failed to get radio_disable for phy_name=" << hal_conf.phy_name;
++    if (!m_local_gw) {
++        if (!beerocks::bpl::bpl_cfg_get_radio_disable_by_phy(hal_conf.phy_name,
++                                                              m_radio_disable)) {
++            LOG(DEBUG) << "Failed to get radio_disable for phy_name=" << hal_conf.phy_name;
++        }
++    } else {
++        // Gateway/controller mode owns radio_disable in the controller configuration. Do not
++        // read a stale agent-side UCI value and let it override the runtime configuration.
++        LOG(DEBUG) << "Gateway mode: ignoring UCI radio_disable for phy=" << hal_conf.phy_name;
+     }
+ 
+     hal_conf.radio_disable      = m_radio_disable;
+@@ -2743,7 +2751,8 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+                 if (ap_wlan_hal->get_iface_name().empty() &&
+                     ap_wlan_hal->get_radio_info().available_vaps.empty()) {
+                     m_radio_disable = true;
+-                    if (!beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_iface, true)) {
++                    if (beerocks::bpl::cfg_is_master() == 0 &&
++                        !beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_iface, true)) {
+                         LOG(ERROR) << "Failed to set radio_disable in UCI for phy=" << m_iface;
+                     }
+                     if (!teardown_confirmation_sent) {
+@@ -2909,7 +2918,8 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+             if (radio_disabled_after_update) {
+                 if (!m_radio_disable) {
+                     m_radio_disable = true;
+-                    if (!beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_iface, true)) {
++                    if (beerocks::bpl::cfg_is_master() == 0 &&
++                        !beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_iface, true)) {
+                         LOG(ERROR) << "Failed to set radio_disable in UCI for phy=" << m_iface;
+                     }
+                     LOG(INFO) << "All VAPs were disabled on " << m_iface
+@@ -2917,8 +2927,13 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+                 }
+             } else if (m_radio_disable) {
+                 m_radio_disable = false;
+-                if (!beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_iface, false)) {
+-                    LOG(ERROR) << "Failed to clear radio_disable in UCI for phy=" << m_iface;
++                if (beerocks::bpl::cfg_is_master() == 0) {
++                    if (!beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_iface, false)) {
++                        LOG(ERROR) << "Failed to clear radio_disable in UCI for phy=" << m_iface;
++                    }
++                } else {
++                    LOG(DEBUG) << "Gateway mode: keeping radio_disable in UCI for phy="
++                               << m_iface << " while clearing the runtime state";
+                 }
+                 LOG(INFO) << "Valid VAP(s) received on " << m_iface
+                           << " after credentials update - clearing radio_disable";
+@@ -3004,6 +3019,47 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+         m_vaps_teardown_confirmed = false;
+ #endif
+ 
++        // A radio-disable request can remove the hostapd control/configuration state before
++        // the subsequent teardown-only credentials update is handled.  In that case the
++        // normal per-BSS cleanup in update_vap_credentials() cannot resolve vap_id anymore,
++        // leaving stale wifi-iface sections behind and causing the next boot/re-enable to
++        // recreate VAPs from obsolete UCI entries.
++        //
++        // UCI is persistent configuration owned by the agent only.  The co-located gateway
++        // must keep its UCI sections intact because the Controller owns that configuration.
++        if (beerocks::bpl::cfg_is_master() == 0) {
++            const auto &radio_info = ap_wlan_hal->get_radio_info();
++            std::set<std::string> cleaned_vap_ifaces;
++
++            for (const auto &vap_entry : radio_info.available_vaps) {
++                const auto &vap = vap_entry.second;
++                if (vap.bss.empty()) {
++                    continue;
++                }
++
++                // UCI stores the base VAP name (for example wlan1_1), while hostapd may
++                // expose an MLO link name (for example wlan1_1_link0).  Normalize both forms
++                // and clean each UCI section only once when several links share one VAP.
++                std::string uci_iface = vap.bss;
++                const auto link_pos = uci_iface.find("_link");
++                const bool is_mlo = link_pos != std::string::npos || vap.mld_id >= 0;
++                if (link_pos != std::string::npos) {
++                    uci_iface.erase(link_pos);
++                }
++
++                if (!cleaned_vap_ifaces.insert(uci_iface).second) {
++                    continue;
++                }
++
++                if (!beerocks::bpl::bpl_cfg_set_wifi_iface_teardown(
++                        uci_iface, radio_info.radio_id, is_mlo)) {
++                    LOG(WARNING) << "Failed to remove wifi-iface UCI section for VAP "
++                                 << uci_iface << " on radio " << radio_info.radio_id
++                                 << " during radio disable";
++                }
++            }
++        }
++
+ #ifdef USE_PRPLMESH_NLHAL
+         // Set radio_disable proactively, before tearing down the interface, rather than
+         // waiting for the later AP_Disabled event to confirm it. is_radio_disabled() is
+@@ -3013,7 +3069,8 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+         // gone but Monitor still believes the radio is enabled, and its hostapd
+         // ping/reattach fallback treats that as fatal (crashing the fronthaul process).
+         m_radio_disable = true;
+-        if (!beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_iface, true)) {
++        if (beerocks::bpl::cfg_is_master() == 0 &&
++            !beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_iface, true)) {
+             LOG(ERROR) << "Failed to set radio_disable in UCI for phy=" << m_iface;
+         }
+ 
+@@ -3028,7 +3085,8 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+         if (!ap_wlan_hal->disable()) {
+             LOG(ERROR) << "Failed disabling radio on iface: " << ap_wlan_hal->get_iface_name();
+             m_radio_disable = false;
+-            if (!beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_iface, false)) {
++            if (beerocks::bpl::cfg_is_master() == 0 &&
++                !beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_iface, false)) {
+                 LOG(ERROR) << "Failed to clear radio_disable in UCI for phy=" << m_iface;
+             }
+             return;
+@@ -4636,7 +4694,8 @@ bool ApManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+             ap_wlan_hal->refresh_vaps_info();
+             if (ap_wlan_hal->get_radio_info().available_vaps.empty()) {
+                 m_radio_disable = true;
+-                if (!beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_iface, true)) {
++                if (beerocks::bpl::cfg_is_master() == 0 &&
++                    !beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_iface, true)) {
+                     LOG(ERROR) << "Failed to set radio_disable in UCI for phy=" << m_iface;
+                 }
+                 LOG(INFO) << "No VAPs remain on " << m_iface << " - setting radio_disable";
+@@ -5598,11 +5657,17 @@ bool ApManager::handle_ap_enabled(int vap_id)
+     // A real VAP just came up on this radio - that is proof the radio is no longer disabled,
+     // even though no explicit ACTION_APMANAGER_RADIO_ENABLE_REQUEST was ever sent (non-AT
+     // controllers never send one). Persist to UCI here only, since ap_manager is the process
+-    // that actually confirmed the platform-level enablement.
++    // that actually confirmed the platform-level enablement. Gateway mode keeps the persistent
++    // prplmesh value controller-owned, so only the agent-only path writes the clear.
+     if (m_radio_disable) {
+         m_radio_disable = false;
+-        if (!beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_iface, false)) {
+-            LOG(ERROR) << "Failed to clear radio_disable in UCI for phy=" << m_iface;
++        if (beerocks::bpl::cfg_is_master() == 0) {
++            if (!beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_iface, false)) {
++                LOG(ERROR) << "Failed to clear radio_disable in UCI for phy=" << m_iface;
++            }
++        } else {
++            LOG(DEBUG) << "Gateway mode: keeping radio_disable in UCI for phy=" << m_iface
++                       << " while clearing the runtime state";
+         }
+         LOG(INFO) << "AP_Enabled on vap_id=" << int(vap_id) << " - clearing radio_disable for "
+                   << m_iface;
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index b2458b315..98bdcec87 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -2618,15 +2618,20 @@ bool ap_wlan_hal_nl80211::enable()
+     // radio state changes are instead driven by a vendor Service Status TLV).
+     m_radio_info.radio_state = bwl::eRadioState::ENABLED;
+ 
+-    // Persist to UCI too: ApManager::create_ap_wlan_hal() reads radio_disable from UCI at
+-    // fronthaul-process startup and feeds it into m_hal_conf.radio_disable, which gates whether
+-    // refresh_radio_info() issues a real hostapd STATUS query. Without persisting this, a
+-    // fronthaul process respawned while disabled would read a stale "enabled" value, attempt a
+-    // STATUS query against a radio with no live hostapd/VAP, fail attach, and get stuck in a
+-    // restart loop.
+-    if (!beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_radio_info.phy_name, false)) {
+-        LOG(WARNING) << "Failed to persist radio_disable=0 to UCI for phy_name="
+-                     << m_radio_info.phy_name;
++    // Persist to UCI in agent-only mode: ApManager::create_ap_wlan_hal() reads radio_disable
++    // from UCI at fronthaul-process startup and feeds it into m_hal_conf.radio_disable, which
++    // gates whether refresh_radio_info() issues a real hostapd STATUS query. The gateway keeps
++    // this persistent value controller-owned.
++    if (beerocks::bpl::cfg_is_master() == 0) {
++        if (!beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_radio_info.phy_name, false)) {
++            LOG(WARNING) << "Failed to persist radio_disable=0 to UCI for phy_name="
++                         << m_radio_info.phy_name;
++        }
++    } else {
++        // The gateway/controller owns the persistent prplmesh radio configuration. Keep its
++        // radio_disable value unchanged even though this process updates its runtime state.
++        LOG(DEBUG) << "Gateway mode: keeping radio_disable in UCI for phy_name="
++                   << m_radio_info.phy_name << " while enabling the runtime radio";
+     }
+     // Also update this process's own in-memory flag so refresh_radio_info() calls made by this
+     // same process (before any respawn) reflect the change immediately.
+@@ -2644,8 +2649,10 @@ bool ap_wlan_hal_nl80211::disable()
+     // enabled" guard.
+     m_radio_info.radio_state = bwl::eRadioState::DISABLED;
+ 
+-    // Persist to UCI too - see the comment in enable() above for why this is required.
+-    if (!beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_radio_info.phy_name, true)) {
++    // Persist to UCI only for agent-managed configurations. In gateway/controller-agent mode
++    // the controller owns the persistent prplmesh radio configuration.
++    if (beerocks::bpl::cfg_is_master() == 0 &&
++        !beerocks::bpl::bpl_cfg_set_radio_disable_by_phy(m_radio_info.phy_name, true)) {
+         LOG(WARNING) << "Failed to persist radio_disable=1 to UCI for phy_name="
+                      << m_radio_info.phy_name;
+     }
+@@ -6204,6 +6211,15 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                             // otherwise leave vap_info (and vap_info.bss) dangling for the
+                             // remainder of this block.
+                             const std::string vap_bss_name = vap_info.bss;
++                            // UCI stores the base VAP name, whereas hostapd may report an MLO
++                            // link name here. Use the actual BSS interface rather than vap_id
++                            // (the hostapd configuration-map key) when removing persistent UCI
++                            // state; the two are not guaranteed to be identical.
++                            std::string uci_vap_iface = vap_bss_name;
++                            const auto uci_link_pos = uci_vap_iface.find("_link");
++                            if (uci_link_pos != std::string::npos) {
++                                uci_vap_iface.erase(uci_link_pos);
++                            }
+                             if (links_present > 1) {
+                                 LOG(ERROR) << "Hit remove link " << bss_it.bssid;
+                                 // Check if mld link to be removed is not management vap link
+@@ -6219,7 +6235,13 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                                     // section if that was the last remaining link, since the MLD
+                                     // interface no longer exists at that point.
+                                     if(beerocks::bpl::cfg_is_master()==0) {
+-                                        beerocks::bpl::bpl_cfg_set_wifi_iface_teardown(vap_id, m_radio_info.radio_id, removed_last_link);
++                                        if (!beerocks::bpl::bpl_cfg_set_wifi_iface_teardown(
++                                                uci_vap_iface, m_radio_info.radio_id,
++                                                removed_last_link)) {
++                                            LOG(WARNING)
++                                                << "Failed to remove wifi-iface UCI section for "
++                                                << uci_vap_iface << " after LINK_REMOVE";
++                                        }
+                                     }
+                                 }
+                             } else {
+@@ -6232,7 +6254,12 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                                 }
+                                 // disable the vap in wireless config
+                                 if(beerocks::bpl::cfg_is_master()==0) {
+-                                    beerocks::bpl::bpl_cfg_set_wifi_iface_teardown(vap_id, m_radio_info.radio_id, true);
++                                    if (!beerocks::bpl::bpl_cfg_set_wifi_iface_teardown(
++                                            uci_vap_iface, m_radio_info.radio_id, true)) {
++                                        LOG(WARNING)
++                                            << "Failed to remove wifi-iface UCI section for "
++                                            << uci_vap_iface << " after BSS removal";
++                                    }
+                                 }
+                                 // Remove the MLO entry from mld_pair_entrant.txt (common for both link-remove and bss-remove paths)
+                                 if (remove_mld_entry_by_ifname(base_iface) == 0) {
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index c3a795566..faab044fa 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -3595,7 +3595,7 @@ bool bpl_cfg_set_wifi_iface_teardown(const std::string &iface, const std::string
+     }
+ 
+     for (const auto &sec : all_iface_sections) {
+-        std::string device_val, ifname_val;
++        std::string device_val, ifname_val, mode_val;
+         if (!uci_get_option(package_name, section_type, sec, "device", device_val)) {
+             continue;
+         }
+@@ -3606,6 +3606,14 @@ bool bpl_cfg_set_wifi_iface_teardown(const std::string &iface, const std::string
+             continue;
+         }
+         if (ifname_val == iface) {
++            // Radio teardown removes AP VAP configuration only. Keep persistent backhaul STA
++            // interfaces intact so the radio can reconnect using its stored credentials.
++            if (uci_get_option(package_name, section_type, sec, "mode", mode_val) &&
++                mode_val == "sta") {
++                LOG(DEBUG) << "bpl_cfg_set_wifi_iface_teardown: preserving STA section " << sec
++                           << " for interface " << iface;
++                continue;
++            }
+             section_name = sec;
+             LOG(INFO) << "bpl_cfg_set_wifi_iface_teardown: found section " << sec
+                       << " for interface " << iface;
+@@ -3614,9 +3622,12 @@ bool bpl_cfg_set_wifi_iface_teardown(const std::string &iface, const std::string
+     }
+ 
+     if (section_name.empty()) {
+-        LOG(ERROR) << "bpl_cfg_set_wifi_iface_teardown: section not found for interface "
++        // Teardown can be requested more than once: the radio-disable path removes the
++        // persistent section before the credentials-update path gets to process its explicit
++        // TEARDOWN entry.  The requested end state is already satisfied in this case.
++        LOG(DEBUG) << "bpl_cfg_set_wifi_iface_teardown: section already absent for interface "
+                    << iface << " on radio " << radio_id;
+-        return false;
++        return true;
+     }
+ 
+     // Remove the wifi-iface section entirely
+diff --git a/framework/platform/bpl/include/bpl/bpl_cfg.h b/framework/platform/bpl/include/bpl/bpl_cfg.h
+index e0945a6e5..734a612f8 100644
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -1253,15 +1253,15 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+                                   const son::wireless_utils::sBssInfoConf &configuration, std::string &radio_id);
+ 
+ /**
+- * @brief Sets disabled=1 for the wifi-iface section corresponding to the given interface.
++ * @brief Removes the wifi-iface section corresponding to the given interface.
+  *
+- * This is a lightweight teardown helper that only marks the interface as disabled
+- * in the persistent wireless UCI config without touching any other credential fields.
+- * It is called during BSS teardown so that the interface stays disabled across reboots.
++ * It is called during BSS teardown so that stale VAP configuration is not recreated
++ * across reboots. For MLO interfaces, the corresponding wifi-mld section is removed
++ * when the last link is torn down.
+  *
+  * @param [in] iface     Interface name (e.g. "wlan0_1").
+  * @param [in] radio_id  Radio identifier used to locate the correct wifi-device section.
+- * @return true on success and false otherwise.
++ * @return true on success, including when the section is already absent, and false otherwise.
+  */
+ bool bpl_cfg_set_wifi_iface_teardown(const std::string &iface, const std::string &radio_id, bool is_mlo = false);
+ 
+-- 
+2.34.1
+
