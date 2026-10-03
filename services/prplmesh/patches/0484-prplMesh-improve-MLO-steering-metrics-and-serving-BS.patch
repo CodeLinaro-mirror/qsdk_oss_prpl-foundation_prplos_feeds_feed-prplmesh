@@ -1,0 +1,364 @@
+From aeeb5e3a104a7500384bdd4d6bd6c89884cb975e Mon Sep 17 00:00:00 2001
+From: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+Date: Fri, 2 Oct 2026 15:13:57 +0530
+Subject: [PATCH] prplMesh: improve MLO steering metrics and serving BSSID
+
+Problem:
+
+Affiliated STA Metrics TLVs were missing for MLO clients when their
+association was stored under one radio while affiliated-link statistics
+were reported by other radios. Unassociated measurements also frequently
+returned no RSSI for sparse traffic, and single-link MLD clients could be
+reported on the wrong serving band.
+
+Root cause:
+
+The metrics path required the link MAC in the current radio's associated
+client map even though MLO clients may be keyed by MLD MAC on another
+radio. The nl80211 monitor used a fixed 100 ms ROC duration. In addition,
+the HAL replaced the association-frame BSSID with the AP MLD MAC, and the
+AP manager accepted that non-link-specific address as the serving BSSID.
+
+Fix:
+
+Resolve MLD and affiliated MACs through the global associated STA MLD
+registry and validate metrics against the station's AP MLD or affiliated
+BSS set. Make the ROC duration configurable from 10 to 5000 ms with a
+500 ms default. Preserve the association-frame link BSSID, and fall back
+to the enumerated VAP MAC when an MLO event reports zero or the AP MLD
+MAC, so topology notifications retain the actual serving link.
+
+Signed-off-by: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+---
+ agent/config/beerocks_agent.conf.in           |  7 ++
+ .../ap_manager/ap_manager.cpp                 | 14 +++-
+ .../fronthaul_manager/monitor/monitor.cpp     | 20 ++++++
+ .../tasks/link_metrics_collection_task.cpp    | 65 ++++++++++++++++++-
+ .../bcl/include/bcl/beerocks_config_file.h    |  1 +
+ .../bcl/source/beerocks_config_file.cpp       |  2 +
+ .../beerocks/bwl/include/bwl/mon_wlan_hal.h   |  1 +
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 11 ++--
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 16 +++--
+ .../bwl/onewifi/mon_wlan_hal_onewifi.cpp      |  5 ++
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   |  5 ++
+ 11 files changed, 133 insertions(+), 14 deletions(-)
+
+diff --git a/agent/config/beerocks_agent.conf.in b/agent/config/beerocks_agent.conf.in
+index 208d95a30..120a63bb2 100644
+--- a/agent/config/beerocks_agent.conf.in
++++ b/agent/config/beerocks_agent.conf.in
+@@ -108,6 +108,13 @@ on_boot_scan=0
+ # The value must be a positive number in milliseconds within the chip's supported limits
+ dwell_time=20
+ 
++# unassoc_sta_roc_duration_ms: Remain-on-channel duration used to collect
++# unassociated STA RSSI measurements. Increase this when client uplink traffic
++# is sparse; for example, 1000 ms gives a better chance of observing traffic
++# generated once per second. The driver must support the configured duration.
++# Valid range: 10-5000 ms. Default: 500 ms.
++unassoc_sta_roc_duration_ms=500
++
+ # Indicates whether unicast traffic statistics are collected per station
+ # 1 = enable
+ clients_unicast_measurements=0
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 64247f49e..d5a10ded1 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -4088,10 +4088,18 @@ bool ApManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t event_ptr)
+         // different VAP in the MLD. Fall back to the enumerated VAP MAC only when
+         // the HAL did not provide an association BSSID.
+         auto serving_link_mac = msg->params.bssid;
+-        if (serving_link_mac == beerocks::net::network_utils::ZERO_MAC) {
++        const auto ap_mld_mac = vap_node->second.ap_mld_mac.empty()
++                                    ? beerocks::net::network_utils::ZERO_MAC
++                                    : tlvf::mac_from_string(vap_node->second.ap_mld_mac);
++        const bool has_link_bssid =
++            serving_link_mac != beerocks::net::network_utils::ZERO_MAC &&
++            (!msg->params.is_mlo || serving_link_mac != ap_mld_mac);
++
++        if (!has_link_bssid) {
+             serving_link_mac = tlvf::mac_from_string(vap_node->second.mac);
+-            LOG(DEBUG) << "STA association BSSID is empty - falling back to VAP MAC "
+-                       << serving_link_mac;
++            LOG(DEBUG) << "STA association BSSID is not link-specific - falling back to VAP MAC "
++                       << serving_link_mac << " (reported=" << msg->params.bssid
++                       << ", AP_MLD_MAC=" << ap_mld_mac << ")";
+         } else {
+             LOG(DEBUG) << "Preserving association-frame serving BSSID " << serving_link_mac;
+         }
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+index 89d560659..1a6da8c94 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+@@ -394,6 +394,26 @@ bool Monitor::thread_init()
+                        "beacon_11k_table_measurement_duration", 200,
+                        bwl::nl80211::set_beacon_11k_table_measurement_duration);
+ 
++    constexpr uint32_t default_unassoc_roc_duration_ms = 500;
++    constexpr uint32_t min_unassoc_roc_duration_ms     = 10;
++    constexpr uint32_t max_unassoc_roc_duration_ms     = 5000;
++    uint32_t unassoc_roc_duration_ms                   = default_unassoc_roc_duration_ms;
++    if (!beerocks_slave_conf.unassoc_sta_roc_duration_ms.empty()) {
++        auto configured_duration =
++            string_utils::stoi(beerocks_slave_conf.unassoc_sta_roc_duration_ms);
++        if (configured_duration < static_cast<int>(min_unassoc_roc_duration_ms) ||
++            configured_duration > static_cast<int>(max_unassoc_roc_duration_ms)) {
++            LOG(WARNING) << "Invalid unassoc_sta_roc_duration_ms value: "
++                         << configured_duration << ", using default "
++                         << default_unassoc_roc_duration_ms << " ms";
++        } else {
++            unassoc_roc_duration_ms = static_cast<uint32_t>(configured_duration);
++        }
++    }
++    LOG(INFO) << "Unassociated STA ROC measurement duration: "
++              << unassoc_roc_duration_ms << " ms";
++    bwl::nl80211::set_unassoc_sta_roc_duration_ms(unassoc_roc_duration_ms);
++
+ #ifdef USE_PRPLMESH_NLHAL
+     bwl::HALState state = mon_wlan_hal->get_state();
+     std::string interface_mld_mac;
+diff --git a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+index 28abb39d9..6b2e938b7 100644
+--- a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+@@ -62,6 +62,8 @@
+  */
+ #include <bwl/nl80211_client_factory.h>
+ 
++#include <algorithm>
++
+ namespace {
+ 
+ struct sPerLinkStaInfo {
+@@ -1676,13 +1678,72 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+                 continue;
+             }
+ 
+-            auto assoc_client = radio->associated_clients.find(affl_sta_metrics->sta_mac_addr());
++            const sMacAddr &sta_mac = affl_sta_metrics->sta_mac_addr();
++            bool            metric_matches_association = false;
++
++            /* Keep the legacy/SLO lookup first. For an MLO STA, however, the
++             * monitor reports the affiliated link MAC while associated_clients
++             * is keyed by the STA MLD MAC and is populated only on the radio
++             * which received the association notification. Requiring the link
++             * MAC to exist in this response radio's associated_clients drops
++             * valid TLV 0xe4 data from the other affiliated radios. */
++            auto assoc_client = radio->associated_clients.find(sta_mac);
+             if (assoc_client != radio->associated_clients.end() &&
+                 (assoc_client->second.bssid == metric.bssid ||
+                  (bss_apmld_mac != net::network_utils::ZERO_MAC &&
+                   assoc_client->second.bssid == bss_apmld_mac))) {
++                metric_matches_association = true;
++            }
++
++            /* Resolve MLO stations globally. The monitor may report either the
++             * STA MLD MAC or an affiliated link MAC, so handle both forms. The
++             * metric is accepted only if this AP Metrics response belongs to
++             * the same AP MLD, or to one of the MLD's affiliated BSSes. */
++            const AgentDB::sAssociatedStaMld *mld_info_ptr = nullptr;
++            if (!metric_matches_association) {
++                for (const auto &mld_entry : db->associated_sta_mlds) {
++                    const auto &mld_info = mld_entry.second;
++                    if (mld_info.mld_config.sta_mld_mac == sta_mac) {
++                        mld_info_ptr = &mld_info;
++                        break;
++                    }
++
++                    for (const auto &aff_sta : mld_info.affiliated_stas) {
++                        if (aff_sta.affiliated_sta_mac == sta_mac) {
++                            mld_info_ptr = &mld_info;
++                            break;
++                        }
++                    }
++                    if (mld_info_ptr) {
++                        break;
++                    }
++                }
++            }
++
++            if (mld_info_ptr) {
++                const bool ap_mld_matches =
++                    bss_apmld_mac != net::network_utils::ZERO_MAC &&
++                    mld_info_ptr->mld_config.ap_mld_mac != net::network_utils::ZERO_MAC &&
++                    bss_apmld_mac == mld_info_ptr->mld_config.ap_mld_mac;
++                const bool affiliated_bss_matches =
++                    std::any_of(mld_info_ptr->affiliated_stas.begin(),
++                                mld_info_ptr->affiliated_stas.end(),
++                                [&metric](const AgentDB::sAssociatedStaMld::sAffiliatedSta &sta) {
++                                    return sta.bssid == metric.bssid;
++                                });
++
++                metric_matches_association = ap_mld_matches || affiliated_bss_matches;
++                if (metric_matches_association) {
++                    LOG(DEBUG) << "Accepting TLV 0xe4 via MLD registry: sta=" << sta_mac
++                               << " sta_mld=" << mld_info_ptr->mld_config.sta_mld_mac
++                               << " bssid=" << metric.bssid
++                               << " ap_mld=" << bss_apmld_mac;
++                }
++            }
++
++            if (metric_matches_association) {
+                 affiliated_sta_metrics.push_back({
+-                    affl_sta_metrics->sta_mac_addr(),
++                    sta_mac,
+                     affl_sta_metrics->bytes_sent(),
+                     affl_sta_metrics->bytes_received(),
+                     affl_sta_metrics->packets_sent(),
+diff --git a/common/beerocks/bcl/include/bcl/beerocks_config_file.h b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+index 94159450a..8a9160477 100644
+--- a/common/beerocks/bcl/include/bcl/beerocks_config_file.h
++++ b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+@@ -118,6 +118,7 @@ public:
+         std::string enable_system_hang_test;
+         std::string monitor_polling_rate_msec;
+         std::string monitor_measurement_window_poll_count;
++        std::string unassoc_sta_roc_duration_ms;
+         std::string profile_x_disallow_override_unsupported_configuration;
+         std::string on_boot_scan;
+         std::string dwell_time;
+diff --git a/common/beerocks/bcl/source/beerocks_config_file.cpp b/common/beerocks/bcl/source/beerocks_config_file.cpp
+index 894ff67a6..e7137123f 100644
+--- a/common/beerocks/bcl/source/beerocks_config_file.cpp
++++ b/common/beerocks/bcl/source/beerocks_config_file.cpp
+@@ -181,6 +181,8 @@ bool config_file::read_slave_config_file(const std::string &config_file_path, sC
+             std::make_tuple("monitor_polling_rate_msec=", &conf.monitor_polling_rate_msec, 0),
+             std::make_tuple("monitor_measurement_window_poll_count=",
+                             &conf.monitor_measurement_window_poll_count, 0),
++            std::make_tuple("unassoc_sta_roc_duration_ms=",
++                            &conf.unassoc_sta_roc_duration_ms, 0),
+             std::make_tuple("profile_x_disallow_override_unsupported_configuration=",
+                             &conf.profile_x_disallow_override_unsupported_configuration, 0),
+             std::make_tuple("on_boot_scan=", &conf.on_boot_scan, 0),
+diff --git a/common/beerocks/bwl/include/bwl/mon_wlan_hal.h b/common/beerocks/bwl/include/bwl/mon_wlan_hal.h
+index cbce7d78b..5b9bdfbd9 100644
+--- a/common/beerocks/bwl/include/bwl/mon_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/mon_wlan_hal.h
+@@ -194,6 +194,7 @@ void set_beacon_11k_measurement_mode(uint8_t mode);
+ void set_beacon_11k_active_measurement_duration(uint16_t duration);
+ void set_beacon_11k_passive_measurement_duration(uint16_t duration);
+ void set_beacon_11k_table_measurement_duration(uint16_t duration);
++void set_unassoc_sta_roc_duration_ms(uint32_t duration_ms);
+ }
+ 
+ } // namespace bwl
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index b2458b315..50863ac4e 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -7397,11 +7397,12 @@ void ap_wlan_hal_nl80211::detect_mlo_client(
+                    << " resolved_is_mlo=" << (is_mlo ? "true" : "false");
+ 
+         if (is_mlo) {
+-            // For MLO clients, override BSSID with AP MLD MAC
+-            const std::string &ap_mld_mac = m_radio_info.available_vaps[vap_id].ap_mld_mac;
+-            if (!ap_mld_mac.empty()) {
+-                msg->params.bssid = tlvf::mac_from_string(ap_mld_mac);
+-            }
++            // Keep params.bssid as the link-specific BSSID obtained from the
++            // association frame. The AP MLD MAC is added separately by
++            // ap_manager when it builds the client-associated notification.
++            // Overwriting this field here loses the serving-link identity and
++            // makes a single-link MLD client appear associated to whichever BSS
++            // shares the AP MLD MAC (typically link 0).
+ 
+             // Collect affiliated link MACs from peer_addr[N].
+             // Use continue (not break) so non-contiguous link IDs (e.g. 0, 2) are
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 2d293a11d..87f45a92c 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -52,6 +52,7 @@ static uint8_t g_beacon_11k_measurement_mode = BEACON_MEASUREMENT_MODE_PASSIVE;
+ static uint16_t g_beacon_11k_active_measurement_duration  = 50;   // BcnrptActiveDuration
+ static uint16_t g_beacon_11k_passive_measurement_duration = 110;  // BcnrptPassiveDuration
+ static uint16_t g_beacon_11k_table_measurement_duration   = 200;  // BcnrptBcnTableDuration
++static uint32_t g_unassoc_sta_roc_duration_ms             = 500;
+ 
+ // Function to set the global beacon 11k measurement mode
+ void set_beacon_11k_measurement_mode(uint8_t mode)
+@@ -81,6 +82,13 @@ void set_beacon_11k_table_measurement_duration(uint16_t duration)
+                << g_beacon_11k_table_measurement_duration << " TU";
+ }
+ 
++void set_unassoc_sta_roc_duration_ms(uint32_t duration_ms)
++{
++    g_unassoc_sta_roc_duration_ms = duration_ms;
++    LOG(DEBUG) << "Global unassoc_sta_roc_duration_ms set to: "
++               << g_unassoc_sta_roc_duration_ms << " ms";
++}
++
+ // Minimal required implementation to resolve link error.
+ bool mon_wlan_hal_nl80211::nl_event_handle(struct nl_msg *msg, void *arg)
+ {
+@@ -2450,7 +2458,7 @@ bool mon_wlan_hal_nl80211::sta_unassoc_rssi_measurement(
+ 
+     /* MACs this invocation added to the pending list. The list may already hold
+      * entries from a PREVIOUS, still-in-flight ROC scan (a repeat query arriving
+-     * inside the ~600ms ROC window); those belong to that scan, not to this call,
++     * inside the active ROC window); those belong to that scan, not to this call,
+      * so this call must neither count them as its own work nor tear them down on
+      * its error paths. Tracked by MAC rather than by index because the sleeper
+      * thread of an earlier scan can drain the list while we are not holding the
+@@ -2476,7 +2484,7 @@ bool mon_wlan_hal_nl80211::sta_unassoc_rssi_measurement(
+ 
+             /* Pre-check: if this MAC is already in m_pending_unassoc_measurements,
+              * a ROC scan is already in progress for it (triggered by a previous query
+-             * that arrived within the 600ms ROC window).  Skip the echo-add entirely
++             * that arrived within the active ROC window). Skip the echo-add entirely
+              * to avoid the EEXIST kernel error storm — the in-flight ROC scan will
+              * return the RSSI when it expires. */
+             bool already_pending = std::any_of(
+@@ -2501,7 +2509,7 @@ bool mon_wlan_hal_nl80211::sta_unassoc_rssi_measurement(
+                      * (noise floor) which the steering app treats as no-measurement.
+                      *
+                      * Note: the "already in pending list" case (repeated query within
+-                     * the 600ms ROC window) is handled by the pre-check above, so
++                     * the active ROC window) is handled by the pre-check above, so
+                      * EEXIST here genuinely means the STA is associated. */
+                     LOG(INFO) << "sta_unassoc_rssi_measurement: skipping " << mac_address
+                               << " (associated peer on this radio)";
+@@ -2560,7 +2568,7 @@ bool mon_wlan_hal_nl80211::sta_unassoc_rssi_measurement(
+     }
+ 
+     // Trigger a single ROC scan. All measurements will be based on this scan.
+-    uint32_t roc_duration_ms = 100;
++    const uint32_t roc_duration_ms = g_unassoc_sta_roc_duration_ms;
+     if (!trigger_roc_scan(first_channel, roc_duration_ms)) {
+         LOG(ERROR) << "Failed to trigger ROC scan on channel " << int(first_channel);
+         /* Clean up only the measurements THIS call added. Entries from an
+diff --git a/common/beerocks/bwl/onewifi/mon_wlan_hal_onewifi.cpp b/common/beerocks/bwl/onewifi/mon_wlan_hal_onewifi.cpp
+index 193a8bddb..8e91da20d 100644
+--- a/common/beerocks/bwl/onewifi/mon_wlan_hal_onewifi.cpp
++++ b/common/beerocks/bwl/onewifi/mon_wlan_hal_onewifi.cpp
+@@ -626,6 +626,11 @@ void set_beacon_11k_table_measurement_duration(uint16_t duration)
+     (void)duration;
+ }
+ 
++void set_unassoc_sta_roc_duration_ms(uint32_t duration_ms)
++{
++    (void)duration_ms;
++}
++
+ } // namespace nl80211
+ 
+ } // namespace bwl
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index a0eccadfa..02a63a391 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -4806,6 +4806,11 @@ void set_beacon_11k_table_measurement_duration(uint16_t duration)
+     LOG(DEBUG) << "set_beacon_11k_table_measurement_duration called with duration=" << duration
+                << " TU - NOT IMPLEMENTED for whm HAL (Purple OS platform)";
+ }
++void set_unassoc_sta_roc_duration_ms(uint32_t duration_ms)
++{
++    LOG(DEBUG) << "set_unassoc_sta_roc_duration_ms called with duration=" << duration_ms
++               << " ms - NOT IMPLEMENTED for whm HAL (Purple OS platform)";
++}
+ } // namespace nl80211
+ 
+ std::shared_ptr<ap_wlan_hal> ap_wlan_hal_create(std::string iface_name, bwl::hal_conf_t hal_conf,
+-- 
+2.34.1
+
