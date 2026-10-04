@@ -1,0 +1,371 @@
+From 9bb6d8e24e198b4bbad249feac8a52120c8c8fc8 Mon Sep 17 00:00:00 2001
+From: Manoj Sekar <sekar@qti.qualcomm.com>
+Date: Wed, 23 Sep 2026 10:59:17 +0530
+Subject: [PATCH] whm: Add Channel Scan support with BSS Load utilization
+ scaling support
+
+The pWHM Channel Scan path (mon_wlan_hal_whm) supports both a fresh scan
+(WiFi.Radio.*.startScan()) and fetching already-available results
+(WiFi.Radio.*.getScanResults() / getScanCombinedData()), but three defects
+kept it from producing spec-compliant Channel Scan Reports and made the
+fresh-scan flow unreliable, especially on 5GHz DFS channels.
+
+1. DFS Background CAC causes startScan() to fail (Resource busy)
+   A fresh Channel Scan on PRPLOS/pWHM frequently failed to ever start.
+   The wld driver returned NL80211_CMD_TRIGGER_SCAN -16 (Resource busy):
+
+     wld: nlCore  - nl error:-16 (Resource busy) (cmd:33:NL80211_CMD_TRIGGER_SCAN)
+     wld: wldScan - wlan1: scan start failed -5 / error in starting scan
+     mon_wlan_hal_whm.cpp --> remote function call startScan Failed!
+     monitor.cpp --> channel_scan_trigger Failed
+
+   Root cause (confirmed from field logs on the 5GHz radio): the driver
+   refuses the foreground scan with "wlan1: rad not ready for scan
+   (state:BG_CAC)" because the radio is performing a mandatory DFS
+   Background CAC (Channel Availability Check / radar detection) on the
+   requested 5GHz DFS channels (52/56/60/64). 2.4GHz (non-DFS) has no CAC
+   and succeeds on the first try.
+
+   The generic radio "Status" DM parameter is USELESS for detecting this -
+   it reports 'Up' throughout CAC. The correct, driver-authoritative signal
+   is "WiFi.Radio.{i}.ChannelMgt.RadioStatus", confirmed by field
+   inspection to read "BG_CAC_NS" while CAC is running and transition to
+   "Up" the instant CAC completes.
+
+   Fix channel_scan_trigger():
+   - Always issue stopScan() before starting, unconditionally, so the wld
+     scan resource is released regardless of which entity holds it (not
+     just scans this HAL started).
+   - Poll ChannelMgt.RadioStatus (not "Status") and defer startScan()
+     while CAC is in progress, waiting up to 650s to cover the full
+     regulatory CAC duration (60s typ., up to 600s on some ETSI
+     weather-radar channels). Fail open (proceed to startScan()) if
+     RadioStatus cannot be read.
+   - Once RadioStatus indicates ready, retry startScan() up to 3 times
+     with a 300ms settle delay for genuinely transient busy conditions,
+     re-checking RadioStatus between attempts in case CAC restarted
+     (e.g. a radar hit).
+   - On exhaustion (CAC timeout or transient-busy retries exhausted),
+     push Channel_Scan_Aborted so ChannelScanTask retries at its own
+     cadence instead of hanging in WAIT_FOR_RESULTS_READY.
+
+   Added [CAC] and channel_scan_trigger debug logs (pre-scan stop,
+   CAC wait/defer, per-attempt start success/failure, exhaustion) for
+   field diagnosis.
+
+2. Fresh-scan race / hang prevention
+   channel_scan_trigger() set m_scan_active=true only AFTER calling
+   startScan() and pushing Channel_Scan_Triggered. This left two windows
+   that stranded the ChannelScanTask FSM in WAIT_FOR_RESULTS_READY until
+   it timed out and aborted:
+     a) A fast ScanComplete=done arriving the instant startScan() returned
+        was dropped by process_scan_complete_event() as "not requested by
+        bwl" because m_scan_active was still false.
+     b) A startScan() failure returned false without emitting
+        Channel_Scan_Aborted, so the task waited for a completion that
+        never came.
+   Fix: arm m_scan_active BEFORE startScan(); on startScan() failure roll
+   back the flag and push Channel_Scan_Aborted so the task retries; on a
+   Channel_Scan_Triggered enqueue failure, abort the scan so the radio is
+   not left scanning while the task is unaware.
+
+   Also raised PassiveChannelTime to a 150ms floor (independent of the
+   caller-supplied dwell_time_msec). Channels that have not completed DFS
+   CAC are forced into passive-only scanning by regulation - no probe
+   request can be sent, so discovery depends purely on the target AP's
+   own beacon happening to fire during the dwell window. Confirmed in the
+   field: a 20ms dwell (fine for 2.4GHz active scanning) returned a
+   completely empty result on 5GHz DFS channels 52/56/60/64.
+   ActiveChannelTime is left unchanged.
+
+3. BSS Load Channel Utilization scaling
+   pWHM reports the BSS Load "ChannelUtilization" as the raw 802.11 byte
+   (0..255) - e.g. 133 - but the EasyMesh Channel Scan Result TLV /
+   sChannelScanResults expects a 0..100 percentage. The value was being
+   copied verbatim, so the Controller saw out-of-range utilization
+   (e.g. "133%"). Scale it as (raw * 100) / 255, matching the nl80211
+   backend. StationCount now also sets load_bss_ie_present so the
+   neighbor is reported with "Utilization Present: True".
+
+   NOTE: the BSS Load fields (ChannelUtilization / StationCount) are only
+   populated by pWHM when QBSS reporting is enabled on the APs:
+       ubus-cli WiFi.AccessPoint.*.Qbss.Enable=1
+
+   Both the fresh-scan and cached-result paths share the same result
+   formatter, so the utilization scaling fix applies to both.
+
+   Added [CHAN-SCAN] debug logs (per-BSS channel_utilization with raw
+   value, station_count) to make field debugging of the BSS Load /
+   utilization values straightforward.
+
+Signed-off-by: Manoj Sekar <sekar@qti.qualcomm.com>
+---
+ common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp | 217 +++++++++++++++++--
+ 1 file changed, 195 insertions(+), 22 deletions(-)
+
+diff --git a/common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp
+index 8cd15bc..a01d681 100644
+--- a/common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp
+@@ -16,8 +16,11 @@
+ 
+ #include <easylogging++.h>
+ 
++#include <algorithm>
++#include <chrono>
+ #include <cmath>
+ #include <iomanip>
++#include <thread>
+ #include <unordered_set>
+ #include <unistd.h>
+ #include <utility>
+@@ -685,40 +688,199 @@ bool mon_wlan_hal_whm::channel_scan_trigger(int dwell_time_msec,
+         channels.pop_back();
+     }
+ 
+-    if (m_scan_active) {
+-        AmbiorixVariant result_abort;
+-        AmbiorixVariant args_abort(AMXC_VAR_ID_HTABLE);
+-        //scan is already active, as per spec, cancel the old one and start new one
+-        if (!m_ambiorix_cl.call(m_radio_path, "stopScan", args_abort, result_abort)) {
+-            LOG(INFO) << " remote function stopScan startScan Failed!";
+-        }
+-        m_scan_active = false; // optimistically reset m_scan_active
+-        LOG(INFO) << "m_scan_active: " << m_scan_active;
+-    }
+-
+     /**
+      *Since it is mentioned that the custom dwell time parameter can be set with the prpl
+      *controller in the future, it is more appropriate to set the dwell time from here
+      */
++    // PassiveChannelTime must be long enough to reliably catch a beacon (typical Beacon
++    // Interval ~100-102.4ms), NOT just the caller's dwell_time_msec. Channels that have not
++    // completed DFS CAC (e.g. 52-64 when the radio itself is parked elsewhere, such as on
++    // 36/80MHz) are FORCED into passive-only scanning by regulation - no probe request can be
++    // sent, so discovery depends purely on the target AP's own beacon happening to fire during
++    // our dwell window. Confirmed in the field: with PassiveChannelTime==ActiveChannelTime==20ms
++    // (the same short dwell that works fine for 2.4GHz ACTIVE scanning - probe req -> near
++    // instant probe resp), the very first 5GHz off-channel scan of 52/56/60/64 returned
++    // completely empty ("ssid_results_as_list are empty"), and subsequent scans only sometimes
++    // caught a lone BSS by chance (Wireshark: "Scan Type: Passive scan" on those channels).
++    // ActiveChannelTime keeps using the caller-supplied dwell_time_msec unchanged - this floor
++    // ONLY raises PassiveChannelTime, so active-scan timing (e.g. 2.4GHz, or 5GHz channels that
++    // HAVE completed CAC and can be actively probed) is unaffected.
++    static constexpr int PASSIVE_CHANNEL_TIME_FLOOR_MS = 150;
++    const int passive_channel_time = std::max(dwell_time_msec, PASSIVE_CHANNEL_TIME_FLOOR_MS);
++    if (passive_channel_time != dwell_time_msec) {
++        LOG(DEBUG) << "channel_scan_trigger: flooring PassiveChannelTime to "
++                   << passive_channel_time << "ms (requested dwell_time_msec=" << dwell_time_msec
++                   << "ms) to reliably catch a beacon during forced-passive DFS scanning on "
++                   << m_radio_path;
++    }
++
+     AmbiorixVariant new_map(AMXC_VAR_ID_HTABLE);
+-    new_map.add_child("PassiveChannelTime", dwell_time_msec);
++    new_map.add_child("PassiveChannelTime", passive_channel_time);
+     new_map.add_child("ActiveChannelTime", dwell_time_msec);
+     bool ret = m_ambiorix_cl.update_object(m_radio_path + "ScanConfig.", new_map);
+     if (!ret) {
+         LOG(WARNING) << "failed to update Active/PassiveChannelTime for " << m_radio_path;
+     }
+ 
+-    AmbiorixVariant result;
+-    AmbiorixVariant args(AMXC_VAR_ID_HTABLE);
+-    if (!channels.empty()) {
+-        args.add_child("channels", channels);
++    // Issue a stopScan() first to clear any lingering pWHM foreground scan. A stopScan() failure
++    // here is non-fatal ("no scan running").
++    {
++        AmbiorixVariant result_abort;
++        AmbiorixVariant args_abort(AMXC_VAR_ID_HTABLE);
++        if (!m_ambiorix_cl.call(m_radio_path, "stopScan", args_abort, result_abort)) {
++            LOG(DEBUG) << "channel_scan_trigger: pre-scan stopScan() on " << m_radio_path
++                       << " returned failure (likely nothing was scanning) - continuing";
++        } else {
++            LOG(DEBUG) << "channel_scan_trigger: pre-scan stopScan() OK on " << m_radio_path;
++        }
++        m_scan_active = false;
++    }
++
++    // Root cause (confirmed from field logs on the 5GHz radio): the driver refuses the foreground
++    // scan with "wlan1: rad not ready for scan (state:BG_CAC)" because the radio is performing a
++    // mandatory DFS Background CAC (Channel Availability Check / radar detection) on the requested
++    // 5GHz DFS channels (52/56/60/64). 2.4GHz (non-DFS) has no CAC and succeeds on the first try.
++    //
++    // The generic radio "Status" DM parameter is USELESS for detecting this - it reports 'Up'
++    // throughout CAC. The correct, driver-authoritative signal is the dedicated
++    // "WiFi.Radio.{i}.ChannelMgt.RadioStatus" sub-object parameter, confirmed by direct field
++    // inspection to read "BG_CAC_NS" while CAC is running and transition to "Up" the instant CAC
++    // completes. Poll THIS parameter (not "Status") before/around each startScan() attempt so we
++    // wait exactly as long as CAC actually takes - no fixed guess, no wasted retries once the
++    // radio is genuinely ready, and no premature giving-up if CAC legitimately needs the full
++    // regulatory duration (60s typ., up to 600s on some ETSI weather-radar channels).
++    //
++    // Poll cadence: check RadioStatus every POLL_INTERVAL; a mismatch (still "*_CAC*"/"*_NS")
++    // means "don't even bother calling startScan() yet" - skip straight to the next sleep instead
++    // of generating a doomed startScan() attempt (and its log spam) on every poll tick. Only call
++    // startScan() once RadioStatus has cleared to a ready state, or if we've never managed to read
++    // RadioStatus at all (fail open - rely on the startScan() result itself in that case).
++    static constexpr auto CAC_MAX_WAIT       = std::chrono::seconds(650); // covers 600s ETSI CAC + margin
++    static constexpr auto CAC_POLL_INTERVAL  = std::chrono::seconds(2);
++    static constexpr int  SCAN_START_MAX_ATTEMPTS = 3; // short retry AFTER RadioStatus looks ready
++
++    auto is_radio_status_busy_with_cac = [](const std::string &radio_status) {
++        // Match case-insensitively on "CAC" so both the confirmed "BG_CAC_NS" and any other
++        // vendor CAC-flavoured value (e.g. plain "CAC", "CAC_NS", "FG_CAC") are covered.
++        std::string status_uc = radio_status;
++        std::transform(status_uc.begin(), status_uc.end(), status_uc.begin(), ::toupper);
++        return status_uc.find("CAC") != std::string::npos;
++    };
++
++    const auto wait_deadline = std::chrono::steady_clock::now() + CAC_MAX_WAIT;
++    bool radio_status_readable = false;
++    for (;;) {
++        std::string radio_status;
++        radio_status_readable =
++            m_ambiorix_cl.get_param(radio_status, m_radio_path + "ChannelMgt.", "RadioStatus") &&
++            !radio_status.empty();
++
++        if (!radio_status_readable) {
++            LOG(DEBUG) << "channel_scan_trigger: could not read ChannelMgt.RadioStatus for "
++                       << m_radio_path << " - proceeding without CAC gating (will rely on "
++                          "startScan() result)";
++            break; // fail open: no CAC visibility, fall through to the startScan attempt below
++        }
++
++        if (!is_radio_status_busy_with_cac(radio_status)) {
++            LOG(DEBUG) << "channel_scan_trigger: radio " << m_radio_path
++                       << " ChannelMgt.RadioStatus='" << radio_status << "' (not CAC) - proceeding";
++            break;
++        }
++
++        LOG(INFO) << "[CAC] channel_scan_trigger: radio " << m_radio_path
++                  << " ChannelMgt.RadioStatus='" << radio_status
++                  << "' - CAC in progress, deferring scan trigger";
++
++        if (std::chrono::steady_clock::now() + CAC_POLL_INTERVAL >= wait_deadline) {
++            LOG(ERROR) << "channel_scan_trigger: radio " << m_radio_path
++                       << " still in CAC (ChannelMgt.RadioStatus='" << radio_status
++                       << "') after " << std::chrono::duration_cast<std::chrono::seconds>(
++                                             CAC_MAX_WAIT).count()
++                       << "s wait - surfacing abort so the task reports the channel(s) as "
++                          "unavailable";
++            m_scan_active = false;
++            event_queue_push(Event::Channel_Scan_Aborted);
++            return false;
++        }
++        std::this_thread::sleep_for(CAC_POLL_INTERVAL);
+     }
+-    if (!m_ambiorix_cl.call(m_radio_path, "startScan", args, result)) {
+-        LOG(ERROR) << " remote function call startScan Failed!";
++
++    // RadioStatus indicates ready (or was unreadable - fail open). Try startScan() with a SHORT
++    // bounded retry only for a genuinely transient busy (e.g. a just-finished scan/ACS pass still
++    // settling) - CAC itself has already been waited out above, so this is no longer a blind
++    // long-running retry.
++    bool started = false;
++    for (int attempt = 1; attempt <= SCAN_START_MAX_ATTEMPTS; ++attempt) {
++        AmbiorixVariant result;
++        AmbiorixVariant args(AMXC_VAR_ID_HTABLE);
++        if (!channels.empty()) {
++            args.add_child("channels", channels);
++        }
++
++        // Set m_scan_active BEFORE issuing startScan(), not after. The pWHM "ScanComplete=done"
++        // notification for a very fast scan can arrive on the event socket the instant startScan()
++        // returns - if m_scan_active were still false at that point, process_scan_complete_event()
++        // would take the "results from a scan not requested by bwl" branch, drop the completion,
++        // and the task FSM would sit in WAIT_FOR_RESULTS_READY until it times out and aborts.
++        // Arming the flag first closes that race; cleared again below if the call fails.
++        m_scan_active = true;
++        if (m_ambiorix_cl.call(m_radio_path, "startScan", args, result)) {
++            started = true;
++            LOG(INFO) << "channel_scan_trigger: startScan OK on " << m_radio_path << " (attempt "
++                      << attempt << "/" << SCAN_START_MAX_ATTEMPTS << ")";
++            break;
++        }
++
++        m_scan_active = false;
++
++        // If RadioStatus is readable, re-check it - a radar hit / new CAC could have started
++        // between our wait-loop above and this startScan() call. If so, bail out of the short
++        // retry immediately and go back to actually waiting for CAC rather than spinning.
++        if (radio_status_readable) {
++            std::string radio_status;
++            if (m_ambiorix_cl.get_param(radio_status, m_radio_path + "ChannelMgt.", "RadioStatus") &&
++                is_radio_status_busy_with_cac(radio_status)) {
++                LOG(WARNING) << "channel_scan_trigger: radio " << m_radio_path
++                             << " entered CAC (ChannelMgt.RadioStatus='" << radio_status
++                             << "') during retry - aborting scan (cannot run during CAC)";
++                event_queue_push(Event::Channel_Scan_Aborted);
++                return false;
++            }
++        }
++
++        LOG(WARNING) << "channel_scan_trigger: startScan failed on " << m_radio_path
++                     << " (attempt " << attempt << "/" << SCAN_START_MAX_ATTEMPTS
++                     << ", transient busy - RadioStatus not CAC)";
++
++        if (attempt < SCAN_START_MAX_ATTEMPTS) {
++            AmbiorixVariant result_abort;
++            AmbiorixVariant args_abort(AMXC_VAR_ID_HTABLE);
++            if (!m_ambiorix_cl.call(m_radio_path, "stopScan", args_abort, result_abort)) {
++                LOG(DEBUG) << "channel_scan_trigger: inter-retry stopScan() on " << m_radio_path
++                           << " returned failure - continuing";
++            }
++            std::this_thread::sleep_for(std::chrono::milliseconds(300));
++        }
++    }
++
++    if (!started) {
++        LOG(ERROR) << "channel_scan_trigger: startScan failed on " << m_radio_path << " after "
++                   << SCAN_START_MAX_ATTEMPTS
++                   << " attempt(s) (transient busy, RadioStatus not CAC) - surfacing abort so "
++                      "the task retries";
++        m_scan_active = false;
++        event_queue_push(Event::Channel_Scan_Aborted);
++        return false;
++    }
++
++    if (!event_queue_push(Event::Channel_Scan_Triggered)) {
++        LOG(ERROR) << "Failed to queue Channel_Scan_Triggered for " << m_radio_path;
++        // Abort the scan we just started so we don't leave the radio scanning with the task
++        // unaware (which would again strand the FSM until timeout).
++        channel_scan_abort();
+         return false;
+     }
+-    event_queue_push(Event::Channel_Scan_Triggered);
+-    m_scan_active = true;
+     LOG(INFO) << "m_scan_active: " << m_scan_active;
+     return true;
+ }
+@@ -772,13 +934,24 @@ bool mon_wlan_hal_whm::channel_scan_dump_cached_results()
+         }
+ 
+         if (map.find("ChannelUtilization") != map.end()) {
+-            results.channel_utilization = std::stoul(map["ChannelUtilization"]);
+-            results.load_bss_ie_present = 1;
++            // pWHM (via getScanCombinedData / QBSS BSS Load) reports Channel Utilization as the
++            // raw 802.11 BSS Load byte (0..255), NOT a percentage. The EasyMesh Channel Scan
++            // Result TLV / sChannelScanResults expects a 0..100 percentage, so scale it here.
++            // This mirrors the nl80211 backend fix ((data[2] * 100) / 255). Without the scale, a
++            // raw value like 133 is reported verbatim as "133%" to the Controller.
++            const uint32_t raw_utilization = std::stoul(map["ChannelUtilization"]);
++            results.channel_utilization    = (raw_utilization * 100) / 255;
++            results.load_bss_ie_present     = 1;
++            LOG(DEBUG) << "[CHAN-SCAN] BSS Load for " << results.bssid
++                       << ": channel_utilization=" << int(results.channel_utilization)
++                       << "% (raw=" << raw_utilization << ")";
+         }
+ 
+         if (map.find("StationCount") != map.end()) {
+             results.station_count       = std::stoul(map["StationCount"]);
+             results.load_bss_ie_present = 1;
++            LOG(DEBUG) << "[CHAN-SCAN] BSS Load for " << results.bssid
++                       << ": station_count=" << results.station_count;
+         }
+ 
+         LOG(DEBUG) << "Processing results for BSSID:" << results.bssid
+-- 
+2.34.1
+
