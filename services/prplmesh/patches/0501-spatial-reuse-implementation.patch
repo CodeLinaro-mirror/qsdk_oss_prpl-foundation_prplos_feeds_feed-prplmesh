@@ -1,0 +1,446 @@
+From 4abece2e4a690108ad6b5733640bd1e8b4590925 Mon Sep 17 00:00:00 2001
+From: Sudharsan Eswaran <eswaran@qti.qualcomm.com>
+Date: Sat, 26 Sep 2026 13:41:29 +0530
+Subject: [PATCH] spatial reuse implementation
+
+Signed-off-by: Sudharsan Eswaran <eswaran@qti.qualcomm.com>
+---
+ .../slave/tasks/channel_selection_task.cpp    |  34 ++-
+ .../slave/tasks/channel_selection_task.h      |   3 +-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 259 +++++++++++++++++-
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     |   1 +
+ .../bwl/nl80211/base_wlan_hal_nl80211.h       |   3 +-
+ .../bwl/shared/nl80211_client_impl.cpp        |   2 +
+ 6 files changed, 289 insertions(+), 13 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+index 1cadac737..9ca6cfd90 100644
+--- a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+@@ -2235,8 +2235,13 @@ void ChannelSelectionTask::handle_channel_selection_request(ieee1905_1::CmduMess
+             return;
+         }
+ 
++        auto &radio_request = m_pending_selection.requests[spatial_reuse_request_tlv->radio_uid()];
++        radio_request.spatial_reuse_request_received = true;
++
+         auto wifi6_caps =
+             reinterpret_cast<beerocks::net::sWIFI6Capabilities *>(&radio->wifi6_capability);
++        radio_request.spatial_reuse_request_supported = wifi6_caps->spatial_reuse;
++
+         if (!wifi6_caps->spatial_reuse) {
+             LOG(WARNING) << "WiFi 6 capabilities does not support spatial reuse params for radio: "
+                          << spatial_reuse_request_tlv->radio_uid();
+@@ -2293,13 +2298,13 @@ void ChannelSelectionTask::handle_channel_selection_request(ieee1905_1::CmduMess
+                 LOG(ERROR) << "addClass ieee1905_1::tlvSpatialReuseConfigResponse has failed";
+                 return;
+             }
+-            auto wifi6_caps =
+-                reinterpret_cast<beerocks::net::sWIFI6Capabilities *>(&radio->wifi6_capability);
+             spatial_reuse_config_response_tlv->radio_uid() = radio_mac;
+             // Set the response code to ACCEPT if it is WiFi6 and it supports spatial reuse params
+-            if (wifi6_caps->spatial_reuse) {
++            if (request_iter->second.spatial_reuse_request_supported) {
+                 spatial_reuse_config_response_tlv->response_code() =
+                     wfa_map::tlvSpatialReuseConfigResponse::ACCEPT;
++                LOG(INFO) << "Spatial Reuse Config Response TLV added: radio="
++                          << radio_mac << " response_code=ACCEPT";
+             } else {
+                 LOG(WARNING) << "WiFi 6 capabilities does not support spatial reuse params";
+                 spatial_reuse_config_response_tlv->response_code() =
+@@ -2378,7 +2383,9 @@ void ChannelSelectionTask::handle_channel_selection_request(ieee1905_1::CmduMess
+             // it is never re-evaluated. Only skip the legacy dispatch below when the auto path
+             // already sent something, or when there is genuinely nothing left to send.
+             if (auto_path_dispatched ||
+-                (!request.power_switch_received && !request.spatial_reuse_request_received &&
++                (!request.power_switch_received &&
++                 !(request.spatial_reuse_request_received &&
++                   request.spatial_reuse_request_supported) &&
+                  !request.eht_operations_received)) {
+                 continue;
+             }
+@@ -2392,7 +2399,8 @@ void ChannelSelectionTask::handle_channel_selection_request(ieee1905_1::CmduMess
+ 
+         // Check if Channel-Switch is needed
+         if (!request.channel_switch_needed && !request.power_switch_received &&
+-            !request.spatial_reuse_request_received && !request.eht_operations_received) {
++            !(request.spatial_reuse_request_received && request.spatial_reuse_request_supported) &&
++            !request.eht_operations_received) {
+             LOG(DEBUG) << "No Channel Switch needed for radio " << radio_mac;
+             request.manually_send_operating_report = true;
+             continue;
+@@ -3866,6 +3874,15 @@ bool ChannelSelectionTask::handle_spatial_reuse_tlv(
+         spatial_reuse_tlv.srg_partial_bssid_bitmap();
+     radio_request.spatial_reuse_request_received = true;
+ 
++    auto radio = AgentDB::get()->get_radio_by_mac(radio_mac, AgentDB::eMacType::RADIO);
++    if (!radio) {
++        LOG(ERROR) << "Radio not found: " << radio_mac;
++        return false;
++    }
++    radio_request.outgoing_request.channel   = radio->wifi_channel.get_channel();
++    radio_request.outgoing_request.bandwidth = radio->wifi_channel.get_bandwidth();
++    radio_request.outgoing_request.freq_type = radio->wifi_channel.get_freq_type();
++
+     LOG(DEBUG)
+         << "Received BSS color params : " << radio_request.spatial_reuse_request.bss_color
+         << " hesiga_spatial_reuse_value15_allowed : "
+@@ -4210,7 +4227,10 @@ bool ChannelSelectionTask::send_channel_switch_request(
+     request_msg->tx_limit_valid() = request.outgoing_request.tx_limit_valid;
+ 
+     // Spatial reuse request params
+-    if (request.spatial_reuse_request_received) {
++    const bool spatial_reuse_config_valid =
++        request.spatial_reuse_request_received && request.spatial_reuse_request_supported;
++
++    if (spatial_reuse_config_valid) {
+         request_msg->sr_params().bss_color = request.spatial_reuse_request.bss_color;
+         request_msg->sr_params().hesiga_spatial_reuse_value15_allowed =
+             request.spatial_reuse_request.hesiga_spatial_reuse_value15_allowed;
+@@ -4231,7 +4251,7 @@ bool ChannelSelectionTask::send_channel_switch_request(
+             request.spatial_reuse_request.srg_partial_bssid_bitmap;
+     }
+ 
+-    request_msg->spatial_reuse_valid() = request.spatial_reuse_request_received;
++    request_msg->spatial_reuse_valid() = spatial_reuse_config_valid;
+ 
+     // EHT Operation params
+     if (request.eht_operations_received) {
+diff --git a/agent/src/beerocks/slave/tasks/channel_selection_task.h b/agent/src/beerocks/slave/tasks/channel_selection_task.h
+index 84134fa5f..ffe6d055f 100644
+--- a/agent/src/beerocks/slave/tasks/channel_selection_task.h
++++ b/agent/src/beerocks/slave/tasks/channel_selection_task.h
+@@ -100,7 +100,8 @@ private:
+         bool power_switch_received          = false;
+         bool channel_switch_needed          = false;
+         bool eht_operations_received        = false;
+-        bool spatial_reuse_request_received = false;
++        bool spatial_reuse_request_received  = false;
++        bool spatial_reuse_request_supported = false;
+         bool is_zwdfs_needed                = false;
+         bool manually_send_operating_report = false;
+     };
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index c94fb9b7c..8dbc3202e 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -20,6 +20,7 @@
+ #include <chrono>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <iomanip>
+ #include <sstream>
+ #include <thread>
+@@ -9273,15 +9274,265 @@ bool ap_wlan_hal_nl80211::set_hop_count(uint8_t hop_count)
+ bool ap_wlan_hal_nl80211::set_spatial_reuse_config(
+     son::wireless_utils::sSpatialReuseParams &spatial_reuse_params)
+ {
+-    LOG(TRACE) << __func__ << " - NOT IMPLEMENTED!";
+-    return false;
++    const std::string target_iface = m_radio_info.iface_name;
++
++    if (!is_wpa_ctrl_interface_registered(target_iface)) {
++        LOG(DEBUG) << __func__ << ": iface " << target_iface
++                   << " not registered yet, registering its wpa_ctrl socket";
++        if (add_interface(target_iface) < 0) {
++            LOG(WARNING) << __func__ << ": add_interface(" << target_iface
++                         << ") failed; will still attempt hostapd commands";
++        }
++    }
++
++    const uint8_t sr_control =
++        (spatial_reuse_params.psr_disallowed ? 0x01 : 0x00) |
++        (spatial_reuse_params.non_srg_offset_valid ? 0x04 : 0x00) |
++        (spatial_reuse_params.srg_information_valid ? 0x08 : 0x00) |
++        (spatial_reuse_params.hesiga_spatial_reuse_value15_allowed ? 0x10 : 0x00);
++
++    LOG(INFO) << __func__ << ": setting spatial reuse config on iface=" << target_iface
++              << " bss_color=" << int(spatial_reuse_params.bss_color)
++              << " partial_bss_color=" << int(spatial_reuse_params.partial_bss_color)
++              << " he_spr_sr_control=" << int(sr_control)
++              << " psr_disallowed=" << spatial_reuse_params.psr_disallowed
++              << " non_srg_offset_valid=" << spatial_reuse_params.non_srg_offset_valid
++              << " srg_information_valid=" << spatial_reuse_params.srg_information_valid
++              << " hesiga_spatial_reuse_value15_allowed="
++              << spatial_reuse_params.hesiga_spatial_reuse_value15_allowed
++              << " non_srg_obsspd_max_offset="
++              << int(spatial_reuse_params.non_srg_obsspd_max_offset)
++              << " srg_obsspd_min_offset=" << int(spatial_reuse_params.srg_obsspd_min_offset)
++              << " srg_obsspd_max_offset=" << int(spatial_reuse_params.srg_obsspd_max_offset)
++              << " srg_bss_color_bitmap=" << spatial_reuse_params.srg_bss_color_bitmap
++              << " srg_partial_bssid_bitmap="
++              << spatial_reuse_params.srg_partial_bssid_bitmap;
++
++    auto send_hostapd_set = [&](const std::string &param, const std::string &value) {
++        const std::string cmd = "SET " + param + " " + value;
++        std::string reply;
++
++        LOG(DEBUG) << __func__ << ": sending hostapd command on iface=" << target_iface
++                   << " cmd='" << cmd << "'";
++        if (!wpa_ctrl_send_msg_bufsize(cmd, reply, BUFFER_SIZE, target_iface)) {
++            LOG(ERROR) << __func__ << ": hostapd command failed on iface=" << target_iface
++                       << " cmd='" << cmd << "' reply='" << reply << "'";
++            return false;
++        }
++        beerocks::string_utils::trim(reply);
++        LOG(DEBUG) << __func__ << ": hostapd command succeeded on iface=" << target_iface
++                   << " cmd='" << cmd << "' reply='" << reply << "'";
++        return true;
++    };
++
++    auto bitmap_uint64_to_string = [](uint64_t bitmap) {
++        std::string value;
++        for (int bit = 0; bit < 64; ++bit) {
++            if (!((bitmap >> bit) & 1)) {
++                continue;
++            }
++            if (!value.empty()) {
++                value += ' ';
++            }
++            value += std::to_string(bit);
++        }
++        return value;
++    };
++
++    bool success = true;
++    success &= send_hostapd_set("he_bss_color", std::to_string(spatial_reuse_params.bss_color));
++    success &= send_hostapd_set("he_bss_color_partial",
++                                std::to_string(spatial_reuse_params.partial_bss_color));
++    success &= send_hostapd_set("he_spr_sr_control", std::to_string(sr_control));
++    if (spatial_reuse_params.non_srg_offset_valid) {
++        success &= send_hostapd_set(
++            "he_spr_non_srg_obss_pd_max_offset",
++            std::to_string(spatial_reuse_params.non_srg_obsspd_max_offset));
++    }
++    if (spatial_reuse_params.srg_information_valid) {
++        success &= send_hostapd_set("he_spr_srg_obss_pd_min_offset",
++                                    std::to_string(spatial_reuse_params.srg_obsspd_min_offset));
++        success &= send_hostapd_set("he_spr_srg_obss_pd_max_offset",
++                                    std::to_string(spatial_reuse_params.srg_obsspd_max_offset));
++        success &= send_hostapd_set("he_spr_srg_bss_colors",
++                                    bitmap_uint64_to_string(
++                                        spatial_reuse_params.srg_bss_color_bitmap));
++        success &= send_hostapd_set(
++            "he_spr_srg_partial_bssid",
++            bitmap_uint64_to_string(spatial_reuse_params.srg_partial_bssid_bitmap));
++    }
++
++    if (!success) {
++        LOG(ERROR) << __func__ << ": failed to set one or more spatial reuse parameters on iface="
++                   << target_iface;
++        return false;
++    }
++
++    if (!update_beacon(target_iface)) {
++        LOG(ERROR) << __func__ << ": UPDATE_BEACON failed after spatial reuse config on iface="
++                   << target_iface;
++        return false;
++    }
++
++    LOG(INFO) << __func__ << ": spatial reuse config set successfully on iface=" << target_iface;
++    return true;
+ }
+ 
+ bool ap_wlan_hal_nl80211::get_spatial_reuse_config(
+     son::wireless_utils::sSpatialReuseParams &spatial_reuse_params)
+ {
+-    LOG(TRACE) << __func__ << " - NOT IMPLEMENTED!";
+-    return false;
++    const std::string target_iface = m_radio_info.iface_name;
++
++    if (!is_wpa_ctrl_interface_registered(target_iface)) {
++        LOG(DEBUG) << __func__ << ": iface " << target_iface
++                   << " not registered yet, registering its wpa_ctrl socket";
++        if (add_interface(target_iface) < 0) {
++            LOG(WARNING) << __func__ << ": add_interface(" << target_iface
++                         << ") failed; will still attempt hostapd commands";
++        }
++    }
++
++    auto get_hostapd_value = [&](const std::string &param, std::string &value) {
++        const std::string cmd = "GET " + param;
++        std::string reply;
++
++        LOG(DEBUG) << __func__ << ": sending hostapd command on iface=" << target_iface
++                   << " cmd='" << cmd << "'";
++        if (!wpa_ctrl_send_msg_bufsize(cmd, reply, BUFFER_SIZE, target_iface)) {
++            LOG(ERROR) << __func__ << ": hostapd command failed on iface=" << target_iface
++                       << " cmd='" << cmd << "' reply='" << reply << "'";
++            return false;
++        }
++        beerocks::string_utils::trim(reply);
++        value = reply;
++        LOG(DEBUG) << __func__ << ": hostapd returned " << param << "='" << value
++                   << "' on iface=" << target_iface;
++        return true;
++    };
++
++    auto get_hostapd_uint = [&](const std::string &param, uint64_t &value) {
++        std::string value_str;
++        if (!get_hostapd_value(param, value_str)) {
++            return false;
++        }
++        if (value_str.empty()) {
++            LOG(ERROR) << __func__ << ": empty hostapd value for " << param
++                       << " on iface=" << target_iface;
++            return false;
++        }
++
++        char *end = nullptr;
++        value     = std::strtoull(value_str.c_str(), &end, 0);
++        if (!end || *end != '\0') {
++            LOG(ERROR) << __func__ << ": invalid numeric hostapd value for " << param
++                       << " on iface=" << target_iface << " value='" << value_str << "'";
++            return false;
++        }
++        return true;
++    };
++
++    auto bitmap_string_to_uint64 = [](std::string bitmap_str) {
++        uint64_t result = 0;
++        beerocks::string_utils::trim(bitmap_str);
++        if (bitmap_str.empty()) {
++            return result;
++        }
++
++        for (auto &c : bitmap_str) {
++            if (c == ',') {
++                c = ' ';
++            }
++        }
++
++        std::istringstream ss(bitmap_str);
++        int bit = 0;
++        while (ss >> bit) {
++            if (bit < 0 || bit > 63) {
++                LOG(WARNING) << "Invalid spatial reuse bitmap bit index " << bit
++                             << " in hostapd value '" << bitmap_str << "'";
++                continue;
++            }
++            result |= (1ULL << bit);
++        }
++        return result;
++    };
++
++    uint64_t bss_color                = 0;
++    uint64_t partial_bss_color        = 0;
++    uint64_t sr_control               = 0;
++    bool success = true;
++    success &= get_hostapd_uint("he_bss_color", bss_color);
++    success &= get_hostapd_uint("he_bss_color_partial", partial_bss_color);
++    success &= get_hostapd_uint("he_spr_sr_control", sr_control);
++
++    if (!success) {
++        LOG(ERROR) << __func__ << ": failed to get mandatory spatial reuse parameters on iface="
++                   << target_iface;
++        return false;
++    }
++
++    spatial_reuse_params.bss_color = static_cast<uint8_t>(bss_color);
++    spatial_reuse_params.partial_bss_color = static_cast<uint8_t>(partial_bss_color);
++    spatial_reuse_params.psr_disallowed = sr_control & 0x01;
++    spatial_reuse_params.non_srg_offset_valid = sr_control & 0x04;
++    spatial_reuse_params.srg_information_valid = sr_control & 0x08;
++    spatial_reuse_params.hesiga_spatial_reuse_value15_allowed = sr_control & 0x10;
++
++    spatial_reuse_params.non_srg_obsspd_max_offset = 0;
++    spatial_reuse_params.srg_obsspd_min_offset     = 0;
++    spatial_reuse_params.srg_obsspd_max_offset     = 0;
++    spatial_reuse_params.srg_bss_color_bitmap      = 0;
++    spatial_reuse_params.srg_partial_bssid_bitmap  = 0;
++
++    if (spatial_reuse_params.non_srg_offset_valid) {
++        uint64_t non_srg_obsspd_max = 0;
++        if (!get_hostapd_uint("he_spr_non_srg_obss_pd_max_offset", non_srg_obsspd_max)) {
++            LOG(ERROR) << __func__ << ": failed to get Non-SRG OBSS PD max offset on iface="
++                       << target_iface;
++            return false;
++        }
++        spatial_reuse_params.non_srg_obsspd_max_offset =
++            static_cast<uint8_t>(non_srg_obsspd_max);
++    }
++
++    if (spatial_reuse_params.srg_information_valid) {
++        uint64_t srg_obsspd_min = 0;
++        uint64_t srg_obsspd_max = 0;
++        std::string srg_bss_colors;
++        std::string srg_partial_bssid;
++
++        success &= get_hostapd_uint("he_spr_srg_obss_pd_min_offset", srg_obsspd_min);
++        success &= get_hostapd_uint("he_spr_srg_obss_pd_max_offset", srg_obsspd_max);
++        success &= get_hostapd_value("he_spr_srg_bss_colors", srg_bss_colors);
++        success &= get_hostapd_value("he_spr_srg_partial_bssid", srg_partial_bssid);
++        if (!success) {
++            LOG(ERROR) << __func__ << ": failed to get SRG information on iface=" << target_iface;
++            return false;
++        }
++
++        spatial_reuse_params.srg_obsspd_min_offset = static_cast<uint8_t>(srg_obsspd_min);
++        spatial_reuse_params.srg_obsspd_max_offset = static_cast<uint8_t>(srg_obsspd_max);
++        spatial_reuse_params.srg_bss_color_bitmap = bitmap_string_to_uint64(srg_bss_colors);
++        spatial_reuse_params.srg_partial_bssid_bitmap = bitmap_string_to_uint64(srg_partial_bssid);
++    }
++
++    LOG(INFO) << __func__ << ": got spatial reuse config from iface=" << target_iface
++              << " bss_color=" << int(spatial_reuse_params.bss_color)
++              << " partial_bss_color=" << int(spatial_reuse_params.partial_bss_color)
++              << " he_spr_sr_control=" << sr_control
++              << " psr_disallowed=" << spatial_reuse_params.psr_disallowed
++              << " non_srg_offset_valid=" << spatial_reuse_params.non_srg_offset_valid
++              << " srg_information_valid=" << spatial_reuse_params.srg_information_valid
++              << " hesiga_spatial_reuse_value15_allowed="
++              << spatial_reuse_params.hesiga_spatial_reuse_value15_allowed
++              << " non_srg_obsspd_max_offset="
++              << int(spatial_reuse_params.non_srg_obsspd_max_offset)
++              << " srg_obsspd_min_offset=" << int(spatial_reuse_params.srg_obsspd_min_offset)
++              << " srg_obsspd_max_offset=" << int(spatial_reuse_params.srg_obsspd_max_offset)
++              << " srg_bss_color_bitmap=" << spatial_reuse_params.srg_bss_color_bitmap
++              << " srg_partial_bssid_bitmap="
++              << spatial_reuse_params.srg_partial_bssid_bitmap;
++    return true;
+ }
+ 
+ bool ap_wlan_hal_nl80211::start_platform_acs(
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index 22a9e51ed..65660818a 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -881,6 +881,7 @@ bool base_wlan_hal_nl80211::wpa_ctrl_send_msg_bufsize(const std::string &cmd, st
+ 
+     if ((!strncmp(local_buffer.data(), "FAIL", 4)) ||
+         (!strncmp(local_buffer.data(), "UNKNOWN", 7))) {
++        reply.assign(local_buffer.data());
+         LOG(WARNING) << "wpa_ctrl_send_msg_bufsize: cmd '" << cmd << "' returned: "
+                      << local_buffer.data();
+         return false;
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
+index 730aca8a4..d367f2d57 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
+@@ -128,7 +128,8 @@ protected:
+      * be received without changing the global buffer size for all commands.
+      *
+      * @param [in]  cmd      Command to send.
+-     * @param [out] reply    Received reply (empty on failure).
++     * @param [out] reply    Received reply. Empty on transport failure, but populated for
++     *                        hostapd FAIL/UNKNOWN replies.
+      * @param [in]  buf_size Size of the temporary buffer to allocate.
+      * @param [in]  ifname   Interface name (defaults to the radio iface).
+      * @return true on success, false on error.
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.cpp b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+index 534da7441..fab54c523 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -753,6 +753,8 @@ bool nl80211_client_impl::get_radio_info(const std::string &interface_name, radi
+ 
+                     band.wifi6_capability = band.wifi6_capability | (3 << 6);
+                     band.wifi6_capability = band.wifi6_capability | (1 << 4);
++                    band.wifi6_capability = band.wifi6_capability | ((uint64_t)1 << 1);
++                    LOG(DEBUG) << "WiFi 6 spatial reuse capability is enabled for HE-supported band";
+ 
+                     const struct nlattr *nl_he_cap = tb_band[NL80211_BAND_ATTR_IFTYPE_DATA];
+                     nla_for_each_attr(nl_band, static_cast<struct nlattr *>(nla_data(nl_he_cap)),
+-- 
+2.34.1
+
