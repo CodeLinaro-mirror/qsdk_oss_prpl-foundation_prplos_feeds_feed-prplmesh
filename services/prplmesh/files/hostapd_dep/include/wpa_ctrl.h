@@ -126,6 +126,7 @@ extern "C" {
 #ifdef CONFIG_QCN_EXTN
 /** Ind Rep - WDS STA Pre-connect State */
 #define WPA_EVENT_PRE_CONNECTING "CTRL-EVENT-PRE-CONNECTING "
+#define MAX_REPLY_EXTN_BUF (320 * 1024)
 #endif
 
 
@@ -192,6 +193,10 @@ extern "C" {
 #define WPS_EVENT_DPP_NO_URI "WPS-DPP-NO-URI "
 /** Result of SCS setup */
 #define WPA_EVENT_SCS_RESULT "CTRL-EVENT-SCS-RESULT "
+/** Deferred SCS request notification to application */
+#define WPA_EVENT_SCS_REQUEST_NOTIFY "CTRL-EVENT-SCS-REQUEST-NOTIFY "
+/** SCS installation status notification to application */
+#define WPA_EVENT_SCS_STATUS_NOTIFY "CTRL-EVENT-SCS-STATUS-NOTIFY "
 /* Event indicating DSCP policy */
 #define WPA_EVENT_DSCP_POLICY "CTRL-EVENT-DSCP-POLICY "
 
@@ -403,6 +408,7 @@ extern "C" {
 #define DFS_EVENT_CAC_COMPLETED "DFS-CAC-COMPLETED "
 #define DFS_EVENT_NOP_FINISHED "DFS-NOP-FINISHED "
 #define DFS_EVENT_PRE_CAC_EXPIRED "DFS-PRE-CAC-EXPIRED "
+#define DFS_EVENT_UPLINK_CSA "DFS-UPLINK-CSA "
 
 /* AWGN events */
 #define INTERFERENCE_DETECTED "INTERFERENCE-DETECTED "
@@ -438,6 +444,15 @@ extern "C" {
 
 /* parameters: <STA address> <dialog token> <link measurement report> */
 #define LINK_MSR_RESP_RX "LINK-MSR-RESP-RX "
+
+/* parameters: <STA address> <dialog token> <report mode> <LCI data hex> */
+#define LCI_RESP_RX "LCI-RESP-RX "
+
+/* parameters: <STA address> <dialog token> <channel load> */
+#define CHANNEL_LOAD_RESP_RX "CHANNEL-LOAD-RESP-RX "
+
+/* parameters: <STA address> <dialog token> <anpi> <ipi0..ipi7> */
+#define NOISE_HIST_RESP_RX "NOISE-HIST-RESP-RX "
 
 /* PMKSA cache entry added; parameters: <BSSID> <network_id> */
 #define PMKSA_CACHE_ADDED "PMKSA-CACHE-ADDED "
@@ -710,4 +725,6 @@ char * wpa_ctrl_get_remote_ifname(struct wpa_ctrl *ctrl);
 }
 #endif
 
+int hostapd_cli_recovery_in_progress(void);
+void hostapd_cli_msg_cb(char *msg, size_t len);
 #endif /* WPA_CTRL_H */
