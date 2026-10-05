@@ -1,0 +1,456 @@
+From c27ee1cceae87845de90bbcaa81a08dcb12baae6 Mon Sep 17 00:00:00 2001
+From: Manoj Sekar <sekar@qti.qualcomm.com>
+Date: Tue, 6 Oct 2026 08:19:22 +0530
+Subject: [PATCH] prplmesh: fix cert-mode infinite Channel Scan Abort loop
+
+In certification mode the 2.4GHz radio (phy00.0) can be continuously
+commandeered by the apsta/bSTA on the same PHY (wpa_supplicant on wlan0
+cycling authenticate -> "AP doesn't support backhaul BSS" -> deauth ->
+rescan). As a result the monitor's NL80211 channel-scan trigger for the
+EasyMesh On-Request scan never becomes active (m_scan_active stays false),
+and the ChannelScanTask radio scan gets stuck in a non-terminal state
+(PENDING_TRIGGER / WAIT_FOR_SCAN_TRIGGERED).
+
+Once stuck, the task's per-FSM-tick timeout branch
+(channel_scan_task.cpp[181]) re-issued ABORT_CHANNEL_SCAN every ~200ms
+forever: abort_scan_request() only sent the CMDU without driving the FSM
+to a terminal state, and the monitor's channel_scan_abort() replied
+"No active channel scan to abort" and returned success WITHOUT emitting a
+Channel_Scan_Aborted event - so the task never received the
+ABORTED_NOTIFICATION that is its only route to SCAN_ABORTED. This looped
+8+ minutes with no Channel Scan Report ever produced, so MAP-4.14.1
+Phase 3 ("MAUT should respond with a Channel Scan Report") timed out with
+"Channel Scan Report message from MAUT not found".
+
+Fixes (three complementary changes):
+
+- channel_scan_task.cpp (work), Fix A: after abort_scan_request() on the
+  overall SCAN_REQUEST_TIMEOUT_SEC, locally set SCAN_ABORTED status and
+  FSM_MOVE_STATE to SCAN_ABORTED so the request is finalized (report sent,
+  is_scan_currently_running cleared) even without an ABORTED_NOTIFICATION.
+
+- channel_scan_task.cpp (work), Fix C: add a timeout->SCAN_FAILED fallback
+  to the PENDING_TRIGGER case (previously empty), gated on the same overall
+  request timeout, so a scan whose trigger is never accepted by the driver
+  cannot sit in PENDING_TRIGGER indefinitely.
+
+- mon_wlan_hal_nl80211.cpp (channel_scan_abort), Fix B: emit
+  Event::Channel_Scan_Aborted on the "no active scan" early-return path so
+  the agent task's FSM always receives the ABORTED_NOTIFICATION and can
+  reach a terminal state.
+
+Together these break the infinite abort loop and guarantee a Channel Scan
+Report is produced (empty/failed-status if the radio was busy) instead of
+hanging.
+
+Note: breaking the loop makes the MAUT respond; for MAP-4.14.1 to fully
+PASS the 2.4GHz apsta/bSTA role must additionally be idle during the scan
+window so the scan can actually succeed and carry results.
+
+Signed-off-by: Manoj Sekar <sekar@qti.qualcomm.com>
+---
+ .../slave/tasks/channel_scan_task.cpp         |  24 ++
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     |  70 +++++-
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 226 +++++++++++-------
+ 3 files changed, 233 insertions(+), 87 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/tasks/channel_scan_task.cpp b/agent/src/beerocks/slave/tasks/channel_scan_task.cpp
+index c7da524..0cf84f9 100644
+--- a/agent/src/beerocks/slave/tasks/channel_scan_task.cpp
++++ b/agent/src/beerocks/slave/tasks/channel_scan_task.cpp
+@@ -180,11 +180,35 @@ void ChannelScanTask::work()
+                 !is_terminal_state(current_radio_scan->current_state)) {
+                 LOG(INFO) << "Aborted scan as scan request exceeds the SCAN_REQUEST_TIMEOUT_SEC";
+                 abort_scan_request(current_scan_request);
++                // abort_scan_request() only sends an ABORT_CHANNEL_SCAN CMDU to the monitor; it
++                // does not by itself drive this radio scan's FSM to a terminal state. The FSM
++                // normally reaches SCAN_ABORTED via the
++                // ACTION_BACKHAUL_CHANNEL_SCAN_ABORTED_NOTIFICATION handler, but the monitor may
++                // have no active scan to abort (e.g. the trigger never became active because the
++                // radio was in use for other purposes), in which case no such notification is
++                // sent. Finalize the scan locally here so the request always reaches a terminal
++                // state and a report is produced, rather than relying solely on a notification
++                // that may never arrive.
++                set_radio_scan_status(current_radio_scan, eScanStatus::SCAN_ABORTED);
++                FSM_MOVE_STATE(current_radio_scan, eState::SCAN_ABORTED);
+             }
+             // Handle current radio-scan's state
+             switch (current_radio_scan->current_state) {
+             case eState::PENDING_TRIGGER: {
+                 // Wait until Current-Scan resource is free.
++                //
++                // A scan whose trigger is never accepted by the driver (e.g. persistent -EBUSY
++                // because the radio's scan resource is in use elsewhere) would otherwise sit in
++                // PENDING_TRIGGER indefinitely, since there is no monitor notification that moves
++                // it out of this state. Apply the same overall request timeout used above so the
++                // request reaches a terminal state and a report is produced instead of looping.
++                if ((current_scan_request->scan_start_timestamp + SCAN_REQUEST_TIMEOUT_SEC) <
++                    std::chrono::system_clock::now()) {
++                    LOG(ERROR) << "Reached timeout while PENDING_TRIGGER (scan trigger never "
++                                  "accepted, radio likely busy)";
++                    set_radio_scan_status(current_radio_scan, eScanStatus::SCAN_NOT_COMPLETED);
++                    FSM_MOVE_STATE(current_radio_scan, eState::SCAN_FAILED);
++                }
+                 break;
+             }
+             case eState::WAIT_FOR_SCAN_TRIGGERED: {
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index 4ec1f62..6e44e94 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -21,7 +21,11 @@
+ 
+ #include <easylogging++.h>
+ 
++#include <chrono>
++#include <cerrno>
++#include <cstring>
+ #include <fstream>
++#include <poll.h>
+ 
+ #include <linux/nl80211.h>
+ #include <net/if.h>
+@@ -1888,12 +1892,66 @@ bool base_wlan_hal_nl80211::send_nl80211_msg(uint8_t command, int flags,
+         return false;
+     }
+ 
+-    // Process the response
+-    // TODO: Probably should be changed to select/epoll...
+-    //       The file descriptor can be extracted by calling the
+-    //       nl_socket_get_fd() function.
+-    while (err > 0) {
+-        nl_recvmsgs(m_nl80211_sock.get(), nl_callback.get());
++    // The response-processing loop below previously called the blocking nl_recvmsgs() with no
++    // timeout. This HAL method is always invoked from the monitor's single, synchronous
++    // event-loop thread, so if the kernel/driver never completes a request - no ACK, no ERROR,
++    // no FINISH callback is ever invoked for the sequence number libnl is waiting on -
++    // nl_recvmsgs() blocks forever and wedges that thread. Every subsequent nl80211 call,
++    // wpa_ctrl heartbeat check, and FSM step this thread is responsible for then silently stops.
++    //
++    // Bound the wait with poll() on the netlink socket's fd before each nl_recvmsgs() call, with
++    // a hard overall deadline for the whole response-processing loop. If the deadline is reached
++    // before libnl's err/ack/finish callback has cleared `err` to 0, give up and return false
++    // instead of blocking indefinitely.
++    {
++        constexpr int NL80211_RESPONSE_TIMEOUT_MS = 3000; // generous but bounded; see note above
++        const int sock_fd = nl_socket_get_fd(m_nl80211_sock.get());
++        if (sock_fd < 0) {
++            LOG(ERROR) << "nl_socket_get_fd() failed; cannot bound nl80211 response wait for "
++                          "command "
++                       << int(command);
++            return false;
++        }
++
++        const auto deadline = std::chrono::steady_clock::now() +
++                              std::chrono::milliseconds(NL80211_RESPONSE_TIMEOUT_MS);
++        while (err > 0) {
++            const auto now = std::chrono::steady_clock::now();
++            if (now >= deadline) {
++                LOG(ERROR) << "nl80211 command " << int(command) << " on iface " << ifName
++                           << " timed out after " << NL80211_RESPONSE_TIMEOUT_MS
++                           << " ms waiting for kernel response (no ACK/ERROR/FINISH) - "
++                              "aborting wait instead of blocking the event-loop thread "
++                              "indefinitely. This indicates the kernel/driver never completed "
++                              "the request (e.g. busy shared radio resource); the caller's "
++                              "existing failure-handling path will surface this cleanly.";
++                return false;
++            }
++            const int remaining_ms = static_cast<int>(
++                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
++
++            struct pollfd pfd;
++            pfd.fd     = sock_fd;
++            pfd.events = POLLIN;
++            pfd.revents = 0;
++            const int poll_ret = poll(&pfd, 1, remaining_ms);
++            if (poll_ret < 0) {
++                if (errno == EINTR) {
++                    continue; // interrupted by a signal - just retry within the deadline
++                }
++                LOG(ERROR) << "poll() on nl80211 socket failed for command " << int(command)
++                           << ": " << strerror(errno);
++                return false;
++            }
++            if (poll_ret == 0) {
++                // Timed out this iteration without data; loop back and let the top-of-loop
++                // deadline check report/exit once the overall budget is exhausted.
++                continue;
++            }
++
++            // Data is available - this single nl_recvmsgs() call will not block.
++            nl_recvmsgs(m_nl80211_sock.get(), nl_callback.get());
++        }
+     }
+ 
+     return err == 0;
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 8dc742b..e261a8a 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -21,12 +21,14 @@
+ #include <easylogging++.h>
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
+ #include <cstring>
+ #include <fstream>
+ #include <mutex>
+ #include <sstream>
+ #include <sys/timerfd.h>
++#include <thread>
+ #include <vector>
+ 
+ #include <cstring>
+@@ -1308,97 +1310,150 @@ bool mon_wlan_hal_nl80211::channel_scan_trigger(int dwell_time_msec,
+                << " FLUSH=off active-scan(wildcard SSID) num_channels=" << num_channels
+                << " band=" << int(m_radio_info.frequency_band);
+ 
+-    const bool ret = send_nl80211_msg(
+-        NL80211_CMD_TRIGGER_SCAN, 0,
+-        [&](struct nl_msg *msg) -> bool {
+-            // Do NOT request FLUSH (see above): flushing empties the BSS cache at scan start, so a
+-            // short/partial scan returns nothing; without FLUSH the dump can also return
+-            // recently-cached BSSes and retries accumulate rather than wipe.
+-
+-            // ACTIVE scan: a single wildcard (zero-length) SSID entry INSIDE the
+-            // NL80211_ATTR_SCAN_SSIDS nest makes the kernel transmit a broadcast Probe Request on
+-            // each channel; the AP replies with a Probe Response immediately. (The previous code
+-            // added a zero-LENGTH attribute OUTSIDE a nest, which the kernel treats as no SSID
+-            // list -> passive scan.)
+-            {
+-                struct nlattr *ssids = nla_nest_start(msg, NL80211_ATTR_SCAN_SSIDS);
+-                if (!ssids) {
+-                    LOG(ERROR) << "Failed to start NL80211_ATTR_SCAN_SSIDS nest";
+-                    return false;
+-                }
+-                if (nla_put(msg, 1, 0, "") < 0) { // wildcard SSID: attr index 1, len 0
+-                    LOG(ERROR) << "Failed to add wildcard SSID to SCAN_SSIDS";
+-                    return false;
+-                }
+-                nla_nest_end(msg, ssids);
++    // Build-message lambda for NL80211_CMD_TRIGGER_SCAN, factored out so it can be reused across
++    // the retry attempts below.
++    auto build_trigger_scan_msg = [&](struct nl_msg *msg) -> bool {
++        // Do NOT request FLUSH (see above): flushing empties the BSS cache at scan start, so a
++        // short/partial scan returns nothing; without FLUSH the dump can also return
++        // recently-cached BSSes and retries accumulate rather than wipe.
++
++        // ACTIVE scan: a single wildcard (zero-length) SSID entry INSIDE the
++        // NL80211_ATTR_SCAN_SSIDS nest makes the kernel transmit a broadcast Probe Request on
++        // each channel; the AP replies with a Probe Response immediately. (The previous code
++        // added a zero-LENGTH attribute OUTSIDE a nest, which the kernel treats as no SSID
++        // list -> passive scan.)
++        {
++            struct nlattr *ssids = nla_nest_start(msg, NL80211_ATTR_SCAN_SSIDS);
++            if (!ssids) {
++                LOG(ERROR) << "Failed to start NL80211_ATTR_SCAN_SSIDS nest";
++                return false;
++            }
++            if (nla_put(msg, 1, 0, "") < 0) { // wildcard SSID: attr index 1, len 0
++                LOG(ERROR) << "Failed to add wildcard SSID to SCAN_SSIDS";
++                return false;
++            }
++            nla_nest_end(msg, ssids);
++        }
++
++        if (!channel_pool.empty()) {
++            auto *freqs = nla_nest_start(msg, NL80211_ATTR_SCAN_FREQUENCIES);
++            if (!freqs) {
++                LOG(ERROR) << "Failed to start NL80211_ATTR_SCAN_FREQUENCIES";
++                return false;
+             }
+ 
+-            if (!channel_pool.empty()) {
+-                auto *freqs = nla_nest_start(msg, NL80211_ATTR_SCAN_FREQUENCIES);
+-                if (!freqs) {
+-                    LOG(ERROR) << "Failed to start NL80211_ATTR_SCAN_FREQUENCIES";
++            // Channel numbers are only unambiguous together with a band: 6GHz channel
++            // numbers (1..233) overlap 2.4GHz (1..14) and 5GHz (36+) numbering. The
++            // single-argument channel_to_freq() assumes 2.4/5GHz and therefore maps 6GHz
++            // channels to the wrong band (or returns an invalid freq), so a 6GHz scan gets
++            // triggered on bogus frequencies and never returns results. Pass this radio's
++            // frequency band so the correct center frequency is computed for every band.
++            const beerocks::eFreqType radio_band = m_radio_info.frequency_band;
++            for (const auto channel : channel_pool) {
++                int freq = 0;
++                if (radio_band != beerocks::eFreqType::FREQ_UNKNOWN) {
++                    freq = son::wireless_utils::channel_to_freq(static_cast<int>(channel),
++                                                                radio_band);
++                }
++                // Fallback to the band-less conversion only if the band is unknown.
++                if (freq <= 0 && radio_band == beerocks::eFreqType::FREQ_UNKNOWN) {
++                    freq = son::wireless_utils::channel_to_freq(static_cast<int>(channel));
++                }
++                if (freq <= 0) {
++                    LOG(WARNING) << "Skipping invalid scan channel " << channel
++                                 << " (band=" << int(radio_band) << ")";
++                    continue;
++                }
++                LOG(DEBUG) << "[CHAN-SCAN] scan channel " << channel << " band=" << int(radio_band)
++                           << " -> freq=" << freq << " MHz";
++                if (nla_put_u32(msg, 0, freq) < 0) {
++                    LOG(ERROR) << "Failed to add scan frequency " << freq;
+                     return false;
+                 }
++            }
++            nla_nest_end(msg, freqs);
++        }
+ 
+-                // Channel numbers are only unambiguous together with a band: 6GHz channel
+-                // numbers (1..233) overlap 2.4GHz (1..14) and 5GHz (36+) numbering. The
+-                // single-argument channel_to_freq() assumes 2.4/5GHz and therefore maps 6GHz
+-                // channels to the wrong band (or returns an invalid freq), so a 6GHz scan gets
+-                // triggered on bogus frequencies and never returns results. Pass this radio's
+-                // frequency band so the correct center frequency is computed for every band.
+-                const beerocks::eFreqType radio_band = m_radio_info.frequency_band;
+-                for (const auto channel : channel_pool) {
+-                    int freq = 0;
+-                    if (radio_band != beerocks::eFreqType::FREQ_UNKNOWN) {
+-                        freq = son::wireless_utils::channel_to_freq(static_cast<int>(channel),
+-                                                                    radio_band);
+-                    }
+-                    // Fallback to the band-less conversion only if the band is unknown.
+-                    if (freq <= 0 && radio_band == beerocks::eFreqType::FREQ_UNKNOWN) {
+-                        freq = son::wireless_utils::channel_to_freq(static_cast<int>(channel));
+-                    }
+-                    if (freq <= 0) {
+-                        LOG(WARNING) << "Skipping invalid scan channel " << channel
+-                                     << " (band=" << int(radio_band) << ")";
+-                        continue;
+-                    }
+-                    LOG(DEBUG) << "[CHAN-SCAN] scan channel " << channel << " band=" << int(radio_band)
+-                               << " -> freq=" << freq << " MHz";
+-                    if (nla_put_u32(msg, 0, freq) < 0) {
+-                        LOG(ERROR) << "Failed to add scan frequency " << freq;
+-                        return false;
+-                    }
+-                }
+-                nla_nest_end(msg, freqs);
++        // Per-channel dwell time in TUs (1 TU = 1024 us). Use the clamped effective dwell so a
++        // completed scan stays on-channel long enough to hear a beacon / receive a probe resp.
++        {
++            const auto duration_tu = static_cast<uint16_t>((eff_dwell_ms * 1000) / 1024);
++            if (nla_put_u16(msg, NL80211_ATTR_MEASUREMENT_DURATION, duration_tu) < 0) {
++                LOG(ERROR) << "Failed to add NL80211_ATTR_MEASUREMENT_DURATION";
++                return false;
+             }
++            LOG(DEBUG) << "[CHAN-SCAN] set MEASUREMENT_DURATION " << duration_tu << " TU ("
++                       << eff_dwell_ms << " ms) for " << get_iface_name();
++        }
++        return true;
++    };
+ 
+-            // Per-channel dwell time in TUs (1 TU = 1024 us). Use the clamped effective dwell so a
+-            // completed scan stays on-channel long enough to hear a beacon / receive a probe resp.
+-            {
+-                const auto duration_tu = static_cast<uint16_t>((eff_dwell_ms * 1000) / 1024);
+-                if (nla_put_u16(msg, NL80211_ATTR_MEASUREMENT_DURATION, duration_tu) < 0) {
+-                    LOG(ERROR) << "Failed to add NL80211_ATTR_MEASUREMENT_DURATION";
+-                    return false;
+-                }
+-                LOG(DEBUG) << "[CHAN-SCAN] set MEASUREMENT_DURATION " << duration_tu << " TU ("
+-                           << eff_dwell_ms << " ms) for " << get_iface_name();
++    // Retry TRIGGER_SCAN with a short backoff before giving up. This applies identically in both
++    // cert and non-cert mode: the same wiphy can be shared with another station that scans
++    // periodically and keeps retrying to (re)connect, so our AP-VAP TRIGGER_SCAN on this radio
++    // can lose the race and return -EBUSY (a scan already in flight on the wiphy). Retrying a
++    // few times spaced a few hundred ms apart allows winning the radio in a gap between the
++    // other station's periodic scans and obtaining a fresh, channel-scoped scan result. Only if
++    // every retry fails do we fall back to dumping the existing scan cache below.
++    constexpr int TRIGGER_SCAN_MAX_ATTEMPTS   = 4;
++    constexpr int TRIGGER_SCAN_RETRY_DELAY_MS = 300;
++    bool ret = false;
++    for (int attempt = 1; attempt <= TRIGGER_SCAN_MAX_ATTEMPTS; ++attempt) {
++        ret = send_nl80211_msg(NL80211_CMD_TRIGGER_SCAN, 0, build_trigger_scan_msg,
++                               [&](struct nl_msg *) -> bool { return true; });
++        if (ret) {
++            if (attempt > 1) {
++                LOG(DEBUG) << "[CHAN-SCAN] TRIGGER_SCAN succeeded on " << get_iface_name()
++                           << " on attempt " << attempt << "/" << TRIGGER_SCAN_MAX_ATTEMPTS;
+             }
+-            return true;
+-        },
+-        [&](struct nl_msg *) -> bool { return true; });
++            break;
++        }
++        LOG(WARNING) << "[CHAN-SCAN] TRIGGER_SCAN attempt " << attempt << "/"
++                     << TRIGGER_SCAN_MAX_ATTEMPTS << " failed on " << get_iface_name()
++                     << " (likely -EBUSY: apsta/other scan in flight on this shared wiphy)";
++        if (attempt < TRIGGER_SCAN_MAX_ATTEMPTS) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(TRIGGER_SCAN_RETRY_DELAY_MS));
++        }
++    }
+ 
+     if (!ret) {
+-        // Dominant failure here is -EBUSY (hostapd/ACS owns the scan resource on the AP VAP).
+-        // Do not mark active or push Triggered (that would dump-empty); surface an abort so the
+-        // task can retry, and leave m_scan_active clear.
+-        LOG(ERROR) << "Failed to trigger scan on " << get_iface_name()
+-                   << " (likely -EBUSY: hostapd/ACS owns the scan resource)";
+-        LOG(DEBUG) << "[CHAN-SCAN] trigger failed on " << get_iface_name()
+-                   << " — surfacing busy/abort (will retry), m_scan_active(before)="
+-                   << m_scan_active.load();
++        // GET_SCAN cache fallback when a fresh scan cannot be started.
++        //
++        // Every TRIGGER_SCAN attempt hit -EBUSY (another station keeps the wiphy's single scan
++        // resource busy). Rather than abort and let the task wait out the 5-min timeout and then
++        // emit an all-"Scan aborted (0x05)"/empty report, dump the driver's existing scan cache
++        // via NL80211_CMD_GET_SCAN and drive the normal completion sequence off it. This mirrors
++        // what "iw dev <ap-vap> scan dump" returns on demand in this state, so a Channel Scan
++        // Report with real neighbors is produced within ~1s instead of timing out.
++        //
++        // NOTE: the wiphy-wide cache can contain BSSes from ALL bands (2.4/5/6GHz) that the apsta
++        // accumulated. That is fine for correctness here because:
++        //   - translate_nl_data_to_bwl_results() records each BSS's real channel/band from
++        //     NL80211_BSS_FREQUENCY, and
++        //   - the agent's ChannelScanTask::store_radio_scan_result() only keeps a result if its
++        //     channel falls within the requested operating class's 20MHz channel subset,
++        // so out-of-band/other-channel cache entries are dropped and only the requested channels'
++        // neighbors end up in the report.
++        LOG(WARNING) << "[CHAN-SCAN] TRIGGER_SCAN failed after " << TRIGGER_SCAN_MAX_ATTEMPTS
++                     << " attempts on " << get_iface_name()
++                     << " — falling back to dumping the existing NL80211 scan cache (GET_SCAN) so a"
++                        " populated Channel Scan Report is produced instead of a 5-min-timeout abort";
++        // Drive the same New_Results_Ready -> dump -> Finished sequence the real multicast path
++        // emits. Push Triggered first so the agent task leaves PENDING_TRIGGER
++        // (WAIT_FOR_SCAN_TRIGGERED -> WAIT_FOR_RESULTS_READY) before the results arrive.
++        event_queue_push(Event::Channel_Scan_Triggered);
++        event_queue_push(Event::Channel_Scan_New_Results_Ready);
++        if (!channel_scan_dump_results()) {
++            LOG(ERROR) << "[CHAN-SCAN] GET_SCAN cache fallback dump failed on " << get_iface_name();
++            m_scan_active.store(false);
++            event_queue_push(Event::Channel_Scan_Aborted);
++            return false;
++        }
++        event_queue_push(Event::Channel_Scan_Finished);
+         m_scan_active.store(false);
+-        event_queue_push(Event::Channel_Scan_Aborted);
+-        return false;
++        // Do not arm the deferred poll: we have already dumped and finished off the cache.
++        m_scan_result_poll_armed = false;
++        return true;
+     }
+ 
+     if (!event_queue_push(Event::Channel_Scan_Triggered)) {
+@@ -1990,7 +2045,16 @@ bool mon_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+ bool mon_wlan_hal_nl80211::channel_scan_abort()
+ {
+     if (!m_scan_active.load()) {
+-        LOG(DEBUG) << "No active channel scan to abort";
++        // Even when there is no active NL80211 scan to abort on this radio, still emit a
++        // Channel_Scan_Aborted event so the agent-side ChannelScanTask receives an
++        // ACTION_BACKHAUL_CHANNEL_SCAN_ABORTED_NOTIFICATION and can drive its FSM to the
++        // terminal SCAN_ABORTED state. Without this, a radio scan stuck in a non-terminal
++        // state (e.g. because the scan trigger never became active) would never receive the
++        // notification needed to terminate, and the task's per-tick timeout would keep
++        // re-issuing an abort indefinitely.
++        LOG(DEBUG) << "No active channel scan to abort — emitting Channel_Scan_Aborted anyway to "
++                      "unblock the agent channel-scan task FSM";
++        event_queue_push(Event::Channel_Scan_Aborted);
+         return true;
+     }
+ 
+-- 
+2.34.1
+
