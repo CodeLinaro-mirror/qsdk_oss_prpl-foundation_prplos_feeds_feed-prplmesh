@@ -1,0 +1,573 @@
+From 03b42954805c6261c29c752fac3e9cc31a2e1db8 Mon Sep 17 00:00:00 2001
+From: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+Date: Thu, 8 Oct 2026 09:37:49 +0530
+Subject: [PATCH] NLHAL: stabilize MLO BSS registration and ownership
+
+Wait for kernel and hostapd to register newly added BSSes before using them for MLO operations, and accept valid DFS/CAC states during VAP credential updates.
+
+Filter refresh and monitor events to the local MLO link, use STATUS indices when rebuilding the VAP map, and prevent stale mld_ap state for non-MLO BSSes. Skip VAP DB refresh after failed MLD reconfiguration and use the resolved VAP interface for kernel state checks.
+
+Signed-off-by: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 |   7 +-
+ agent/src/beerocks/slave/son_slave_thread.cpp |   8 +-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 239 +++++++++++++++---
+ .../bwl/nl80211/ap_wlan_hal_nl80211.h         |  15 ++
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     |  48 +++-
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      |  61 +++++
+ 6 files changed, 332 insertions(+), 46 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 438a1f6a1..2dd6bd8c2 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -3833,7 +3833,12 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+         ap_wlan_hal->update_mld_mode(request->ssid(), request->mld_mode());
+ 
+ #ifdef USE_PRPLMESH_NLHAL
+-        ap_wlan_hal->handle_mld_reconfig(request->ssid(), request->mld_unit());
++        const bool mld_reconfig_ok =
++            ap_wlan_hal->handle_mld_reconfig(request->ssid(), request->mld_unit());
++        if (!mld_reconfig_ok) {
++            LOG(ERROR) << "MLD reconfiguration failed for SSID " << request->ssid()
++                       << "; skipping VAP DB update notification";
++        }
+ 
+         // Notify monitor thread to refresh its VAP DB after MLD reconfig
+         auto vap_update_notif = message_com::create_vs_message<
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index bda6b8c03..aba77705a 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -8776,9 +8776,11 @@ bool slave_thread::update_vaps_info(const std::string &iface,
+         const auto previous_bssid        = bss.mac;
+         const std::string previous_iface_name = bss.iface_name;
+ #ifdef USE_PRPLMESH_NLHAL
+-        std::string base_interface = net::strip_link_suffix(iface);
+-        const bool is_enabled = has_bssid && !iface_name.empty() &&
+-                                network_utils::linux_iface_is_up_and_running(base_interface);
++        const std::string base_interface = net::strip_link_suffix(iface_name);
++        const bool kernel_iface_up =
++            has_bssid && !iface_name.empty() &&
++            network_utils::linux_iface_is_up_and_running(base_interface);
++        const bool is_enabled = kernel_iface_up;
+ #else
+         const sMacAddr &ap_mld_mac = vaps[vap_idx].ap_mld_mac;
+         const bool is_enabled      = has_bssid && !iface_name.empty() &&
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 1ebce94c0..7f2ce7008 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -18,6 +18,8 @@
+ #include <bcl/son/son_wireless_utils.h>
+ #include <bpl/bpl_cfg.h>
+ #include <bwl/key_value_parser.h>
++#include <algorithm>
++#include <cctype>
+ #include <cerrno>
+ #include <chrono>
+ #include <cmath>
+@@ -66,6 +68,8 @@ static constexpr int  MLD_ADD_CTRL_READY_MAX_RETRIES = 25;
+ static constexpr auto MLD_ADD_CTRL_READY_RETRY_DELAY  = std::chrono::milliseconds(200);
+ static constexpr int  MLD_ADD_TARGET_READY_MAX_RETRIES = 50;
+ static constexpr auto MLD_ADD_TARGET_READY_RETRY_DELAY = std::chrono::milliseconds(200);
++static constexpr int  BSS_REGISTRATION_MAX_ATTEMPTS = 25;
++static constexpr auto BSS_REGISTRATION_POLL_DELAY = std::chrono::milliseconds(200);
+ static constexpr char MLD_RECONFIG_LOCK_PATH[] =
+     "/var/lock/prplmesh-mld-reconfig.lock";
+ 
+@@ -137,6 +141,147 @@ private:
+     bool m_locked = false;
+ };
+ 
++int ap_wlan_hal_nl80211::wait_for_added_bss_ready(const std::string &ifname)
++{
++    if (ifname.empty()) {
++        LOG(ERROR) << "Cannot wait for registration of an empty BSS name";
++        return beerocks::net::FileDescriptor::invalid_descriptor;
++    }
++
++    std::string kernel_ifname;
++    extractLinkBaseInterface(ifname, kernel_ifname);
++
++    for (int attempt = 1; attempt <= BSS_REGISTRATION_MAX_ATTEMPTS; ++attempt) {
++        const auto ifindex = if_nametoindex(kernel_ifname.c_str());
++
++        if (ifindex != 0) {
++            // add_interface() also waits for the dedicated hostapd socket and
++            // rebinds a temporary global-socket registration when it appears.
++            const int fd = base_wlan_hal_nl80211::add_interface(ifname);
++            if (fd >= 0) {
++                parsed_obj_map_t status;
++
++                // STATUS on the expected per-interface socket confirms that
++                // hostapd has registered this exact name. Registration alone
++                // is not sufficient: hostapd can respond while the BSS is
++                // still in HT_SCAN. Accept ENABLED and DFS; DFS is valid
++                // while CAC is in progress.
++                if (wpa_ctrl_send_msg("STATUS", status, ifname)) {
++                    const auto state_it = status.find("state");
++                    const std::string state =
++                        state_it != status.end() ? state_it->second : std::string();
++                    const std::string state_for_log =
++                        state.empty() ? std::string("unknown") : state;
++
++                    LOG(INFO) << "BSS " << ifname
++                              << " is registered with hostapd, ifindex=" << ifindex
++                              << ", state=" << state_for_log;
++
++                    if (state == "ENABLED" || state == "DFS") {
++                        return fd;
++                    }
++
++                    LOG(DEBUG) << "BSS " << ifname
++                               << " is registered but not ready, state="
++                               << state_for_log;
++                }
++            }
++        }
++
++        if (attempt < BSS_REGISTRATION_MAX_ATTEMPTS) {
++            std::this_thread::sleep_for(BSS_REGISTRATION_POLL_DELAY);
++        }
++    }
++
++    LOG(WARNING) << "BSS " << ifname
++                 << " did not become registered and ready within the timeout";
++    return beerocks::net::FileDescriptor::invalid_descriptor;
++}
++
++bool ap_wlan_hal_nl80211::resolve_sta_connected_interface(
++    const std::string &event_iface,
++    int event_link_id,
++    std::string &resolved_iface)
++{
++    resolved_iface = event_iface;
++
++    std::string base_iface;
++    extractLinkBaseInterface(event_iface, base_iface);
++
++    if (base_iface.empty() || m_hal_conf.phy_name.empty()) {
++        LOG(DEBUG) << "Cannot validate STA_Connected ownership for " << event_iface;
++        return false;
++    }
++
++    // Reuse the already registered hostapd command socket. Do not register,
++    // connect, or remove a socket in this event path.
++    parsed_obj_map_t status;
++    if (!wpa_ctrl_send_msg("STATUS", status, base_iface)) {
++        LOG(DEBUG) << "STATUS unavailable for " << base_iface
++                   << "; ignoring STA_Connected";
++        return false;
++    }
++
++    int num_links = 0;
++    const auto links_it = status.find("num_links");
++    if (links_it != status.end() && !links_it->second.empty() &&
++        std::all_of(links_it->second.begin(), links_it->second.end(),
++                    [](unsigned char c) { return std::isdigit(c); })) {
++        num_links = beerocks::string_utils::stoi(links_it->second);
++    }
++
++    const auto phy_it = status.find("phy");
++    // SLO and single-link operation: with at most one operational link,
++    // hostapd's PHY field is authoritative. Preserve the event interface name.
++    if (num_links <= 1) {
++        const bool owns_phy =
++            phy_it != status.end() && phy_it->second == m_hal_conf.phy_name;
++
++        if (!owns_phy) {
++            LOG(DEBUG) << "Ignoring STA_Connected for foreign PHY: " << base_iface
++                       << ", event_phy="
++                       << (phy_it != status.end() ? phy_it->second : "<missing>")
++                       << ", local_phy=" << m_hal_conf.phy_name;
++            return false;
++        }
++
++        resolved_iface = event_iface;
++        return true;
++    }
++
++    // A true MLO event must identify the affiliated link.
++    if (event_link_id < 0) {
++        LOG(DEBUG) << "Ignoring MLO STA_Connected without LINKID for " << base_iface;
++        return false;
++    }
++
++    int radio_idx = -1;
++    if (!get_this_radio_idx(radio_idx)) {
++        LOG(DEBUG) << "Cannot determine radio index for " << m_hal_conf.phy_name;
++        return false;
++    }
++
++    std::string local_link_iface;
++    if (!m_nl80211_client->get_iface_with_link_idx(
++            base_iface + "##" + std::to_string(radio_idx), local_link_iface)) {
++        LOG(DEBUG) << "No local MLO link found for " << base_iface
++                   << " on radio index " << radio_idx;
++        return false;
++    }
++
++    const std::string expected_iface =
++        base_iface + "_link" + std::to_string(event_link_id);
++
++    if (local_link_iface != expected_iface) {
++        LOG(DEBUG) << "Ignoring STA_Connected for foreign MLO link: local="
++                   << local_link_iface << ", event=" << expected_iface;
++        return false;
++    }
++
++    resolved_iface = local_link_iface;
++    return true;
++}
++
+ 
+ 
+ class ScopedMldReconfigLock {
+@@ -8448,32 +8593,53 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+     // STA Connected
+     case Event::STA_Connected: {
+ 
+-        /* Skip events for links not owned by this ap_manager.
+-         * All ap_manager processes receive the same AP-STA-CONNECTED event; the
+-         * LINKID field identifies which link the STA connected on.  Only the
+-         * ap_manager that owns that link interface should process the event. */
+-        {
+-            auto linkid_it = parsed_obj.find("LINKID");
+-            if (linkid_it != parsed_obj.end() && !linkid_it->second.empty()) {
+-                int link_id = beerocks::string_utils::stoi(linkid_it->second);
+-                if (link_id >= 0) {
+-                    std::string base_iface;
+-                    extractLinkBaseInterface(interface, base_iface);
+-                    std::string expected_link_iface =
+-                        base_iface + "_link" + std::to_string(link_id);
+-
+-                    if (get_vap_id_with_bss(expected_link_iface) < 0) {
+-                        LOG(DEBUG) << "STA_Connected: skipping event for "
+-                                   << parsed_obj[bwl::EVENT_KEYLESS_PARAM_MAC]
+-                                   << " LINKID=" << link_id
+-                                   << " link_iface=" << expected_link_iface
+-                                   << " (not owned by this ap_manager)";
+-                        return true;
+-                    }
+-                }
++        const std::string event_iface = interface;
++        int event_link_id = -1;
++
++        if (from_global_sock) {
++            const auto linkid_it = parsed_obj.find("LINKID");
++            if (linkid_it != parsed_obj.end() && !linkid_it->second.empty() &&
++                std::all_of(linkid_it->second.begin(), linkid_it->second.end(),
++                            [](unsigned char c) { return std::isdigit(c); })) {
++                event_link_id = beerocks::string_utils::stoi(linkid_it->second);
+             }
+         }
+ 
++        int interface_link_id = -1;
++        extractLinkId(interface, interface_link_id);
++
++        if (event_link_id < 0) {
++            event_link_id = interface_link_id;
++        }
++
++        if (event_link_id >= 0 && interface_link_id >= 0 &&
++            event_link_id != interface_link_id) {
++            LOG(DEBUG) << "STA_Connected link mismatch: iface=" << event_iface
++                       << ", event_link_id=" << event_link_id
++                       << ", interface_link_id=" << interface_link_id;
++            return true;
++        }
++
++        std::string resolved_iface;
++        if (!resolve_sta_connected_interface(event_iface, event_link_id,
++                                              resolved_iface)) {
++            return true;
++        }
++
++        if (resolved_iface != interface) {
++            interface = resolved_iface;
++            vap_id = get_vap_id_with_bss(interface);
++
++            if (vap_id < 0) {
++                LOG(DEBUG) << "Resolved STA_Connected interface has no vap_id: "
++                           << interface;
++                return true;
++            }
++        }
++
++        LOG(DEBUG) << "Accepted AP STA_Connected: iface=" << interface
++                   << ", link_id=" << event_link_id << ", vap_id=" << vap_id;
++
+         // TODO: Change to HAL objects
+         auto msg_buff =
+             ALLOC_SMART_BUFFER(sizeof(sACTION_APMANAGER_CLIENT_ASSOCIATED_NOTIFICATION));
+@@ -9247,9 +9413,9 @@ int ap_wlan_hal_nl80211::add_bss(std::string &ifname, son::wireless_utils::sBssI
+             LOG(INFO) << "ADD BSS succeeded for " << ifname << " after clearing stale state";
+         }
+ 
+-        fd = base_wlan_hal_nl80211::add_interface(ifname);
++        fd = wait_for_added_bss_ready(ifname);
+         if (fd < 0) {
+-            LOG(DEBUG) << "Failed to register and connect the new BSS interface!";
++            LOG(DEBUG) << "Failed to confirm registration of the new BSS interface!";
+             // ADD may have returned while hostapd was still completing the
+             // asynchronous netdev/control-socket setup. If registration still
+             // fails, remove the half-created BSS so a later retry cannot meet
+@@ -9460,15 +9626,13 @@ bool ap_wlan_hal_nl80211::add_mld_link(std::string &new_iface,std::string &prev_
+     // add_interface() above can register the global control socket before the MLD
+     // primary exists. A PING through that global socket is not sufficient readiness:
+     // hostapd can still reject MLD_ADD_LINK while the primary is being created. Wait
+-    // until the target netdev and its dedicated control socket exist and STATUS reports
+-    // an enabled AP. This is especially important when all radios start with zero VAPs.
++    // until the target netdev and its dedicated control socket exist and STATUS responds.
+     bool target_ready = false;
+ 
+     // base_ctrl_path is the directory used for generated hostapd configuration
+     // files (/var/run/), not the hostapd control-socket directory. Using it here
+     // probes /var/run/<iface>, while the actual sockets are under the configured
+-    // control directory (normally /var/run/hostapd/<iface>). The resulting false
+-    // negative prevented every cross-radio MLD_ADD_LINK from reaching hostapd.
++    // control directory (normally /var/run/hostapd/<iface>).
+     std::string target_ctrl_dir;
+     const auto target_ctrl_dir_pos = m_hal_conf.wpa_ctrl_path.find_last_of('/');
+     if (target_ctrl_dir_pos != std::string::npos) {
+@@ -9487,7 +9651,8 @@ bool ap_wlan_hal_nl80211::add_mld_link(std::string &new_iface,std::string &prev_
+                 parsed_obj_map_t status;
+                 if (wpa_ctrl_send_msg("STATUS", status, new_iface)) {
+                     auto state_it = status.find("state");
+-                    target_ready = state_it != status.end() && state_it->second == "ENABLED";
++                    target_ready = state_it != status.end() &&
++                                   state_it->second == "ENABLED";
+                 }
+             }
+         }
+@@ -9503,9 +9668,8 @@ bool ap_wlan_hal_nl80211::add_mld_link(std::string &new_iface,std::string &prev_
+ 
+     if (!target_ready) {
+         LOG(WARNING) << "MLD target " << new_iface
+-                     << " did not reach hostapd ENABLED state after "
+-                     << MLD_ADD_TARGET_READY_MAX_RETRIES
+-                     << " attempts";
++                     << " did not register with hostapd after "
++                     << MLD_ADD_TARGET_READY_MAX_RETRIES << " attempts";
+         // If this call created the target mapping, release it before returning.
+         // Otherwise every failed cross-radio readiness attempt retains a pair
+         // of control sockets and the next retry eventually exhausts FDs. Keep
+@@ -9515,7 +9679,8 @@ bool ap_wlan_hal_nl80211::add_mld_link(std::string &new_iface,std::string &prev_
+         }
+         return false;
+     } else {
+-        LOG(INFO) << "MLD target " << new_iface << " is ready for MLD_ADD_LINK";
++        LOG(INFO) << "MLD target " << new_iface
++                  << " is registered and ready for MLD_ADD_LINK";
+     }
+ 
+     int fd_link = beerocks::net::FileDescriptor::invalid_descriptor;
+@@ -9563,9 +9728,9 @@ bool ap_wlan_hal_nl80211::add_mld_link(std::string &new_iface,std::string &prev_
+ 
+         LOG(INFO) << "link_id updated to: " << link_id;
+         LOG(INFO) << "bss updated to: " << new_bss_link;
+-        fd_link = base_wlan_hal_nl80211::add_interface(new_bss_link);
++        fd_link = wait_for_added_bss_ready(new_bss_link);
+         if (fd_link < 0) {
+-            LOG(ERROR) << "Failed to register and connect the Link of new BSS interface!";
++            LOG(ERROR) << "Failed to confirm registration of the Link of new BSS interface!";
+             // Do not report MLD_ADD_LINK as successful when the resulting link
+             // cannot be observed by the HAL. Returning success here leaves the
+             // VAP in the database as an MLD member although its control socket
+@@ -10770,7 +10935,7 @@ bool ap_wlan_hal_nl80211::create_new_hostapd_conf_file(std::string &ifname, son:
+     if (!ieee80211be_sprt.empty() &&
+         bss_conf.wifi_compat_mode != WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11AX &&
+         bss_conf.wifi_compat_mode != WSC::eWscWifiCompatMode::WIFI_COMPAT_MODE_11AC) {
+-        conf.set_create_vap_value(vap_id, "mld_ap","1");
++        conf.set_create_vap_value(vap_id,"mld_ap","1");
+     }
+ 
+     // Handle WiFi compat mode (AC / AX / BE) by writing the appropriate disable_11* options.
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+index e43e82bcb..4c2fbefd8 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+@@ -293,6 +293,21 @@ protected:
+     }
+ 
+ private:
++    /**
++     * @brief Wait until the kernel interface exists and hostapd reports the BSS ready.
++     *
++     * The hostapd STATUS response confirms registration and operational
++     * readiness. ENABLED is accepted for normal operation and DFS is accepted
++     * while CAC is in progress. Transitional states such as HT_SCAN are polled.
++     */
++    int wait_for_added_bss_ready(const std::string &ifname);
++
++    // Resolve ownership only for AP-STA-CONNECTED events. This uses the
++    // already registered hostapd command socket and does not register sockets.
++    bool resolve_sta_connected_interface(const std::string &event_iface,
++                                         int event_link_id,
++                                         std::string &resolved_iface);
++
+     // Transaction-aware overload used by update_vap_credentials(). In-place compatibility
+     // changes queue their reload here and commit their UCI update after the batched hostapd
+     // reload succeeds.
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index cf9ae18c5..cfbd96d73 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -24,6 +24,7 @@
+ #include <chrono>
+ #include <cerrno>
+ #include <cstring>
++#include <utility>
+ #include <fstream>
+ #include <poll.h>
+ 
+@@ -1480,17 +1481,26 @@ bool base_wlan_hal_nl80211::refresh_vaps_info(int id)
+     // clear the available vaps
+     m_radio_info.available_vaps.clear();
+ 
++    int this_radio_idx = -1;
++    const bool have_radio_idx = get_this_radio_idx(this_radio_idx);
++
++    // Cache local link resolution per MLD base interface. The netlink query
++    // is independent of the individual STATUS entry.
++    std::unordered_map<std::string, std::string> local_link_cache;
++
+     // Try reading values of the requested VAP
+     for (int bss_idx = 0; bss_idx < bss_count; bss_idx++) {
+ 	auto &vap_element = m_radio_info.available_vaps[vap_id];
+ 
++        const auto status_idx = std::to_string(bss_idx);
++
+         // Try reading values of the requested VAP
+-        vap_element.bss  = reply["bss[" + std::to_string(vap_id) + "]"];
+-        vap_element.mac  = reply["bssid[" + std::to_string(vap_id) + "]"];
+-        vap_element.ssid = reply["ssid[" + std::to_string(vap_id) + "]"];
++        vap_element.bss  = reply["bss[" + status_idx + "]"];
++        vap_element.mac  = reply["bssid[" + status_idx + "]"];
++        vap_element.ssid = reply["ssid[" + status_idx + "]"];
++
++        std::string mld_mac_key = "mld_addr[" + status_idx + "]";
+ 
+-        std::string mld_mac_key = "mld_addr[" + std::to_string(vap_id) + "]";
+-        
+         auto it = reply.find(mld_mac_key);
+         if (it != reply.end()) {
+             vap_element.ap_mld_mac = it->second;
+@@ -1551,6 +1561,34 @@ bool base_wlan_hal_nl80211::refresh_vaps_info(int id)
+         LOG(INFO) << "vap_element.link_id updated to: " << vap_element.link_id;
+         LOG(INFO) << "vap_element.bss updated to: " << vap_element.bss;
+ 
++        if (vap_element.link_id >= 0 && have_radio_idx) {
++            std::string mld_iface;
++            extractLinkBaseInterface(original_bss, mld_iface);
++
++            const std::string cache_key =
++                mld_iface + "##" + std::to_string(this_radio_idx);
++            auto cache_it = local_link_cache.find(cache_key);
++            if (cache_it == local_link_cache.end()) {
++                std::string local_link_iface;
++                if (!m_nl80211_client->get_iface_with_link_idx(
++                        cache_key, local_link_iface)) {
++                    LOG(DEBUG) << "No local MLO link for " << cache_key;
++                    local_link_iface.clear();
++                }
++                cache_it = local_link_cache.emplace(
++                    cache_key, std::move(local_link_iface)).first;
++            }
++
++            if (cache_it->second.empty() ||
++                cache_it->second != vap_element.bss) {
++                LOG(DEBUG) << "Skipping foreign MLO link from radio "
++                           << this_radio_idx << ": bss=" << vap_element.bss
++                           << ", local_link=" << cache_it->second;
++                m_radio_info.available_vaps.erase(vap_id);
++                continue;
++            }
++        }
++
+         // If get_bss_link_id changed the BSS name to a link-specific name (e.g. "wlan1.1_link0"),
+         // also register the MLD interface control socket (e.g. "wlan1.1").
+         // This is needed so that commands like REQ_BEACON can be sent to the MLD interface,
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index e261a8a6e..a8939523b 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -21,6 +21,7 @@
+ #include <easylogging++.h>
+ 
+ #include <algorithm>
++#include <cctype>
+ #include <chrono>
+ #include <cmath>
+ #include <cstring>
+@@ -1852,6 +1853,66 @@ bool mon_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+     switch (event) {
+ 
+     case Event::STA_Connected: {
++        const std::string event_iface = interface;
++
++        int event_link_id = -1;
++        const auto from_global_it =
++            parsed_obj.find(EVENT_PARAM_FROM_GLOBAL_SOCK);
++        const bool from_global_sock =
++            from_global_it != parsed_obj.end() &&
++            from_global_it->second == "1";
++
++        if (from_global_sock) {
++            const auto linkid_it = parsed_obj.find("LINKID");
++            if (linkid_it != parsed_obj.end() && !linkid_it->second.empty() &&
++                std::all_of(linkid_it->second.begin(), linkid_it->second.end(),
++                            [](unsigned char c) { return std::isdigit(c); })) {
++                event_link_id = beerocks::string_utils::stoi(linkid_it->second);
++            }
++        }
++
++        int interface_link_id = -1;
++        extractLinkId(event_iface, interface_link_id);
++
++        if (event_link_id < 0) {
++            event_link_id = interface_link_id;
++        }
++
++        if (event_link_id >= 0 && interface_link_id >= 0 &&
++            event_link_id != interface_link_id) {
++            LOG(DEBUG) << "STA_Connected link mismatch: iface=" << event_iface
++                       << ", event_link_id=" << event_link_id
++                       << ", interface_link_id=" << interface_link_id;
++            return true;
++        }
++
++        std::string base_iface;
++        extractLinkBaseInterface(event_iface, base_iface);
++
++        std::string expected_iface = event_iface;
++        if (event_link_id >= 0 && !base_iface.empty()) {
++            expected_iface =
++                base_iface + "_link" + std::to_string(event_link_id);
++        }
++
++        int owned_vap_id = get_vap_id_with_bss(expected_iface);
++
++        // SLO may use the base interface even when LINKID=0 is reported.
++        if (owned_vap_id < 0 && event_iface == base_iface) {
++            owned_vap_id = get_vap_id_with_bss(base_iface);
++        }
++
++        if (owned_vap_id < 0) {
++            LOG(DEBUG) << "Ignoring STA_Connected for foreign link: iface="
++                       << event_iface << ", link_id=" << event_link_id
++                       << ", expected_iface=" << expected_iface;
++            return true;
++        }
++
++        // Override the generic first-link fallback with the exact local VAP.
++        vap_id = owned_vap_id;
++        LOG(DEBUG) << "Accepted STA_Connected: iface=" << expected_iface
++                   << ", link_id=" << event_link_id << ", vap_id=" << vap_id;
+ 
+         // TODO: Change to HAL objects
+         auto msg_buff = ALLOC_SMART_BUFFER(sizeof(sACTION_MONITOR_CLIENT_ASSOCIATED_NOTIFICATION));
+-- 
+2.34.1
+
