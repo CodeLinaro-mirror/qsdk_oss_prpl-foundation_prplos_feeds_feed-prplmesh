@@ -1,0 +1,280 @@
+From c0713f74c6c34f8c36117bbc24432d2bf2a19952 Mon Sep 17 00:00:00 2001
+From: Sureshkumar <suresure@qti.qualcomm.com>
+Date: Wed, 7 Oct 2026 12:28:55 +0530
+Subject: [PATCH] bwl/monitor: Fix RSSI handling for MLO STAs and add RSSI
+ debug tracing
+
+The WHM HAL update_stations_stats() relied solely on signal_dbm
+(NL80211_STA_INFO_SIGNAL, instantaneous RSSI). For MLO STAs, the kernel
+does not expose an aggregated top-level SIGNAL value, causing
+signal_dbm to remain 0. As a result, RSSI samples were never collected,
+rx_rssi_curr was not updated at measurement-window close, and Beacon
+Metrics TLV (0x96) RCPI was reported as RSSI_INVALID.
+
+Align WHM RSSI resolution with the nl80211 HAL path:
+
+  P1: signal_avg_dbm (AvgSignalStrength / EWMA)
+      - Preferred source
+      - More stable
+      - Required for MLO STAs
+
+  P2: signal_dbm
+      - Fallback for newly associated STAs before EWMA is available
+
+Additionally, add LOG(DEBUG) [RSSI-DBG] traces across the RSSI pipeline:
+
+  - nl80211: dump raw SIGNAL/SIGNAL_AVG values and RSSI resolution result
+  - monitor: trace rx_rssi_curr updates at measurement-window close
+  - monitor_stats: trace rx_rssi_curr to RCPI encoding during Beacon
+    Metrics TLV (0x96) generation
+
+The [RSSI-DBG] tag provides end-to-end visibility of RSSI processing and
+simplifies field debugging.
+
+Signed-off-by: Sureshkumar <suresure@qti.qualcomm.com>
+---
+ .../fronthaul_manager/monitor/monitor.cpp     | 10 ++++
+ .../monitor/monitor_stats.cpp                 |  4 ++
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 59 +++++++++++++++----
+ common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp  | 46 ++++++++++++++-
+ 4 files changed, 103 insertions(+), 16 deletions(-)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+index 1a6da8c94..0ce04467d 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+@@ -1319,8 +1319,18 @@ bool Monitor::update_sta_stats(const std::chrono::steady_clock::time_point &time
+                 if (sta_stats.rx_rssi_curr != int8_t(rssi_db)) {
+                     sta_node->set_last_change_time();
+                 }
++                LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
++                           << " window_close samples_cnt="
++                           << int(sta_stats.hal_stats.rx_rssi_watt_samples_cnt)
++                           << " rx_rssi_curr updated " << int(sta_stats.rx_rssi_curr) << " -> "
++                           << int(int8_t(rssi_db));
+                 sta_stats.rx_rssi_curr = int8_t(rssi_db);
+                 //LOG(INFO)  << sta_mac << ", rx_rssi=" << int(rssi_db);
++            } else {
++                LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
++                           << " window_close samples_cnt=0 -> rx_rssi_curr NOT updated,"
++                           << " staying at " << int(sta_stats.rx_rssi_curr)
++                           << " (RSSI_INVALID=" << int(beerocks::RSSI_INVALID) << ")";
+             }
+ 
+             sta_node->set_rx_rssi_ready(true);
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor_stats.cpp b/agent/src/beerocks/fronthaul_manager/monitor/monitor_stats.cpp
+index 32db76449..3d7db4a7f 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor_stats.cpp
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor_stats.cpp
+@@ -214,6 +214,10 @@ void monitor_stats::send_associated_sta_link_metrics(const sMeasurementsRequest
+     bss_info.sta_measured_uplink_rcpi_dbm_enc =
+         wireless_utils::convert_rcpi_from_rssi(sta_stats.rx_rssi_curr);
+ 
++    LOG(TRACE) << "[RSSI-DBG] sta=" << sta_metrics->sta_mac() << " TLV(0x96) build:"
++               << " rx_rssi_curr=" << int(sta_stats.rx_rssi_curr)
++               << " -> rcpi_dbm_enc=" << int(bss_info.sta_measured_uplink_rcpi_dbm_enc);
++
+     LOG(DEBUG) << "Send ACTION_MONITOR_CLIENT_ASSOCIATED_STA_LINK_METRIC_RESPONSE "
+                << "for mac " << sta_metrics->sta_mac() << ", message_id = " << request.message_id;
+     m_slave_client->send_cmdu(cmdu_tx);
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 8dc742b54..9fc0ba4c9 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -599,13 +599,39 @@ bool mon_wlan_hal_nl80211::update_stations_stats(const std::string &vap_iface_na
+             //   P2: top-level SIGNAL fallback (when EWMA not yet seeded after association)
+             //
+             // Grep tag: [RSSI-DBG] — use "grep RSSI-DBG" to trace the full RSSI resolution.
++            {
++                LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac << " iface=" << vap_iface_name
++                           << " base_iface=" << base_interface
++                           << " is_mlo=" << (tb[NL80211_ATTR_MLO_LINKS] ? 1 : 0)
++                           << " raw_SIGNAL_present=" << (sinfo[NL80211_STA_INFO_SIGNAL] ? 1 : 0)
++                           << " raw_SIGNAL_val="
++                           << (sinfo[NL80211_STA_INFO_SIGNAL]
++                                   ? int(int8_t(nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL])))
++                                   : 0)
++                           << " raw_SIGNAL_AVG_present="
++                           << (sinfo[NL80211_STA_INFO_SIGNAL_AVG] ? 1 : 0)
++                           << " raw_SIGNAL_AVG_val="
++                           << (sinfo[NL80211_STA_INFO_SIGNAL_AVG]
++                                   ? int(int8_t(nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL_AVG])))
++                                   : 0)
++                           << " rx_packets="
++                           << (sinfo[NL80211_STA_INFO_RX_PACKETS]
++                                   ? nla_get_u32(sinfo[NL80211_STA_INFO_RX_PACKETS])
++                                   : 0)
++                           << " inactive_time_ms="
++                           << (sinfo[NL80211_STA_INFO_INACTIVE_TIME]
++                                   ? nla_get_u32(sinfo[NL80211_STA_INFO_INACTIVE_TIME])
++                                   : 0)
++                           << " is_read_unicast=" << is_read_unicast;
++            }
++
+             {
+                 int8_t signal = 0;
+                 bool signal_valid = false;
+ 
+                 if (tb[NL80211_ATTR_MLO_LINKS]) {
+                     // MLO STA: scan per-link SIGNAL_AVG, pick strongest valid link.
+-                    LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                    LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
+                                << " MLO path: scanning per-link SIGNAL_AVG from NL80211_ATTR_MLO_LINKS";
+                     struct nlattr *link_attr;
+                     int rem_links;
+@@ -624,12 +650,12 @@ bool mon_wlan_hal_nl80211::update_stations_stats(const std::string &vap_iface_na
+                             continue;
+                         }
+                         if (!link_sinfo[NL80211_STA_INFO_SIGNAL_AVG]) {
+-                            LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                            LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
+                                        << " MLO link: SIGNAL_AVG attr absent, skipping";
+                             continue;
+                         }
+                         int8_t link_sig = int8_t(nla_get_u8(link_sinfo[NL80211_STA_INFO_SIGNAL_AVG]));
+-                        LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                        LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
+                                    << " MLO link SIGNAL_AVG=" << int(link_sig) << " dBm"
+                                    << (link_sig < 0 ? " (active)" : " (idle/invalid, skipped)");
+                         if (link_sig < 0 && (!signal_valid || link_sig > signal)) {
+@@ -638,18 +664,18 @@ bool mon_wlan_hal_nl80211::update_stations_stats(const std::string &vap_iface_na
+                         }
+                     }
+                     if (signal_valid) {
+-                        LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                        LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
+                                    << " MLO P1 resolved: strongest per-link SIGNAL_AVG="
+                                    << int(signal) << " dBm";
+                     } else {
+-                        LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                        LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
+                                    << " MLO P1 failed: all per-link SIGNAL_AVG are 0/invalid"
+                                    << " -> trying P2 top-level SIGNAL_AVG";
+                     }
+                     // Fallback: top-level SIGNAL_AVG if all per-link values were 0/invalid.
+                     if (!signal_valid && sinfo[NL80211_STA_INFO_SIGNAL_AVG]) {
+                         int8_t sig = int8_t(nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL_AVG]));
+-                        LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                        LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
+                                    << " MLO P2 top-level SIGNAL_AVG=" << int(sig) << " dBm"
+                                    << (sig < 0 ? " -> VALID" : " -> 0/invalid");
+                         if (sig < 0) { signal = sig; signal_valid = true; }
+@@ -657,28 +683,28 @@ bool mon_wlan_hal_nl80211::update_stations_stats(const std::string &vap_iface_na
+                     // Last resort: top-level SIGNAL.
+                     if (!signal_valid && sinfo[NL80211_STA_INFO_SIGNAL]) {
+                         int8_t sig = int8_t(nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL]));
+-                        LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                        LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
+                                    << " MLO P3 top-level SIGNAL=" << int(sig) << " dBm"
+                                    << (sig < 0 ? " -> VALID" : " -> 0/invalid");
+                         if (sig < 0) { signal = sig; signal_valid = true; }
+                     }
+                 } else {
+                     // SLO/regular STA: top-level SIGNAL_AVG preferred, SIGNAL fallback.
+-                    LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                    LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
+                                << " SLO path: trying top-level SIGNAL_AVG";
+                     if (sinfo[NL80211_STA_INFO_SIGNAL_AVG]) {
+                         int8_t sig = int8_t(nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL_AVG]));
+-                        LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                        LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
+                                    << " SLO P1 SIGNAL_AVG=" << int(sig) << " dBm"
+                                    << (sig < 0 ? " -> VALID" : " -> 0/invalid, trying P2 SIGNAL");
+                         if (sig < 0) { signal = sig; signal_valid = true; }
+                     } else {
+-                        LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                        LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
+                                    << " SLO P1 SIGNAL_AVG attr absent -> trying P2 SIGNAL";
+                     }
+                     if (!signal_valid && sinfo[NL80211_STA_INFO_SIGNAL]) {
+                         int8_t sig = int8_t(nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL]));
+-                        LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                        LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
+                                    << " SLO P2 SIGNAL=" << int(sig) << " dBm"
+                                    << (sig < 0 ? " -> VALID" : " -> 0/invalid");
+                         if (sig < 0) { signal = sig; signal_valid = true; }
+@@ -686,15 +712,22 @@ bool mon_wlan_hal_nl80211::update_stations_stats(const std::string &vap_iface_na
+                 }
+ 
+                 if (signal_valid) {
+-                    LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                    LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
+                                << " FINAL signal=" << int(signal) << " dBm"
+                                << " -> rx_rssi_watt updated";
++                    LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
++                               << " sample_result=VALID signal=" << int(signal)
++                               << " samples_cnt_after=" << int(sta_stats.rx_rssi_watt_samples_cnt + 1);
+                     sta_stats.rx_rssi_watt += pow(10, (signal / 10.0));
+                     sta_stats.rx_rssi_watt_samples_cnt++;
+                 } else {
+-                    LOG(DEBUG) << "[RSSI-DBG] sta=" << sta_mac
++                    LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
+                                << " no valid RSSI from any source"
+                                << " -> rx_rssi_watt NOT updated (RCPI may saturate)";
++                    LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
++                               << " sample_result=STARVED (no valid SIGNAL/SIGNAL_AVG from driver)"
++                               << " samples_cnt_unchanged="
++                               << int(sta_stats.rx_rssi_watt_samples_cnt);
+                 }
+             }
+ 
+diff --git a/common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp
+index a01d68129..5e8963d96 100644
+--- a/common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/mon_wlan_hal_whm.cpp
+@@ -466,9 +466,49 @@ bool mon_wlan_hal_whm::update_stations_stats(const std::string &vap_iface_name,
+     sta_stats.tx_phy_rate_100kb = sta_info.tx_bitrate_100kbps;
+     sta_stats.rx_phy_rate_100kb = sta_info.rx_bitrate_100kbps;
+     sta_stats.dl_bandwidth      = sta_info.dl_bandwidth;
+-    if (sta_info.signal_dbm != 0) {
+-        sta_stats.rx_rssi_watt += std::pow(10, (int8_t(sta_info.signal_dbm) / 10.0));
+-        sta_stats.rx_rssi_watt_samples_cnt++;
++    // RX RSSI: prefer AvgSignalStrength (EWMA, more stable) over instantaneous SignalStrength,
++    // mirroring the nl80211 HAL SLO-path priority.
++    //
++    // signal_avg_dbm = NL80211_STA_INFO_SIGNAL_AVG (kernel EWMA average).
++    // signal_dbm     = NL80211_STA_INFO_SIGNAL     (instantaneous, last packet).
++    //
++    // For MLO STAs, signal_dbm is 0 — the kernel does not aggregate signal across links into
++    // a single top-level value. signal_avg_dbm contains the actual per-link average and is
++    // the only valid source for MLO STAs.
++    //
++    // Validity gate: != 0 (not < 0) because the WHM/PWHM Ambiorix DM encoding is
++    // platform-dependent — some platforms return negative dBm (-65), others return positive
++    // magnitude (65). Zero always means "not measured / not available".
++    //
++    // Grep tag: [RSSI-DBG] — use "grep RSSI-DBG" to trace the full RSSI resolution.
++    {
++        int8_t signal     = 0;
++        bool signal_valid = false;
++
++        // P1: AvgSignalStrength (EWMA average — preferred, more stable, works for MLO STAs)
++        if (sta_info.signal_avg_dbm != 0) {
++            signal       = sta_info.signal_avg_dbm;
++            signal_valid = true;
++            LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
++                       << " whm P1 AvgSignalStrength=" << int(signal) << " dBm -> VALID";
++        }
++        // P2: SignalStrength fallback (instantaneous, when EWMA not yet seeded after association)
++        if (!signal_valid && sta_info.signal_dbm != 0) {
++            signal       = sta_info.signal_dbm;
++            signal_valid = true;
++            LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
++                       << " whm P2 SignalStrength=" << int(signal) << " dBm -> VALID";
++        }
++        if (signal_valid) {
++            LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
++                       << " FINAL signal=" << int(signal) << " dBm -> rx_rssi_watt updated";
++            sta_stats.rx_rssi_watt += std::pow(10, (signal / 10.0));
++            sta_stats.rx_rssi_watt_samples_cnt++;
++        } else {
++            LOG(TRACE) << "[RSSI-DBG] sta=" << sta_mac
++                       << " no valid RSSI (signal_avg_dbm=0 and signal_dbm=0)"
++                       << " -> rx_rssi_watt NOT updated (RCPI may saturate)";
++        }
+     }
+ 
+     //complement missing info in sta_info struct
+-- 
+2.34.1
+
