@@ -1,0 +1,305 @@
+From 40cf4ffa605adbf1ec86e1cbec5be1fbba3c2dd7 Mon Sep 17 00:00:00 2001
+From: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+Date: Thu, 8 Oct 2026 11:44:39 +0530
+Subject: [PATCH] prplMesh: stabilize MLO handling and country code
+ advertisement
+
+Problem:
+
+MLO metric responses repeatedly scanned the full associated MLD registry,
+and disconnect events from global and per-link hostapd sockets could be
+processed by multiple AP managers or monitors. A delayed duplicate could
+clear a newly restored association, causing metrics to stop for affiliated
+links. In addition, the controller and agent data model could advertise
+non-printable country-code bytes when the optional country setting was
+absent or invalid.
+
+Root cause:
+
+Metric processing had no response-local mapping between MLD and affiliated
+STA MAC addresses. AP-manager and nl80211 monitor disconnect handling did
+not consistently filter duplicate or foreign LINKID events. The UCI PHY
+configuration path also left country_code uninitialized, and the agent
+database accepted invalid country values.
+
+Fix:
+
+Build one MAC-to-MLD index per AP metrics response and reuse it for link and
+traffic metric resolution. Apply LINKID ownership filtering to AP-manager
+and nl80211 monitor disconnect handling, suppress duplicate per-link events,
+and clear non-owner association-frame caches without notifying the agent.
+Initialize the country-code buffer, accept only valid two-letter uppercase
+codes, and leave the value empty when no valid code is configured.
+
+Signed-off-by: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/son_slave_thread.cpp | 14 ++--
+ .../tasks/link_metrics_collection_task.cpp    | 67 +++++++------------
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 40 +++++++++++
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 41 ++++++++++++
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     |  5 ++
+ 5 files changed, 119 insertions(+), 48 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 31baff86f..707db8afd 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -748,13 +748,10 @@ bool slave_thread::read_platform_configuration()
+         db->device_conf.front_radio.config[fronthaul_iface].configured_channel = params.channel;
+         db->device_conf.front_radio.config[fronthaul_iface].sub_band_dfs = params.sub_band_dfs;
+ 
+-        CountryCode current_country;
++        CountryCode current_country{};
+         current_country[0] = params.country_code[0];
+         current_country[1] = params.country_code[1];
+ 
+-        // take the latest
+-        db->device_conf.country_code = current_country;
+-
+         bool db_country_code_empty =
+             (db->device_conf.country_code[0] == 0) && (db->device_conf.country_code[1] == 0);
+ 
+@@ -764,6 +761,15 @@ bool slave_thread::read_platform_configuration()
+                        << db->device_conf.country_code[0] << db->device_conf.country_code[1];
+         }
+ 
++        // Keep the first valid country code observed across radios.  If no
++        // radio has one configured, leave the value empty rather than
++        // advertising an invalid country code.
++        if (db_country_code_empty &&
++            current_country[0] >= 'A' && current_country[0] <= 'Z' &&
++            current_country[1] >= 'A' && current_country[1] <= 'Z') {
++            db->device_conf.country_code = current_country;
++        }
++
+         LOG(DEBUG) << "wlan settings " << fronthaul_iface << ":";
+         LOG(DEBUG) << "band_enabled=" << params.enabled;
+         LOG(DEBUG) << "channel=" << params.channel;
+diff --git a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+index 6b2e938b7..38e20b393 100644
+--- a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+@@ -1329,6 +1329,20 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+     auto &collected_link_sta_macs    = m_collected_link_sta_macs;
+     auto &collected_traffic_sta_macs = m_collected_traffic_sta_macs;
+ 
++    /* Build a response-local index for both STA MLD MACs and affiliated-link
++     * MACs. Several metric TLVs may refer to either form, so avoid repeatedly
++     * scanning the complete MLD registry and every affiliated-link list for
++     * each metric. emplace() preserves the first match, matching the previous
++     * linear-search behavior if stale duplicate MACs exist in the registry. */
++    std::unordered_map<sMacAddr, const AgentDB::sAssociatedStaMld *> mac_to_mld;
++    for (const auto &mld_entry : db->associated_sta_mlds) {
++        const auto &mld_info = mld_entry.second;
++        mac_to_mld.emplace(mld_info.mld_config.sta_mld_mac, &mld_info);
++        for (const auto &aff_sta : mld_info.affiliated_stas) {
++            mac_to_mld.emplace(aff_sta.affiliated_sta_mac, &mld_info);
++        }
++    }
++
+     for (const auto &ap_metrics_tlv : ap_metrics_tlv_list) {
+         wfa_map::tlvApExtendedMetrics *ap_extended_metrics_tlv     = 0;
+         wfa_map::tlvAffiliatedApMetrics *affiliated_ap_metrics_tlv = 0;
+@@ -1498,19 +1512,9 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+              * associated_sta_mlds.  The monitor may send the MLD MAC or the
+              * affiliated link MAC as sta_mac — handle both. */
+             const AgentDB::sAssociatedStaMld *mld_info_ptr = nullptr;
+-            for (const auto &mld_entry : db->associated_sta_mlds) {
+-                const auto &mld_info = mld_entry.second;
+-                if (mld_info.mld_config.sta_mld_mac == sta_mac) {
+-                    mld_info_ptr = &mld_info;
+-                    break;
+-                }
+-                for (const auto &aff_sta : mld_info.affiliated_stas) {
+-                    if (aff_sta.affiliated_sta_mac == sta_mac) {
+-                        mld_info_ptr = &mld_info;
+-                        break;
+-                    }
+-                }
+-                if (mld_info_ptr) { break; }
++            auto mld_it = mac_to_mld.find(sta_mac);
++            if (mld_it != mac_to_mld.end()) {
++                mld_info_ptr = mld_it->second;
+             }
+ 
+             if (mld_info_ptr && !mld_info_ptr->affiliated_stas.empty()) {
+@@ -1701,22 +1705,9 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+              * the same AP MLD, or to one of the MLD's affiliated BSSes. */
+             const AgentDB::sAssociatedStaMld *mld_info_ptr = nullptr;
+             if (!metric_matches_association) {
+-                for (const auto &mld_entry : db->associated_sta_mlds) {
+-                    const auto &mld_info = mld_entry.second;
+-                    if (mld_info.mld_config.sta_mld_mac == sta_mac) {
+-                        mld_info_ptr = &mld_info;
+-                        break;
+-                    }
+-
+-                    for (const auto &aff_sta : mld_info.affiliated_stas) {
+-                        if (aff_sta.affiliated_sta_mac == sta_mac) {
+-                            mld_info_ptr = &mld_info;
+-                            break;
+-                        }
+-                    }
+-                    if (mld_info_ptr) {
+-                        break;
+-                    }
++                auto mld_it = mac_to_mld.find(sta_mac);
++                if (mld_it != mac_to_mld.end()) {
++                    mld_info_ptr = mld_it->second;
+                 }
+             }
+ 
+@@ -2051,21 +2042,9 @@ void LinkMetricsCollectionTask::handle_ap_metrics_response(ieee1905_1::CmduMessa
+              * stat.sta_mac may be the MLD MAC (monitor bug) or the link MAC
+              * (correct monitor behaviour).  Handle both cases. */
+             const AgentDB::sAssociatedStaMld *mld_info_ptr = nullptr;
+-            for (auto &mld_entry : db->associated_sta_mlds) {
+-                auto &mld_info = mld_entry.second;
+-                /* Case 1: stat.sta_mac is the MLD MAC */
+-                if (mld_info.mld_config.sta_mld_mac == stat.sta_mac) {
+-                    mld_info_ptr = &mld_info;
+-                    break;
+-                }
+-                /* Case 2: stat.sta_mac is already an affiliated link MAC */
+-                for (const auto &aff_sta : mld_info.affiliated_stas) {
+-                    if (aff_sta.affiliated_sta_mac == stat.sta_mac) {
+-                        mld_info_ptr = &mld_info;
+-                        break;
+-                    }
+-                }
+-                if (mld_info_ptr) { break; }
++            auto mld_it = mac_to_mld.find(stat.sta_mac);
++            if (mld_it != mac_to_mld.end()) {
++                mld_info_ptr = mld_it->second;
+             }
+ 
+             if (mld_info_ptr) {
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 50863ac4e..4e5980bb2 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -8240,6 +8240,46 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+     // STA Disconnected
+     case Event::STA_Disconnected: {
+ 
++        /* MLO hostapd delivers AP-STA-DISCONNECTED on both the global socket
++         * and the link-specific socket. The global event contains LINKID and
++         * is sufficient to identify the owning ap_manager, so ignore the
++         * duplicate link-socket delivery. SLO VAP names do not contain
++         * "_link" and continue to use their per-VAP event. */
++        if (!from_global_sock && interface.find("_link") != std::string::npos) {
++            LOG(DEBUG) << "STA_Disconnected: ignoring duplicate event on per-link socket for "
++                       << interface;
++            return true;
++        }
++
++        /* The global hostapd socket is shared by all ap_manager instances.
++         * Process an MLO disconnect only in the instance that owns the link
++         * identified by LINKID. Without this check, foreign managers emit
++         * duplicate disconnect notifications which can arrive after a new
++         * connect notification and incorrectly clear an active association. */
++        auto linkid_it = parsed_obj.find("LINKID");
++        if (linkid_it != parsed_obj.end() && !linkid_it->second.empty()) {
++            int link_id = beerocks::string_utils::stoi(linkid_it->second);
++            if (link_id >= 0) {
++                std::string base_iface;
++                extractLinkBaseInterface(interface, base_iface);
++                std::string expected_link_iface =
++                    base_iface + "_link" + std::to_string(link_id);
++
++                if (get_vap_id_with_bss(expected_link_iface) < 0) {
++                    LOG(DEBUG) << "STA_Disconnected: skipping event for "
++                               << parsed_obj[bwl::EVENT_KEYLESS_PARAM_MAC]
++                               << " LINKID=" << link_id
++                               << " link_iface=" << expected_link_iface
++                               << " (not owned by this ap_manager)";
++                    // The association-frame cache is local to each HAL instance.
++                    // Clear its copy even though only the owner may notify the agent.
++                    m_latest_assoc_frame.erase(
++                        parsed_obj[bwl::EVENT_KEYLESS_PARAM_MAC]);
++                    return true;
++                }
++            }
++        }
++
+         // TODO: Change to HAL objects
+         auto msg_buff =
+             ALLOC_SMART_BUFFER(sizeof(sACTION_APMANAGER_CLIENT_DISCONNECTED_NOTIFICATION));
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 87f45a92c..bd3494969 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -1715,6 +1715,12 @@ bool mon_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+         LOG(DEBUG) << "Could not find interface name.";
+     }
+ 
++    bool from_global_sock = false;
++    auto from_global_it   = parsed_obj.find(EVENT_PARAM_FROM_GLOBAL_SOCK);
++    if (from_global_it != parsed_obj.end()) {
++        from_global_sock = (from_global_it->second == "1");
++    }
++
+     // AP-ENABLED / AP-DISABLED come on the global socket and carry the VAP iface name
+     // in `interface`.  Handle them before the vap_id guard because the VAP may not yet
+     // be in available_vaps (AP-ENABLED) or may have just been removed (AP-DISABLED).
+@@ -1811,6 +1817,41 @@ bool mon_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+ 
+     case Event::STA_Disconnected: {
+ 
++        /* MLO hostapd delivers AP-STA-DISCONNECTED on both the global socket
++         * and the link-specific socket. Process the global event and ignore
++         * the duplicate per-link delivery. SLO VAP names do not contain
++         * "_link" and continue to use their per-VAP event. */
++        if (!from_global_sock && interface.find("_link") != std::string::npos) {
++            LOG(DEBUG) << "STA_Disconnected: ignoring duplicate event on per-link socket for "
++                       << interface;
++            return true;
++        }
++
++        /* The global hostapd socket is shared by all monitor instances. Only
++         * the monitor which owns LINKID may erase its station node. Otherwise
++         * one affiliated-link disconnect removes the same MLD MAC from every
++         * radio monitor and suppresses associated-link metrics for links that
++         * are still connected. */
++        auto linkid_it = parsed_obj.find("LINKID");
++        if (linkid_it != parsed_obj.end() && !linkid_it->second.empty()) {
++            int link_id = beerocks::string_utils::stoi(linkid_it->second);
++            if (link_id >= 0) {
++                std::string base_iface;
++                extractLinkBaseInterface(interface, base_iface);
++                std::string expected_link_iface =
++                    base_iface + "_link" + std::to_string(link_id);
++
++                if (get_vap_id_with_bss(expected_link_iface) < 0) {
++                    LOG(DEBUG) << "STA_Disconnected: skipping event for "
++                               << parsed_obj[bwl::EVENT_KEYLESS_PARAM_MAC]
++                               << " LINKID=" << link_id
++                               << " link_iface=" << expected_link_iface
++                               << " (not owned by this monitor)";
++                    return true;
++                }
++            }
++        }
++
+         // TODO: Change to HAL objects
+         auto msg_buff =
+             ALLOC_SMART_BUFFER(sizeof(sACTION_MONITOR_CLIENT_DISCONNECTED_NOTIFICATION));
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index c3a795566..4193d6403 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -657,6 +657,11 @@ static int cfg_get_wifi_params_from_phy(const std::string &phy_name,
+         return RETURN_ERR;
+     }
+ 
++    /* CountryCode is optional in UCI.  Clear it before reading the radio
++     * section so a missing country option cannot leave stack bytes in the
++     * Profile-2 CAC capabilities TLV. */
++    memset(wlan_params->country_code, 0, sizeof(wlan_params->country_code));
++
+     auto pos = phy_name.rfind('.');
+     if (pos == std::string::npos) {
+         return RETURN_ERR;
+-- 
+2.34.1
+
