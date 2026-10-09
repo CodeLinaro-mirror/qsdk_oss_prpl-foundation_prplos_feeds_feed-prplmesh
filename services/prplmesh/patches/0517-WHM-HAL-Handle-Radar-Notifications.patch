@@ -1,0 +1,327 @@
+From 988316e689774a9c8959f2b32021c2d70d957b0a Mon Sep 17 00:00:00 2001
+From: Manoj Sekar <sekar@qti.qualcomm.com>
+Date: Fri, 9 Oct 2026 08:59:54 +0530
+Subject: [PATCH] prplmesh: whm: fix radar detection event mapping, delivery,
+ and DFS state tracking
+
+The whm backend did not reliably report radar-triggered DFS channels in
+the Channel Preference Report's CAC Status/Completion Report TLV. This
+was caused by four separate issues:
+
+1. Missing event mapping
+
+   wpaCtrl_to_bwl_event() did not translate the "DFS-RADAR-DETECTED"
+   opcode to any beerocks event; it fell through to Event::Invalid
+   and was silently dropped by the default case in
+   process_wpa_ctrl_event().
+
+2. Missing/unreliable event delivery
+
+   "DFS-RADAR-DETECTED" is fired on the AccessPoint/VAP path. The
+   existing subscription handler for AP-path wpaCtrl events discards
+   any event whose path is not yet present in the agent's internal
+   VAP-info map (e.g. during early boot, before VAP info has been
+   populated), so the event could be dropped before even reaching the
+   opcode mapping above.
+
+3. DFS state never updated for radar-triggered channels
+
+   refresh_radio_info() derives each channel's DFS state only while
+   iterating the platform's reported list of currently possible
+   channels. When a channel is hit by radar, the platform may remove
+   it from that list entirely instead of keeping it listed with a
+   radar/non-occupancy marker. Because the loop only visited the
+   possible-channels list, a radar-hit channel removed from it was
+   never visited, so its DFS state was never updated to reflect the
+   radar detection.
+
+4. Timing race between the channel-switch notification and the
+   platform's radar-channel data becoming available
+
+   The platform populates its radar-triggered-channels data and
+   fires its channel-switch/CSA notification as two independent,
+   loosely-synchronized events. The agent previously relied solely on
+   the channel-switch notification to trigger a refresh of its
+   channel/radio info and the subsequent Channel Preference Report
+   rebuild. When the radar-triggered-channels data had not yet been
+   updated by the time that refresh ran, the resulting report could
+   be built from stale data, omitting the just-detected radar
+   channels entirely - even though all of the above issues were
+   otherwise fixed.
+
+Together, these issues meant that a radar detection - whether or not
+it was accompanied by an immediate channel switch - could fail to be
+reflected in the agent's channel/radio state and could fail to
+produce a correctly populated CAC Status/Completion Report TLV.
+
+This change:
+
+- Adds an explicit mapping for "DFS-RADAR-DETECTED" to
+  Event::DFS_RADAR_Detected, and handles it by recording the channel
+  switch reason as Radar and pushing the event through the normal
+  event queue. This reuses the existing shared handling for
+  DFS_RADAR_Detected/ACS_Completed/CSA_Finished, which refreshes the
+  radio info and propagates the notification further up the stack.
+
+- Adds a dedicated event subscription for "DFS-RADAR-DETECTED" on all
+  AccessPoint paths, independent of the current state of the VAP-info
+  map, so the event is reliably forwarded to the wpaCtrl event handler
+  regardless of VAP-info population timing. This follows the same
+  pattern already used for AWGN interference detection, which has the
+  same underlying delivery characteristics.
+
+- Fixes refresh_radio_info() to derive each channel's DFS state from
+  the union of the platform's possible-channels list and its
+  radar-triggered-channels list, instead of the possible-channels
+  list alone. This guarantees a radar-hit channel's DFS state is
+  always updated to reflect the radar detection, even if the platform
+  has removed that channel from the possible-channels list.
+
+- Adds a dedicated subscription directly on the platform's
+  radar-triggered-channels parameter, independent of the
+  channel-switch notification. Whenever that data changes, the agent
+  refreshes its radio/channel info and re-triggers the Channel
+  Preference Report rebuild with guaranteed-current data, removing
+  the dependency on any particular ordering between the two
+  independent platform events.
+
+- Additionally, a channel-change event whose reason indicates a
+  radar-driven change is now always treated as such, instead of only
+  being accepted when a specific prior internal state had been armed
+  by an earlier CAC failure on the same radio - avoiding a case where
+  a radar-driven channel change with no such preceding CAC failure
+  was previously dropped entirely.
+
+No functional changes are introduced to the nl80211 backend or to any
+other part of the agent; only the missing event mapping and its
+handler, the dedicated subscriptions, and the DFS-state derivation fix
+are added for the whm backend.
+
+Signed-off-by: Manoj Sekar <sekar@qti.qualcomm.com>
+---
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   | 80 ++++++++++++++++++-
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.h     |  1 +
+ common/beerocks/bwl/whm/base_wlan_hal_whm.cpp | 57 +++++++++++--
+ 3 files changed, 129 insertions(+), 9 deletions(-)
+
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index 0851303..eb0f1ea 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -100,6 +100,12 @@ static ap_wlan_hal::Event wpaCtrl_to_bwl_event(const std::string &opcode)
+         return ap_wlan_hal::Event::ACS_Completed;
+     } else if (opcode == "ACS-FAILED") {
+         return ap_wlan_hal::Event::ACS_Failed;
++    } else if (opcode == "DFS-RADAR-DETECTED") {
++        // Surface radar detection as an explicit event, independent of whether
++        // a channel switch follows, matching the nl80211 backend behavior.
++        LOG(WARNING) << "[RADAR-DBG] wpaCtrl_to_bwl_event: matched DFS-RADAR-DETECTED opcode"
++                     << " -> mapping to Event::DFS_RADAR_Detected";
++        return ap_wlan_hal::Event::DFS_RADAR_Detected;
+     }
+ 
+     return ap_wlan_hal::Event::Invalid;
+@@ -151,6 +157,7 @@ ap_wlan_hal_whm::ap_wlan_hal_whm(const std::string &iface_name, hal_event_cb_t c
+     subscribe_to_ap_mgmt_frame_events();
+     subscribe_to_afc_update_events();
+     subscribe_to_awgn_events();
++    subscribe_to_radar_events();
+ }
+ 
+ ap_wlan_hal_whm::~ap_wlan_hal_whm() {}
+@@ -1708,6 +1715,43 @@ void ap_wlan_hal_whm::subscribe_to_awgn_events()
+     m_ambiorix_cl.subscribe_to_object_event(wbapi_utils::search_path_ap(), event_handler, filter);
+ }
+ 
++void ap_wlan_hal_whm::subscribe_to_radar_events()
++{
++    // Subscribe to wpaCtrlEvents on ALL AccessPoint paths without VAP filtering.
++    // DFS-RADAR-DETECTED is fired on the VAP/AccessPoint path. The standard
++    // subscribe_to_ap_events() handler drops any event whose path is not yet present in
++    // m_vapsExtInfo (e.g. during early boot, before VAP info has been populated) - the same
++    // class of issue already fixed for AWGN via subscribe_to_awgn_events(). This dedicated
++    // subscription ensures DFS-RADAR-DETECTED is always forwarded to process_wpa_ctrl_event(),
++    // independent of the current state of m_vapsExtInfo.
++    auto event_handler        = std::make_shared<sAmbiorixEventHandler>();
++    event_handler->event_type = AMX_CL_WPA_CTRL_EVT;
++
++    event_handler->callback_fn = [this](AmbiorixVariant &event_data) -> void {
++        std::string event_str;
++        if (!event_data.read_child<>(event_str, "eventData") || event_str.empty()) {
++            return;
++        }
++
++        // Only handle DFS-RADAR-DETECTED events
++        if (event_str.find("DFS-RADAR-DETECTED") == std::string::npos) {
++            return;
++        }
++
++        LOG(WARNING) << "[RADAR-DBG] subscribe_to_radar_events: DFS-RADAR-DETECTED received"
++                     << " -> calling process_wpa_ctrl_event";
++        process_wpa_ctrl_event(event_data);
++    };
++
++    // Subscribe to all AP paths - no VAP filter restriction
++    std::string filter = "(path matches '" + wbapi_utils::search_path_ap() +
++                         "[0-9]+.$') && (notification == '" + AMX_CL_WPA_CTRL_EVT + "')";
++
++    LOG(WARNING) << "[RADAR-DBG] subscribe_to_radar_events: filter=" << filter
++                 << " radio=" << get_iface_name();
++    m_ambiorix_cl.subscribe_to_object_event(wbapi_utils::search_path_ap(), event_handler, filter);
++}
++
+ bool ap_wlan_hal_whm::simulate_awgn()
+ {
+     // Trigger AWGN simulation on the WHM platform by invoking the DCS.Simulation RPC method
+@@ -2802,6 +2846,18 @@ bool ap_wlan_hal_whm::process_radio_event(const std::string &interface, const st
+         LOG(WARNING) << "request updating vaps list of radio " << interface;
+         event_queue_push(Event::APS_update_list);
+         return true;
++    } else if (key == "RadarTriggeredDfsChannels") {
++        // Fired when the platform's RadarTriggeredDfsChannels list is actually updated.
++        // Refresh the full channel/radio info now that the data is guaranteed to be
++        // current (see subscribe_to_radio_events() for why relying solely on the prior
++        // CSA/channel-switch notification can race ahead of this list being populated),
++        // then re-trigger the same Radar-reason notification path used for an explicit
++        // DFS-RADAR-DETECTED event, so a Channel Preference Report rebuild is requested
++        // with the now-current radar/NOL channel data.
++        refresh_radio_info();
++        m_radio_info.last_csa_sw_reason = ChanSwReason::Radar;
++        event_queue_push(Event::DFS_RADAR_Detected);
++        return true;
+     }
+     return true;
+ }
+@@ -2824,10 +2880,16 @@ bool ap_wlan_hal_whm::process_radio_channel_change_event(const AmbiorixVariant *
+     if (chan_change_reason != "MANUAL" && chan_change_reason != "AUTO") {
+         LOG(INFO) << "chan_change_reason other than MANUAL or AUTO:" << chan_change_reason;
+ 
+-        // Handle DFS channel changes
+-        if (chan_change_reason == "DFS" && m_accept_dfs_channel_change_after_cac_failure) {
+-            LOG(INFO) << "Channel change event received following a failed CAC_Completed, "
+-                      << "handling it as part of the radar flow...";
++        // Handle DFS channel changes. A "DFS" reason always indicates a radar-driven
++        // channel change (whether or not it was preceded by a CAC failure on this
++        // radio) and must always be accepted and forwarded as Radar - previously this
++        // was only accepted when m_accept_dfs_channel_change_after_cac_failure had been
++        // armed by a prior CAC failure, causing a radar-driven channel change with no
++        // such preceding CAC failure to fall through to the "Unsupported channel change
++        // reason" branch below and be dropped entirely (no CSA notification at all).
++        if (chan_change_reason == "DFS") {
++            LOG(INFO) << "Channel change event received due to a radar-driven DFS channel "
++                      << "change, handling it as part of the radar flow...";
+             m_accept_dfs_channel_change_after_cac_failure = false;
+             m_radio_info.last_csa_sw_reason               = ChanSwReason::Radar;
+         }
+@@ -3487,6 +3549,16 @@ bool ap_wlan_hal_whm::process_wpa_ctrl_event(const beerocks::wbapi::AmbiorixVari
+         event_queue_push(Event::DFS_NOP_Finished, msg_buff);
+         break;
+     }
++    case Event::DFS_RADAR_Detected: {
++        // Radar detection is independent of any channel switch that may or may not
++        // follow it. Always record the reason as Radar and push the event so the
++        // shared DFS_RADAR_Detected/ACS_Completed/CSA_Finished handling refreshes
++        // the radio info and notifies the rest of the stack, keeping behavior
++        // consistent with the nl80211 backend.
++        m_radio_info.last_csa_sw_reason = ChanSwReason::Radar;
++        event_queue_push(event);
++        break;
++    }
+     case Event::CSA_Finished: {
+         const std::string reason  = parsed_obj["reason"];
+         ChanSwReason chanSwReason = ChanSwReason::Unknown;
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
+index 58b22f7..73fd9c5 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.h
+@@ -314,6 +314,7 @@ private:
+      * when wld sends them with a mismatched path.
+      */
+     void subscribe_to_awgn_events();
++    void subscribe_to_radar_events();
+ 
+     /**
+      * @brief Process event "BSS-TM-RESP"
+diff --git a/common/beerocks/bwl/whm/base_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/base_wlan_hal_whm.cpp
+index fd084ee..a5396c2 100644
+--- a/common/beerocks/bwl/whm/base_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/base_wlan_hal_whm.cpp
+@@ -114,6 +114,32 @@ void base_wlan_hal_whm::subscribe_to_radio_events()
+ 
+     m_ambiorix_cl.subscribe_to_object_event(wifi_radio_channel_path, event_handler,
+                                             filter_radio_channel);
++
++    // Subscribe directly to RadarTriggeredDfsChannels parameter changes on ChannelMgt.
++    // The platform may populate this list a short time after the channel-switch/CSA
++    // notification fires (both are driven by independent, loosely-synchronized events on
++    // the platform side). Relying solely on the CSA/channel-switch notification to trigger
++    // a radio-info refresh can therefore race ahead of this list actually being updated,
++    // resulting in a refresh that misses the just-detected radar channels. Subscribing
++    // directly to this parameter removes that race: the refresh (and the resulting
++    // Channel Preference Report rebuild) is triggered exactly when the data becomes
++    // available, regardless of its timing relative to any channel-switch event.
++    std::string channel_mgt_obj_path       = m_radio_path + "ChannelMgt.";
++    std::string filter_radar_triggered_chs = "(path matches '" + channel_mgt_obj_path +
++                                             "$')"
++                                             " && (notification == '" +
++                                             AMX_CL_OBJECT_CHANGED_EVT +
++                                             "')"
++                                             " && (contains('parameters.RadarTriggeredDfsChannels'))";
++
++    auto radar_channels_event_handler        = std::make_shared<sAmbiorixEventHandler>();
++    radar_channels_event_handler->event_type = AMX_CL_OBJECT_CHANGED_EVT;
++    radar_channels_event_handler->callback_fn = [this](AmbiorixVariant &event_data) -> void {
++        process_radio_event(get_iface_name(), "RadarTriggeredDfsChannels", nullptr);
++    };
++
++    m_ambiorix_cl.subscribe_to_object_event(channel_mgt_obj_path, radar_channels_event_handler,
++                                            filter_radar_triggered_chs);
+ }
+ 
+ void base_wlan_hal_whm::subscribe_to_radio_channel_change_events()
+@@ -831,16 +857,37 @@ bool base_wlan_hal_whm::refresh_radio_info()
+ 
+     if (radio->read_child(s_val, "PossibleChannels")) {
+         auto channels_vec = beerocks::string_utils::str_split(s_val, ',');
+-        for (auto &chan_str : channels_vec) {
++
++        // pWHM may remove a channel from PossibleChannels entirely once radar is
++        // detected on it (rather than keeping the channel listed with a NOL/radar
++        // marker). If that channel is only iterated from channels_vec below, it is
++        // silently skipped and its entry in m_radio_info.channels_list is left at
++        // its previous (stale, non-UNAVAILABLE) dfs_state - meaning a radar/NOL
++        // channel is never reported via the CAC Status Report TLV's detected-pairs
++        // (non-occupancy) list. To guarantee every radar-triggered channel is always
++        // reflected with dfs_state=UNAVAILABLE regardless of its current presence in
++        // PossibleChannels, iterate the union of channels_vec and
++        // radar_triggered_channels_set below instead of channels_vec alone.
++        std::unordered_set<std::string> union_channels_set(channels_vec.begin(),
++                                                            channels_vec.end());
++        union_channels_set.insert(radar_triggered_channels_set.begin(),
++                                  radar_triggered_channels_set.end());
++
++        for (auto &chan_str : union_channels_set) {
++            if (chan_str.empty()) {
++                continue;
++            }
+             uint32_t chanNum   = beerocks::string_utils::stoi(chan_str);
+             auto &channel_info = m_radio_info.channels_list[chanNum];
+ 
+             if (son::wireless_utils::is_dfs_channel(chanNum, m_radio_info.frequency_band)) {
+-                if (cleared_channels_set.find(chan_str) != cleared_channels_set.end()) {
+-                    channel_info.dfs_state = beerocks::eDfsState::AVAILABLE;
+-                } else if (radar_triggered_channels_set.find(chan_str) !=
+-                           radar_triggered_channels_set.end()) {
++                if (radar_triggered_channels_set.find(chan_str) !=
++                    radar_triggered_channels_set.end()) {
++                    // Radar/NOL takes priority over any (possibly stale) cleared-channel
++                    // membership for the same channel number.
+                     channel_info.dfs_state = beerocks::eDfsState::UNAVAILABLE;
++                } else if (cleared_channels_set.find(chan_str) != cleared_channels_set.end()) {
++                    channel_info.dfs_state = beerocks::eDfsState::AVAILABLE;
+                 } else {
+                     channel_info.dfs_state = beerocks::eDfsState::USABLE;
+                 }
+-- 
+2.34.1
+
