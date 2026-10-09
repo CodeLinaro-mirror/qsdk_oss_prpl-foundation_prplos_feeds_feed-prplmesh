@@ -1,0 +1,259 @@
+From a6a9efaddaf9102df9f2110491649510749ae87a Mon Sep 17 00:00:00 2001
+From: Sonali Naresh <sonanare@qti.qualcomm.com>
+Date: Thu, 8 Oct 2026 14:54:40 +0530
+Subject: [PATCH] Reply complete for ETH onboarding after all CONFIGURED
+
+Signed-off-by: Sonali Naresh <sonanare@qti.qualcomm.com>
+---
+ .../backhaul_manager/backhaul_manager.cpp     | 67 +++++++++++++++++--
+ .../slave/backhaul_manager/backhaul_manager.h | 10 ++-
+ .../bcl/include/bcl/beerocks_ucc_listener.h   |  9 +--
+ .../bcl/source/beerocks_ucc_listener.cpp      |  7 +-
+ .../master/controller_ucc_listener.cpp        |  9 +--
+ .../beerocks/master/controller_ucc_listener.h |  4 +-
+ 6 files changed, 88 insertions(+), 18 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 4981335..f0a53c8 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -99,6 +99,11 @@ constexpr auto dev_reset_default_timeout = std::chrono::seconds(UCC_REPLY_COMPLE
+  */
+ constexpr auto dev_reset_default_teardown_wait = std::chrono::seconds(3);
+ 
++/**
++ * Timeout for deferred ETH backhaul dev_set_config reply
++ */
++constexpr std::chrono::seconds BackhaulManager::DEV_SET_CONFIG_ETH_BACKHAUL_TIMEOUT_SECONDS;
++
+ /**
+  * Delay before retrying DPP chirp after a DPP-FAIL or DPP-CONF-FAILED event. Kept past the DPP
+  * Controller's connection staleness window, so a retry chirp's Presence Announcement doesn't
+@@ -2474,8 +2479,10 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+                     handle_dev_reset_default(fd, params);
+                 };
+             handlers.on_dev_set_config =
+-                [&](const std::unordered_map<std::string, std::string> &params,
+-                    std::string &err_string) { return handle_dev_set_config(params, err_string); };
++                [&](int fd, const std::unordered_map<std::string, std::string> &params,
++                    std::string &err_string, bool &reply_deferred) {
++                    return handle_dev_set_config(fd, params, err_string, reply_deferred);
++                };
+             m_agent_ucc_listener->set_handlers(handlers);
+         }
+ 
+@@ -6249,8 +6256,9 @@ void BackhaulManager::handle_dev_reset_default(
+               << " - AP/STA VAPs reset to default (certification mode)";
+ }
+ 
+-bool BackhaulManager::handle_dev_set_config(
+-    const std::unordered_map<std::string, std::string> &params, std::string &err_string)
++bool BackhaulManager::handle_dev_set_config(int fd,
++                                            const std::unordered_map<std::string, std::string> &params,
++                                            std::string &err_string, bool &reply_deferred)
+ {
+     if (params.find(dev_set_config_bss_info_param) != params.end()) {
+         err_string = "parameter 'bss_info' is not relevant to the agent";
+@@ -6328,6 +6336,9 @@ bool BackhaulManager::handle_dev_set_config(
+     if (backhaul == DEV_SET_ETH) {
+         // wired backhaul connection.
+         m_selected_backhaul = DEV_SET_ETH;
++        m_dev_set_config_eth_backhaul_fd = fd;
++        m_dev_set_config_eth_backhaul_reply_sent = false;  // Reset flag for new command
++        reply_deferred = true;
+     } else {
+         // wireless backhaul connection.
+         // backhaul param must be a radio UID, in hex, starting with 0x
+@@ -6374,6 +6385,54 @@ bool BackhaulManager::handle_dev_set_config(
+     // Signal to backhaul manager that it can continue onboarding.
+     m_is_in_reset_state = false;
+ 
++    if (m_selected_backhaul == DEV_SET_ETH) {
++        if (m_dev_set_config_eth_backhaul_timer !=
++            beerocks::net::FileDescriptor::invalid_descriptor) {
++            m_timer_manager->remove_timer(m_dev_set_config_eth_backhaul_timer);
++        }
++
++        m_dev_set_config_eth_backhaul_reply_sent = false;
++        auto timeout_start = std::chrono::steady_clock::now();
++        m_dev_set_config_eth_backhaul_timer = m_timer_manager->add_timer(
++            "Dev Set Config ETH Backhaul", std::chrono::milliseconds(500),
++            std::chrono::milliseconds(500), [this, timeout_start](int, beerocks::EventLoop &) {
++                auto db = AgentDB::get();
++
++                // Skip if reply was already sent
++                if (m_dev_set_config_eth_backhaul_reply_sent) {
++                    return true;
++                }
++
++                if (db->statuses.ap_autoconfiguration_completed) {
++                    if (m_dev_set_config_eth_backhaul_fd !=
++                        beerocks::net::FileDescriptor::invalid_descriptor) {
++                        m_agent_ucc_listener->send_reply(m_dev_set_config_eth_backhaul_fd);
++                        m_dev_set_config_eth_backhaul_reply_sent = true;
++                    }
++                    m_dev_set_config_eth_backhaul_fd = beerocks::net::FileDescriptor::invalid_descriptor;
++                    return true;
++                }
++
++                if (std::chrono::steady_clock::now() - timeout_start >=
++                    DEV_SET_CONFIG_ETH_BACKHAUL_TIMEOUT_SECONDS) {
++                    if (m_dev_set_config_eth_backhaul_fd !=
++                        beerocks::net::FileDescriptor::invalid_descriptor) {
++                        m_agent_ucc_listener->send_reply(m_dev_set_config_eth_backhaul_fd, "Timeout");
++                        m_dev_set_config_eth_backhaul_reply_sent = true;
++                    }
++                    m_dev_set_config_eth_backhaul_fd = beerocks::net::FileDescriptor::invalid_descriptor;
++                    return true;
++                }
++                return true;
++            });
++        if (m_dev_set_config_eth_backhaul_timer ==
++            beerocks::net::FileDescriptor::invalid_descriptor) {
++            err_string = "failed creating ETH backhaul completion timer";
++            return false;
++        }
++        return true;
++    }
++
+     if (!apply_qos_management_settings()) {
+         err_string = "failed applying QoS management settings";
+         return false;
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+index 5e111d5..25b1e0b 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+@@ -1080,8 +1080,8 @@ private:
+      * 
+      * @return true on success and false otherwise.
+      */
+-    bool handle_dev_set_config(const std::unordered_map<std::string, std::string> &params,
+-                               std::string &err_string);
++    bool handle_dev_set_config(int fd, const std::unordered_map<std::string, std::string> &params,
++                               std::string &err_string, bool &reply_deferred);
+ 
+     /**
+      * @brief Apply pending certification QoS management settings to fronthaul VAPs.
+@@ -1143,6 +1143,12 @@ private:
+      */
+     std::string m_selected_backhaul;
+ 
++    int m_dev_set_config_eth_backhaul_fd = beerocks::net::FileDescriptor::invalid_descriptor;
++    int m_dev_set_config_eth_backhaul_timer =
++        beerocks::net::FileDescriptor::invalid_descriptor;
++    bool m_dev_set_config_eth_backhaul_reply_sent = false;
++    static constexpr std::chrono::seconds DEV_SET_CONFIG_ETH_BACKHAUL_TIMEOUT_SECONDS{60};
++
+     /**
+      * @brief QoS management settings received from WFA-CA dev_set_config.
+      */
+diff --git a/common/beerocks/bcl/include/bcl/beerocks_ucc_listener.h b/common/beerocks/bcl/include/bcl/beerocks_ucc_listener.h
+index af6bbca..1cd96dc 100644
+--- a/common/beerocks/bcl/include/bcl/beerocks_ucc_listener.h
++++ b/common/beerocks/bcl/include/bcl/beerocks_ucc_listener.h
+@@ -61,7 +61,8 @@ public:
+      * @return true on success and false otherwise.
+      */
+     using DevSetConfigHandler = std::function<bool(
+-        const std::unordered_map<std::string, std::string> &params, std::string &err_string)>;
++        int fd, const std::unordered_map<std::string, std::string> &params, std::string &err_string,
++        bool &reply_deferred)>;
+ 
+     /**
+      * Set of command handler functions, one function to handle each possible WFA-CA command 
+@@ -150,15 +151,15 @@ public:
+      * 
+      * @return true on success and false otherwise.
+      */
+-    bool handle_dev_set_config(const std::unordered_map<std::string, std::string> &params,
+-                               std::string &err_string) const
++    bool handle_dev_set_config(int fd, const std::unordered_map<std::string, std::string> &params,
++                               std::string &err_string, bool &reply_deferred) const
+     {
+         if (!m_handlers.on_dev_set_config) {
+             err_string = unhandled_command_error_string;
+             return false;
+         }
+ 
+-        return m_handlers.on_dev_set_config(params, err_string);
++        return m_handlers.on_dev_set_config(fd, params, err_string, reply_deferred);
+     }
+ 
+ private:
+diff --git a/common/beerocks/bcl/source/beerocks_ucc_listener.cpp b/common/beerocks/bcl/source/beerocks_ucc_listener.cpp
+index 7ae8713..804b2a1 100644
+--- a/common/beerocks/bcl/source/beerocks_ucc_listener.cpp
++++ b/common/beerocks/bcl/source/beerocks_ucc_listener.cpp
+@@ -803,6 +803,7 @@ void beerocks_ucc_listener::handle_wfa_ca_command(int fd, const std::string &com
+         }
+ 
+         bool first = true;
++        bool reply_deferred = false;
+         for (const auto &bss_info_vector : bss_infos) {
+             std::unordered_map<std::string, std::string> params;
+ 
+@@ -819,7 +820,7 @@ void beerocks_ucc_listener::handle_wfa_ca_command(int fd, const std::string &com
+                 first               = false;
+             }
+ 
+-            if (!handle_dev_set_config(params, err_string)) {
++            if (!handle_dev_set_config(fd, params, err_string, reply_deferred)) {
+                 break;
+             }
+         }
+@@ -830,7 +831,9 @@ void beerocks_ucc_listener::handle_wfa_ca_command(int fd, const std::string &com
+         }
+ 
+         // Send back second reply
+-        reply_ucc(fd, eWfaCaStatus::COMPLETE);
++        if (!reply_deferred) {
++            reply_ucc(fd, eWfaCaStatus::COMPLETE);
++        }
+         break;
+     }
+     case eWfaCaCommand::DEV_SET_RFEATURE: {
+diff --git a/controller/src/beerocks/master/controller_ucc_listener.cpp b/controller/src/beerocks/master/controller_ucc_listener.cpp
+index 689da76..aeb2f16 100644
+--- a/controller/src/beerocks/master/controller_ucc_listener.cpp
++++ b/controller/src/beerocks/master/controller_ucc_listener.cpp
+@@ -30,9 +30,9 @@ controller_ucc_listener::controller_ucc_listener(db &database, ieee1905_1::CmduM
+         [&](int fd, const std::unordered_map<std::string, std::string> &params) {
+             handle_dev_reset_default(fd, params);
+         };
+-    handlers.on_dev_set_config = [&](const std::unordered_map<std::string, std::string> &params,
+-                                     std::string &err_string) {
+-        return handle_dev_set_config(params, err_string);
++    handlers.on_dev_set_config = [&](int fd, const std::unordered_map<std::string, std::string> &params,
++                                     std::string &err_string, bool &reply_deferred) {
++        return handle_dev_set_config(fd, params, err_string, reply_deferred);
+     };
+     set_handlers(handlers);
+ }
+@@ -474,7 +474,8 @@ void controller_ucc_listener::handle_dev_reset_default(
+ }
+ 
+ bool controller_ucc_listener::handle_dev_set_config(
+-    const std::unordered_map<std::string, std::string> &params, std::string &err_string)
++    int fd, const std::unordered_map<std::string, std::string> &params, std::string &err_string,
++    bool &reply_deferred)
+ {
+     if (params.find("backhaul") != params.end()) {
+         err_string = "parameter 'backhaul' is not relevant to the controller";
+diff --git a/controller/src/beerocks/master/controller_ucc_listener.h b/controller/src/beerocks/master/controller_ucc_listener.h
+index 2b56e54..c05055b 100644
+--- a/controller/src/beerocks/master/controller_ucc_listener.h
++++ b/controller/src/beerocks/master/controller_ucc_listener.h
+@@ -78,8 +78,8 @@ private:
+      * 
+      * @return true on success and false otherwise.
+      */
+-    bool handle_dev_set_config(const std::unordered_map<std::string, std::string> &params,
+-                               std::string &err_string);
++    bool handle_dev_set_config(int fd, const std::unordered_map<std::string, std::string> &params,
++                               std::string &err_string, bool &reply_deferred);
+ 
+     /**
+      * @brief Converts the radio preference map to TLV format.
+-- 
+2.34.1
+
