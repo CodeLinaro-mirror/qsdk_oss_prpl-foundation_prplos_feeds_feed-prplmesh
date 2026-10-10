@@ -1,0 +1,546 @@
+From fd6e8abdda10ab962e3df5f50169019db5900205 Mon Sep 17 00:00:00 2001
+From: Muthuchamy Kumar <muthucha@qti.qualcomm.com>
+Date: Thu, 8 Oct 2026 00:09:33 +0530
+Subject: [PATCH] Add sequential AP autoconfiguration and QCOM controller
+ interop
+
+- Add sequential_ap_autoconfig to serialize AP Search, WSC M1/M2, and
+  configuration completion per radio.
+- Coordinate radio ordering, retries, renewals, MLD updates, and timeout
+  recovery in sequential mode.
+- Add interop_with_qcomcontroller to omit EM_AP_AGENT and advertise the
+  legacy MAP profile when enabled.
+- Preserve existing parallel onboarding and normal service advertisement
+  by default.
+
+Signed-off-by: Muthuchamy Kumar <muthucha@qti.qualcomm.com>
+---
+ agent/config/beerocks_agent.conf.in           |  12 +
+ agent/src/beerocks/slave/agent_db.h           |   4 +
+ .../beerocks/slave/beerocks_agent_main.cpp    |  32 +++
+ .../slave/tasks/ap_autoconfiguration_task.cpp | 213 +++++++++++++++---
+ .../slave/tasks/ap_autoconfiguration_task.h   |   7 +
+ .../slave/tasks/capability_reporting_task.cpp |  11 +-
+ .../bcl/include/bcl/beerocks_config_file.h    |   2 +
+ .../bcl/source/beerocks_config_file.cpp       |   2 +
+ 8 files changed, 253 insertions(+), 30 deletions(-)
+
+diff --git a/agent/config/beerocks_agent.conf.in b/agent/config/beerocks_agent.conf.in
+index 161104996..6fdb28b67 100644
+--- a/agent/config/beerocks_agent.conf.in
++++ b/agent/config/beerocks_agent.conf.in
+@@ -128,6 +128,18 @@ clients_unicast_measurements=0
+ # send_btm_to_non_11v_sta = 1 -> Allow sending BTM requests to STAs even if they do not support 802.11v
+ send_btm_to_non_11v_sta=1
+ 
++# sequential_ap_autoconfig: serialize AP-Autoconfiguration per radio/band.
++# 0 = parallel onboarding (default)
++# 1 = Search -> Response -> Early AP Capability -> M1 -> M2/configuration-complete
++#     for one radio before starting the next radio. Enable for legacy controllers
++#     that cannot safely handle parallel cloning sessions (for example 13.1).
++sequential_ap_autoconfig=0
++
++# interop_with_qcomcontroller: enable interoperability with QCOM controllers.
++# 0 = normal service/profile advertisement (default)
++# 1 = omit EM_AP_AGENT and advertise the legacy MAP profile override.
++interop_with_qcomcontroller=0
++
+ # rsn_overriding_supported: Advertise RSN_Overriding = 1 in the AP Capability TLV
+ # (Wi-Fi EasyMesh v6.1 sections 17.2.6, 9.1 and 7.1).
+ # When set to 1, the Agent tells the Controller that it understands the special
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 2ceac17cb..f9fd150ff 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -194,6 +194,10 @@ public:
+         bool is_multiap_profile_1_as_of_r4 = false;
+         int dwell_time;
+         bool send_btm_to_non_11v_sta = false;
++        // Serialize AP-Autoconfiguration per radio for legacy-controller interoperability.
++        bool sequential_ap_autoconfig = false;
++        // Enable QCOM-controller interoperability for AP-Autoconfiguration Search.
++        bool interop_with_qcomcontroller = false;
+         /**
+          * RSN Overriding capability advertise.
+          *
+diff --git a/agent/src/beerocks/slave/beerocks_agent_main.cpp b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+index 10c474be2..01d397bb7 100644
+--- a/agent/src/beerocks/slave/beerocks_agent_main.cpp
++++ b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+@@ -501,6 +501,38 @@ static int run_beerocks_slave(beerocks::config_file::sConfigSlave &beerocks_slav
+             beerocks::string_utils::stoi(beerocks_slave_conf.send_btm_to_non_11v_sta);
+         db->device_conf.send_btm_to_non_11v_sta = send_btm_to_non_11v_sta;
+ 
++        // sequential_ap_autoconfig: serialize Search/M1/M2 onboarding per radio.
++        // The default remains parallel for current controllers.
++        if (beerocks_slave_conf.sequential_ap_autoconfig.empty() ||
++            beerocks_slave_conf.sequential_ap_autoconfig == "0") {
++            db->device_conf.sequential_ap_autoconfig = false;
++        } else if (beerocks_slave_conf.sequential_ap_autoconfig == "1") {
++            db->device_conf.sequential_ap_autoconfig = true;
++        } else {
++            LOG(WARNING) << "Invalid sequential_ap_autoconfig value '"
++                         << beerocks_slave_conf.sequential_ap_autoconfig
++                         << "'. Expected 0 or 1. Treating as 0.";
++            db->device_conf.sequential_ap_autoconfig = false;
++        }
++        LOG(INFO) << "Set sequential_ap_autoconfig to: "
++                  << db->device_conf.sequential_ap_autoconfig;
++
++        // interop_with_qcomcontroller: enable QCOM-controller interoperability.
++        // Empty / "0" -> disabled; "1" -> enabled. Invalid values are disabled.
++        if (beerocks_slave_conf.interop_with_qcomcontroller.empty() ||
++            beerocks_slave_conf.interop_with_qcomcontroller == "0") {
++            db->device_conf.interop_with_qcomcontroller = false;
++        } else if (beerocks_slave_conf.interop_with_qcomcontroller == "1") {
++            db->device_conf.interop_with_qcomcontroller = true;
++        } else {
++            LOG(WARNING) << "Invalid interop_with_qcomcontroller value '"
++                         << beerocks_slave_conf.interop_with_qcomcontroller
++                         << "'. Expected 0 or 1. Treating as 0.";
++            db->device_conf.interop_with_qcomcontroller = false;
++        }
++        LOG(INFO) << "Set interop_with_qcomcontroller to: "
++                  << db->device_conf.interop_with_qcomcontroller;
++
+         // rsn_overriding_supported: advertise RSN_Overriding=1 in the AP Capability TLV
+         // (Wi-Fi EasyMesh v6.1 §17.2.6/§9.1/§7.1). Optional; default 0 (do not advertise).
+         // Absent / empty / "0" -> false; "1" -> true. Any other value is treated as false
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index fcd956700..12daafebe 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -26,6 +26,8 @@
+ #include <bcl/beerocks_wifi_channel.h>
+ #include <mapf/common/utils.h>
+ 
++#include <algorithm>
++
+ #include <beerocks/tlvf/beerocks_message.h>
+ #include <beerocks/tlvf/beerocks_message_apmanager.h>
+ #include <beerocks/tlvf/beerocks_message_control.h>
+@@ -343,6 +345,7 @@ template <typename BssConfig> static inline std::string dump_bssconfig_compact(c
+ } // namespace
+ 
+ static constexpr uint8_t AUTOCONFIG_DISCOVERY_TIMEOUT_SECONDS = 3;
++static constexpr uint8_t kMaxSequentialM2Retries              = 20;
+ 
+ // Minimum spacing between two DPP BSS-configuration sends to ap_manager, so that
+ // multiple radios' hostapd interface create/teardown calls don't all happen in the
+@@ -392,6 +395,31 @@ ApAutoConfigurationTask::ApAutoConfigurationTask(slave_thread &btl_ctx,
+ {
+ }
+ 
++void ApAutoConfigurationTask::start_next_sequential_radio()
++{
++    auto db = AgentDB::get();
++    if (!db->device_conf.sequential_ap_autoconfig) {
++        return;
++    }
++
++    for (const auto &radio_iface : m_sequential_radio_order) {
++        auto conf_it = m_radios_conf_params.find(radio_iface);
++        if (conf_it == m_radios_conf_params.end() ||
++            conf_it->second.state != eState::UNCONFIGURED) {
++            continue;
++        }
++
++        m_sequential_active_radio = radio_iface;
++        LOG(INFO) << "Sequential AP autoconfiguration: starting radio " << radio_iface;
++        FSM_MOVE_STATE(radio_iface, eState::CONTROLLER_DISCOVERY);
++        m_task_is_active = true;
++        return;
++    }
++
++    LOG(DEBUG) << "Sequential AP autoconfiguration: all radios completed";
++    m_sequential_active_radio.clear();
++}
++
+ void ApAutoConfigurationTask::work()
+ {
+     if (!m_task_is_active) {
+@@ -411,6 +439,11 @@ void ApAutoConfigurationTask::work()
+         case eState::CONTROLLER_DISCOVERY: {
+             auto db = AgentDB::get();
+ 
++            if (db->device_conf.sequential_ap_autoconfig &&
++                m_sequential_active_radio != radio_iface) {
++                break;
++            }
++
+             auto radio = db->radio(radio_iface);
+             if (!radio) {
+                 continue;
+@@ -487,6 +520,10 @@ void ApAutoConfigurationTask::work()
+             if (!radio) {
+                 continue;
+             }
++            if (db->device_conf.sequential_ap_autoconfig &&
++                m_sequential_active_radio != radio_iface) {
++                break;
++            }
+             // For DPP: check if ANY band completed (the radio that sent the Search got a Response).
+             // Radios that skipped sending (different band) must also advance when discovery completes.
+             bool completed = m_discovery_status[radio->wifi_channel.get_freq_type()].completed;
+@@ -531,6 +568,10 @@ void ApAutoConfigurationTask::work()
+         }
+         case eState::SEND_AP_AUTOCONFIGURATION_WSC_M1: {
+             auto db = AgentDB::get();
++            if (db->device_conf.sequential_ap_autoconfig &&
++                m_sequential_active_radio != radio_iface) {
++                break;
++            }
+             auto radio = db->radio(radio_iface);
+             if (!radio) {
+                 break;
+@@ -575,7 +616,27 @@ void ApAutoConfigurationTask::work()
+         }
+         case eState::WAIT_AP_AUTOCONFIGURATION_WSC_M2: {
+             if (std::chrono::steady_clock::now() > conf_params.timeout) {
+-                FSM_MOVE_STATE(radio_iface, eState::SEND_AP_AUTOCONFIGURATION_WSC_M1);
++                auto db = AgentDB::get();
++                if (db->device_conf.sequential_ap_autoconfig) {
++                    if (++conf_params.m2_timeout_retry_count > kMaxSequentialM2Retries) {
++                        LOG(ERROR) << "Sequential AP autoconfiguration: giving up on "
++                                   << radio_iface << " after repeated M2 timeouts; marking SKIPPED";
++                        FSM_MOVE_STATE(radio_iface, eState::SKIPPED);
++                        break;
++                    }
++                    auto radio = db->radio(radio_iface);
++                    if (radio) {
++                        m_discovery_status[radio->wifi_channel.get_freq_type()] = {};
++                    }
++                    db->statuses.controller_discovery_completed = false;
++                    LOG(WARNING) << "M2 timeout on " << radio_iface << " (retry "
++                                 << int(conf_params.m2_timeout_retry_count) << "/"
++                                 << int(kMaxSequentialM2Retries) << ")"
++                                 << "; restarting sequential AP autoconfiguration from Search";
++                    FSM_MOVE_STATE(radio_iface, eState::CONTROLLER_DISCOVERY);
++                } else {
++                    FSM_MOVE_STATE(radio_iface, eState::SEND_AP_AUTOCONFIGURATION_WSC_M1);
++                }
+             }
+             break;
+         }
+@@ -598,6 +659,17 @@ void ApAutoConfigurationTask::work()
+ 
+     // Update status on the database.
+     auto db = AgentDB::get();
++    if (db->device_conf.sequential_ap_autoconfig && !m_sequential_active_radio.empty()) {
++        auto active_it = m_radios_conf_params.find(m_sequential_active_radio);
++        if (active_it != m_radios_conf_params.end() &&
++            (active_it->second.state == eState::CONFIGURED ||
++             active_it->second.state == eState::SKIPPED)) {
++            start_next_sequential_radio();
++            if (!m_sequential_active_radio.empty()) {
++                return;
++            }
++        }
++    }
+     if (configured_aps_count > 0 && configured_aps_count == m_radios_conf_params.size()) {
+ 
+         // Verify every radio affiliated with an AP MLD (per the controller's AP MLD
+@@ -687,12 +759,50 @@ void ApAutoConfigurationTask::handle_event(uint8_t event_enum_value, const void
+         for (auto &discovery_status : m_discovery_status) {
+             discovery_status.second = {};
+         }
++        m_sequential_radio_order.clear();
++        m_sequential_active_radio.clear();
+         m_task_is_active = false;
+         break;
+     }
+     case START_AP_AUTOCONFIGURATION: {
+         auto db = AgentDB::get();
++
++        if (db->device_conf.sequential_ap_autoconfig && event_obj) {
++            const auto specific_iface = *reinterpret_cast<const std::string *>(event_obj);
++            auto target_it            = m_radios_conf_params.find(specific_iface);
++            if (target_it != m_radios_conf_params.end() &&
++                !m_sequential_active_radio.empty() &&
++                m_sequential_active_radio != specific_iface) {
++                target_it->second.state = eState::UNCONFIGURED;
++                target_it->second.m2_timeout_retry_count = 0;
++                auto target_radio       = db->radio(specific_iface);
++                if (target_radio) {
++                    m_discovery_status[target_radio->wifi_channel.get_freq_type()] = {};
++                }
++                if (std::find(m_sequential_radio_order.begin(), m_sequential_radio_order.end(),
++                              specific_iface) == m_sequential_radio_order.end()) {
++                    m_sequential_radio_order.push_back(specific_iface);
++                }
++                LOG(INFO) << "Sequential AP autoconfiguration: deferring restart of "
++                          << specific_iface << " until active radio "
++                          << m_sequential_active_radio << " completes";
++                return;
++            }
++
++            if (target_it != m_radios_conf_params.end() &&
++                m_sequential_active_radio == specific_iface &&
++                target_it->second.state != eState::CONFIGURED &&
++                target_it->second.state != eState::SKIPPED) {
++                LOG(DEBUG) << "Sequential AP autoconfiguration: ignoring duplicate restart for "
++                           << specific_iface;
++                return;
++            }
++        }
++
+         db->statuses.controller_discovery_completed = false;
++        std::vector<std::string> requested_radios;
++        m_sequential_radio_order.clear();
++        m_sequential_active_radio.clear();
+         for (const auto radio : db->get_radios_list()) {
+             if (!radio) {
+                 continue;
+@@ -718,13 +828,34 @@ void ApAutoConfigurationTask::handle_event(uint8_t event_enum_value, const void
+             // clear controller discover completed flag and msg_sent flag to send search message
+             m_discovery_status[radio->wifi_channel.get_freq_type()].completed = false;
+             m_discovery_status[radio->wifi_channel.get_freq_type()].msg_sent = false;
++            m_radios_conf_params[radio->front.iface_name].m2_timeout_retry_count = 0;
+ 
+             //change early capability report sent to false so that it is sent again
+             db->controller_info.early_ap_capability_report_sent = false;
+ 
+             LOG(DEBUG) << "starting discovery sequence on radio_iface=" << radio->front.iface_name;
+-            FSM_MOVE_STATE(radio->front.iface_name, eState::CONTROLLER_DISCOVERY);
+-            m_task_is_active = true;
++            requested_radios.push_back(radio->front.iface_name);
++            if (db->device_conf.sequential_ap_autoconfig) {
++                FSM_MOVE_STATE(radio->front.iface_name, eState::UNCONFIGURED);
++            } else {
++                FSM_MOVE_STATE(radio->front.iface_name, eState::CONTROLLER_DISCOVERY);
++                m_task_is_active = true;
++            }
++        }
++
++        if (db->device_conf.sequential_ap_autoconfig) {
++            m_sequential_radio_order = requested_radios;
++            std::stable_sort(m_sequential_radio_order.begin(), m_sequential_radio_order.end(),
++                             [&](const std::string &lhs, const std::string &rhs) {
++                                 const auto lhs_radio = db->radio(lhs);
++                                 const auto rhs_radio = db->radio(rhs);
++                                 if (!lhs_radio || !rhs_radio) {
++                                     return lhs < rhs;
++                                 }
++                                 return static_cast<uint8_t>(lhs_radio->wifi_channel.get_freq_type()) <
++                                        static_cast<uint8_t>(rhs_radio->wifi_channel.get_freq_type());
++                             });
++            start_next_sequential_radio();
+         }
+ 
+         /* Workaround: Send Gratuitous ARP to get autoconfig response
+@@ -1398,13 +1529,17 @@ bool ApAutoConfigurationTask::send_ap_autoconfiguration_search_message(
+         }
+     }
+ 
+-    auto numberOfSupportedService = 2;
+-    if (db->device_conf.local_controller) {
+-        numberOfSupportedService += 2;
++    std::vector<wfa_map::tlvSupportedService::eSupportedService> supported_services = {
++        wfa_map::tlvSupportedService::eSupportedService::MULTI_AP_AGENT};
++    if (!db->device_conf.interop_with_qcomcontroller && !db->device_conf.certification_mode) {
++        supported_services.push_back(
++            wfa_map::tlvSupportedService::eSupportedService::EM_AP_AGENT);
+     }
+-    if (db->device_conf.certification_mode) {
+-        // The R4 QCA WFA controller won't answer Autoconfig Searches that specify EM_AP_AGENT as a supported service. See PPM-3287.
+-        numberOfSupportedService = 1;
++    if (db->device_conf.local_controller && !db->device_conf.certification_mode) {
++        supported_services.push_back(
++            wfa_map::tlvSupportedService::eSupportedService::MULTI_AP_CONTROLLER);
++        supported_services.push_back(
++            wfa_map::tlvSupportedService::eSupportedService::EM_AP_CONTROLLER);
+     }
+ 
+     ieee1905_1::tlvAutoconfigFreqBand::eValue freq_band =
+@@ -1477,7 +1612,7 @@ bool ApAutoConfigurationTask::send_ap_autoconfiguration_search_message(
+             LOG(ERROR) << "addClass wfa_map::tlvSupportedService failed";
+             return false;
+         }
+-        if (!tlvSupportedService->alloc_supported_service_list(numberOfSupportedService)) {
++        if (!tlvSupportedService->alloc_supported_service_list(supported_services.size())) {
+             LOG(ERROR) << "alloc_supported_service_list failed";
+             return false;
+         }
+@@ -1488,19 +1623,7 @@ bool ApAutoConfigurationTask::send_ap_autoconfiguration_search_message(
+                 LOG(ERROR) << "Invalid tlvSupportedService";
+                 return false;
+             }
+-            if (serviceID == 0) {
+-                std::get<1>(supportedServiceTuple) =
+-                    wfa_map::tlvSupportedService::eSupportedService::MULTI_AP_AGENT;
+-            } else if (serviceID == 1) {
+-                std::get<1>(supportedServiceTuple) =
+-                    wfa_map::tlvSupportedService::eSupportedService::EM_AP_AGENT;
+-            } else if (serviceID == 2) {
+-                std::get<1>(supportedServiceTuple) =
+-                    wfa_map::tlvSupportedService::eSupportedService::MULTI_AP_CONTROLLER;
+-            } else if (serviceID == 3) {
+-                std::get<1>(supportedServiceTuple) =
+-                    wfa_map::tlvSupportedService::eSupportedService::EM_AP_CONTROLLER;
+-            }
++            std::get<1>(supportedServiceTuple) = supported_services[serviceID];
+         }
+ 
+         auto tlvSearchedService = m_cmdu_tx.addClass<wfa_map::tlvSearchedService>();
+@@ -1572,8 +1695,15 @@ bool ApAutoConfigurationTask::send_ap_autoconfiguration_search_message(
+             wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_3;
+     }
+ 
++    // Third-party-controller interoperability uses the legacy MAP profile on the wire
++    // without changing the configured profile used elsewhere by the Agent.
++    const auto advertised_multi_ap_profile =
++        db->device_conf.interop_with_qcomcontroller
++            ? static_cast<wfa_map::tlvProfile2MultiApProfile::eMultiApProfile>(6)
++            : db->device_conf.multi_ap_profile;
++
+     const bool include_profile_tlv =
+-        (db->device_conf.multi_ap_profile >
++        (advertised_multi_ap_profile >
+          wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_1) ||
+         db->device_conf.is_multiap_profile_1_as_of_r4;
+ 
+@@ -1587,7 +1717,7 @@ bool ApAutoConfigurationTask::send_ap_autoconfiguration_search_message(
+             LOG(ERROR) << "addClass wfa_map::tlvProfile2MultiApProfile failed";
+             return false;
+         }
+-        tlvProfile2MultiApProfile->profile() = db->device_conf.multi_ap_profile;
++        tlvProfile2MultiApProfile->profile() = advertised_multi_ap_profile;
+     }
+ 
+     // Chirp TLV is meaningful for a wired extender (its Search reaches the controller
+@@ -1624,7 +1754,8 @@ bool ApAutoConfigurationTask::send_ap_autoconfiguration_search_message(
+     }
+ 
+     LOG(DEBUG) << "sending autoconfig search message, bridge_mac=" << db->bridge.mac
+-               << " multi_ap_profile=" << db->device_conf.multi_ap_profile
++               << " multi_ap_profile=" << static_cast<int>(advertised_multi_ap_profile)
++               << (db->device_conf.interop_with_qcomcontroller ? " (QCOM controller interop)" : "")
+                << (include_profile_tlv ? " with Profile TLV" : " without Profile TLV");
+     return m_btl_ctx.send_cmdu_to_controller({}, m_cmdu_tx);
+ }
+@@ -3518,6 +3649,32 @@ void ApAutoConfigurationTask::restart_autoconfiguration_for_all_radios()
+ 
+     db->statuses.controller_discovery_completed = false;
+ 
++    if (db->device_conf.sequential_ap_autoconfig) {
++        m_sequential_radio_order.clear();
++        m_sequential_active_radio.clear();
++        for (const auto &radio : db->get_radios_list()) {
++            if (!radio) {
++                continue;
++            }
++            m_radios_conf_params[radio->front.iface_name].state = eState::UNCONFIGURED;
++            m_radios_conf_params[radio->front.iface_name].m2_timeout_retry_count = 0;
++            m_discovery_status[radio->wifi_channel.get_freq_type()] = {};
++            m_sequential_radio_order.push_back(radio->front.iface_name);
++        }
++        std::stable_sort(m_sequential_radio_order.begin(), m_sequential_radio_order.end(),
++                         [&](const std::string &lhs, const std::string &rhs) {
++                             const auto lhs_radio = db->radio(lhs);
++                             const auto rhs_radio = db->radio(rhs);
++                             if (!lhs_radio || !rhs_radio) {
++                                 return lhs < rhs;
++                             }
++                             return static_cast<uint8_t>(lhs_radio->wifi_channel.get_freq_type()) <
++                                    static_cast<uint8_t>(rhs_radio->wifi_channel.get_freq_type());
++                         });
++        start_next_sequential_radio();
++        return;
++    }
++
+     for (const auto radio : db->get_radios_list()) {
+         if (!radio) {
+             return;
+@@ -4968,7 +5125,9 @@ bool ApAutoConfigurationTask::handle_agent_ap_mld_configuration_tlv(
+             auto db      = AgentDB::get();
+             if (conf_it != m_radios_conf_params.end() &&
+                 conf_it->second.state == eState::CONFIGURED &&
+-                db->dpp_extender_config.onboarding_type != AgentDB::OnboardingType::DPP) {
++                db->dpp_extender_config.onboarding_type != AgentDB::OnboardingType::DPP &&
++                (!db->device_conf.sequential_ap_autoconfig ||
++                 m_sequential_active_radio.empty())) {
+                 LOG(INFO) << "Radio " << iface_name
+                           << " newly added to MLD config while already CONFIGURED"
+                           << " — triggering re-autoconfiguration to obtain MLD IDs";
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+index 9137aef5d..8cf8599dd 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+@@ -122,6 +122,7 @@ private:
+     struct sConfigurationParams {
+         eState state = eState::UNCONFIGURED;
+         std::chrono::steady_clock::time_point timeout;
++        uint8_t m2_timeout_retry_count = 0;
+         std::unique_ptr<mapf::encryption::diffie_hellman> dh = nullptr;
+         //copy of M1 message used for authentication
+         uint8_t *m1_auth_buf         = nullptr;
+@@ -208,6 +209,10 @@ private:
+      */
+     std::unordered_map<std::string, sConfigurationParams> m_radios_conf_params;
+ 
++    // Active radio and deterministic order used when sequential onboarding is enabled.
++    std::vector<std::string> m_sequential_radio_order;
++    std::string m_sequential_active_radio;
++
+     /**
+      * @brief Convert enum of task state to string.
+      * 
+@@ -239,6 +244,8 @@ private:
+ 
+     bool m_task_is_active = false;
+ 
++    void start_next_sequential_radio();
++
+     /**
+      * @brief Stores the last bss_infos per radio interface name.
+      * Used by APPLY_HIDDEN_SSID_CONFIG event to re-apply credentials
+diff --git a/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp b/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp
+index 93760651f..2965cd4b6 100644
+--- a/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp
++++ b/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp
+@@ -846,9 +846,14 @@ bool CapabilityReportingTask::prepare_ap_capability_message(bool early)
+         return false;
+     }
+ #endif /* defined(IEEE80211_BN) */
+-    if (!slave_thread::add_eht_operations_tlv(m_cmdu_tx)) {
+-        LOG(ERROR) << "Error filling TLV_EHT_OPERATIONS";
+-        return false;
++    if (!early || !db->device_conf.interop_with_qcomcontroller) {
++        if (!slave_thread::add_eht_operations_tlv(m_cmdu_tx)) {
++            LOG(ERROR) << "Error filling TLV_EHT_OPERATIONS";
++            return false;
++        }
++    } else {
++        LOG(DEBUG) << "Skipping TLV_EHT_OPERATIONS in Early AP Capability Report "
++                      "for QCOM controller interoperability";
+     }
+ 
+     if (!early) {
+diff --git a/common/beerocks/bcl/include/bcl/beerocks_config_file.h b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+index bbcfc3ab4..00bfffa27 100644
+--- a/common/beerocks/bcl/include/bcl/beerocks_config_file.h
++++ b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+@@ -151,6 +151,8 @@ public:
+         std::string enable_cotdma;
+         std::string clients_unicast_measurements;
+         std::string send_btm_to_non_11v_sta;
++        std::string sequential_ap_autoconfig;
++        std::string interop_with_qcomcontroller;
+         std::string rsn_overriding_supported;
+         std::string beacon_11k_default_measurement_mode;
+         std::string beacon_11k_bsta_measurement_mode;
+diff --git a/common/beerocks/bcl/source/beerocks_config_file.cpp b/common/beerocks/bcl/source/beerocks_config_file.cpp
+index cbdf53415..fadf87940 100644
+--- a/common/beerocks/bcl/source/beerocks_config_file.cpp
++++ b/common/beerocks/bcl/source/beerocks_config_file.cpp
+@@ -204,6 +204,8 @@ bool config_file::read_slave_config_file(const std::string &config_file_path, sC
+             std::make_tuple("enable_cotdma=", &conf.enable_cotdma, 0),
+             std::make_tuple("clients_unicast_measurements=", &conf.clients_unicast_measurements, 0),
+             std::make_tuple("send_btm_to_non_11v_sta=", &conf.send_btm_to_non_11v_sta, 0),
++            std::make_tuple("sequential_ap_autoconfig=", &conf.sequential_ap_autoconfig, 0),
++            std::make_tuple("interop_with_qcomcontroller=", &conf.interop_with_qcomcontroller, 0),
+             std::make_tuple("rsn_overriding_supported=", &conf.rsn_overriding_supported, 0),
+             std::make_tuple("beacon_11k_default_measurement_mode=", &conf.beacon_11k_default_measurement_mode, 0),
+             std::make_tuple("beacon_11k_bsta_measurement_mode=", &conf.beacon_11k_bsta_measurement_mode, 0),
+-- 
+2.34.1
