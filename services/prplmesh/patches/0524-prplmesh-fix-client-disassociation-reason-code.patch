@@ -1,0 +1,229 @@
+From 3d074628ec5068a3857dd97a7d0950d23cd8f227 Mon Sep 17 00:00:00 2001
+From: Sandeep Tomer <stomer@qti.qualcomm.com>
+Date: Sat, 10 Oct 2026 22:31:39 +0530
+Subject: [PATCH] [prplmesh] fix client disassociation reason code propagation
+
+Capture client-originated Deauthentication and Disassociation reason codes
+from hostapd management frames and attach them to the matching client
+disconnect event. Widen the reason field to 16 bits so all IEEE 802.11
+reason codes are preserved.
+
+Signed-off-by: Sandeep Tomer <stomer@qti.qualcomm.com>
+---
+ .../bwl/include/bwl/base_wlan_hal_types.h     |  2 +-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 99 ++++++++++++++++++-
+ .../bwl/nl80211/ap_wlan_hal_nl80211.h         | 12 +++
+ .../beerocks/tlvf/beerocks_message_common.h   |  3 +-
+ .../tlvf/beerocks_message_common.yaml         |  2 +-
+ 5 files changed, 113 insertions(+), 5 deletions(-)
+
+diff --git a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+index 178c163ed..613947763 100644
+--- a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
++++ b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+@@ -457,7 +457,7 @@ typedef struct {
+     sMacAddr bssid;
+ #endif
+     int8_t vap_id;
+-    uint8_t reason;
++    uint16_t reason;
+     uint8_t source;
+     uint8_t type;
+ } sClientDisconnectionParams;
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index b231a13e0..132f9adfd 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -68,6 +68,11 @@ static constexpr auto MLD_ADD_TARGET_READY_RETRY_DELAY = std::chrono::millisecon
+ static constexpr char MLD_RECONFIG_LOCK_PATH[] =
+     "/var/lock/prplmesh-mld-reconfig.lock";
+ 
++// A Deauthentication/Disassociation frame is delivered just before the corresponding
++// AP-STA-DISCONNECTED event. Do not reuse an old reason if hostapd never emits that event.
++static constexpr auto PENDING_DISCONNECTION_REASON_MAX_AGE = std::chrono::seconds(2);
++static constexpr size_t MAX_PENDING_DISCONNECTION_REASONS  = 256;
++
+ // A credential update changes hostapd configuration shared by all radio processes and may
+ // create/remove MLO links. Hold this lock for the complete transaction so another radio
+ // cannot start an MLD operation against partially updated credentials.
+@@ -8352,8 +8357,81 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+             LOG(ERROR) << "Management frame without data!";
+             return false;
+         }
++
++        const auto &frame_hex = parsed_obj["buf"];
++        constexpr size_t DEAUTH_DISASSOC_FRAME_LENGTH =
++            sizeof(s80211MgmtFrame::sHeader) + sizeof(uint16_t);
++
++        // hostapd sends the client-originated Deauthentication/Disassociation frame before
++        // AP-STA-DISCONNECTED. The latter event has no reason code, so retain the on-air
++        // reason for the matching disconnect notification.
++        bool frame_is_hex = (frame_hex.size() % 2 == 0);
++        for (const auto c : frame_hex) {
++            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
++                  (c >= 'A' && c <= 'F'))) {
++                frame_is_hex = false;
++                break;
++            }
++        }
++
++        if (frame_is_hex) {
++            const auto raw_frame =
++                beerocks::string_utils::hex_to_bytes<std::vector<uint8_t>>(frame_hex);
++
++            if (raw_frame.size() >= DEAUTH_DISASSOC_FRAME_LENGTH) {
++                const auto *frame_header =
++                    reinterpret_cast<const s80211MgmtFrame *>(raw_frame.data());
++                const auto frame_type = frame_header->header.frame_control.bits.type;
++                const auto frame_subtype = frame_header->header.frame_control.bits.subtype;
++
++                if (frame_type == 0 &&
++                    (frame_subtype == static_cast<uint8_t>(s80211MgmtFrame::eType::DEAUTH) ||
++                     frame_subtype == static_cast<uint8_t>(s80211MgmtFrame::eType::DISASSOC))) {
++                    const auto sta_mac = tlvf::mac_to_string(frame_header->header.sa);
++                    const auto cache_key = std::to_string(vap_id) + ":" + sta_mac;
++                    // Reason Code is a little-endian 16-bit field right after the header.
++                    // Explicit cast: the shift/or promotes to int, which cannot be used in the
++                    // braced initializer below without a (-Werror) narrowing conversion.
++                    const uint16_t reason = static_cast<uint16_t>(
++                        raw_frame[sizeof(s80211MgmtFrame::sHeader)] |
++                        (raw_frame[sizeof(s80211MgmtFrame::sHeader) + 1] << 8));
++
++                    const auto now = std::chrono::steady_clock::now();
++                    for (auto it = m_pending_disconnection_reasons.begin();
++                         it != m_pending_disconnection_reasons.end();) {
++                        if (now - it->second.received_at > PENDING_DISCONNECTION_REASON_MAX_AGE) {
++                            it = m_pending_disconnection_reasons.erase(it);
++                        } else {
++                            ++it;
++                        }
++                    }
++
++                    if (m_pending_disconnection_reasons.size() >=
++                            MAX_PENDING_DISCONNECTION_REASONS &&
++                        m_pending_disconnection_reasons.find(cache_key) ==
++                            m_pending_disconnection_reasons.end()) {
++                        LOG(WARNING) << "Clearing full pending-disconnection-reason cache";
++                        m_pending_disconnection_reasons.clear();
++                    }
++
++                    m_pending_disconnection_reasons[cache_key] = {
++                        reason,
++                        std::chrono::steady_clock::now(),
++                    };
++                    LOG(DEBUG) << "Cached "
++                               << (frame_subtype == static_cast<uint8_t>(
++                                                        s80211MgmtFrame::eType::DEAUTH)
++                                       ? "Deauthentication"
++                                       : "Disassociation")
++                               << " reason=" << reason << " for STA " << sta_mac
++                               << " on vap_id=" << vap_id;
++                    break;
++                }
++            }
++        }
++
+         // Tunnel the Management request to the controller
+-        auto mgmt_frame = create_mgmt_frame_notification(parsed_obj["buf"].c_str());
++        auto mgmt_frame = create_mgmt_frame_notification(frame_hex.c_str());
+         if (mgmt_frame) {
+             event_queue_push(Event::MGMT_Frame, mgmt_frame);
+             // only save association and re-association request frames:
+@@ -8525,11 +8603,28 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+         msg->params.vap_id = vap_id;
+         msg->params.mac    = tlvf::mac_from_string(parsed_obj[bwl::EVENT_KEYLESS_PARAM_MAC]);
+ 
++        const auto sta_mac   = tlvf::mac_to_string(msg->params.mac);
++        const auto cache_key = std::to_string(vap_id) + ":" + sta_mac;
++        const auto reason_it = m_pending_disconnection_reasons.find(cache_key);
++        if (reason_it != m_pending_disconnection_reasons.end()) {
++            const auto reason_age = std::chrono::steady_clock::now() - reason_it->second.received_at;
++            if (reason_age <= PENDING_DISCONNECTION_REASON_MAX_AGE) {
++                msg->params.reason = reason_it->second.reason;
++                LOG(DEBUG) << "Using cached disconnect reason=" << msg->params.reason
++                           << " for STA " << sta_mac << " on vap_id=" << vap_id;
++            } else {
++                LOG(DEBUG) << "Discarding stale disconnect reason for STA " << sta_mac
++                           << " on vap_id=" << vap_id;
++            }
++            // Do not erase on use: hostapd reports AP-STA-DISCONNECTED on both the global and
++            // the per-VAP control sockets and each one is forwarded as a separate disconnect
++            // event, so the duplicate must see the same reason. Entries expire by age instead.
++        }
++
+         // Add the message to the queue
+         event_queue_push(Event::STA_Disconnected, msg_buff);
+ 
+         {
+-            const std::string &sta_mac = parsed_obj[bwl::EVENT_KEYLESS_PARAM_MAC];
+             m_latest_assoc_frame.erase(sta_mac);
+             // Remove the entry from the shared assoc frame DB.
+             remove_assoc_frame(sta_mac);
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+index e43e82bcb..bb9902991 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+@@ -13,9 +13,11 @@
+ #include <bwl/ap_wlan_hal.h>
+ #include <bpl/bpl_cfg.h>
+ #include <hostapd/configuration.h>
++#include <chrono>
+ #include <functional>
+ #include <set>
+ #include <string>
++#include <unordered_map>
+ #include <utility>
+ #include <vector>
+ 
+@@ -318,6 +320,16 @@ private:
+     // include it in STA-CONNECTED:
+     std::unordered_map<std::string, std::shared_ptr<sMGMT_FRAME_NOTIFICATION>>
+         m_latest_assoc_frame = {};
++
++    // hostapd reports a received Deauthentication/Disassociation frame separately from
++    // AP-STA-DISCONNECTED. Keep its 802.11 reason until the matching disconnect arrives.
++    struct sPendingDisconnectionReason {
++        uint16_t reason;
++        std::chrono::steady_clock::time_point received_at;
++    };
++    std::unordered_map<std::string, sPendingDisconnectionReason>
++        m_pending_disconnection_reasons = {};
++
+     uint16_t m_aid           = 2007; // AIDs must be in the range 1-2007
+     // Primary VLAN ID for the backhaul AP; set by set_primary_vlan_id() and
+     // embedded in the hostapd conf by create_new_hostapd_conf_file().
+diff --git a/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_common.h b/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_common.h
+index 022fed929..005e3f821 100644
+--- a/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_common.h
++++ b/common/beerocks/tlvf/AutoGenerated/include/beerocks/tlvf/beerocks_message_common.h
+@@ -193,12 +193,13 @@ typedef struct sClientDisconnectionParams {
+     sMacAddr mac;
+     sMacAddr bssid;
+     int8_t vap_id;
+-    uint8_t reason;
++    uint16_t reason;
+     uint8_t source;
+     uint8_t type;
+     void struct_swap(){
+         mac.struct_swap();
+         bssid.struct_swap();
++        tlvf_swap(16, reinterpret_cast<uint8_t*>(&reason));
+     }
+     void struct_init(){
+         mac.struct_init();
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_common.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_common.yaml
+index 8f7fc722f..90f005191 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_common.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_common.yaml
+@@ -154,7 +154,7 @@ sClientDisconnectionParams:
+   mac: sMacAddr
+   bssid: sMacAddr
+   vap_id: int8_t
+-  reason: uint8_t
++  reason: uint16_t
+   source: uint8_t
+   type: uint8_t
+ 
+-- 
+2.34.1
+
