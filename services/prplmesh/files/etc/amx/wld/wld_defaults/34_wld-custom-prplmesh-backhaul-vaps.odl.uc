@@ -1,16 +1,5 @@
 %populate {
     object WiFi {
-        object Radio {
-{% for ( let Radio in BD.Radios ) : %}
-            object '{{Radio.Alias}}' {
-                parameter DTIMPeriod = 2;
-                object IEEE80211be {
-                    parameter MLReconfigurationCount = 12;
-                }
-            }
-{% endfor; %}
-        }
-
         object AccessPoint {
 {% for ( let Itf in BD.Interfaces ) : if ( BDfn.isInterfaceWirelessAp(Itf.Name) ) : %}
 {% if (Itf.OperatingFrequency != "") : %}

@@ -168,6 +168,8 @@ define Package/prplmesh/install
 	$(INSTALL_DIR) $(1)/etc/amx/prplmesh/defaults.d
 	$(INSTALL_DIR) $(1)/etc/amx/tr181-device/extensions
 	$(INSTALL_DIR) $(1)/etc/amx/tr181-syslog/defaults.d
+	$(INSTALL_DIR) $(1)/etc/amx/tr181-bridging/tr181-bridging_defaults/
+	$(INSTALL_DIR) $(1)/etc/amx/wld/wld_defaults/
 	$(INSTALL_BIN) ./files/etc/init.d/* $(1)/etc/init.d/
 ifeq ($(CONFIG_PACKAGE_prplmesh-process-manager),y)
 	echo 'enable() { return 0; }' >>$(1)/etc/init.d/prplmesh
@@ -175,6 +177,8 @@ endif
 	$(INSTALL_BIN) ./files/etc/uci-defaults/* $(1)/etc/uci-defaults/
 	$(CP) ./files/etc/amx/prplmesh/defaults.d/* $(1)/etc/amx/prplmesh/defaults.d/
 	$(CP) ./files/etc/amx/tr181-syslog/defaults.d/* $(1)/etc/amx/tr181-syslog/defaults.d/
+	$(CP) ./files/etc/amx/tr181-bridging/tr181-bridging_defaults/* $(1)/etc/amx/tr181-bridging/tr181-bridging_defaults/
+	$(CP) ./files/etc/amx/wld/wld_defaults/* $(1)/etc/amx/wld/wld_defaults/
 	$(CP) $(PKG_INSTALL_DIR)/opt/prplmesh/bin $(1)/opt/prplmesh/
 	$(CP) $(PKG_INSTALL_DIR)/opt/prplmesh/scripts $(1)/opt/prplmesh/
 	$(CP) $(PKG_INSTALL_DIR)/opt/prplmesh/lib/*.so* $(1)/usr/lib/
