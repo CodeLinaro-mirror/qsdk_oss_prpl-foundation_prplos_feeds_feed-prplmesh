@@ -1,0 +1,953 @@
+From a100e93585ee997c04933e88072987fa2dcfc570 Mon Sep 17 00:00:00 2001
+From: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+Date: Wed, 14 Oct 2026 01:45:47 +0530
+Subject: [PATCH] prplMesh: harden MLO association and metrics handling
+
+Problem:
+
+MLO association capabilities and link metrics could be lost or reported
+inconsistently after link changes. Association-frame persistence was
+also vulnerable to malformed data and concurrent updates, while the
+11k response window was fixed at ten seconds.
+
+Root cause:
+
+Association frames were keyed only by an affiliated link and capability
+reporting did not reliably verify frame availability. The association
+frame database used unsynchronized read-modify-write operations and
+exception-prone hexadecimal parsing. The 11k timeout was a compile-time
+constant.
+
+Fix:
+
+Recover association capabilities using the client MLD and sibling AP MLD,
+validate frame data, serialize and atomically persist database updates,
+and make the 11k response timeout configurable. The existing MLO handling
+and country-code advertisement changes from patch 0494 were already present
+in the target history.
+
+Change-Id: I7f4c1a8d2e6b4903a5c7d9e1f8b6c2a4d0e5f7b9
+Signed-off-by: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+---
+ agent/config/beerocks_agent.conf.in           |   4 +
+ agent/src/beerocks/slave/agent_db.h           |   1 +
+ .../beerocks/slave/beerocks_agent_main.cpp    |   1 +
+ agent/src/beerocks/slave/son_slave_thread.cpp |  17 +
+ agent/src/beerocks/slave/son_slave_thread.h   |   1 +
+ .../slave/tasks/capability_reporting_task.cpp |  29 +-
+ .../tasks/link_metrics_collection_task.cpp    |   7 +-
+ .../bcl/include/bcl/beerocks_config_file.h    |   1 +
+ .../bcl/source/beerocks_config_file.cpp       |   2 +
+ common/beerocks/bwl/common/base_wlan_hal.cpp  | 315 ++++++++++++++++++
+ .../beerocks/bwl/include/bwl/assoc_frame_db.h | 133 +-------
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 154 +++++----
+ 12 files changed, 463 insertions(+), 202 deletions(-)
+
+diff --git a/agent/config/beerocks_agent.conf.in b/agent/config/beerocks_agent.conf.in
+index 6fdb28b67..3cd75ca7f 100644
+--- a/agent/config/beerocks_agent.conf.in
++++ b/agent/config/beerocks_agent.conf.in
+@@ -120,6 +120,10 @@ dwell_time=20
+ # Valid range: 10-5000 ms. Default: 500 ms.
+ unassoc_sta_roc_duration_ms=500
+ 
++# multi_chan_bcn_resp_timeout: Minimum timeout before sending a multi-channel
++# Beacon Metrics Response, in milliseconds. Default: 3000 ms.
++multi_chan_bcn_resp_timeout=3000
++
+ # Indicates whether unicast traffic statistics are collected per station
+ # 1 = enable
+ clients_unicast_measurements=0
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 3f3ba8b0d..8cc33f5e9 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -177,6 +177,7 @@ public:
+         int zwdfs_flag;
+         uint32_t best_channel_rank_threshold;
+         uint16_t multi_chan_bcn_req_duration;
++        uint32_t multi_chan_bcn_resp_timeout;
+ 
+         std::string vendor;
+         std::string model;
+diff --git a/agent/src/beerocks/slave/beerocks_agent_main.cpp b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+index 01d397bb7..9ee49dcfd 100644
+--- a/agent/src/beerocks/slave/beerocks_agent_main.cpp
++++ b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+@@ -245,6 +245,7 @@ static void fill_son_slave_config(const beerocks::config_file::sConfigSlave &bee
+             : static_cast<uint16_t>(beerocks::eGlobals::UCC_LISTENER_PORT);
+     agent_conf.bridge_iface             = beerocks_slave_conf.bridge_iface;
+     agent_conf.backhaul_preferred_bssid = beerocks_slave_conf.backhaul_preferred_bssid;
++    agent_conf.multi_chan_bcn_resp_timeout = beerocks_slave_conf.multi_chan_bcn_resp_timeout;
+ 
+     // disable stopping on failure initially. Later on, it will be read from BPL as part of
+     // cACTION_PLATFORM_SON_SLAVE_REGISTER_RESPONSE
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 3db123618..63ad3eabf 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -125,6 +125,8 @@ constexpr std::chrono::seconds WAIT_FOR_FRONTHAUL_JOINED_TIMEOUT_SEC  = std::chr
+ 
+ namespace {
+ 
++constexpr uint32_t DEFAULT_MULTI_CHAN_BCN_RESP_TIMEOUT = 3000;
++
+ // Mirrors controller-side DppCryptoHelper::ec_key_to_jwk() (not linked into the agent build);
+ // hand-adapted here since this is the only agent-side call site that needs DER->JWK for DPP.
+ std::string base64url_encode(const uint8_t *data, size_t len)
+@@ -884,6 +886,19 @@ bool slave_thread::read_platform_configuration()
+                      << " using default configuration ";
+     }
+ 
++    db->device_conf.multi_chan_bcn_resp_timeout = DEFAULT_MULTI_CHAN_BCN_RESP_TIMEOUT;
++    if (!config.multi_chan_bcn_resp_timeout.empty()) {
++        const auto timeout_ms = beerocks::string_utils::stoi(config.multi_chan_bcn_resp_timeout);
++        if (timeout_ms > 0) {
++            db->device_conf.multi_chan_bcn_resp_timeout = static_cast<uint32_t>(timeout_ms);
++        } else {
++            LOG(WARNING) << "Invalid multi_chan_bcn_resp_timeout value: "
++                         << config.multi_chan_bcn_resp_timeout
++                         << ", using default "
++                         << DEFAULT_MULTI_CHAN_BCN_RESP_TIMEOUT << " ms";
++        }
++    }
++
+     if (!bpl::get_max_prioritization_rules(db->device_conf.max_prioritization_rules)) {
+         LOG(WARNING) << "get_max_prioritization_rules() failed!"
+                      << " using default configuration ";
+@@ -1001,6 +1016,8 @@ bool slave_thread::read_platform_configuration()
+     LOG(DEBUG) << beerocks::utils::get_zwdfs_string(db->device_conf.zwdfs_flag);
+     LOG(DEBUG) << "best_channel_rank_threshold: " << db->device_conf.best_channel_rank_threshold;
+     LOG(DEBUG) << "multi_chan_bcn_req_duration: " << db->device_conf.multi_chan_bcn_req_duration;
++    LOG(DEBUG) << "multi_chan_bcn_resp_timeout: "
++               << db->device_conf.multi_chan_bcn_resp_timeout << " ms";
+     LOG(DEBUG) << "max_prioritization_rules: " << db->device_conf.max_prioritization_rules;
+     LOG(DEBUG) << "check_connectivity_to_controller_enable: "
+                << db->device_conf.check_connectivity_to_controller_enable;
+diff --git a/agent/src/beerocks/slave/son_slave_thread.h b/agent/src/beerocks/slave/son_slave_thread.h
+index 355d31c47..5c58246b9 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.h
++++ b/agent/src/beerocks/slave/son_slave_thread.h
+@@ -60,6 +60,7 @@ public:
+         std::string bridge_iface;
+         int stop_on_failure_attempts;
+         std::string backhaul_preferred_bssid;
++        std::string multi_chan_bcn_resp_timeout;
+ 
+         // Radio configuration
+         struct sRadioConfig {
+diff --git a/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp b/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp
+index b61952189..22c644a72 100644
+--- a/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp
++++ b/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp
+@@ -169,13 +169,11 @@ void CapabilityReportingTask::handle_client_capability_query(ieee1905_1::CmduMes
+         return;
+     }
+ 
+-    client_capability_report_tlv->result_code() = wfa_map::tlvClientCapabilityReport::SUCCESS;
+-    LOG(DEBUG) << "Result Code: SUCCESS";
+-
+     // Add frame body of the most recently received (Re)Association Request frame from this client.
+     auto &client_info = radio->associated_clients.at(client_info_tlv_r->client_mac());
++    bool association_frame_found = client_info.association_frame_length > 0;
+ 
+-    if (client_info.association_frame_length > 0) {
++    if (association_frame_found) {
+         // Frame is in memory — normal path for SLO clients and MLO clients where
+         // AP-MGMT-FRAME-RECEIVED arrived before AP-STA-CONNECTED.
+         client_capability_report_tlv->set_association_frame(client_info.association_frame.data(),
+@@ -229,12 +227,35 @@ void CapabilityReportingTask::handle_client_capability_query(ieee1905_1::CmduMes
+             }
+         }
+ 
++        // The affiliated-link map may not be populated yet when the first
++        // capability query races the MLO connection event. Scan persisted
++        // frames by the embedded MLD MAC as the final MLO fallback.
++        if (frame_bytes.empty()) {
++            frame_bytes = bwl::restore_assoc_frame_from_db_by_mld_mac(
++                tlvf::mac_to_string(client_info_tlv_r->client_mac()));
++            if (!frame_bytes.empty()) {
++                LOG(DEBUG) << "Capability report: restored assoc frame by MLD MAC "
++                           << client_info_tlv_r->client_mac() << " (" << frame_bytes.size()
++                           << " bytes)";
++            }
++        }
++
+         if (!frame_bytes.empty()) {
+             client_capability_report_tlv->set_association_frame(
+                 frame_bytes.data(), frame_bytes.size());
++            association_frame_found = true;
+         }
+     }
+ 
++    if (!association_frame_found) {
++        client_capability_report_tlv->result_code() = wfa_map::tlvClientCapabilityReport::FAILURE;
++        LOG(WARNING) << "Capability report: association frame unavailable for STA "
++                     << client_info_tlv_r->client_mac();
++    } else {
++        client_capability_report_tlv->result_code() = wfa_map::tlvClientCapabilityReport::SUCCESS;
++        LOG(DEBUG) << "Result Code: SUCCESS";
++    }
++
+     LOG(DEBUG) << "Send a CLIENT_CAPABILITY_REPORT_MESSAGE back to controller";
+     m_btl_ctx.send_cmdu_to_controller({}, m_cmdu_tx);
+ }
+diff --git a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+index 467b1fcc5..4b889a4b7 100644
+--- a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+@@ -164,9 +164,6 @@ using namespace multi_vendor;
+ /* Minimum delay between consecutive Beacon Metrics Queries (in ms) */
+ #define MULTI_CHAN_MIN_BCN_REQ_DELAY 400
+ 
+-/* Minimum timeout to send the Beacon Metrics Response (in ms) */
+-#define MULTI_CHAN_MIN_BCN_RESP_TIMEOUT 10000
+-
+ namespace beerocks {
+ 
+ LinkMetricsCollectionTask::LinkMetricsCollectionTask(
+@@ -610,9 +607,9 @@ bool LinkMetricsCollectionTask::schedule_beacon_metrics_query(
+     if (ap_channel_reports_list_length != 0) {
+         timeout_ms = (beacon_params.chan_report_list.size() *
+                           (MULTI_CHAN_MIN_BCN_REQ_DELAY + beacon_params.params.duration) +
+-                      MULTI_CHAN_MIN_BCN_RESP_TIMEOUT);
++                      db->device_conf.multi_chan_bcn_resp_timeout);
+     } else {
+-        timeout_ms = MULTI_CHAN_MIN_BCN_RESP_TIMEOUT;
++        timeout_ms = db->device_conf.multi_chan_bcn_resp_timeout;
+     }
+ 
+     /* Inform ALL AP Managers to catch the beacon metrics responses.
+diff --git a/common/beerocks/bcl/include/bcl/beerocks_config_file.h b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+index 00bfffa27..34ec8ca20 100644
+--- a/common/beerocks/bcl/include/bcl/beerocks_config_file.h
++++ b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+@@ -119,6 +119,7 @@ public:
+         std::string monitor_polling_rate_msec;
+         std::string monitor_measurement_window_poll_count;
+         std::string unassoc_sta_roc_duration_ms;
++        std::string multi_chan_bcn_resp_timeout;
+         std::string profile_x_disallow_override_unsupported_configuration;
+         std::string on_boot_scan;
+         std::string dwell_time;
+diff --git a/common/beerocks/bcl/source/beerocks_config_file.cpp b/common/beerocks/bcl/source/beerocks_config_file.cpp
+index fadf87940..c6e124406 100644
+--- a/common/beerocks/bcl/source/beerocks_config_file.cpp
++++ b/common/beerocks/bcl/source/beerocks_config_file.cpp
+@@ -183,6 +183,8 @@ bool config_file::read_slave_config_file(const std::string &config_file_path, sC
+                             &conf.monitor_measurement_window_poll_count, 0),
+             std::make_tuple("unassoc_sta_roc_duration_ms=",
+                             &conf.unassoc_sta_roc_duration_ms, 0),
++            std::make_tuple("multi_chan_bcn_resp_timeout=",
++                            &conf.multi_chan_bcn_resp_timeout, 0),
+             std::make_tuple("profile_x_disallow_override_unsupported_configuration=",
+                             &conf.profile_x_disallow_override_unsupported_configuration, 0),
+             std::make_tuple("on_boot_scan=", &conf.on_boot_scan, 0),
+diff --git a/common/beerocks/bwl/common/base_wlan_hal.cpp b/common/beerocks/bwl/common/base_wlan_hal.cpp
+index 0fcf524d6..1cbe2f062 100644
+--- a/common/beerocks/bwl/common/base_wlan_hal.cpp
++++ b/common/beerocks/bwl/common/base_wlan_hal.cpp
+@@ -7,14 +7,23 @@
+  */
+ 
+ #include <bwl/base_wlan_hal.h>
++#include <bwl/assoc_frame_db.h>
+ 
+ #include <bcl/beerocks_string_utils.h>
+ #include <bpl/bpl_cfg.h>
+ 
+ #include <errno.h>
++#include <cerrno>
++#include <cstring>
++#include <fcntl.h>
++#include <fstream>
++#include <iomanip>
++#include <sstream>
+ #include <sys/eventfd.h>
++#include <sys/file.h>
+ #include <unistd.h>
+ #include <unordered_set>
++#include <utility>
+ 
+ #include <easylogging++.h>
+ 
+@@ -354,4 +363,310 @@ void base_wlan_hal::extractRadioId(const std::string &interface_name, int &radio
+     }
+ }
+ 
++namespace {
++
++static constexpr const char *ASSOC_FRAMES_DB_LOCK_PATH = "/tmp/beerocks/sta_assoc_frames.lock";
++static constexpr const char *ASSOC_FRAMES_DB_DIR_PATH  = "/tmp/beerocks";
++
++class DbLock {
++public:
++    DbLock() : m_fd(::open(ASSOC_FRAMES_DB_LOCK_PATH, O_CREAT | O_RDWR | O_CLOEXEC, 0644))
++    {
++        if (m_fd < 0) {
++            LOG(ERROR) << "assoc frame DB: failed to open lock file "
++                       << ASSOC_FRAMES_DB_LOCK_PATH << ": " << std::strerror(errno);
++            return;
++        }
++        int result;
++        do {
++            result = ::flock(m_fd, LOCK_EX);
++        } while (result < 0 && errno == EINTR);
++        if (result < 0) {
++            LOG(ERROR) << "assoc frame DB: failed to lock " << ASSOC_FRAMES_DB_LOCK_PATH
++                       << ": " << std::strerror(errno);
++            ::close(m_fd);
++            m_fd = -1;
++            return;
++        }
++        m_locked = true;
++    }
++
++    ~DbLock()
++    {
++        if (m_fd < 0) return;
++        if (m_locked && ::flock(m_fd, LOCK_UN) < 0) {
++            LOG(ERROR) << "assoc frame DB: failed to unlock " << ASSOC_FRAMES_DB_LOCK_PATH
++                       << ": " << std::strerror(errno);
++        }
++        ::close(m_fd);
++    }
++
++    bool acquired() const { return m_locked; }
++    DbLock(const DbLock &)            = delete;
++    DbLock &operator=(const DbLock &) = delete;
++
++private:
++    int  m_fd     = -1;
++    bool m_locked = false;
++};
++
++static std::string assoc_frame_bytes_to_hex(const std::vector<uint8_t> &bytes)
++{
++    std::ostringstream hex;
++    for (uint8_t byte : bytes) {
++        hex << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
++    }
++    return hex.str();
++}
++
++static bool write_all(int fd, const std::string &data)
++{
++    size_t offset = 0;
++    while (offset < data.size()) {
++        const ssize_t written = ::write(fd, data.data() + offset, data.size() - offset);
++        if (written < 0 && errno == EINTR) continue;
++        if (written <= 0) return false;
++        offset += static_cast<size_t>(written);
++    }
++    return true;
++}
++
++static bool write_assoc_frame_db_atomic(const std::vector<std::string> &lines)
++{
++    char tmp_path[] = "/tmp/beerocks/sta_assoc_frames.txt.XXXXXX";
++    const int fd     = ::mkstemp(tmp_path);
++    if (fd < 0) {
++        LOG(ERROR) << "assoc frame DB: failed to create temporary file: "
++                   << std::strerror(errno);
++        return false;
++    }
++
++    std::string contents;
++    for (const auto &line : lines) {
++        contents += line;
++        contents.push_back('\n');
++    }
++
++    bool success = write_all(fd, contents);
++    if (success && ::fsync(fd) < 0) {
++        LOG(ERROR) << "assoc frame DB: failed to sync temporary file: "
++                   << std::strerror(errno);
++        success = false;
++    }
++    if (::close(fd) < 0) success = false;
++    if (!success) {
++        ::unlink(tmp_path);
++        return false;
++    }
++
++    if (::rename(tmp_path, ASSOC_FRAMES_DB_PATH) < 0) {
++        LOG(ERROR) << "assoc frame DB: failed to replace database: "
++                   << std::strerror(errno);
++        ::unlink(tmp_path);
++        return false;
++    }
++
++    const int dir_fd = ::open(ASSOC_FRAMES_DB_DIR_PATH, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++    if (dir_fd < 0) {
++        LOG(ERROR) << "assoc frame DB: failed to open database directory for sync: "
++                   << std::strerror(errno);
++        return false;
++    }
++    const bool dir_synced = (::fsync(dir_fd) == 0);
++    if (!dir_synced) {
++        LOG(ERROR) << "assoc frame DB: failed to sync database directory: "
++                   << std::strerror(errno);
++    }
++    ::close(dir_fd);
++    return dir_synced;
++}
++
++static bool decode_assoc_frame_hex(const std::string &hex_str, std::vector<uint8_t> &out)
++{
++    auto nibble = [](char c) -> int {
++        if (c >= '0' && c <= '9') return c - '0';
++        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
++        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
++        return -1;
++    };
++    out.clear();
++    if (hex_str.empty() || hex_str.size() % 2) return false;
++    out.reserve(hex_str.size() / 2);
++    for (size_t i = 0; i < hex_str.size(); i += 2) {
++        const int hi = nibble(hex_str[i]);
++        const int lo = nibble(hex_str[i + 1]);
++        if (hi < 0 || lo < 0) {
++            out.clear();
++            return false;
++        }
++        out.push_back(static_cast<uint8_t>((hi << 4) | lo));
++    }
++    return true;
++}
++
++} // namespace
++
++bool persist_assoc_frame(const std::string &sta_mac, const std::vector<uint8_t> &frame)
++{
++    DbLock db_lock;
++    if (!db_lock.acquired()) return false;
++
++    std::vector<std::string> lines;
++    std::ifstream ifs(ASSOC_FRAMES_DB_PATH);
++    if (ifs) {
++        std::string line;
++        while (std::getline(ifs, line)) {
++            if (line.empty()) continue;
++            std::istringstream ss(line);
++            std::string mac;
++            ss >> mac;
++            if (mac != sta_mac) lines.push_back(line);
++        }
++    }
++    lines.push_back(sta_mac + " " + assoc_frame_bytes_to_hex(frame));
++    if (!write_assoc_frame_db_atomic(lines)) {
++        LOG(ERROR) << "Failed to persist assoc frame for " << sta_mac;
++        return false;
++    }
++    LOG(DEBUG) << "Persisted assoc frame for " << sta_mac << " (" << frame.size()
++               << " bytes) to " << ASSOC_FRAMES_DB_PATH;
++    return true;
++}
++
++bool remove_assoc_frame(const std::string &sta_mac)
++{
++    DbLock db_lock;
++    if (!db_lock.acquired()) return false;
++
++    std::ifstream ifs(ASSOC_FRAMES_DB_PATH);
++    if (!ifs) return true;
++    std::vector<std::string> lines;
++    std::string line;
++    bool removed = false;
++    while (std::getline(ifs, line)) {
++        if (line.empty()) continue;
++        std::istringstream ss(line);
++        std::string mac;
++        ss >> mac;
++        if (mac == sta_mac) {
++            removed = true;
++        } else {
++            lines.push_back(line);
++        }
++    }
++    if (!removed) return true;
++    if (!write_assoc_frame_db_atomic(lines)) {
++        LOG(ERROR) << "Failed to remove persisted assoc frame for " << sta_mac;
++        return false;
++    }
++    LOG(DEBUG) << "Removed persisted assoc frame for " << sta_mac << " from "
++               << ASSOC_FRAMES_DB_PATH;
++    return true;
++}
++
++bool extract_mld_mac_from_assoc_frame(const std::vector<uint8_t> &frame,
++                                      std::string &mld_mac_out)
++{
++    static constexpr uint8_t IE_ID_EXTENSION     = 255;
++    static constexpr uint8_t IE_EXT_MULTI_LINK   = 107;
++    static constexpr size_t MLE_MLCTRL_OFFSET    = 1;
++    static constexpr size_t MLE_CINFO_LEN_OFFSET = 3;
++    static constexpr size_t MLE_CINFO_MAC_OFFSET = 4;
++    static constexpr size_t MLE_CINFO_MIN_LEN    = 7;
++    static constexpr uint16_t candidate_offsets[] = {4, 10};
++
++    size_t best_offset = 4;
++    int best_count     = -1;
++    for (uint16_t offset : candidate_offsets) {
++        if (frame.size() <= static_cast<size_t>(offset) + 2) continue;
++        size_t pos = offset;
++        int count  = 0;
++        while (pos + 2 <= frame.size()) {
++            const uint8_t element_len = frame[pos + 1];
++            if (pos + 2 + element_len > frame.size()) break;
++            ++count;
++            pos += 2 + element_len;
++        }
++        if (count > best_count) {
++            best_count  = count;
++            best_offset = offset;
++        }
++    }
++
++    size_t pos         = best_offset;
++    const uint8_t *mle = nullptr;
++    size_t mle_len     = 0;
++    while (pos + 2 <= frame.size()) {
++        const uint8_t id           = frame[pos];
++        const uint8_t element_len  = frame[pos + 1];
++        if (pos + 2 + element_len > frame.size()) break;
++        if (id == IE_ID_EXTENSION && element_len >= 1 && frame[pos + 2] == IE_EXT_MULTI_LINK) {
++            mle     = frame.data() + pos + 2;
++            mle_len = element_len;
++            break;
++        }
++        pos += 2 + element_len;
++    }
++    if (!mle || mle_len < MLE_CINFO_MAC_OFFSET + 6 ||
++        (mle[MLE_MLCTRL_OFFSET] & 0x07) != 0 ||
++        mle[MLE_CINFO_LEN_OFFSET] < MLE_CINFO_MIN_LEN) {
++        return false;
++    }
++
++    char mac_buf[18];
++    std::snprintf(mac_buf, sizeof(mac_buf), "%02x:%02x:%02x:%02x:%02x:%02x",
++                  mle[MLE_CINFO_MAC_OFFSET], mle[MLE_CINFO_MAC_OFFSET + 1],
++                  mle[MLE_CINFO_MAC_OFFSET + 2], mle[MLE_CINFO_MAC_OFFSET + 3],
++                  mle[MLE_CINFO_MAC_OFFSET + 4], mle[MLE_CINFO_MAC_OFFSET + 5]);
++    mld_mac_out = mac_buf;
++    return true;
++}
++
++std::vector<uint8_t> restore_assoc_frame_from_db(const std::string &sta_mac)
++{
++    std::ifstream ifs(ASSOC_FRAMES_DB_PATH);
++    if (!ifs) return {};
++    std::vector<uint8_t> valid_frame;
++    std::string line;
++    while (std::getline(ifs, line)) {
++        if (line.empty()) continue;
++        std::istringstream ss(line);
++        std::string mac, hex_str;
++        ss >> mac >> hex_str;
++        if (mac != sta_mac) continue;
++        std::vector<uint8_t> frame;
++        if (!decode_assoc_frame_hex(hex_str, frame)) {
++            LOG(WARNING) << "assoc frame DB: corrupt entry for " << mac << ", skipping";
++            continue;
++        }
++        valid_frame = std::move(frame);
++    }
++    return valid_frame;
++}
++
++std::vector<uint8_t> restore_assoc_frame_from_db_by_mld_mac(const std::string &mld_mac)
++{
++    std::ifstream ifs(ASSOC_FRAMES_DB_PATH);
++    if (!ifs) return {};
++    std::string line;
++    while (std::getline(ifs, line)) {
++        if (line.empty()) continue;
++        std::istringstream ss(line);
++        std::string mac, hex_str;
++        ss >> mac >> hex_str;
++        if (mac.empty() || hex_str.empty()) continue;
++        std::vector<uint8_t> frame;
++        if (!decode_assoc_frame_hex(hex_str, frame)) {
++            LOG(WARNING) << "assoc frame DB: corrupt entry for " << mac << ", skipping";
++            continue;
++        }
++        std::string candidate_mld_mac;
++        if (extract_mld_mac_from_assoc_frame(frame, candidate_mld_mac) &&
++            candidate_mld_mac == mld_mac) {
++            return frame;
++        }
++    }
++    return {};
++}
++
+ } // namespace bwl
+diff --git a/common/beerocks/bwl/include/bwl/assoc_frame_db.h b/common/beerocks/bwl/include/bwl/assoc_frame_db.h
+index f226a53dc..b675755df 100644
+--- a/common/beerocks/bwl/include/bwl/assoc_frame_db.h
++++ b/common/beerocks/bwl/include/bwl/assoc_frame_db.h
+@@ -25,9 +25,6 @@
+  */
+ 
+ #include <cstdint>
+-#include <cstdio>
+-#include <fstream>
+-#include <sstream>
+ #include <string>
+ #include <vector>
+ 
+@@ -37,17 +34,8 @@ namespace bwl {
+ /// process boundaries (AP manager → agent) and agent restarts.
+ static constexpr const char *ASSOC_FRAMES_DB_PATH = "/tmp/beerocks/sta_assoc_frames.txt";
+ 
+-namespace assoc_frame_db_internal {
+-inline std::vector<uint8_t> decode_hex_frame(const std::string &hex_str)
+-{
+-    std::vector<uint8_t> frame;
+-    frame.reserve(hex_str.size() / 2);
+-    for (size_t i = 0; i + 1 < hex_str.size(); i += 2) {
+-        frame.push_back(static_cast<uint8_t>(std::stoi(hex_str.substr(i, 2), nullptr, 16)));
+-    }
+-    return frame;
+-}
+-} // namespace assoc_frame_db_internal
++bool persist_assoc_frame(const std::string &sta_mac, const std::vector<uint8_t> &frame);
++bool remove_assoc_frame(const std::string &sta_mac);
+ 
+ /**
+  * @brief Extract the MLD MAC address from an association/reassociation request
+@@ -64,70 +52,8 @@ inline std::vector<uint8_t> decode_hex_frame(const std::string &hex_str)
+  * @return true if a Basic-variant MLE with a valid MLD MAC field was found,
+  *         false otherwise (frame too short, no MLE, or non-Basic variant).
+  */
+-inline bool extract_mld_mac_from_assoc_frame(const std::vector<uint8_t> &frame,
+-                                              std::string &mld_mac_out)
+-{
+-    static constexpr uint8_t IE_ID_EXTENSION      = 255;
+-    static constexpr uint8_t IE_EXT_MULTI_LINK    = 107;
+-    static constexpr size_t  MLE_MLCTRL_OFFSET    = 1;
+-    static constexpr size_t  MLE_CINFO_LEN_OFFSET = 3;
+-    static constexpr size_t  MLE_CINFO_MAC_OFFSET = 4;
+-    static constexpr size_t  MLE_CINFO_MIN_LEN    = 7;
+-
+-    static constexpr uint16_t candidate_offsets[] = {4, 10};
+-    size_t best_offset = 4;
+-    int best_count      = -1;
+-    for (uint16_t off : candidate_offsets) {
+-        if (frame.size() <= (size_t)off + 2) { continue; }
+-        size_t pos = off;
+-        int count  = 0;
+-        while (pos + 2 <= frame.size()) {
+-            uint8_t elen = frame[pos + 1];
+-            if (pos + 2 + elen > frame.size()) { break; }
+-            count++;
+-            pos += 2 + elen;
+-        }
+-        if (count > best_count) {
+-            best_count  = count;
+-            best_offset = off;
+-        }
+-    }
+-
+-    size_t pos = best_offset;
+-    const uint8_t *mle    = nullptr;
+-    size_t mle_elen        = 0;
+-    while (pos + 2 <= frame.size()) {
+-        uint8_t id   = frame[pos];
+-        uint8_t elen = frame[pos + 1];
+-        if (pos + 2 + elen > frame.size()) { break; }
+-        if (id == IE_ID_EXTENSION && elen >= 1 && frame[pos + 2] == IE_EXT_MULTI_LINK) {
+-            mle      = frame.data() + pos + 2;
+-            mle_elen = elen;
+-            break;
+-        }
+-        pos += 2 + elen;
+-    }
+-    if (!mle || mle_elen < MLE_CINFO_MAC_OFFSET + 6) {
+-        return false;
+-    }
+-
+-    if ((mle[MLE_MLCTRL_OFFSET] & 0x07) != 0) {
+-        return false;
+-    }
+-
+-    uint8_t cinfo_len = mle[MLE_CINFO_LEN_OFFSET];
+-    if (cinfo_len < MLE_CINFO_MIN_LEN) {
+-        return false;
+-    }
+-
+-    char mac_buf[18];
+-    snprintf(mac_buf, sizeof(mac_buf), "%02x:%02x:%02x:%02x:%02x:%02x",
+-             mle[MLE_CINFO_MAC_OFFSET], mle[MLE_CINFO_MAC_OFFSET + 1],
+-             mle[MLE_CINFO_MAC_OFFSET + 2], mle[MLE_CINFO_MAC_OFFSET + 3],
+-             mle[MLE_CINFO_MAC_OFFSET + 4], mle[MLE_CINFO_MAC_OFFSET + 5]);
+-    mld_mac_out = mac_buf;
+-    return true;
+-}
++bool extract_mld_mac_from_assoc_frame(const std::vector<uint8_t> &frame,
++                                      std::string &mld_mac_out);
+ 
+ /**
+  * @brief Restore the association frame for one STA from the shared DB file.
+@@ -144,28 +70,7 @@ inline bool extract_mld_mac_from_assoc_frame(const std::vector<uint8_t> &frame,
+  * @param sta_mac  MAC address string to look up (e.g. "bc:cd:99:9f:94:77").
+  * @return         Raw frame bytes, or empty vector if not found.
+  */
+-inline std::vector<uint8_t> restore_assoc_frame_from_db(const std::string &sta_mac)
+-{
+-    std::ifstream ifs(ASSOC_FRAMES_DB_PATH);
+-    if (!ifs) {
+-        return {};
+-    }
+-
+-    std::string line;
+-    while (std::getline(ifs, line)) {
+-        if (line.empty()) {
+-            continue;
+-        }
+-        std::istringstream ss(line);
+-        std::string mac, hex_str;
+-        ss >> mac >> hex_str;
+-        if (mac != sta_mac) {
+-            continue;
+-        }
+-        return assoc_frame_db_internal::decode_hex_frame(hex_str);
+-    }
+-    return {};
+-}
++std::vector<uint8_t> restore_assoc_frame_from_db(const std::string &sta_mac);
+ 
+ /**
+  * @brief Restore the association frame for an MLO STA by its MLD MAC.
+@@ -182,33 +87,7 @@ inline std::vector<uint8_t> restore_assoc_frame_from_db(const std::string &sta_m
+  * @return         Raw frame bytes of the matching entry, or empty vector if
+  *                  no entry's embedded MLD MAC matches.
+  */
+-inline std::vector<uint8_t> restore_assoc_frame_from_db_by_mld_mac(const std::string &mld_mac)
+-{
+-    std::ifstream ifs(ASSOC_FRAMES_DB_PATH);
+-    if (!ifs) {
+-        return {};
+-    }
+-
+-    std::string line;
+-    while (std::getline(ifs, line)) {
+-        if (line.empty()) {
+-            continue;
+-        }
+-        std::istringstream ss(line);
+-        std::string mac, hex_str;
+-        ss >> mac >> hex_str;
+-        if (mac.empty() || hex_str.empty()) {
+-            continue;
+-        }
+-        auto frame = assoc_frame_db_internal::decode_hex_frame(hex_str);
+-        std::string candidate_mld_mac;
+-        if (extract_mld_mac_from_assoc_frame(frame, candidate_mld_mac) &&
+-            candidate_mld_mac == mld_mac) {
+-            return frame;
+-        }
+-    }
+-    return {};
+-}
++std::vector<uint8_t> restore_assoc_frame_from_db_by_mld_mac(const std::string &mld_mac);
+ 
+ } // namespace bwl
+ 
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 736d996b3..af5759fa5 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -841,67 +841,6 @@ static std::string bytes_to_hex(const std::vector<uint8_t> &bytes)
+     return hex.str();
+ }
+ 
+-// Persist or update the association frame for one STA in the shared DB file.
+-// The file path is defined in <bwl/assoc_frame_db.h> as bwl::ASSOC_FRAMES_DB_PATH.
+-// Format: one line per STA — "<sta_mac> <hex_frame>\n"
+-static void persist_assoc_frame(const std::string &sta_mac,
+-                                 const std::vector<uint8_t> &frame)
+-{
+-    std::string new_hex = bytes_to_hex(frame);
+-
+-    // Read existing lines, replacing any entry for this sta_mac
+-    std::vector<std::string> lines;
+-    std::ifstream ifs(bwl::ASSOC_FRAMES_DB_PATH);
+-    if (ifs) {
+-        std::string line;
+-        while (std::getline(ifs, line)) {
+-            if (line.empty()) continue;
+-            std::istringstream ss(line);
+-            std::string mac;
+-            ss >> mac;
+-            if (mac == sta_mac) continue; // will be replaced
+-            lines.push_back(line);
+-        }
+-    }
+-    lines.push_back(sta_mac + " " + new_hex);
+-
+-    std::ofstream ofs(bwl::ASSOC_FRAMES_DB_PATH, std::ios::trunc);
+-    if (ofs) {
+-        for (const auto &l : lines) ofs << l << "\n";
+-        LOG(DEBUG) << "Persisted assoc frame for " << sta_mac
+-                   << " (" << frame.size() << " bytes) to " << bwl::ASSOC_FRAMES_DB_PATH;
+-    }
+-}
+-
+-// Remove the entry for a given sta_mac from the shared DB file.
+-static void remove_assoc_frame(const std::string &sta_mac)
+-{
+-    std::ifstream ifs(bwl::ASSOC_FRAMES_DB_PATH);
+-    if (!ifs) return;
+-
+-    std::vector<std::string> lines;
+-    std::string line;
+-    bool removed = false;
+-    while (std::getline(ifs, line)) {
+-        if (line.empty()) continue;
+-        std::istringstream ss(line);
+-        std::string mac;
+-        ss >> mac;
+-        if (mac == sta_mac) { removed = true; continue; }
+-        lines.push_back(line);
+-    }
+-    ifs.close();
+-
+-    if (!removed) return;
+-    std::ofstream ofs(bwl::ASSOC_FRAMES_DB_PATH, std::ios::trunc);
+-    if (ofs) {
+-        for (const auto &l : lines) ofs << l << "\n";
+-        LOG(DEBUG) << "Removed persisted assoc frame for " << sta_mac
+-                   << " from " << bwl::ASSOC_FRAMES_DB_PATH;
+-    }
+-}
+-
+-
+ // Builds the assocresp_elements hexdump for the Multi-AP backhaul vendor IE.
+ // @param hop_count  0x00 = local agent (gateway), 0x01 = standalone extender, 0xFF = unreachable.
+ // @return  Lowercase hex string, e.g. "dd050013741b01".
+@@ -8183,6 +8122,38 @@ bool ap_wlan_hal_nl80211::generate_connected_clients_events(
+                 }
+             }
+ 
++            // An MLO association frame can be received on any affiliated AP link,
++            // while STA-FIRST/STA-NEXT reports the MLD on another link.  Accept a
++            // frame from a sibling VAP only when its embedded MLD matches and the
++            // frame BSSID belongs to the same AP MLD as the current VAP.
++            if (it == m_latest_assoc_frame.end() && !vap.second.ap_mld_mac.empty()) {
++                for (auto &kv : m_latest_assoc_frame) {
++                    std::string candidate_mld_mac;
++                    if (!extract_mld_mac_from_assoc_frame(kv.second->data, candidate_mld_mac) ||
++                        candidate_mld_mac != client_mac) {
++                        continue;
++                    }
++
++                    const std::string candidate_bssid = tlvf::mac_to_string(kv.second->bssid);
++                    const auto sibling_vap = std::find_if(
++                        m_radio_info.available_vaps.begin(), m_radio_info.available_vaps.end(),
++                        [&candidate_bssid, &vap](const auto &vap_kv) {
++                            return vap_kv.second.mac == candidate_bssid &&
++                                   vap_kv.second.ap_mld_mac == vap.second.ap_mld_mac;
++                        });
++                    if (sibling_vap == m_radio_info.available_vaps.end()) {
++                        continue;
++                    }
++
++                    it = m_latest_assoc_frame.find(kv.first);
++                    LOG(DEBUG) << "MLO assoc frame cross-link fallback: MLD_MAC=" << client_mac
++                               << " -> link_MAC=" << kv.first
++                               << " (frame_BSSID=" << candidate_bssid
++                               << ", AP_MLD=" << vap.second.ap_mld_mac << ")";
++                    break;
++                }
++            }
++
+             if (it == m_latest_assoc_frame.end()) {
+                 // Agent restarted while STA was associated — no over-the-air frame in cache.
+                 // Try to restore from the shared assoc frame DB persisted at first association.
+@@ -8690,7 +8661,7 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+                 m_latest_assoc_frame[src_mac] = mgmt_frame;
+                 LOG(DEBUG) << "Saved assoc frame";
+                 // Persist to the shared DB so the frame survives agent restart.
+-                persist_assoc_frame(src_mac, mgmt_frame->data);
++                bwl::persist_assoc_frame(src_mac, mgmt_frame->data);
+             }
+         }
+ 
+@@ -8808,10 +8779,61 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+             }
+         }
+ 
++        // The association frame may have arrived on a sibling AP link owned by
++        // this ap_manager. Match both the embedded client MLD and the AP MLD so
++        // a frame from another client or another AP cannot be attributed here.
++        if (it_sta == m_latest_assoc_frame.end() &&
++            !m_radio_info.available_vaps[vap_id].ap_mld_mac.empty()) {
++            const std::string &current_ap_mld = m_radio_info.available_vaps[vap_id].ap_mld_mac;
++            for (auto &kv : m_latest_assoc_frame) {
++                std::string candidate_mld_mac;
++                if (!extract_mld_mac_from_assoc_frame(kv.second->data, candidate_mld_mac) ||
++                    candidate_mld_mac != src_mac) {
++                    continue;
++                }
++
++                const std::string candidate_bssid = tlvf::mac_to_string(kv.second->bssid);
++                const auto sibling_vap = std::find_if(
++                    m_radio_info.available_vaps.begin(), m_radio_info.available_vaps.end(),
++                    [&candidate_bssid, &current_ap_mld](const auto &vap_kv) {
++                        return vap_kv.second.mac == candidate_bssid &&
++                               vap_kv.second.ap_mld_mac == current_ap_mld;
++                    });
++                if (sibling_vap == m_radio_info.available_vaps.end()) {
++                    continue;
++                }
++
++                it_sta = m_latest_assoc_frame.find(kv.first);
++                LOG(DEBUG) << "MLO STA_Connected cross-link assoc frame fallback: MLD_MAC="
++                           << src_mac << " -> link_MAC=" << kv.first
++                           << " (frame_BSSID=" << candidate_bssid
++                           << ", AP_MLD=" << current_ap_mld << ")";
++                break;
++            }
++        }
++
+         if (it_sta == m_latest_assoc_frame.end()) {
+-            LOG(WARNING) << "STA-CONNECTED without previously receiving a (re-)association frame!"
+-                         << " client_mac=" << src_mac;
+-            msg->params.association_frame_length = 0;
++            // AP-STA-CONNECTED can race AP-MGMT-FRAME-RECEIVED across MLO
++            // radios. Recover the persisted frame by its embedded MLD MAC when
++            // the local cache is not populated yet.
++            auto frame_bytes = bwl::restore_assoc_frame_from_db(src_mac);
++            if (frame_bytes.empty()) {
++                frame_bytes = bwl::restore_assoc_frame_from_db_by_mld_mac(src_mac);
++            }
++            if (!frame_bytes.empty() &&
++                frame_bytes.size() <= sizeof(msg->params.association_frame)) {
++                std::copy(frame_bytes.begin(), frame_bytes.end(),
++                          msg->params.association_frame);
++                msg->params.association_frame_length = frame_bytes.size();
++                assoc_frame_type = assoc_frame::AssocReqFrame::ASSOCIATION_REQUEST;
++                LOG(DEBUG) << "Restored persisted assoc frame for " << src_mac << " ("
++                           << frame_bytes.size() << " bytes)";
++            } else {
++                LOG(WARNING) << "STA-CONNECTED without previously receiving a (re-)association "
++                                "frame! client_mac="
++                             << src_mac;
++                msg->params.association_frame_length = 0;
++            }
+         } else {
+             // Add the latest association frame
+             // PPM-1718: parse the association frame and make sure it belongs to the right MAC address.
+@@ -8937,7 +8959,7 @@ bool ap_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+         {
+             m_latest_assoc_frame.erase(sta_mac);
+             // Remove the entry from the shared assoc frame DB.
+-            remove_assoc_frame(sta_mac);
++            bwl::remove_assoc_frame(sta_mac);
+         }
+ 
+     } break;
+-- 
+2.34.1
+
