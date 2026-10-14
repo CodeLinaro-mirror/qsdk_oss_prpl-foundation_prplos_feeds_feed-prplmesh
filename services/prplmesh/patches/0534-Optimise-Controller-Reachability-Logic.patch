@@ -1,0 +1,233 @@
+From 547846e9c1c555dfbc43a19865f103bee126645e Mon Sep 17 00:00:00 2001
+From: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+Date: Tue, 13 Oct 2026 22:25:34 +0530
+Subject: [PATCH] Optimise Controller Reachability Logic
+
+Signed-off-by: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+---
+ .../backhaul_manager/backhaul_manager.cpp     | 45 +-----------
+ .../tasks/controller_connectivity_task.cpp    | 70 +++++++++++++++++++
+ .../tasks/controller_connectivity_task.h      | 16 +++++
+ 3 files changed, 88 insertions(+), 43 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 9c6735f92..457f84917 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -2308,19 +2308,6 @@ bool BackhaulManager::backhaul_fsm_wireless(bool &skip_select)
+ 
+         auto now = std::chrono::steady_clock::now();
+         if (now > state_time_stamp_timeout) {
+-            LOG(DEBUG) << "reconnect wait timed out";
+-
+-            // The reconnect timeout has elapsed - clear the BSSID pin so the bSTA is free
+-            // to scan and connect to other BSSes instead of continuing to retry the same one.
+-            {
+-                auto db        = AgentDB::get();
+-                auto iface_hal = get_wireless_hal(db->backhaul.selected_iface_name);
+-                if (iface_hal && !iface_hal->unpin_bssid()) {
+-                    LOG(ERROR) << "Failed to unpin bssid on iface "
+-                               << db->backhaul.selected_iface_name;
+-                }
+-            }
+-
+             // Before scanning, check if ethernet is now available.
+             if (try_switch_to_wired_backhaul()) {
+                 break;
+@@ -3318,21 +3305,6 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+             break;
+         }
+ 
+-        // Pin the bSTA to this BSSID so that, if it later gets disconnected, it keeps
+-        // retrying the same node rather than roaming away immediately (loop-avoidance:
+-        // gives the other agents' heartbeat mechanism a chance to detect loss of
+-        // controller reachability before this bSTA connects elsewhere).
+-        // Only pin if the BSSID is a valid unicast MAC - a zero/broadcast BSSID would
+-        // otherwise pin the bSTA to an unusable address, blocking any real connection.
+-        if (bssid != beerocks::net::network_utils::ZERO_MAC &&
+-            bssid != beerocks::net::network_utils::WILD_MAC) {
+-            if (!iface_hal->pin_bssid(bssid)) {
+-                LOG(ERROR) << "Failed to pin bssid " << bssid << " on iface " << iface;
+-            }
+-        } else {
+-            LOG(WARNING) << "Skipping pin_bssid: invalid BSSID " << bssid << " on iface " << iface;
+-        }
+-
+         if (db->device_conf.certification_mode) {
+             /* When the station is connected we wanted to enable
+                3addr multicast packets entering the system.
+@@ -3704,26 +3676,13 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+ #endif
+             if (FSM_IS_IN_STATE(OPERATIONAL) || FSM_IS_IN_STATE(CONNECTED)) {
+ 
+-                // Re-assert the BSSID pin (defensively, in case it was not already set or
+-                // was cleared) so that the bSTA keeps retrying this same node while we wait
+-                // for reconnection below, instead of roaming away immediately.
+-                if (db->backhaul.backhaul_bssid != beerocks::net::network_utils::ZERO_MAC) {
+-                    auto iface_hal = get_wireless_hal(iface);
+-                    if (iface_hal && !iface_hal->pin_bssid(db->backhaul.backhaul_bssid)) {
+-                        LOG(ERROR) << "Failed to re-pin bssid " << db->backhaul.backhaul_bssid
+-                                   << " on iface " << iface;
+-                    }
+-                }
+-
+                 if (m_backhaul_steering_bssid == beerocks::net::network_utils::ZERO_MAC) {
+                     platform_notify_error(bpl::eErrorCode::BH_DISCONNECTED,
+                                           "Backhaul disconnected on operational state");
+                     stop_on_failure_attempts--;
+ 
+-                    state_time_stamp_timeout =
+-                        std::chrono::steady_clock::now() +
+-                        std::chrono::seconds(WIRELESS_WAIT_FOR_RECONNECT_TIMEOUT);
+-                    FSM_MOVE_STATE(WIRELESS_WAIT_FOR_RECONNECT);
++                    // Start a fresh scan immediately after the physical disconnect.
++                    FSM_MOVE_STATE(INITIATE_SCAN);
+                 } else {
+                     // The steer caused a disconnect. Do not cancel the steering timer yet -
+                     // give the bSTA the full remaining steering window (up to the 10s timeout)
+diff --git a/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp b/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp
+index e21ad4835..64225cd6b 100644
+--- a/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp
++++ b/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp
+@@ -21,6 +21,7 @@ using namespace beerocks;
+ using namespace net;
+ 
+ static constexpr std::chrono::seconds HEARTBEAT_SENDING_PERIOD_SEC{2};
++static constexpr std::chrono::seconds HEARTBEAT_RESPONSE_TIMEOUT_SEC{1};
+ static constexpr uint8_t MAX_HEARTBEAT_COUNT{8};
+ static constexpr uint8_t INDIRECT_TIMEOUT_MULTIPLIER{3};
+ 
+@@ -100,6 +101,10 @@ void ControllerConnectivityTask::work()
+     }
+     case eState::CONTROLLER_MONITORING: {
+ 
++        if (check_indirect_controller_health()) {
++            break;
++        }
++
+         if (check_controller_message_timeout()) {
+             clear_heartbeat_counters();
+             FSM_MOVE_STATE(WAIT_RESPONSE_FROM_CONTROLLER);
+@@ -215,6 +220,12 @@ void ControllerConnectivityTask::handle_event(uint8_t event_enum_value, const vo
+         m_direct_link_to_controller                   = false;
+         db->controller_info.direct_link_to_controller = false;
+         m_backhaul_connected_time                     = std::chrono::steady_clock::now();
++        // Do not carry a pre-disconnect controller timestamp into the new
++        // discovery cycle. The first discovery frame is handled before the
++        // controller bridge MAC is stored, so it cannot refresh this value.
++        db->controller_info.last_controller_contact_time = m_backhaul_connected_time;
++        m_indirect_probe_waiting = false;
++        m_indirect_probe_failed  = false;
+         m_btl_ctx.notify_controller_reachability(false);
+         FSM_MOVE_STATE(WAIT_FOR_CONTROLLER_DISCOVERY);
+         break;
+@@ -227,6 +238,14 @@ void ControllerConnectivityTask::handle_event(uint8_t event_enum_value, const vo
+     }
+     case CONTROLLER_DISCOVERED: {
+         LOG(ERROR) << "CONTROLLER_DISCOVERED is received";
++        // Discovery establishes a new monitoring epoch. Prevent a stale
++        // timestamp from immediately entering the heartbeat timeout path.
++        auto now = std::chrono::steady_clock::now();
++        AgentDB::get()->controller_info.last_controller_contact_time = now;
++        m_last_indirect_probe_send_time    = now;
++        m_last_indirect_probe_contact_time = now;
++        m_indirect_probe_waiting           = false;
++        m_indirect_probe_failed            = false;
+         m_btl_ctx.notify_controller_reachability(true);
+         FSM_MOVE_STATE(CONTROLLER_MONITORING);
+         break;
+@@ -291,6 +310,57 @@ bool ControllerConnectivityTask::check_controller_message_timeout()
+     return false;
+ }
+ 
++bool ControllerConnectivityTask::check_indirect_controller_health()
++{
++    if (m_direct_link_to_controller) {
++        return false;
++    }
++
++    auto db = AgentDB::get();
++    auto now = std::chrono::steady_clock::now();
++    auto last_contact = db->controller_info.last_controller_contact_time;
++
++    // Any controller traffic received after the probe was sent is treated as
++    // a successful response for the current probe epoch.
++    if (m_indirect_probe_waiting && last_contact > m_last_indirect_probe_contact_time) {
++        m_indirect_probe_waiting = false;
++        // Restore hop count only when leaving a failed sequence. Successful
++        // probes while already healthy do not update the AP managers.
++        if (m_indirect_probe_failed) {
++            LOG(INFO) << "Controller HLE probe recovered; restoring controller reachability";
++            m_btl_ctx.notify_controller_reachability(true);
++            m_indirect_probe_failed = false;
++        }
++    }
++
++    if (m_indirect_probe_waiting &&
++        std::chrono::duration_cast<std::chrono::seconds>(now - m_last_indirect_probe_send_time) >=
++            HEARTBEAT_RESPONSE_TIMEOUT_SEC) {
++        m_indirect_probe_waiting = false;
++        // Advertise hop_count=255 only when entering a failed sequence.
++        if (!m_indirect_probe_failed) {
++            LOG(WARNING) << "First indirect controller HLE probe missed; advertising hop_count=255";
++            m_btl_ctx.notify_controller_reachability(false);
++            m_indirect_probe_failed = true;
++        }
++    }
++
++    if (!m_indirect_probe_waiting &&
++        std::chrono::duration_cast<std::chrono::seconds>(now - m_last_indirect_probe_send_time) >=
++            HEARTBEAT_SENDING_PERIOD_SEC) {
++        m_last_indirect_probe_send_time    = now;
++        m_last_indirect_probe_contact_time = last_contact;
++        m_indirect_probe_waiting           = true;
++        if (send_hle_to_controller()) {
++            LOG(DEBUG) << "Sending proactive controller HLE probe for indirect agent";
++        } else {
++            LOG(WARNING) << "Failed sending proactive controller HLE probe for indirect agent";
++        }
++    }
++
++    return false;
++}
++
+ bool ControllerConnectivityTask::check_controller_response_timeout()
+ {
+     auto db               = AgentDB::get();
+diff --git a/agent/src/beerocks/slave/tasks/controller_connectivity_task.h b/agent/src/beerocks/slave/tasks/controller_connectivity_task.h
+index 78b412fe8..5649a9221 100644
+--- a/agent/src/beerocks/slave/tasks/controller_connectivity_task.h
++++ b/agent/src/beerocks/slave/tasks/controller_connectivity_task.h
+@@ -135,6 +135,13 @@ private:
+      */
+     std::chrono::steady_clock::time_point m_last_heartbeat_send_time;
+ 
++    std::chrono::steady_clock::time_point m_last_indirect_probe_send_time;
++    std::chrono::steady_clock::time_point m_last_indirect_probe_contact_time;
++    bool m_indirect_probe_waiting = false;
++    // Latches one failure sequence so hop-count updates happen only on
++    // failure entry and on the first successful recovery response.
++    bool m_indirect_probe_failed  = false;
++
+     /**
+      * @brief Time point when waiting for reconnection exceeds
+      */
+@@ -186,6 +193,15 @@ private:
+      */
+     bool check_controller_message_timeout();
+ 
++    /**
++     * @brief Probes the controller directly for indirectly connected agents.
++     *
++     * Indirect agents cannot wait for the passive message timeout multiplier when
++     * the controller is rebooting. HLE probes validate the controller path while
++     * preserving the existing controller-contact timestamp semantics.
++     */
++    bool check_indirect_controller_health();
++
+     /**
+      * @brief Checks Controller response timeout after message timeout occurs
+      *
+-- 
+2.34.1
+
