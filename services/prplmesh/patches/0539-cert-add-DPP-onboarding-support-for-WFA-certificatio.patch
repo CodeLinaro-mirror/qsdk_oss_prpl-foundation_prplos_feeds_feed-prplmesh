@@ -1,0 +1,2184 @@
+From a84bf55a28a10d61a80967e831b863f909d7483b Mon Sep 17 00:00:00 2001
+From: Parimalarengan Gururajan <gururaja@qti.qualcomm.com>
+Date: Tue, 22 Sep 2026 09:09:30 +0530
+Subject: [PATCH] cert: add DPP onboarding support for WFA certification mode
+
+Add the agent/controller pieces needed to run the DPP certification
+test cases through the UCC (CAPI) interface.
+
+Agent:
+- Move local DPP bootstrap key/URI generation from son_slave_thread
+  into dpp_bootstrap_utils; expose it via the GetLocalBootstrap
+  dev_exec_action, which now returns BootstrappingData.
+- dev_set_config accepts "type,dpp" and switches onboarding to DPP;
+  dev_reset_default reverts to WSC and clears stale DPP state
+  (bootstrap, 1905 credentials/TK, wired session) so test cases can
+  be repeated without a restart.
+- Derive the PMKID with the 1905 PMK and put the matching RSNE in
+  EAPOL-Key M2, as the hostapd Authenticator requires.
+- Add SupportedService TLV to the BSS Configuration Request and
+  accept the Supported Frequency Band TLV in AP-Autoconfiguration
+  Search (observed from qca-ezmesh).
+- Make the DPP config JSON parsing whitespace-tolerant and log it
+  in chunks to avoid syslog truncation.
+
+Controller:
+- SetPeerBootstrap persists the peer URI to /etc/prplmesh/dpp_uri;
+  dev_reset_default wipes peer URIs (keeping the local-agent line)
+  and the forced DPP settings.
+- Reject WSC M1 from remote agents when onboardingtype=DPP.
+- In certification mode, emit cred.akm in name form (dpp+sae+psk)
+  and include the DPP AKM selector.
+
+Signed-off-by: Parimalarengan Gururajan <gururaja@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/agent_db.h           |   5 +
+ .../src/beerocks/slave/agent_ucc_listener.cpp |  31 +-
+ agent/src/beerocks/slave/agent_ucc_listener.h |   2 +-
+ .../backhaul_manager/backhaul_manager.cpp     | 124 ++++++
+ .../beerocks/slave/dpp_bootstrap_utils.cpp    | 408 +++++++++++++++++
+ .../src/beerocks/slave/dpp_bootstrap_utils.h  |  43 ++
+ agent/src/beerocks/slave/son_slave_thread.cpp | 409 +-----------------
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  71 ++-
+ .../beerocks/slave/tasks/dpp_agent_task.cpp   | 123 +++++-
+ .../src/beerocks/slave/tasks/dpp_agent_task.h |   5 +-
+ .../beerocks/slave/tasks/topology_task.cpp    |   2 +-
+ .../bcl/include/bcl/beerocks_ucc_listener.h   |   2 +-
+ .../bcl/source/beerocks_ucc_listener.cpp      |   5 +-
+ controller/src/beerocks/master/controller.cpp |  54 ++-
+ .../master/controller_ucc_listener.cpp        |  44 +-
+ .../beerocks/master/controller_ucc_listener.h |  18 +-
+ .../src/beerocks/master/son_actions.cpp       |   4 +
+ .../master/tasks/dpp_configurator_task.cpp    | 130 +++++-
+ .../master/tasks/dpp_configurator_task.h      |  27 ++
+ .../beerocks/master/tasks/dpp_key_store.cpp   |  55 +++
+ .../src/beerocks/master/tasks/dpp_key_store.h |  11 +
+ framework/platform/bpl/cfg/dm/bpl_cfg.cpp     |   8 +-
+ 22 files changed, 1126 insertions(+), 455 deletions(-)
+ create mode 100644 agent/src/beerocks/slave/dpp_bootstrap_utils.cpp
+ create mode 100644 agent/src/beerocks/slave/dpp_bootstrap_utils.h
+
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 3f3ba8b0d..efa772115 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -1379,6 +1379,11 @@ public:
+         std::array<uint8_t, 32> pmk_1905 = {};
+         bool pmk_valid = false;
+ 
++        // PMKID = Truncate-128(SHA-256(min(NK.x, PK.x) | max(NK.x, PK.x))), computed with the
++        // PMK. A Supplicant puts it in the RSNE of EAPOL-Key M2, which the Authenticator
++        // compares byte-for-byte against the RSNE it built from its own PMKID.
++        std::array<uint8_t, 16> pmkid = {};
++
+         // 1905 PTK (512-bit, derived during 4-way handshake)
+         std::array<uint8_t, 64> ptk_1905 = {};
+ 
+diff --git a/agent/src/beerocks/slave/agent_ucc_listener.cpp b/agent/src/beerocks/slave/agent_ucc_listener.cpp
+index 90f7df55c..9588f6a17 100644
+--- a/agent/src/beerocks/slave/agent_ucc_listener.cpp
++++ b/agent/src/beerocks/slave/agent_ucc_listener.cpp
+@@ -8,9 +8,12 @@
+ 
+ #include "agent_ucc_listener.h"
+ #include "agent_db.h"
++#include "dpp_bootstrap_utils.h"
+ 
++#include <bcl/beerocks_string_utils.h>
+ #include <bcl/network/network_utils.h>
+ #include <beerocks/tlvf/beerocks_message.h>
++#include <bpl/bpl_cfg.h>
+ 
+ #include <easylogging++.h>
+ 
+@@ -286,11 +289,31 @@ bool agent_ucc_listener::handle_dev_set_rfeature(
+ }
+ 
+ bool agent_ucc_listener::handle_dev_exec_action(
+-    const std::unordered_map<std::string, std::string> &params, std::string &err_string)
++    const std::unordered_map<std::string, std::string> &params, std::string &value,
++    std::string &err_string)
+ {
+-    // Will be implemented as part of PPM-1692 and PPM-1693
+-    err_string = "handle_dev_exec_action is not yet implemented in agent mode";
+-    return false;
++    auto action_type_it = params.find("dppactiontype");
++    if (action_type_it == params.end()) {
++        err_string = "handle_dev_exec_action is not yet implemented in agent mode";
++        return false;
++    }
++
++    auto &action_type = action_type_it->second;
++    if (action_type != "GetLocalBootstrap") {
++        err_string = "DPPActionType is not 'GetLocalBootstrap', value is '" + action_type + "'";
++        return false;
++    }
++
++    std::string uri;
++    if (!beerocks::dpp::load_local_bootstrap_into_agentdb(uri)) {
++        err_string = "failed to generate/load local DPP bootstrapping key/URI";
++        return false;
++    }
++
++    auto hex = beerocks::string_utils::bytes_to_hex_string(
++        reinterpret_cast<const uint8_t *>(uri.data()), uri.size());
++    value = "BootstrappingData," + hex;
++    return true;
+ }
+ 
+ bool agent_ucc_listener::handle_custom_command(
+diff --git a/agent/src/beerocks/slave/agent_ucc_listener.h b/agent/src/beerocks/slave/agent_ucc_listener.h
+index 0fb540eda..605bef819 100644
+--- a/agent/src/beerocks/slave/agent_ucc_listener.h
++++ b/agent/src/beerocks/slave/agent_ucc_listener.h
+@@ -36,7 +36,7 @@ private:
+     bool handle_dev_set_rfeature(const std::unordered_map<std::string, std::string> &params,
+                                  std::string &err_string) override;
+     bool handle_dev_exec_action(const std::unordered_map<std::string, std::string> &params,
+-                                std::string &err_string) override;
++                                std::string &value, std::string &err_string) override;
+     bool handle_custom_command(const std::unordered_map<std::string, std::string> &params,
+                                std::string &err_string) override;
+ 
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 9c6735f92..816dd4ddf 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include "backhaul_manager.h"
+ #include "../agent_db.h"
++#include "../dpp_bootstrap_utils.h"
+ 
+ #include <algorithm>
+ 
+@@ -1268,6 +1269,7 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+                 LOG(INFO) << timestamp << "Backhaul Type: Invalid/Unknown";
+             }
+         }
++
+         FSM_MOVE_STATE(OPERATIONAL);
+         break;
+     }
+@@ -6223,6 +6225,61 @@ void BackhaulManager::handle_dev_reset_default(
+     db->controller_info.early_ap_capability_report_sent = false;
+     db->steering_policy.btm_steering_disallowed.clear();
+ 
++    // Undo the OnboardingType=DPP forced by GetLocalBootstrap for the previous test case -
++    // both the persisted config and the live, already-cached AgentDB flag (the DPP consumers
++    // - dpp_agent_task, backhaul_manager, ap_autoconfiguration_task, topology_task - gate on
++    // the in-memory flag right now, in this session, not on the persisted value). Without this,
++    // a WSC-only test run right after a DPP test would silently inherit DPP onboarding, since
++    // dev_set_config never carries this field itself.
++    bool was_dpp_onboarding = (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP);
++
++    bpl::cfg_set_onboarding_type("WSC");
++    db->dpp_extender_config.onboarding_type = AgentDB::OnboardingType::WSC;
++
++    if (was_dpp_onboarding) {
++        // Clear stale DPP state left over from the previous test case so the chirp gate
++        // (ap_autoconfiguration_task.cpp: dpp_onboarding_active) can re-arm cleanly on the
++        // next GetLocalBootstrap/dev_set_config,...,type,dpp cycle. Without this,
++        // dpp_1905_credentials.initialized stays permanently true once a DPP run completes,
++        // which would suppress the Chirp TLV on every subsequent Search in this boot even
++        // though onboarding_type is being forced back to DPP for the new test case.
++        db->dpp_bootstrap.valid = false;
++
++        auto controller_mac = db->controller_info.bridge_mac;
++        if (controller_mac != beerocks::net::network_utils::ZERO_MAC) {
++            // Remove the stale 1905-layer transport key (TK) derived for the previous
++            // DPP-onboarded controller - it no longer applies once this reset takes effect.
++            db->peer_1905_security.erase(controller_mac);
++            if (m_broker_client) {
++                m_broker_client->install_security_key(controller_mac, {}, {}, 0, false);
++            }
++        }
++
++        if (db->dpp_1905_credentials.nak_pkey) {
++            EVP_PKEY_free(db->dpp_1905_credentials.nak_pkey);
++            db->dpp_1905_credentials.nak_pkey = nullptr;
++        }
++        db->dpp_1905_credentials.connector.clear();
++        db->dpp_1905_credentials.nak_private_der.clear();
++        db->dpp_1905_credentials.c_sign_key_der.clear();
++        db->dpp_1905_credentials.c_sign_key_jwk.clear();
++        db->dpp_1905_credentials.pp_key_jwk.clear();
++        db->dpp_1905_credentials.initialized = false;
++
++        // dpp_wired_session.active is only ever cleared by DppAgentTask::reset_onboarding_progress()
++        // on a wireless<->wired connection-type switch, and is never cleared on successful
++        // completion of a wired DPP Auth exchange - a device that stays wired the whole session
++        // (the certification setup here) would otherwise have every subsequent Auth Request
++        // silently dropped as a "duplicate delivery" (see handle_dpp_wired_auth_request()'s
++        // guard), so no Auth Response would ever be sent on a repeated test cycle.
++        if (db->dpp_wired_session.active) {
++            db->dpp_wired_session.reset();
++        }
++
++        LOG(INFO) << "dev_reset_default: cleared stale DPP 1905 security state from the "
++                     "previous test case (bootstrap invalidated, 1905 TK removed)";
++    }
++
+     //check if wired interface is enabled or try to enable it.
+     if (!beerocks::net::network_utils::linux_iface_is_up_and_running(eth_iface)) {
+         LOG(INFO) << "The wired interface " << eth_iface << " is not up, lets try to enable it";
+@@ -6368,6 +6425,73 @@ bool BackhaulManager::handle_dev_set_config(int fd,
+         return false;
+     }
+ 
++    // "Type" is the WFA CAPI-documented onboarding-mechanism selector for this backhaul
++    // connection (Wi-Fi Test Suite Control API Specification: "The onboarding mechanism
++    // utilized by the Agent to onboard to the Controller" - only defined value is "DPP";
++    // absent means the default Profile-1/Profile-2 (WSC) onboarding). Force both the
++    // persisted platform config and the live AgentDB flag - DPP consumers (dpp_agent_task,
++    // backhaul_manager, ap_autoconfiguration_task, topology_task) gate on the in-memory
++    // flag within this session, while other code (e.g. ap_wlan_hal_nl80211.cpp) reads the
++    // platform value fresh - both must agree or the two layers would disagree on mode.
++    auto type_it = params.find("type");
++    if (type_it != params.end()) {
++        auto type_value = type_it->second;
++        std::transform(type_value.begin(), type_value.end(), type_value.begin(), ::tolower);
++        if (type_value == "dpp") {
++            auto db = AgentDB::get();
++            if (db->device_conf.certification_mode) {
++                bpl::cfg_set_onboarding_type("DPP");
++                db->dpp_extender_config.onboarding_type = AgentDB::OnboardingType::DPP;
++
++                // Defensive re-arm of the chirp gate (ap_autoconfiguration_task.cpp:
++                // dpp_onboarding_active) for this transition into DPP mode:
++                // - dpp_bootstrap.valid is normally already true here because
++                //   GetLocalBootstrap runs before this command in the WFA CAPI sequence,
++                //   but re-validate/populate it defensively in case this command arrives
++                //   without a preceding GetLocalBootstrap - load_local_bootstrap_into_agentdb()
++                //   is documented safe to call repeatedly (re-validates every call, only
++                //   generates a new key/URI if none exists yet).
++                // - dpp_1905_credentials.initialized (and the rest of the credential set)
++                //   can only legitimately be non-empty after a completed DPP 1905 handshake,
++                //   which cannot have happened yet at the moment we are just now switching
++                //   onboarding_type to DPP, so clear all of it unconditionally here too as a
++                //   second line of defense alongside the dev_reset_default reset - this is
++                //   what makes a repeated dev_reset_default -> GetLocalBootstrap ->
++                //   dev_set_config,...,type,dpp cycle (same boot, no restart) work again:
++                //   without this, stale credentials from the previous successful run remain,
++                //   and dpp_wired_session.active stays latched true from that prior Auth
++                //   exchange, so the next Auth Request is silently dropped as a "duplicate"
++                //   (see the guard at the top of handle_dpp_wired_auth_request) and no Auth
++                //   Response is ever sent.
++                std::string local_bootstrap_uri;
++                if (!beerocks::dpp::load_local_bootstrap_into_agentdb(local_bootstrap_uri)) {
++                    LOG(ERROR) << "Failed to load/generate local DPP bootstrap key/URI while "
++                                  "switching onboarding to DPP";
++                }
++                if (db->dpp_1905_credentials.nak_pkey) {
++                    EVP_PKEY_free(db->dpp_1905_credentials.nak_pkey);
++                    db->dpp_1905_credentials.nak_pkey = nullptr;
++                }
++                db->dpp_1905_credentials.connector.clear();
++                db->dpp_1905_credentials.nak_private_der.clear();
++                db->dpp_1905_credentials.c_sign_key_der.clear();
++                db->dpp_1905_credentials.c_sign_key_jwk.clear();
++                db->dpp_1905_credentials.pp_key_jwk.clear();
++                db->dpp_1905_credentials.initialized = false;
++
++                if (db->dpp_wired_session.active) {
++                    LOG(INFO) << "DPP: clearing stale wired session (controller="
++                              << db->dpp_wired_session.controller_mac
++                              << ") before starting a new DPP onboarding cycle";
++                    db->dpp_wired_session.reset();
++                }
++            }
++        } else {
++            err_string = "parameter 'type' has invalid value '" + type_it->second + "'";
++            return false;
++        }
++    }
++
+     // Get the selected backhaul specified in received command.
+     auto backhaul = backhaul_it->second;
+     std::transform(backhaul.begin(), backhaul.end(), backhaul.begin(), ::tolower);
+diff --git a/agent/src/beerocks/slave/dpp_bootstrap_utils.cpp b/agent/src/beerocks/slave/dpp_bootstrap_utils.cpp
+new file mode 100644
+index 000000000..a8d752dbd
+--- /dev/null
++++ b/agent/src/beerocks/slave/dpp_bootstrap_utils.cpp
+@@ -0,0 +1,408 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#include "dpp_bootstrap_utils.h"
++
++#include "agent_db.h"
++
++#include <easylogging++.h>
++
++#include <openssl/core_names.h>
++#include <openssl/evp.h>
++#include <openssl/pem.h>
++#include <openssl/sha.h>
++
++#include <array>
++#include <cstring>
++#include <fstream>
++#include <string>
++#include <sys/file.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <unistd.h>
++#include <vector>
++
++namespace beerocks {
++namespace dpp {
++
++static const std::string KEY_DIR  = "/etc/prplmesh/dpp";
++static const std::string KEY_PATH = KEY_DIR + "/bootstrap_key.pem";
++static const std::string URI_PATH = "/etc/prplmesh/dpp_uri";
++
++bool ensure_local_bootstrap_uri(std::string &uri_out)
++{
++    bool key_missing = (access(KEY_PATH.c_str(), F_OK) != 0);
++    bool uri_missing = (access(URI_PATH.c_str(), F_OK) != 0);
++
++    if (key_missing || uri_missing) {
++        LOG(INFO) << "DPP: bootstrap " << (key_missing ? "key" : "URI") << " not found — "
++                  << (key_missing ? "generating new key pair"
++                                  : "regenerating URI from existing key");
++
++        // Create parent directory and key directory if needed (mkdir -p equivalent)
++        const std::string parent_dir = "/etc/prplmesh";
++        struct stat st {};
++        if (stat(parent_dir.c_str(), &st) != 0) {
++            if (mkdir(parent_dir.c_str(), 0755) != 0 && errno != EEXIST) {
++                LOG(ERROR) << "DPP: failed to create directory: " << parent_dir;
++                return false;
++            }
++        }
++        if (stat(KEY_DIR.c_str(), &st) != 0) {
++            if (mkdir(KEY_DIR.c_str(), 0700) != 0 && errno != EEXIST) {
++                LOG(ERROR) << "DPP: failed to create directory: " << KEY_DIR;
++                return false;
++            }
++        }
++
++        EVP_PKEY *new_key = nullptr;
++
++        if (!key_missing) {
++            // Key exists but URI is missing — load the existing key to regenerate URI.
++            // DO NOT generate a new key: that would change the chirp hash and break
++            // any controller that already has the old URI provisioned.
++            FILE *fp = fopen(KEY_PATH.c_str(), "r");
++            if (fp) {
++                new_key = PEM_read_PrivateKey(fp, nullptr, nullptr, nullptr);
++                fclose(fp);
++            }
++            if (!new_key) {
++                LOG(WARNING) << "DPP: failed to load existing key from " << KEY_PATH
++                             << " — generating new key pair";
++            } else {
++                LOG(INFO) << "DPP: loaded existing key, regenerating URI from it";
++            }
++        }
++
++        if (!new_key) {
++            // Either key is missing or loading failed — generate a new key pair
++            EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
++            if (pctx && EVP_PKEY_keygen_init(pctx) == 1 &&
++                EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1) == 1) {
++                EVP_PKEY_keygen(pctx, &new_key);
++            }
++            if (pctx) EVP_PKEY_CTX_free(pctx);
++            if (!new_key) {
++                LOG(ERROR) << "DPP: EC P-256 key generation failed";
++                return false;
++            }
++
++            // Save new private key as PEM (only when key was missing/invalid)
++            FILE *fp = fopen(KEY_PATH.c_str(), "w");
++            if (!fp) {
++                LOG(ERROR) << "DPP: cannot create " << KEY_PATH;
++                EVP_PKEY_free(new_key);
++                return false;
++            }
++            if (PEM_write_PrivateKey(fp, new_key, nullptr, nullptr, 0, nullptr, nullptr) != 1) {
++                LOG(ERROR) << "DPP: PEM_write_PrivateKey failed";
++                fclose(fp);
++                EVP_PKEY_free(new_key);
++                return false;
++            }
++            fclose(fp);
++            chmod(KEY_PATH.c_str(), 0600);
++        } // end if (!new_key) — new key generation
++
++        // Export compressed SPKI DER for the URI K: field.
++        // hostapd uses compressed point form → shorter URI (~88 chars).
++        // Use OpenSSL 3.x EVP_PKEY_todata to get the compressed point, then
++        // build the SPKI DER manually (avoids deprecated EC_KEY APIs).
++        unsigned char *spki_der_ptr = nullptr;
++        int spki_len = 0;
++        {
++            // Request compressed public key via OSSL_PKEY_PARAM_EC_POINT_CONVERSION_FORMAT
++            // then export pub key. OpenSSL 3.x EVP_PKEY_todata approach:
++            OSSL_PARAM params[] = {OSSL_PARAM_construct_utf8_string(
++                                       OSSL_PKEY_PARAM_EC_POINT_CONVERSION_FORMAT,
++                                       const_cast<char *>("compressed"), 0),
++                                   OSSL_PARAM_END};
++            EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_pkey(nullptr, new_key, nullptr);
++            if (pctx) {
++                // Get compressed pubkey point (33 bytes for P-256)
++                uint8_t compressed[33] = {};
++                size_t comp_len        = 0;
++                // Set point format on a duplicate key
++                EVP_PKEY *dup = EVP_PKEY_dup(new_key);
++                if (dup) {
++                    // Use OSSL params to set compressed format
++                    if (EVP_PKEY_set_params(dup, params) == 1) {
++                        EVP_PKEY_get_octet_string_param(dup, OSSL_PKEY_PARAM_PUB_KEY, nullptr, 0,
++                                                         &comp_len);
++                        if (comp_len == 33) {
++                            EVP_PKEY_get_octet_string_param(dup, OSSL_PKEY_PARAM_PUB_KEY,
++                                                             compressed, 33, &comp_len);
++                        }
++                    }
++                    EVP_PKEY_free(dup);
++                }
++                EVP_PKEY_CTX_free(pctx);
++
++                if (comp_len == 33) {
++                    // Build SPKI DER for P-256 compressed point:
++                    // SEQUENCE(57) { SEQUENCE(19) { OID ecPublicKey, OID prime256v1 }
++                    //                BIT STRING(34) { 0x00 || compressed(33) } }
++                    static const uint8_t hdr[] = {0x30, 0x39, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86,
++                                                   0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
++                                                   0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03,
++                                                   0x22, 0x00};
++                    spki_len       = static_cast<int>(sizeof(hdr) + 33);
++                    spki_der_ptr   = static_cast<unsigned char *>(OPENSSL_malloc(spki_len));
++                    if (spki_der_ptr) {
++                        memcpy(spki_der_ptr, hdr, sizeof(hdr));
++                        memcpy(spki_der_ptr + sizeof(hdr), compressed, 33);
++                    } else {
++                        spki_len = 0;
++                    }
++                }
++            }
++            // Fallback to uncompressed SPKI DER
++            if (spki_len <= 0) {
++                spki_len = i2d_PUBKEY(new_key, &spki_der_ptr);
++            }
++        }
++        if (spki_len <= 0 || !spki_der_ptr) {
++            LOG(ERROR) << "DPP: i2d_PUBKEY failed";
++            EVP_PKEY_free(new_key);
++            return false;
++        }
++
++        // Base64url-encode for DPP URI (standard base64, URI uses std encoding with padding)
++        BIO *b64  = BIO_new(BIO_f_base64());
++        BIO *bmem = BIO_new(BIO_s_mem());
++        b64       = BIO_push(b64, bmem);
++        BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
++        BIO_write(b64, spki_der_ptr, spki_len);
++        (void)BIO_flush(b64);
++        BUF_MEM *bptr = nullptr;
++        BIO_get_mem_ptr(bmem, &bptr);
++        std::string key_b64(bptr->data, bptr->length);
++        BIO_free_all(b64);
++        OPENSSL_free(spki_der_ptr);
++
++        // Build DPP URI
++        std::string new_uri = "DPP:V:3;K:" + key_b64 + ";;";
++
++        // Save URI to the shared whitelist file, which the co-located Controller's
++        // DppConfiguratorTask also reads/rewrites. Open with "a+" (not "w") and read the
++        // existing content first, under the same flock() the Controller uses in
++        // write_dpp_uris() (dpp_key_store.cpp), so any admin-provisioned ProvisionDPP
++        // entries the Controller already synced into this file survive this rewrite
++        // instead of being silently truncated away.
++        FILE *uf = fopen(URI_PATH.c_str(), "a+");
++        if (!uf) {
++            LOG(ERROR) << "DPP: cannot open " << URI_PATH;
++            EVP_PKEY_free(new_key);
++            return false;
++        }
++        flock(fileno(uf), LOCK_EX);
++
++        constexpr const char *local_agent_tag = "# local-agent";
++        std::vector<std::string> other_lines;
++        rewind(uf);
++        {
++            char rd_buf[1024];
++            bool skip_next = false;
++            while (fgets(rd_buf, sizeof(rd_buf), uf)) {
++                std::string line(rd_buf);
++                while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
++                    line.pop_back();
++                if (skip_next) {
++                    skip_next = false; // this line was the previous local-agent tag's URI
++                    continue;
++                }
++                if (line == local_agent_tag) {
++                    skip_next = true;
++                    continue;
++                }
++                if (!line.empty()) {
++                    other_lines.push_back(line);
++                }
++            }
++        }
++
++        if (ftruncate(fileno(uf), 0) != 0) {
++            LOG(ERROR) << "DPP: failed to truncate " << URI_PATH;
++            flock(fileno(uf), LOCK_UN);
++            fclose(uf);
++            EVP_PKEY_free(new_key);
++            return false;
++        }
++        rewind(uf);
++
++        fprintf(uf, "%s\n%s\n", local_agent_tag, new_uri.c_str());
++        for (const auto &line : other_lines) {
++            fprintf(uf, "%s\n", line.c_str());
++        }
++        flock(fileno(uf), LOCK_UN);
++        fclose(uf);
++
++        LOG(INFO) << "DPP: generated bootstrap key pair";
++        LOG(INFO) << "DPP: URI saved to " << URI_PATH;
++        LOG(INFO) << "DPP: URI=" << new_uri;
++        LOG(WARNING) << "DPP: IMPORTANT — back up " << KEY_PATH << " and " << URI_PATH
++                     << " before factory reset to preserve the same chirp hash";
++        LOG(WARNING) << "DPP: Provide this URI to the controller: " << new_uri;
++
++        EVP_PKEY_free(new_key);
++        // Fall through — the file now exists, read it back below
++    }
++
++    // Read back the local agent's own URI: the "# local-agent" tag is always written
++    // immediately followed by its URI as the first two lines of the file (whether just
++    // generated above, or already present from a previous run/process).
++    std::ifstream uri_file(URI_PATH);
++    if (!uri_file.is_open()) {
++        LOG(ERROR) << "DPP: cannot open DPP URI file: " << URI_PATH;
++        return false;
++    }
++    std::string uri_line;
++    while (std::getline(uri_file, uri_line)) {
++        uri_line.erase(uri_line.find_last_not_of(" \t\n\r") + 1);
++        if (uri_line.empty() || uri_line[0] == '#') {
++            continue;
++        }
++        break;
++    }
++    if (uri_line.empty()) {
++        LOG(ERROR) << "DPP: no bootstrap URI found in " << URI_PATH;
++        return false;
++    }
++
++    uri_out = uri_line;
++    return true;
++}
++
++bool load_local_bootstrap_into_agentdb(std::string &uri_out)
++{
++    if (!ensure_local_bootstrap_uri(uri_out)) {
++        return false;
++    }
++
++    // 1. Load private key from PEM file
++    FILE *fp = fopen(KEY_PATH.c_str(), "r");
++    if (!fp) {
++        LOG(ERROR) << "DPP: cannot open bootstrap key: " << KEY_PATH;
++        return false;
++    }
++    EVP_PKEY *pkey = PEM_read_PrivateKey(fp, nullptr, nullptr, nullptr);
++    fclose(fp);
++    if (!pkey) {
++        LOG(ERROR) << "DPP: failed to parse bootstrap private key from " << KEY_PATH;
++        return false;
++    }
++
++    // 2. Parse DPP URI — extract K: field → decode SPKI DER
++    const std::string k_prefix = "K:";
++    auto k_pos                 = uri_out.find(k_prefix);
++    if (k_pos == std::string::npos) {
++        LOG(ERROR) << "DPP: DPP URI missing K: field: " << uri_out;
++        EVP_PKEY_free(pkey);
++        return false;
++    }
++    k_pos += k_prefix.size();
++    auto k_end = uri_out.find(';', k_pos);
++    if (k_end == std::string::npos) k_end = uri_out.size();
++    std::string key_b64 = uri_out.substr(k_pos, k_end - k_pos);
++
++    // Base64-decode (standard + url-safe variants)
++    // Replace url-safe chars
++    for (char &c : key_b64) {
++        if (c == '-') c = '+';
++        if (c == '_') c = '/';
++    }
++    // Pad if needed
++    while (key_b64.size() % 4) key_b64 += '=';
++
++    std::vector<uint8_t> spki_der;
++    {
++        // Use OpenSSL BIO for base64 decode
++        BIO *b64  = BIO_new(BIO_f_base64());
++        BIO *bmem = BIO_new_mem_buf(key_b64.data(), static_cast<int>(key_b64.size()));
++        bmem      = BIO_push(b64, bmem);
++        BIO_set_flags(bmem, BIO_FLAGS_BASE64_NO_NL);
++        spki_der.resize(key_b64.size()); // upper bound
++        int decoded_len = BIO_read(bmem, spki_der.data(), static_cast<int>(spki_der.size()));
++        BIO_free_all(bmem);
++        if (decoded_len <= 0) {
++            LOG(ERROR) << "DPP: failed to base64-decode K: field from URI";
++            EVP_PKEY_free(pkey);
++            return false;
++        }
++        spki_der.resize(static_cast<size_t>(decoded_len));
++    }
++
++    // 3. Validate: derive public key from private key and compare with URI SPKI DER.
++    // The URI K: field uses compressed SPKI DER (59 bytes for P-256).
++    // i2d_PUBKEY exports uncompressed SPKI DER (91 bytes). Build compressed form
++    // to match the URI encoding before comparing.
++    {
++        bool match             = false;
++        unsigned char *pub_ptr = nullptr;
++        int pub_len            = i2d_PUBKEY(pkey, &pub_ptr);
++        if (pub_len > 0 && pub_ptr) {
++            // Uncompressed SPKI DER for P-256 ends with: 04 || x(32) || y(32)
++            if (pub_len >= 65) {
++                const unsigned char *point = pub_ptr + (pub_len - 65);
++                if (point[0] == 0x04) {
++                    const unsigned char *x = point + 1;
++                    const unsigned char *y = point + 33;
++                    unsigned char prefix   = (y[31] & 1) ? 0x03 : 0x02;
++                    // Compressed SPKI DER for P-256 (59 bytes):
++                    // 30 39 30 13 06 07 2a864 8ce3d020106082a8648ce3d030107 03 22 00 prefix x[32]
++                    static const unsigned char spki_prefix[] = {
++                        0x30, 0x39, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02,
++                        0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03,
++                        0x22, 0x00};
++                    std::vector<uint8_t> compressed_spki(sizeof(spki_prefix) + 1 + 32);
++                    memcpy(compressed_spki.data(), spki_prefix, sizeof(spki_prefix));
++                    compressed_spki[sizeof(spki_prefix)] = prefix;
++                    memcpy(compressed_spki.data() + sizeof(spki_prefix) + 1, x, 32);
++                    match = (compressed_spki.size() == spki_der.size() &&
++                             memcmp(compressed_spki.data(), spki_der.data(), spki_der.size()) == 0);
++                }
++            }
++            OPENSSL_free(pub_ptr);
++        }
++        if (!match) {
++            LOG(ERROR) << "DPP: bootstrap key mismatch — private key public point "
++                          "does not match K: field in DPP URI. "
++                          "Check /etc/prplmesh/dpp/ and /etc/prplmesh/dpp_uri";
++            EVP_PKEY_free(pkey);
++            return false;
++        }
++    }
++
++    // 4. Compute chirp_hash = SHA256("chirp" || SPKI_DER)
++    //    and pubkey_hash   = SHA256(SPKI_DER)  (hostapd pkhash for dpp_controller)
++    std::array<uint8_t, 32> chirp_hash{};
++    std::array<uint8_t, 32> pubkey_hash{};
++    {
++        std::vector<uint8_t> input;
++        const std::string chirp_prefix = "chirp";
++        input.insert(input.end(), chirp_prefix.begin(), chirp_prefix.end());
++        input.insert(input.end(), spki_der.begin(), spki_der.end());
++        SHA256(input.data(), input.size(), chirp_hash.data());
++    }
++    SHA256(spki_der.data(), spki_der.size(), pubkey_hash.data());
++
++    // 5. Store in AgentDB
++    auto db = AgentDB::get();
++    if (db->dpp_bootstrap.private_key) {
++        EVP_PKEY_free(db->dpp_bootstrap.private_key);
++    }
++    db->dpp_bootstrap.private_key = pkey;
++    db->dpp_bootstrap.key_der     = std::move(spki_der);
++    db->dpp_bootstrap.chirp_hash  = chirp_hash;
++    db->dpp_bootstrap.pubkey_hash = pubkey_hash;
++    db->dpp_bootstrap.dpp_uri     = uri_out;
++    db->dpp_bootstrap.valid       = true;
++
++    LOG(INFO) << "DPP: loaded bootstrap key from " << KEY_PATH;
++
++    return true;
++}
++
++} // namespace dpp
++} // namespace beerocks
+diff --git a/agent/src/beerocks/slave/dpp_bootstrap_utils.h b/agent/src/beerocks/slave/dpp_bootstrap_utils.h
+new file mode 100644
+index 000000000..30ed6f70c
+--- /dev/null
++++ b/agent/src/beerocks/slave/dpp_bootstrap_utils.h
+@@ -0,0 +1,43 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#ifndef __DPP_BOOTSTRAP_UTILS_H__
++#define __DPP_BOOTSTRAP_UTILS_H__
++
++#include <string>
++
++namespace beerocks {
++namespace dpp {
++
++/**
++ * @brief Ensures this agent has its own DPP bootstrapping key pair and URI.
++ *
++ * Generates a P-256 key pair and a "DPP:V:3;K:...;;" URI on first use (persisted to
++ * /etc/prplmesh/dpp/bootstrap_key.pem and /etc/prplmesh/dpp_uri, tagged "# local-agent"),
++ * or reuses the existing ones if already present. Safe to call repeatedly - it will not
++ * regenerate a key/URI that already exists.
++ *
++ * @param[out] uri_out The local agent's own bootstrapping URI, e.g. "DPP:V:3;K:...;;".
++ * @return true on success, false otherwise.
++ */
++bool ensure_local_bootstrap_uri(std::string &uri_out);
++
++/**
++ * @brief Ensures this agent has its own DPP bootstrap key/URI (see
++ * ensure_local_bootstrap_uri()), then loads the private key, validates it against the
++ * URI's K: field, computes its chirp_hash/pubkey_hash, and populates
++ * AgentDB::get()->dpp_bootstrap so the agent is immediately able to act as DPP responder
++ * (chirp, authentication, etc.) without requiring a restart.
++ *
++ * Safe to call repeatedly - re-validates and re-populates AgentDB::dpp_bootstrap every call.
++ *
++ * @param[out] uri_out The local agent's own bootstrapping URI, e.g. "DPP:V:3;K:...;;".
++ * @return true on success, false otherwise.
++ */
++bool load_local_bootstrap_into_agentdb(std::string &uri_out);
++
++} // namespace dpp
++} // namespace beerocks
++
++#endif // __DPP_BOOTSTRAP_UTILS_H__
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 3db123618..95468f031 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -8,6 +8,7 @@
+ #include "son_slave_thread.h"
+ 
+ #include "agent_db.h"
++#include "dpp_bootstrap_utils.h"
+ #include "tlvf_utils.h"
+ 
+ #include "cac_status_database.h"
+@@ -167,7 +168,8 @@ bool der_pubkey_to_jwk(const std::vector<uint8_t> &der, std::string &jwk_out)
+         // Re-export the same key with the point-conversion-form switched to
+         // uncompressed to recover the x/y coordinates the JWK needs (OpenSSL 3.x
+         // param API, mirrors the compressed-form export in
+-        // slave_thread::load_dpp_provisioned_keys() below — avoids deprecated EC_KEY calls).
++        // beerocks::dpp::ensure_local_bootstrap_uri() (dpp_bootstrap_utils.cpp) —
++        // avoids deprecated EC_KEY calls).
+         OSSL_PARAM params[] = {
+             OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_EC_POINT_CONVERSION_FORMAT,
+                                               const_cast<char *>("uncompressed"), 0),
+@@ -985,11 +987,20 @@ bool slave_thread::read_platform_configuration()
+                       << " management_mode=" << db->device_conf.management_mode
+                       << " Enable1905Security=" << db->dpp_extender_config.link_encryption;
+         } else {
++            // Certification mode on the GW's own co-located agent must stay on WSC —
++            // DPP self-onboarding is not exercised by the GW's own certification test cases.
++            const bool force_wsc_cert_gw =
++                db->device_conf.certification_mode &&
++                db->device_conf.management_mode == BPL_MGMT_MODE_MULTIAP_CONTROLLER_AGENT;
+             db->dpp_extender_config.onboarding_type =
+-                (onboarding_type == "DPP") ? AgentDB::OnboardingType::DPP
+-                                            : AgentDB::OnboardingType::WSC;
++                (!force_wsc_cert_gw && onboarding_type == "DPP") ? AgentDB::OnboardingType::DPP
++                                                                  : AgentDB::OnboardingType::WSC;
+             LOG(DEBUG) << "Controller+Agent (GW) mode: local agent onboarding_type="
+-                       << (onboarding_type == "DPP" ? "DPP" : "WSC")
++                       << (db->dpp_extender_config.onboarding_type ==
++                                   AgentDB::OnboardingType::DPP
++                               ? "DPP"
++                               : "WSC")
++                       << " certification_mode=" << db->device_conf.certification_mode
+                        << " Enable1905Security=" << db->dpp_extender_config.link_encryption;
+         }
+     }
+@@ -1020,394 +1031,8 @@ bool slave_thread::load_dpp_provisioned_keys()
+         return true; // nothing to do for WSC mode
+     }
+ 
+-    const std::string key_dir  = "/etc/prplmesh/dpp";
+-    const std::string key_path = key_dir + "/bootstrap_key.pem";
+-    const std::string uri_path = "/etc/prplmesh/dpp_uri";
+-
+-    // -------------------------------------------------------------------------
+-    // If key or URI is missing: auto-generate ONCE and persist.
+-    // This handles first-boot. After generation the files are stable across
+-    // reboots. User should back them up before factory reset to preserve
+-    // the same chirp hash and avoid re-provisioning the controller.
+-    // -------------------------------------------------------------------------
+-    bool key_missing = (access(key_path.c_str(), F_OK) != 0);
+-    bool uri_missing = (access(uri_path.c_str(), F_OK) != 0);
+-
+-    if (key_missing || uri_missing) {
+-        LOG(INFO) << "DPP: bootstrap " << (key_missing ? "key" : "URI")
+-                  << " not found — " << (key_missing ? "generating new key pair" : "regenerating URI from existing key");
+-
+-        // Create parent directory and key directory if needed (mkdir -p equivalent)
+-        const std::string parent_dir = "/etc/prplmesh";
+-        struct stat st{};
+-        if (stat(parent_dir.c_str(), &st) != 0) {
+-            if (mkdir(parent_dir.c_str(), 0755) != 0 && errno != EEXIST) {
+-                LOG(ERROR) << "DPP: failed to create directory: " << parent_dir;
+-                return false;
+-            }
+-        }
+-        if (stat(key_dir.c_str(), &st) != 0) {
+-            if (mkdir(key_dir.c_str(), 0700) != 0 && errno != EEXIST) {
+-                LOG(ERROR) << "DPP: failed to create directory: " << key_dir;
+-                return false;
+-            }
+-        }
+-
+-        EVP_PKEY *new_key = nullptr;
+-
+-        if (!key_missing) {
+-            // Key exists but URI is missing — load the existing key to regenerate URI.
+-            // DO NOT generate a new key: that would change the chirp hash and break
+-            // any controller that already has the old URI provisioned.
+-            FILE *fp = fopen(key_path.c_str(), "r");
+-            if (fp) {
+-                new_key = PEM_read_PrivateKey(fp, nullptr, nullptr, nullptr);
+-                fclose(fp);
+-            }
+-            if (!new_key) {
+-                LOG(WARNING) << "DPP: failed to load existing key from " << key_path
+-                             << " — generating new key pair";
+-            } else {
+-                LOG(INFO) << "DPP: loaded existing key, regenerating URI from it";
+-            }
+-        }
+-
+-        if (!new_key) {
+-            // Either key is missing or loading failed — generate a new key pair
+-            EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+-            if (pctx &&
+-                EVP_PKEY_keygen_init(pctx) == 1 &&
+-                EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1) == 1) {
+-                EVP_PKEY_keygen(pctx, &new_key);
+-            }
+-            if (pctx) EVP_PKEY_CTX_free(pctx);
+-            if (!new_key) {
+-                LOG(ERROR) << "DPP: EC P-256 key generation failed";
+-                LOG(ERROR) << "DPP: EC P-256 key generation failed";
+-                return false;
+-            }
+-
+-            // Save new private key as PEM (only when key was missing/invalid)
+-            FILE *fp = fopen(key_path.c_str(), "w");
+-            if (!fp) {
+-                LOG(ERROR) << "DPP: cannot create " << key_path;
+-                EVP_PKEY_free(new_key);
+-                return false;
+-            }
+-            if (PEM_write_PrivateKey(fp, new_key, nullptr, nullptr, 0, nullptr, nullptr) != 1) {
+-                LOG(ERROR) << "DPP: PEM_write_PrivateKey failed";
+-                fclose(fp);
+-                EVP_PKEY_free(new_key);
+-                return false;
+-            }
+-            fclose(fp);
+-            chmod(key_path.c_str(), 0600);
+-        } // end if (!new_key) — new key generation
+-
+-        // Export compressed SPKI DER for the URI K: field.
+-        // hostapd uses compressed point form → shorter URI (~88 chars).
+-        // Use OpenSSL 3.x EVP_PKEY_todata to get the compressed point, then
+-        // build the SPKI DER manually (avoids deprecated EC_KEY APIs).
+-        unsigned char *spki_der_ptr = nullptr;
+-        int spki_len = 0;
+-        {
+-            // Request compressed public key via OSSL_PKEY_PARAM_EC_POINT_CONVERSION_FORMAT
+-            // then export pub key. OpenSSL 3.x EVP_PKEY_todata approach:
+-            OSSL_PARAM params[] = {
+-                OSSL_PARAM_construct_utf8_string(
+-                    OSSL_PKEY_PARAM_EC_POINT_CONVERSION_FORMAT,
+-                    const_cast<char *>("compressed"), 0),
+-                OSSL_PARAM_END
+-            };
+-            EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_pkey(nullptr, new_key, nullptr);
+-            if (pctx) {
+-                // Get compressed pubkey point (33 bytes for P-256)
+-                uint8_t compressed[33] = {};
+-                size_t comp_len = 0;
+-                // Set point format on a duplicate key
+-                EVP_PKEY *dup = EVP_PKEY_dup(new_key);
+-                if (dup) {
+-                    // Use OSSL params to set compressed format
+-                    if (EVP_PKEY_set_params(dup, params) == 1) {
+-                        EVP_PKEY_get_octet_string_param(dup, OSSL_PKEY_PARAM_PUB_KEY,
+-                                                         nullptr, 0, &comp_len);
+-                        if (comp_len == 33) {
+-                            EVP_PKEY_get_octet_string_param(dup, OSSL_PKEY_PARAM_PUB_KEY,
+-                                                             compressed, 33, &comp_len);
+-                        }
+-                    }
+-                    EVP_PKEY_free(dup);
+-                }
+-                EVP_PKEY_CTX_free(pctx);
+-
+-                if (comp_len == 33) {
+-                    // Build SPKI DER for P-256 compressed point:
+-                    // SEQUENCE(57) { SEQUENCE(19) { OID ecPublicKey, OID prime256v1 }
+-                    //                BIT STRING(34) { 0x00 || compressed(33) } }
+-                    static const uint8_t hdr[] = {
+-                        0x30, 0x39,
+-                          0x30, 0x13,
+-                            0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+-                            0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
+-                          0x03, 0x22, 0x00
+-                    };
+-                    spki_len = static_cast<int>(sizeof(hdr) + 33);
+-                    spki_der_ptr = static_cast<unsigned char *>(OPENSSL_malloc(spki_len));
+-                    if (spki_der_ptr) {
+-                        memcpy(spki_der_ptr, hdr, sizeof(hdr));
+-                        memcpy(spki_der_ptr + sizeof(hdr), compressed, 33);
+-                    } else {
+-                        spki_len = 0;
+-                    }
+-                }
+-            }
+-            // Fallback to uncompressed SPKI DER
+-            if (spki_len <= 0) {
+-                spki_len = i2d_PUBKEY(new_key, &spki_der_ptr);
+-            }
+-        }
+-        if (spki_len <= 0 || !spki_der_ptr) {
+-            LOG(ERROR) << "DPP: i2d_PUBKEY failed";
+-            EVP_PKEY_free(new_key);
+-            return false;
+-        }
+-
+-        // Base64url-encode for DPP URI (standard base64, URI uses std encoding with padding)
+-        BIO *b64  = BIO_new(BIO_f_base64());
+-        BIO *bmem = BIO_new(BIO_s_mem());
+-        b64       = BIO_push(b64, bmem);
+-        BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+-        BIO_write(b64, spki_der_ptr, spki_len);
+-        (void)BIO_flush(b64);
+-        BUF_MEM *bptr = nullptr;
+-        BIO_get_mem_ptr(bmem, &bptr);
+-        std::string key_b64(bptr->data, bptr->length);
+-        BIO_free_all(b64);
+-        OPENSSL_free(spki_der_ptr);
+-
+-        // Build DPP URI
+-        std::string new_uri = "DPP:V:3;K:" + key_b64 + ";;";
+-
+-        // Save URI to the shared whitelist file, which the co-located Controller's
+-        // DppConfiguratorTask also reads/rewrites. Open with "a+" (not "w") and read the
+-        // existing content first, under the same flock() the Controller uses in
+-        // write_dpp_uris() (dpp_key_store.cpp), so any admin-provisioned ProvisionDPP
+-        // entries the Controller already synced into this file survive this rewrite
+-        // instead of being silently truncated away.
+-        FILE *uf = fopen(uri_path.c_str(), "a+");
+-        if (!uf) {
+-            LOG(ERROR) << "DPP: cannot open " << uri_path;
+-            EVP_PKEY_free(new_key);
+-            return false;
+-        }
+-        flock(fileno(uf), LOCK_EX);
+-
+-        constexpr const char *local_agent_tag = "# local-agent";
+-        std::vector<std::string> other_lines;
+-        rewind(uf);
+-        {
+-            char rd_buf[1024];
+-            bool skip_next = false;
+-            while (fgets(rd_buf, sizeof(rd_buf), uf)) {
+-                std::string line(rd_buf);
+-                while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+-                    line.pop_back();
+-                if (skip_next) {
+-                    skip_next = false; // this line was the previous local-agent tag's URI
+-                    continue;
+-                }
+-                if (line == local_agent_tag) {
+-                    skip_next = true;
+-                    continue;
+-                }
+-                if (!line.empty()) {
+-                    other_lines.push_back(line);
+-                }
+-            }
+-        }
+-
+-        if (ftruncate(fileno(uf), 0) != 0) {
+-            LOG(ERROR) << "DPP: failed to truncate " << uri_path;
+-            flock(fileno(uf), LOCK_UN);
+-            fclose(uf);
+-            EVP_PKEY_free(new_key);
+-            return false;
+-        }
+-        rewind(uf);
+-
+-        fprintf(uf, "%s\n%s\n", local_agent_tag, new_uri.c_str());
+-        for (const auto &line : other_lines) {
+-            fprintf(uf, "%s\n", line.c_str());
+-        }
+-        flock(fileno(uf), LOCK_UN);
+-        fclose(uf);
+-
+-        LOG(INFO) << "DPP: generated bootstrap key pair";
+-        LOG(INFO) << "DPP: URI saved to " << uri_path;
+-        LOG(INFO) << "DPP: URI=" << new_uri;
+-        LOG(WARNING) << "DPP: IMPORTANT — back up " << key_path << " and " << uri_path
+-                     << " before factory reset to preserve the same chirp hash";
+-        LOG(WARNING) << "DPP: Provide this URI to the controller: " << new_uri;
+-
+-        EVP_PKEY_free(new_key);
+-        // Fall through — the files now exist, load them below
+-    }
+-
+-    // -------------------------------------------------------------------------
+-    // Load the key and URI (whether just generated or pre-provisioned)
+-    // -------------------------------------------------------------------------
+-
+-    // 1. Load private key from PEM file
+-    FILE *fp = fopen(key_path.c_str(), "r");
+-    if (!fp) {
+-        LOG(ERROR) << "DPP: cannot open bootstrap key: " << key_path;
+-        return false;
+-    }
+-    EVP_PKEY *pkey = PEM_read_PrivateKey(fp, nullptr, nullptr, nullptr);
+-    fclose(fp);
+-    if (!pkey) {
+-        LOG(ERROR) << "DPP: failed to parse bootstrap private key from " << key_path;
+-        return false;
+-    }
+-
+-    // 2. Parse DPP URI — extract K: field → decode SPKI DER
+-    std::ifstream uri_file(uri_path);
+-    if (!uri_file.is_open()) {
+-        LOG(ERROR) << "DPP: cannot open DPP URI file: " << uri_path;
+-        EVP_PKEY_free(pkey);
+-        return false;
+-    }
+-    std::string uri_line;
+-    while (std::getline(uri_file, uri_line)) {
+-        // Trim trailing whitespace/newline
+-        uri_line.erase(uri_line.find_last_not_of(" \t\n\r") + 1);
+-        // Skip comment/marker lines (e.g. "# local-agent") and blank lines —
+-        // the URI is the first real content line.
+-        if (uri_line.empty() || uri_line[0] == '#') {
+-            continue;
+-        }
+-        break;
+-    }
+-
+-    // Extract K: field from URI
+-    const std::string k_prefix = "K:";
+-    auto k_pos = uri_line.find(k_prefix);
+-    if (k_pos == std::string::npos) {
+-        LOG(ERROR) << "DPP: DPP URI missing K: field in " << uri_path;
+-        EVP_PKEY_free(pkey);
+-        return false;
+-    }
+-    k_pos += k_prefix.size();
+-    auto k_end = uri_line.find(';', k_pos);
+-    if (k_end == std::string::npos) k_end = uri_line.size();
+-    std::string key_b64 = uri_line.substr(k_pos, k_end - k_pos);
+-
+-    // Base64-decode (standard + url-safe variants)
+-    // Replace url-safe chars
+-    for (char &c : key_b64) {
+-        if (c == '-') c = '+';
+-        if (c == '_') c = '/';
+-    }
+-    // Pad if needed
+-    while (key_b64.size() % 4) key_b64 += '=';
+-
+-    std::vector<uint8_t> spki_der;
+-    {
+-        // Use OpenSSL BIO for base64 decode
+-        BIO *b64  = BIO_new(BIO_f_base64());
+-        BIO *bmem = BIO_new_mem_buf(key_b64.data(), static_cast<int>(key_b64.size()));
+-        bmem      = BIO_push(b64, bmem);
+-        BIO_set_flags(bmem, BIO_FLAGS_BASE64_NO_NL);
+-        spki_der.resize(key_b64.size()); // upper bound
+-        int decoded_len = BIO_read(bmem, spki_der.data(), static_cast<int>(spki_der.size()));
+-        BIO_free_all(bmem);
+-        if (decoded_len <= 0) {
+-            LOG(ERROR) << "DPP: failed to base64-decode K: field from URI";
+-            EVP_PKEY_free(pkey);
+-            return false;
+-        }
+-        spki_der.resize(static_cast<size_t>(decoded_len));
+-    }
+-
+-    // 3. Validate: derive public key from private key and compare with URI SPKI DER.
+-    // The URI K: field uses compressed SPKI DER (59 bytes for P-256).
+-    // i2d_PUBKEY exports uncompressed SPKI DER (91 bytes). Build compressed form
+-    // to match the URI encoding before comparing.
+-    {
+-        bool match = false;
+-        unsigned char *pub_ptr = nullptr;
+-        int pub_len = i2d_PUBKEY(pkey, &pub_ptr);
+-        if (pub_len > 0 && pub_ptr) {
+-            // Uncompressed SPKI DER for P-256 ends with: 04 || x(32) || y(32)
+-            if (pub_len >= 65) {
+-                const unsigned char *point = pub_ptr + (pub_len - 65);
+-                if (point[0] == 0x04) {
+-                    const unsigned char *x = point + 1;
+-                    const unsigned char *y = point + 33;
+-                    unsigned char prefix = (y[31] & 1) ? 0x03 : 0x02;
+-                    // Compressed SPKI DER for P-256 (59 bytes):
+-                    // 30 39 30 13 06 07 2a864 8ce3d020106082a8648ce3d030107 03 22 00 prefix x[32]
+-                    static const unsigned char spki_prefix[] = {
+-                        0x30, 0x39, 0x30, 0x13, 0x06, 0x07,
+-                        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+-                        0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
+-                        0x03, 0x22, 0x00
+-                    };
+-                    std::vector<uint8_t> compressed_spki(sizeof(spki_prefix) + 1 + 32);
+-                    memcpy(compressed_spki.data(), spki_prefix, sizeof(spki_prefix));
+-                    compressed_spki[sizeof(spki_prefix)] = prefix;
+-                    memcpy(compressed_spki.data() + sizeof(spki_prefix) + 1, x, 32);
+-                    match = (compressed_spki.size() == spki_der.size() &&
+-                             memcmp(compressed_spki.data(), spki_der.data(), spki_der.size()) == 0);
+-                }
+-            }
+-            OPENSSL_free(pub_ptr);
+-        }
+-        if (!match) {
+-            LOG(ERROR) << "DPP: bootstrap key mismatch — private key public point "
+-                          "does not match K: field in DPP URI. "
+-                          "Check /etc/prplmesh/dpp/ and /etc/prplmesh/dpp_uri";
+-            EVP_PKEY_free(pkey);
+-            return false;
+-        }
+-    }
+-
+-    // 4. Compute chirp_hash = SHA256("chirp" || SPKI_DER)
+-    //    and pubkey_hash   = SHA256(SPKI_DER)  (hostapd pkhash for dpp_controller)
+-    std::array<uint8_t, 32> chirp_hash{};
+-    std::array<uint8_t, 32> pubkey_hash{};
+-    {
+-        std::vector<uint8_t> input;
+-        const std::string chirp_prefix = "chirp";
+-        input.insert(input.end(), chirp_prefix.begin(), chirp_prefix.end());
+-        input.insert(input.end(), spki_der.begin(), spki_der.end());
+-        SHA256(input.data(), input.size(), chirp_hash.data());
+-    }
+-    SHA256(spki_der.data(), spki_der.size(), pubkey_hash.data());
+-
+-    // 5. Store in AgentDB
+-    if (db->dpp_bootstrap.private_key) {
+-        EVP_PKEY_free(db->dpp_bootstrap.private_key);
+-    }
+-    db->dpp_bootstrap.private_key = pkey;
+-    db->dpp_bootstrap.key_der     = std::move(spki_der);
+-    db->dpp_bootstrap.chirp_hash  = chirp_hash;
+-    db->dpp_bootstrap.pubkey_hash = pubkey_hash;
+-    db->dpp_bootstrap.dpp_uri     = uri_line;
+-    db->dpp_bootstrap.valid       = true;
+-
+-    LOG(INFO) << "DPP: loaded bootstrap key from " << key_path;
+-    LOG(INFO) << "DPP: chirp_hash=" << [&chirp_hash]() {
+-        std::string hex;
+-        for (auto b : chirp_hash) {
+-            char buf[3];
+-            snprintf(buf, sizeof(buf), "%02x", b);
+-            hex += buf;
+-        }
+-        return hex;
+-    }();
+-
+-    return true;
++    std::string uri;
++    return beerocks::dpp::load_local_bootstrap_into_agentdb(uri);
+ }
+ void slave_thread::start_dpp_tcp_relay_server()
+ {
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 2472eac71..8a8e0069f 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -1700,7 +1700,7 @@ bool ApAutoConfigurationTask::send_ap_autoconfiguration_search_message(
+     const bool dpp_profile3_required =
+         dpp_onboarding_active || db->device_conf.local_controller_dpp_capable;
+ 
+-    if (dpp_profile3_required) {
++    if (dpp_profile3_required || db->device_conf.certification_mode) {
+         // Override profile to Profile-3 so controller uses DPP path
+         db->device_conf.multi_ap_profile =
+             wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_3;
+@@ -2514,26 +2514,59 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+             std::string json(reinterpret_cast<const char *>(blob + offset), sub_len);
+             offset += sub_len;
+ 
+-            LOG(INFO) << "DPP BSS Config Response JSON (type=0x" << std::hex << sub_type
+-                      << std::dec << " len=" << sub_len << "):\n" << json;
++            // Log the complete config object. A single line of this size (typically 800+
++            // bytes with the signed Connector and csign) gets truncated by syslog, so emit it
++            // in fixed-size chunks; concatenating the chunks in order gives the exact JSON.
++            {
++                constexpr size_t kJsonLogChunk = 400;
++                const size_t chunks = (json.size() + kJsonLogChunk - 1) / kJsonLogChunk;
++                LOG(DEBUG) << "DPP BSS Config Response JSON (type=0x" << std::hex << sub_type
++                          << std::dec << " len=" << sub_len << " chunks=" << chunks << "):";
++                for (size_t c = 0; c < chunks; ++c) {
++                    LOG(DEBUG) << "DPP BSS Config JSON [" << (c + 1) << "/" << chunks << "] "
++                              << json.substr(c * kJsonLogChunk, kJsonLogChunk);
++                }
++            }
+ 
+             sDppBssConfig cfg;
+ 
+-            // Extracts `"key":"value"` and returns value, or empty if key is absent. The offset
+-            // past the opening quote is derived from the search string's own length, so the two
+-            // can never silently drift apart if the key text is ever changed.
++            // Extracts `"key":"value"` and returns value, or empty if key is absent or its
++            // value is not a string. JSON allows whitespace around the colon (qca-ezmesh emits
++            // `"key": "value"`, prplMesh `"key":"value"`), and the key text must be followed by
++            // a colon so that the same text used as a *value* is not mistaken for the key.
+             auto extract_quoted_field = [&json](const std::string &key) -> std::string {
+-                std::string needle = "\"" + key + "\":\"";
+-                auto pos = json.find(needle);
+-                if (pos == std::string::npos) {
+-                    return {};
+-                }
+-                pos += needle.size();
+-                auto end = json.find('"', pos);
+-                if (end == std::string::npos) {
+-                    return {};
++                const std::string quoted_key = "\"" + key + "\"";
++                auto is_ws = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
++                size_t search_from = 0;
++                while (true) {
++                    auto pos = json.find(quoted_key, search_from);
++                    if (pos == std::string::npos) {
++                        return {};
++                    }
++                    search_from = pos + quoted_key.size();
++
++                    size_t i = search_from;
++                    while (i < json.size() && is_ws(json[i])) ++i;
++                    if (i >= json.size() || json[i] != ':') {
++                        continue; // not a key, keep looking
++                    }
++                    ++i;
++                    while (i < json.size() && is_ws(json[i])) ++i;
++                    if (i >= json.size() || json[i] != '"') {
++                        return {}; // key found, but the value is not a string
++                    }
++                    ++i;
++
++                    size_t end = i;
++                    while (end < json.size() && json[end] != '"') {
++                        if (json[end] == '\\' && end + 1 < json.size()) ++end; // skip escaped char
++                        ++end;
++                    }
++                    if (end >= json.size()) {
++                        return {};
++                    }
++                    return json.substr(i, end - i);
+                 }
+-                return json.substr(pos, end - pos);
+             };
+ 
+             // Extract wi-fi_tech ("map" = backhaul BSS, "inframap" = fronthaul BSS)
+@@ -2561,6 +2594,12 @@ void ApAutoConfigurationTask::handle_bss_configuration_response(
+             auto csign_pos = json.find(kCsignKey);
+             if (csign_pos != std::string::npos) {
+                 csign_pos += kCsignKey.size();
++                // Skip whitespace between the colon and the object (`"csign": {...}`).
++                while (csign_pos < json.size() &&
++                       (json[csign_pos] == ' ' || json[csign_pos] == '\t' ||
++                        json[csign_pos] == '\n' || json[csign_pos] == '\r')) {
++                    ++csign_pos;
++                }
+                 int depth  = 0;
+                 size_t end = csign_pos;
+                 for (; end < json.size(); ++end) {
+diff --git a/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp b/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
+index 4cb08fd30..24d557270 100644
+--- a/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
++++ b/agent/src/beerocks/slave/tasks/dpp_agent_task.cpp
+@@ -19,6 +19,7 @@
+ #include <tlvf/wfa_map/tlvDppChirpValue.h>
+ #include <tlvf/wfa_map/tlvDppMessage.h>
+ #include <tlvf/wfa_map/tlvProfile2MultiApProfile.h>
++#include <tlvf/wfa_map/tlvSupportedService.h>
+ 
+ #include <openssl/bio.h>
+ #include <openssl/bn.h>
+@@ -110,6 +111,9 @@ static constexpr uint16_t DPP_ATTR_R_AUTH_TAG          = 0x100B;
+ static constexpr uint16_t DPP_ATTR_PROTOCOL_VERSION   = 0x1019;
+ static constexpr uint16_t DPP_ATTR_ENROLLEE_NONCE     = 0x1014;
+ static constexpr uint16_t DPP_ATTR_NET_ACCESS_KEY     = 0x100E;
++// Configuration Attributes object carried (wrapped) in the GAS Config Request. Same ID as above:
++// hostapd's DPP_ATTR_CONFIG_ATTR_OBJ.
++static constexpr uint16_t DPP_ATTR_CONFIG_REQUEST_OBJ = 0x100E;
+ 
+ static const uint8_t *find_attr(const uint8_t *attrs, size_t attrs_len,
+                                  uint16_t attr_id, uint16_t *out_len)
+@@ -1964,7 +1968,7 @@ bool DppAgentTask::build_gas_config_request(const sMacAddr &controller_mac)
+     std::vector<uint8_t> plaintext;
+     append_attr(plaintext, DPP_ATTR_ENROLLEE_NONCE,
+                 sess.e_nonce.data(), 16);
+-    append_attr(plaintext, static_cast<uint16_t>(0x100B) /* DPP_ATTR_CONFIG_REQUEST_OBJ */,
++    append_attr(plaintext, DPP_ATTR_CONFIG_REQUEST_OBJ,
+                 reinterpret_cast<const uint8_t *>(config_req_json.data()),
+                 static_cast<uint16_t>(config_req_json.size()));
+ 
+@@ -2358,6 +2362,31 @@ bool DppAgentTask::send_bss_configuration_request(const sMacAddr &controller_mac
+     }
+     tlvProfile2MultiApProfile->profile() = db->device_conf.multi_ap_profile;
+ 
++    // EasyMesh v6.1 5.3.8 / 17.1.53: a BSS Configuration Request must carry one SupportedService
++    // TLV (a controller such as qca-ezmesh rejects the request without it). Advertise the same
++    // services as the AP-Autoconfiguration Search; the EM Agent service is left out in
++    // certification mode, where the QCA WFA controller does not accept it (see PPM-3287).
++    auto tlvSupportedService = m_cmdu_tx.addClass<wfa_map::tlvSupportedService>();
++    if (!tlvSupportedService) {
++        LOG(ERROR) << "DPP: failed to add tlvSupportedService";
++        return false;
++    }
++    const size_t num_services = db->device_conf.certification_mode ? 1 : 2;
++    if (!tlvSupportedService->alloc_supported_service_list(num_services)) {
++        LOG(ERROR) << "DPP: failed to allocate supported service list";
++        return false;
++    }
++    for (size_t i = 0; i < num_services; ++i) {
++        auto service_tuple = tlvSupportedService->supported_service_list(i);
++        if (!std::get<0>(service_tuple)) {
++            LOG(ERROR) << "DPP: failed accessing supported_service_list[" << i << "]";
++            return false;
++        }
++        std::get<1>(service_tuple) =
++            (i == 0) ? wfa_map::tlvSupportedService::eSupportedService::MULTI_AP_AGENT
++                     : wfa_map::tlvSupportedService::eSupportedService::EM_AP_AGENT;
++    }
++
+     // Append the BSS Configuration Request TLV with DPP JSON object
+     const std::string req_json =
+         "{\"name\":\"prplMesh\",\"wi-fi_tech\":\"map\",\"netRole\":\"mapAgent\"}";
+@@ -2788,6 +2817,39 @@ bool DppAgentTask::derive_1905_pmk(const sMacAddr &peer_mac,
+         LOG(ERROR) << "PMK: ECDH computation failed for " << peer_mac;
+         return false;
+     }
++    // PMKID = Truncate-128(SHA-256(min(NK.x, PK.x) | max(NK.x, PK.x))) (Easy Connect 6.6.x;
++    // hostapd dpp_derive_pmkid()). Needed in the RSNE of EAPOL-Key M2. The x coordinate is at
++    // bytes 1..32 of the key's public point in both the compressed and uncompressed encodings.
++    uint8_t pmkid[16] = {};
++    bool pmkid_ok     = false;
++    {
++        auto pub_x = [](const EVP_PKEY *key, uint8_t *x32) -> bool {
++            uint8_t point[65] = {};
++            size_t point_len  = 0;
++            if (EVP_PKEY_get_octet_string_param(key, OSSL_PKEY_PARAM_PUB_KEY, point,
++                                                 sizeof(point), &point_len) != 1 ||
++                point_len < 33) {
++                return false;
++            }
++            memcpy(x32, point + 1, 32);
++            return true;
++        };
++        uint8_t own_x[32], peer_x[32];
++        if (pub_x(agent_pkey, own_x) && pub_x(peer_pkey, peer_x)) {
++            const bool own_is_min = memcmp(own_x, peer_x, 32) < 0;
++            uint8_t payload[64];
++            memcpy(payload, own_is_min ? own_x : peer_x, 32);
++            memcpy(payload + 32, own_is_min ? peer_x : own_x, 32);
++            uint8_t digest[SHA256_DIGEST_LENGTH];
++            SHA256(payload, sizeof(payload), digest);
++            memcpy(pmkid, digest, sizeof(pmkid));
++            pmkid_ok = true;
++        } else {
++            LOG(ERROR) << "PMK: failed to read public key x coordinates for PMKID, peer "
++                       << peer_mac;
++        }
++    }
++
+     EVP_PKEY_CTX_free(ecdh_ctx);
+     if (agent_pkey_owned) EVP_PKEY_free(agent_pkey);
+     EVP_PKEY_free(peer_pkey);
+@@ -2832,11 +2894,26 @@ bool DppAgentTask::derive_1905_pmk(const sMacAddr &peer_mac,
+     // Store PMK
+     auto &peer_state = db->peer_1905_security[peer_mac];
+     memcpy(peer_state.pmk_1905.data(), pmk, 32);
++    if (pmkid_ok) {
++        memcpy(peer_state.pmkid.data(), pmkid, sizeof(pmkid));
++    } else {
++        peer_state.pmkid.fill(0);
++    }
+     peer_state.pmk_valid       = true;
+     peer_state.tk_valid        = false;
+     peer_state.pmk_derived_time = std::chrono::steady_clock::now();
+ 
+-    LOG(INFO) << "PMK: 1905 PMK derived for peer " << peer_mac;
++    LOG(INFO) << "PMK: 1905 PMK derived for peer " << peer_mac << " pmkid="
++              << [&]() {
++                     std::string h;
++                     char b[3];
++                     if (!pmkid_ok) return std::string("(none)");
++                     for (auto c : pmkid) {
++                         snprintf(b, 3, "%02x", c);
++                         h += b;
++                     }
++                     return h;
++                 }();
+     return true;
+ }
+ 
+@@ -2905,7 +2982,8 @@ bool DppAgentTask::handle_eapol_m1(const sMacAddr &src_mac,
+ 
+     // M2 echoes M1's replay counter (per IEEE 802.11 §12.7.6.3)
+     std::vector<uint8_t> m2 = build_eapol_key_m2(peer_state.a_nonce, peer_state.s_nonce,
+-                                                   peer_state.ptk_1905, replay_counter);
++                                                   peer_state.ptk_1905, replay_counter,
++                                                   peer_state.pmkid);
+ 
+     LOG(INFO) << "4-way: sent M2 (SNonce+MIC) to " << src_mac << " [Supplicant role]";
+     return send_1905_encap_eapol(src_mac, m2);
+@@ -3214,14 +3292,31 @@ std::vector<uint8_t> DppAgentTask::build_eapol_key_m2(
+     const std::array<uint8_t, 32> &anonce,
+     const std::array<uint8_t, 32> &snonce,
+     const std::array<uint8_t, 64> &ptk,
+-    uint64_t replay_counter)
+-{
++    uint64_t replay_counter,
++    const std::array<uint8_t, 16> &pmkid)
++{
++    (void)anonce;
++
++    // Key Data = the RSNE this Supplicant "associates" with: hostapd's Authenticator tells M2
++    // from M4 by Key Data Length (0 means 4/4), and it then requires this RSNE to match, byte
++    // for byte, the one it was given for the association (wpa_compare_rsn_ie()):
++    //   version 1, group + pairwise CCMP-256 (00-0F-AC:10), AKM DPP (50-6F-9A:02),
++    //   RSN capabilities 0, one PMKID.
++    std::vector<uint8_t> rsne = {
++        0x30, 0x26,                                     // RSN element, 38 bytes
++        0x01, 0x00,                                     // version
++        0x00, 0x0F, 0xAC, 0x0A,                         // group cipher: CCMP-256
++        0x01, 0x00, 0x00, 0x0F, 0xAC, 0x0A,             // 1 pairwise cipher: CCMP-256
++        0x01, 0x00, 0x50, 0x6F, 0x9A, 0x02,             // 1 AKM: DPP
++        0x00, 0x00,                                     // RSN capabilities
++        0x01, 0x00,                                     // 1 PMKID
++    };
++    rsne.insert(rsne.end(), pmkid.begin(), pmkid.end());
++
+     std::vector<uint8_t> frame(99, 0);
+ 
+     frame[0] = 0x02;
+     frame[1] = 0x03;
+-    frame[2] = 0x00;
+-    frame[3] = 0x5F; // EAPOL Length = 95
+ 
+     frame[4] = 0x02;
+     // Key Info: Pairwise=1, MIC=1, Version=0 (AKM-defined for DPP)
+@@ -3240,7 +3335,19 @@ std::vector<uint8_t> DppAgentTask::build_eapol_key_m2(
+     // SNonce at offset 17
+     memcpy(frame.data() + 17, snonce.data(), 32);
+ 
+-    // Compute MIC using KCK = PTK[0:16] (DPP KCK = PMK/2 = 16 bytes), MIC at offset 81
++    // Key Data Length (big-endian) at bytes 97-98, Key Data follows at byte 99
++    const uint16_t kd_len = static_cast<uint16_t>(rsne.size());
++    frame[97] = (kd_len >> 8) & 0xFF;
++    frame[98] = kd_len & 0xFF;
++    frame.insert(frame.end(), rsne.begin(), rsne.end());
++
++    // EAPOL body length = total frame - 4 (EAPOL header bytes 0-3)
++    const uint16_t eapol_body_len = static_cast<uint16_t>(frame.size() - 4);
++    frame[2] = (eapol_body_len >> 8) & 0xFF;
++    frame[3] = eapol_body_len & 0xFF;
++
++    // Compute MIC over the whole frame (MIC field still zero) using KCK = PTK[0:16]
++    // (DPP KCK = PMK/2 = 16 bytes); MIC goes at offset 81
+     uint8_t mic[SHA256_DIGEST_LENGTH] = {};
+     size_t mic_len = SHA256_DIGEST_LENGTH;
+     EVP_Q_mac(nullptr, "HMAC", nullptr, "SHA256", nullptr,
+diff --git a/agent/src/beerocks/slave/tasks/dpp_agent_task.h b/agent/src/beerocks/slave/tasks/dpp_agent_task.h
+index b54ee3f1e..6693e62ea 100644
+--- a/agent/src/beerocks/slave/tasks/dpp_agent_task.h
++++ b/agent/src/beerocks/slave/tasks/dpp_agent_task.h
+@@ -479,11 +479,12 @@ private:
+     std::vector<uint8_t> build_eapol_key_m1(const std::array<uint8_t, 32> &anonce,
+                                               uint64_t replay_counter);
+ 
+-    /** @brief Build EAPOL-Key M2 (SNonce + MIC). */
++    /** @brief Build EAPOL-Key M2 (SNonce + RSNE with PMKID as Key Data + MIC). */
+     std::vector<uint8_t> build_eapol_key_m2(const std::array<uint8_t, 32> &anonce,
+                                               const std::array<uint8_t, 32> &snonce,
+                                               const std::array<uint8_t, 64> &ptk,
+-                                              uint64_t replay_counter);
++                                              uint64_t replay_counter,
++                                              const std::array<uint8_t, 16> &pmkid);
+ 
+     /** @brief Build EAPOL-Key M3 (GTK KDE encrypted + MIC). */
+     std::vector<uint8_t> build_eapol_key_m3(const std::array<uint8_t, 32> &anonce,
+diff --git a/agent/src/beerocks/slave/tasks/topology_task.cpp b/agent/src/beerocks/slave/tasks/topology_task.cpp
+index 0b34fec1f..8a0a068e3 100644
+--- a/agent/src/beerocks/slave/tasks/topology_task.cpp
++++ b/agent/src/beerocks/slave/tasks/topology_task.cpp
+@@ -495,7 +495,7 @@ void TopologyTask::handle_topology_query(ieee1905_1::CmduMessageRx &cmdu_rx,
+                 : (db->dpp_credentials.initialized ||
+                    (db->dpp_extender_config.onboarding_type == AgentDB::OnboardingType::DPP &&
+                     db->dpp_bootstrap.valid));
+-        if (dpp_capable) {
++        if (dpp_capable || db->device_conf.certification_mode) {
+             db->device_conf.multi_ap_profile =
+                 wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_3;
+         }
+diff --git a/common/beerocks/bcl/include/bcl/beerocks_ucc_listener.h b/common/beerocks/bcl/include/bcl/beerocks_ucc_listener.h
+index 1cd96dcab..f08ad6fc3 100644
+--- a/common/beerocks/bcl/include/bcl/beerocks_ucc_listener.h
++++ b/common/beerocks/bcl/include/bcl/beerocks_ucc_listener.h
+@@ -188,7 +188,7 @@ protected:
+                                          std::string &err_string)                      = 0;
+ 
+     virtual bool handle_dev_exec_action(const std::unordered_map<std::string, std::string> &params,
+-                                        std::string &err_string) = 0;
++                                        std::string &value, std::string &err_string) = 0;
+ 
+     virtual bool handle_custom_command(const std::unordered_map<std::string, std::string> &params,
+                                        std::string &err_string) = 0;
+diff --git a/common/beerocks/bcl/source/beerocks_ucc_listener.cpp b/common/beerocks/bcl/source/beerocks_ucc_listener.cpp
+index 804b2a192..f7f0463a7 100644
+--- a/common/beerocks/bcl/source/beerocks_ucc_listener.cpp
++++ b/common/beerocks/bcl/source/beerocks_ucc_listener.cpp
+@@ -877,14 +877,15 @@ void beerocks_ucc_listener::handle_wfa_ca_command(int fd, const std::string &com
+             break;
+         }
+ 
+-        if (!handle_dev_exec_action(params, err_string)) {
++        std::string value;
++        if (!handle_dev_exec_action(params, value, err_string)) {
+             LOG(ERROR) << err_string;
+             reply_ucc(fd, eWfaCaStatus::INVALID, err_string);
+             break;
+         }
+ 
+         // Send back second reply
+-        reply_ucc(fd, eWfaCaStatus::COMPLETE);
++        reply_ucc(fd, eWfaCaStatus::COMPLETE, value);
+         break;
+     }
+     case eWfaCaCommand::CUSTOM_CMD: {
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 13884cc61..75fab2f3b 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -390,6 +390,7 @@ bool Controller::start()
+     LOG_IF(!m_task_pool.add_task(m_dpp_configurator_task), FATAL)
+         << "Failed adding DppConfiguratorTask!";
+     LOG(INFO) << "DPP Configurator Task initialized";
++    m_controller_ucc_listener.set_dpp_configurator_task(m_dpp_configurator_task);
+ 
+     // The ProvisionDPP table's "on event" handler (on_action.cpp) may have already fired
+     // during datamodel restore at process startup, before g_database/this task existed —
+@@ -846,10 +847,43 @@ bool Controller::handle_cmdu_1905_autoconfiguration_search(const sMacAddr &src_m
+         LOG(ERROR) << "getClass<tlvSearchedRole> failed";
+         return false;
+     }
++    // The band of an AP-Autoconfiguration Search is carried in the AutoConfig Frequency Band
++    // TLV (0x0E). Some Agents (observed with qca-ezmesh) put the Supported Frequency Band TLV
++    // (0x10, meant for the Response) in its place, with the same values; accept either.
++    ieee1905_1::tlvAutoconfigFreqBand::eValue auto_config_freq_band =
++        ieee1905_1::tlvAutoconfigFreqBand::IEEE_802_11_2_4_GHZ;
+     auto tlvAutoconfigFreqBand = cmdu_rx.getClass<ieee1905_1::tlvAutoconfigFreqBand>();
+-    if (!tlvAutoconfigFreqBand) {
+-        LOG(ERROR) << "getClass<tlvAutoconfigFreqBand> failed";
+-        return false;
++    if (tlvAutoconfigFreqBand) {
++        auto_config_freq_band = tlvAutoconfigFreqBand->value();
++    } else {
++        auto tlvSupportedFreqBandIn = cmdu_rx.getClass<ieee1905_1::tlvSupportedFreqBand>();
++        if (!tlvSupportedFreqBandIn) {
++            LOG(ERROR) << "getClass<tlvAutoconfigFreqBand> and getClass<tlvSupportedFreqBand> "
++                          "failed";
++            return false;
++        }
++        switch (tlvSupportedFreqBandIn->value()) {
++        case ieee1905_1::tlvSupportedFreqBand::BAND_2_4G:
++            auto_config_freq_band = ieee1905_1::tlvAutoconfigFreqBand::IEEE_802_11_2_4_GHZ;
++            break;
++        case ieee1905_1::tlvSupportedFreqBand::BAND_5G:
++            auto_config_freq_band = ieee1905_1::tlvAutoconfigFreqBand::IEEE_802_11_5_GHZ;
++            break;
++        case ieee1905_1::tlvSupportedFreqBand::BAND_6G:
++            auto_config_freq_band = ieee1905_1::tlvAutoconfigFreqBand::IEEE_802_11_6_GHZ;
++            break;
++        case ieee1905_1::tlvSupportedFreqBand::BAND_60G:
++            auto_config_freq_band = ieee1905_1::tlvAutoconfigFreqBand::IEEE_802_11_60_GHZ;
++            break;
++        default:
++            LOG(ERROR) << "unknown Supported Frequency Band value in Search, value="
++                       << int(tlvSupportedFreqBandIn->value());
++            return false;
++        }
++        LOG(INFO) << "AP-Autoconfiguration Search from " << src_mac
++                  << " carries Supported Frequency Band TLV (0x10) instead of AutoConfig "
++                     "Frequency Band (0x0E) — accepting, band="
++                  << int(auto_config_freq_band);
+     }
+     auto tlvSupportedServiceIn = cmdu_rx.getClass<wfa_map::tlvSupportedService>();
+     if (!tlvSupportedServiceIn) {
+@@ -871,7 +905,6 @@ bool Controller::handle_cmdu_1905_autoconfiguration_search(const sMacAddr &src_m
+         return false;
+     }
+ 
+-    auto &auto_config_freq_band = tlvAutoconfigFreqBand->value();
+     LOG(DEBUG) << "band=" << int(auto_config_freq_band);
+ 
+     bool supported_controller_service = false;
+@@ -2504,6 +2537,19 @@ bool Controller::handle_cmdu_1905_autoconfiguration_WSC(const sMacAddr &src_mac,
+         return false;
+     }
+ 
++    // Certification mode with the Controller set to DPP (onboardingtype=DPP): a remote Agent
++    // must be onboarded via DPP, never via WSC. Drop the M1 before the Agent is added to the
++    // database or an M2 is built. The co-located local Agent is exempt: it always onboards via
++    // WSC over the local bridge (it never runs DPP/EAPOL).
++    if (database.setting_certification_mode() &&
++        beerocks::bpl::cfg_get_onboarding_type() == "DPP" &&
++        m1->mac_addr() != database.get_local_bridge_mac()) {
++        LOG(WARNING) << "Certification mode with onboardingtype=DPP — rejecting WSC onboarding "
++                        "(M1) from agent "
++                     << m1->mac_addr() << " (src=" << src_mac << "); it must onboard via DPP";
++        return false;
++    }
++
+     auto radio_basic_caps = cmdu_rx.getClass<wfa_map::tlvApRadioBasicCapabilities>();
+     if (!radio_basic_caps) {
+         LOG(ERROR) << "getClass<wfa_map::tlvApRadioBasicCapabilities> failed";
+diff --git a/controller/src/beerocks/master/controller_ucc_listener.cpp b/controller/src/beerocks/master/controller_ucc_listener.cpp
+index aeb2f16b0..1fcfb4d63 100644
+--- a/controller/src/beerocks/master/controller_ucc_listener.cpp
++++ b/controller/src/beerocks/master/controller_ucc_listener.cpp
+@@ -10,6 +10,8 @@
+ #include <openssl/sha.h>
+ #include <cstring>
+ #include "son_actions.h"
++#include "tasks/dpp_configurator_task.h"
++#include <bpl/bpl_cfg.h>
+ 
+ #include <tlvf/ieee_1905_1/tlvAlMacAddress.h>
+ #include <tlvf/ieee_1905_1/tlvMacAddress.h>
+@@ -156,7 +158,8 @@ bool controller_ucc_listener::handle_dev_set_rfeature(
+ }
+ 
+ bool controller_ucc_listener::handle_dev_exec_action(
+-    const std::unordered_map<std::string, std::string> &params, std::string &err_string)
++    const std::unordered_map<std::string, std::string> &params, std::string &value,
++    std::string &err_string)
+ {
+     auto action_type_it = params.find("dppactiontype");
+     if (action_type_it != params.end()) {
+@@ -166,6 +169,12 @@ bool controller_ucc_listener::handle_dev_exec_action(
+             return false;
+         }
+ 
++        if (m_database.setting_certification_mode()) {
++            beerocks::bpl::cfg_set_onboarding_type("DPP");
++            beerocks::bpl::cfg_set_1905_security_enabled(true);
++            beerocks::bpl::cfg_commit_changes();
++        }
++
+         auto dpp_bootstrapping_data_bytes_it = params.find("dppbootstrappingdata");
+         if (dpp_bootstrapping_data_bytes_it == params.end()) {
+             err_string = "DPPBootstrappingData is missing";
+@@ -178,6 +187,10 @@ bool controller_ucc_listener::handle_dev_exec_action(
+ 
+         LOG(DEBUG) << "bootstrapping data: " << dpp_bootstrapping_data_str;
+ 
++        // Keep the untouched "DPP:...;;" string to persist below — parsing further down
++        // erases the prefix/suffix from dpp_bootstrapping_data_str in place.
++        const std::string full_dpp_uri = dpp_bootstrapping_data_str;
++
+         // dpp_bootstrapping_data is now look like that:
+         // e.g. DPP:V:2;K:MDkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDIgADezecPyVDIgJVgdGBHGBdxRxGpNU7x9cHFBE=;;
+         // Need to parse it according to this rules:
+@@ -313,6 +326,19 @@ bool controller_ucc_listener::handle_dev_exec_action(
+         LOG(DEBUG) << "host:" << m_database.dpp_bootstrapping_info.host;
+         LOG(DEBUG) << "public_key:" << m_database.dpp_bootstrapping_info.public_key;
+ 
++        // Persist the enrollee's URI to /etc/prplmesh/dpp_uri so DppConfiguratorTask's
++        // m_uri_cache picks it up (via inotify) — without this, find_enrollee_by_hash()
++        // has nothing to match against during the real DPP chirp/authentication exchange,
++        // since it never reads m_database.dpp_bootstrapping_info directly.
++        if (m_dpp_configurator_task) {
++            if (!m_dpp_configurator_task->save_peer_bootstrap_uri(full_dpp_uri)) {
++                LOG(ERROR) << "DPP: failed to persist peer bootstrap URI to /etc/prplmesh/dpp_uri";
++            }
++        } else {
++            LOG(WARNING) << "DPP: DppConfiguratorTask not available yet — peer bootstrap URI "
++                            "not persisted to /etc/prplmesh/dpp_uri";
++        }
++
+         return true;
+     }
+     err_string = "command is not supported on the Controller";
+@@ -469,6 +495,22 @@ void controller_ucc_listener::handle_dev_reset_default(
+     // regardless of what was processed in a previous test case.
+     m_bss_info_cleared_mac.clear();
+ 
++    // Wipe any peer DPP bootstrap URI state left over from a previous certification test
++    // case (SetPeerBootstrap CAPI calls, wire DPP_BOOTSTRAPPING_URI_NOTIFICATIONs) — both
++    // the in-memory bootstrapping info and the persisted/cached URIs find_enrollee_by_hash()
++    // matches against during the real chirp/authentication exchange.
++    m_database.dpp_bootstrapping_info = {};
++    if (m_dpp_configurator_task) {
++        m_dpp_configurator_task->clear_peer_bootstrap_uris();
++    }
++
++    // Undo the OnboardingType=DPP/LinkEncryptionEnable=1 forced by SetPeerBootstrap for the
++    // previous test case - otherwise a WSC-only test run right after a DPP test would silently
++    // inherit DPP onboarding, since dev_set_config never carries these two fields itself.
++    beerocks::bpl::cfg_set_onboarding_type("WSC");
++    beerocks::bpl::cfg_set_1905_security_enabled(false);
++    beerocks::bpl::cfg_commit_changes();
++
+     // Send back second reply to UCC client.
+     send_reply(fd);
+ }
+diff --git a/controller/src/beerocks/master/controller_ucc_listener.h b/controller/src/beerocks/master/controller_ucc_listener.h
+index c05055b8c..9a7bee18e 100644
+--- a/controller/src/beerocks/master/controller_ucc_listener.h
++++ b/controller/src/beerocks/master/controller_ucc_listener.h
+@@ -19,6 +19,10 @@ using namespace son;
+ 
+ using radio_preference_tlv_format = std::map<std::pair<uint8_t, uint8_t>, std::set<uint8_t>>;
+ 
++namespace son {
++class DppConfiguratorTask;
++}
++
+ namespace beerocks {
+ class controller_ucc_listener : public beerocks_ucc_listener {
+ public:
+@@ -26,6 +30,17 @@ public:
+                             std::unique_ptr<beerocks::UccServer> ucc_server);
+     ~controller_ucc_listener() override;
+ 
++    /**
++     * @brief Bind the DPP Configurator Task once it exists, so SetPeerBootstrap can persist
++     * the peer's URI into /etc/prplmesh/dpp_uri. Constructed after this listener
++     * (controller.cpp), so it can't be passed to the constructor - set once, right after
++     * the task is created.
++     */
++    void set_dpp_configurator_task(std::shared_ptr<son::DppConfiguratorTask> dpp_configurator_task)
++    {
++        m_dpp_configurator_task = dpp_configurator_task.get();
++    }
++
+ private:
+     std::string fill_version_reply_string() override;
+     bool clear_configuration();
+@@ -38,7 +53,7 @@ private:
+     bool handle_dev_set_rfeature(const std::unordered_map<std::string, std::string> &params,
+                                  std::string &err_string) override;
+     bool handle_dev_exec_action(const std::unordered_map<std::string, std::string> &params,
+-                                std::string &err_string) override;
++                                std::string &value, std::string &err_string) override;
+     bool handle_custom_command(const std::unordered_map<std::string, std::string> &params,
+                                std::string &err_string) override;
+ 
+@@ -59,6 +74,7 @@ private:
+ 
+     db &m_database;
+     std::unordered_set<sMacAddr> m_bss_info_cleared_mac;
++    son::DppConfiguratorTask *m_dpp_configurator_task = nullptr;
+ 
+ private:
+     /**
+diff --git a/controller/src/beerocks/master/son_actions.cpp b/controller/src/beerocks/master/son_actions.cpp
+index 335df4965..61232f4d1 100644
+--- a/controller/src/beerocks/master/son_actions.cpp
++++ b/controller/src/beerocks/master/son_actions.cpp
+@@ -785,6 +785,10 @@ bool son_actions::send_topology_query_msg(const sMacAddr &dest_mac,
+         LOG(ERROR) << "addClass wfa_map::tlvProfile2MultiApProfile failed";
+         return false;
+     }
++    if (database.setting_certification_mode()) {
++        tlvProfile2MultiApProfile->profile() =
++            wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::MULTIAP_PROFILE_3;
++    }
+     return send_cmdu_to_agent(dest_mac, cmdu_tx, database);
+ }
+ 
+diff --git a/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp b/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp
+index 6d8f37182..358520ac2 100644
+--- a/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp
++++ b/controller/src/beerocks/master/tasks/dpp_configurator_task.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include "../controller.h"
+ #include "../son_actions.h"
++#include <bcl/son/son_wireless_utils.h>
+ #include <beerocks/tlvf/beerocks_message.h>
+ #include <mapf/common/logger.h>
+ #include <tlvf/wfa_map/tlv1905EncapDpp.h>
+@@ -902,7 +903,8 @@ bool DppConfiguratorTask::handle_1905_decryption_failure(const sMacAddr &src_mac
+ //   000FAC08 = SAE      (AKM suite 8)
+ //   000FAC24 = SAE-EXT-KEY (AKM suite 24, WPA3-PCM)
+ //   506F9A02 = DPP      (Wi-Fi Alliance OUI, type 2)
+-static std::string wsc_auth_to_base_akm(WSC::eWscAuth auth)
++// Maps the non-DPP AKM bits (and the standalone DPP value) to their AKM suite selectors.
++static std::string wsc_auth_to_non_dpp_akm(WSC::eWscAuth auth)
+ {
+     switch (auth) {
+     case WSC::eWscAuth::WSC_AUTH_WPA2PSK:
+@@ -913,6 +915,8 @@ static std::string wsc_auth_to_base_akm(WSC::eWscAuth auth)
+         return "000FAC24";
+     case WSC::eWscAuth::WSC_AUTH_RSN:
+         return "000FAC08+000FAC24";
++    case WSC::eWscAuth::WSC_AUTH_DPP:
++        return "506F9A02";
+     default:
+         // Handle combined SAE+PSK (sae-mixed) which is a bitfield combination
+         if ((auth & WSC::eWscAuth::WSC_AUTH_SAE) && (auth & WSC::eWscAuth::WSC_AUTH_WPA2PSK)) {
+@@ -924,18 +928,29 @@ static std::string wsc_auth_to_base_akm(WSC::eWscAuth auth)
+     }
+ }
+ 
++// The DPP AKM rides alongside the other AKMs (e.g. DPP+SAE+PSK = 0xe0). A combined value
++// would otherwise reach the `default:` above and lose the DPP bit, so strip it and map the
++// remaining AKMs. With include_dpp_akm (certification mode) the DPP selector is prefixed:
++// "506F9A02+000FAC08+000FAC02" (EasyMesh v6.1 cred.akm). Without it (regular mode) the DPP
++// selector is left out ("000FAC08+000FAC02"): wpa_supplicant still has problems with a DPP
++// AKM in the bSTA credential, so only the legacy AKMs are advertised. A BSS whose only AKM
++// is DPP keeps "506F9A02" in both modes, since nothing else could be advertised.
++static std::string wsc_auth_to_base_akm(WSC::eWscAuth auth, bool include_dpp_akm)
++{
++    if ((auth & WSC::eWscAuth::WSC_AUTH_DPP) && auth != WSC::eWscAuth::WSC_AUTH_DPP) {
++        auto others = static_cast<WSC::eWscAuth>(auth & ~WSC::eWscAuth::WSC_AUTH_DPP);
++        const std::string non_dpp = wsc_auth_to_non_dpp_akm(others);
++        return include_dpp_akm ? "506F9A02+" + non_dpp : non_dpp;
++    }
++    return wsc_auth_to_non_dpp_akm(auth);
++}
++
+ static std::string
+ wsc_auth_to_fh_akm(WSC::eWscAuth auth,
+                    son::wireless_utils::eAdditionalAuth additional_auth =
+                        son::wireless_utils::eAdditionalAuth::NONE,
+-                   bool eppke = false)
++                   bool eppke = false, bool include_dpp_akm = false)
+ {
+-    // WSC_AUTH_DPP may be OR'd into auth alongside a standard AKM (a BSS can be both
+-    // DPP-onboarded and use a standard AKM for its primary RSNE); mask it out here so the
+-    // switch/bitfield checks below match on the base AKM only. The DPP OUI is prepended by
+-    // the caller when that bit is set.
+-    auth = static_cast<WSC::eWscAuth>(auth & ~WSC::eWscAuth::WSC_AUTH_DPP);
+-
+     // 802.11bi EPPKE: the AKM becomes (optional base AKM)+000FAC29[000FAC24]. AKM24, if
+     // present in the base AKM, is folded into the bracket rather than listed twice.
+     if (eppke) {
+@@ -945,22 +960,85 @@ wsc_auth_to_fh_akm(WSC::eWscAuth auth,
+         // to prefix. WSC_AUTH_OPEN is a distinct, explicit "no auth" marker (0x1), not 0.
+         const bool no_base_akm =
+             (auth == WSC::eWscAuth::WSC_AUTH_OPEN) || (static_cast<uint16_t>(auth) == 0);
+-        std::string prefix = no_base_akm ? "" : wsc_auth_to_base_akm(auth) + "+";
++        std::string prefix =
++            no_base_akm ? "" : wsc_auth_to_base_akm(auth, include_dpp_akm) + "+";
+         return prefix + "000FAC29[000FAC24]";
+     }
+ 
+-    return wsc_auth_to_base_akm(auth);
++    return wsc_auth_to_base_akm(auth, include_dpp_akm);
+ }
+ 
+ static std::string
+ wsc_auth_to_bh_akm(WSC::eWscAuth auth,
+                     son::wireless_utils::eAdditionalAuth additional_auth =
+                         son::wireless_utils::eAdditionalAuth::NONE,
+-                    bool eppke = false)
++                    bool eppke = false, bool include_dpp_akm = false)
++{
++    return wsc_auth_to_fh_akm(auth, additional_auth, eppke, include_dpp_akm);
++}
++
++// Certification mode: the DPP/EasyMesh spec also allows cred.akm in name form ("dpp+sae+psk"),
++// which is what the QCA WFA controller sends. Rewrite the AKM suite selectors that have a name
++// form ("506F9A02" -> dpp, "000FAC08" -> sae, "000FAC02" -> psk); selectors without one (e.g.
++// "000FAC24", EPPKE "000FAC29[000FAC24]") are kept as they are.
++static std::string akm_selectors_to_names(const std::string &akm)
++{
++    std::string out;
++    size_t start = 0;
++    while (true) {
++        const size_t plus  = akm.find('+', start);
++        std::string token = akm.substr(start, plus == std::string::npos ? std::string::npos
++                                                                         : plus - start);
++        if (token == "506F9A02") {
++            token = "dpp";
++        } else if (token == "000FAC08") {
++            token = "sae";
++        } else if (token == "000FAC02") {
++            token = "psk";
++        }
++        if (!out.empty()) {
++            out += "+";
++        }
++        out += token;
++        if (plus == std::string::npos) {
++            break;
++        }
++        start = plus + 1;
++    }
++    return out;
++}
++
++// Extend a bSTA's base AKM string with any RSN-Override AKMs (SAE / SAE-EXT-KEY) carried
++// in its SecurityIEs blob (RSNOE/RSNO2E), so the GAS Config Object's cred.akm advertises
++// every AKM wpa_supplicant may need to try against the upstream RSNO-enabled AP — mirrors
++// the "+"-joined multi-AKM convention already used above for WSC_AUTH_RSN/sae-mixed.
++// Unlike generate_backhaul_bss_config()/generate_fronthaul_bss_config() (which blank akm
++// and send the raw SecurityIEs blob per spec Figure 12 for hostapd-facing configs), a
++// bSTA's wpa_supplicant cred object has no SecurityIEs field, so the override AKMs must be
++// folded into the akm string itself.
++static std::string bh_akm_with_rsn_override(const std::string &base_akm,
++                                             const std::vector<uint8_t> &security_ies)
+ {
+-    // Testing hook: wpa_supplicant has a bug parsing "dpp+psk+sae" in the Config Object's
+-    // cred.akm — drop the 506F9A02 (DPP) AKM token so it sees "psk+sae" instead.
+-    return wsc_auth_to_fh_akm(auth, additional_auth, eppke);
++    if (security_ies.empty()) {
++        return base_akm;
++    }
++
++    bool has_akm8 = false, has_akm24 = false;
++    son::rsn_ie_utils::security_ies_akm_presence(security_ies, has_akm8, has_akm24);
++
++    std::string akm = base_akm;
++    auto append_if_missing = [&akm](const std::string &suite) {
++        if (akm.find(suite) == std::string::npos) {
++            akm += (akm.empty() ? "" : "+") + suite;
++        }
++    };
++    if (has_akm8) {
++        append_if_missing("000FAC08");
++    }
++    if (has_akm24) {
++        append_if_missing("000FAC24");
++    }
++    return akm;
+ }
+ 
+ bool DppConfiguratorTask::add_bss_config_response_tlvs(const sMacAddr &agent_mac,
+@@ -1118,10 +1196,12 @@ bool DppConfiguratorTask::add_bss_config_response_tlvs(const sMacAddr &agent_mac
+         auto adjust_auth = [radio_band](WSC::eWscAuth auth) -> WSC::eWscAuth {
+             // On 6GHz, downgrade SAE+PSK (sae-mixed, 0x60) to SAE-only.
+             // Mirrors adjust_security_mode_for_agent() in controller.cpp.
++            // A DPP AKM bit is independent of this downgrade and must survive it.
+             if (radio_band == beerocks::FREQ_6G &&
+                 (auth & WSC::eWscAuth::WSC_AUTH_SAE) &&
+                 (auth & WSC::eWscAuth::WSC_AUTH_WPA2PSK)) {
+-                return WSC::eWscAuth::WSC_AUTH_SAE;
++                return static_cast<WSC::eWscAuth>(WSC::eWscAuth::WSC_AUTH_SAE |
++                                                  (auth & WSC::eWscAuth::WSC_AUTH_DPP));
+             }
+             return auth;
+         };
+@@ -1176,8 +1256,12 @@ bool DppConfiguratorTask::add_bss_config_response_tlvs(const sMacAddr &agent_mac
+                              << " for radio ruid=" << ruid;
+                 continue;
+             }
++            const bool cert_mode = m_database.setting_certification_mode();
+             std::string akm = wsc_auth_to_bh_akm(adjust_auth(bss.authentication_type),
+-                                                 bss.additional_auth, bss.eppke);
++                                                 bss.additional_auth, bss.eppke, cert_mode);
++            if (cert_mode) {
++                akm = akm_selectors_to_names(akm);
++            }
+             std::string custom_alias = son::wireless_utils::vap_type_to_string(bss.vap_type);
+             bool dpp_enabled = (bss.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP) != 0;
+             if (!bss.security_ies.empty() && !agent_supports_rsn_overriding) {
+@@ -1201,10 +1285,12 @@ bool DppConfiguratorTask::add_bss_config_response_tlvs(const sMacAddr &agent_mac
+                              << " for radio ruid=" << ruid;
+                 continue;
+             }
+-            // Testing hook: wpa_supplicant has a bug parsing "dpp+..." in the Config
+-            // Object's cred.akm — drop the 506F9A02 (DPP) AKM token here too.
++            const bool cert_mode = m_database.setting_certification_mode();
+             std::string akm = wsc_auth_to_fh_akm(adjust_auth(bss.authentication_type),
+-                                                 bss.additional_auth, bss.eppke);
++                                                 bss.additional_auth, bss.eppke, cert_mode);
++            if (cert_mode) {
++                akm = akm_selectors_to_names(akm);
++            }
+             std::string custom_alias = son::wireless_utils::vap_type_to_string(bss.vap_type);
+             bool dpp_enabled = (bss.authentication_type & WSC::eWscAuth::WSC_AUTH_DPP) != 0;
+             if (!bss.security_ies.empty() && !agent_supports_rsn_overriding) {
+@@ -1853,8 +1939,10 @@ bool DppConfiguratorTask::send_config_response(sDppSession &session)
+         if (bss.backhaul) {
+             bh_ssid       = bss.ssid;
+             bh_passphrase = bss.network_key;
+-            bh_akm =
+-                wsc_auth_to_bh_akm(bss.authentication_type, bss.additional_auth, bss.eppke);
++            std::string base_bh_akm = wsc_auth_to_bh_akm(
++                bss.authentication_type, bss.additional_auth, bss.eppke,
++                m_database.setting_certification_mode());
++            bh_akm = bh_akm_with_rsn_override(base_bh_akm, bss.security_ies);
+             config_bsta   = is_infra_request
+                                ? generate_backhaul_sta_config(session, bh_ssid, bh_passphrase,
+                                                                bh_akm, "sta", "*")
+diff --git a/controller/src/beerocks/master/tasks/dpp_configurator_task.h b/controller/src/beerocks/master/tasks/dpp_configurator_task.h
+index efae2faee..2b1fc2573 100644
+--- a/controller/src/beerocks/master/tasks/dpp_configurator_task.h
++++ b/controller/src/beerocks/master/tasks/dpp_configurator_task.h
+@@ -148,6 +148,33 @@ public:
+         return m_keystore.write_dpp_uris(uris);
+     }
+ 
++    /**
++     * @brief Persist a peer/enrollee's DPP bootstrapping URI (e.g. received via the CAPI
++     * SetPeerBootstrap action) into /etc/prplmesh/dpp_uri, mirroring the persistence done
++     * for a wire-received DPP_BOOTSTRAPPING_URI_NOTIFICATION in
++     * handle_dpp_bootstrapping_uri_notification(). Without this, the enrollee's bootstrap
++     * key is never added to m_uri_cache, so find_enrollee_by_hash() can't recognize it
++     * during the real chirp/authentication exchange.
++     *
++     * The inotify watcher picks up the file change and reloads m_uri_cache automatically.
++     */
++    bool save_peer_bootstrap_uri(const std::string &dpp_uri)
++    {
++        return m_keystore.save_dpp_uri(dpp_uri);
++    }
++
++    /**
++     * @brief Wipe all peer/enrollee DPP bootstrap URIs - both the persisted
++     * /etc/prplmesh/dpp_uri peer entries and the in-memory m_uri_cache used by
++     * find_enrollee_by_hash() - for "dev_reset_default" to start a fresh certification
++     * test run with no stale SetPeerBootstrap/wire-notification state left over.
++     */
++    bool clear_peer_bootstrap_uris()
++    {
++        m_uri_cache.clear();
++        return m_keystore.clear_peer_uris();
++    }
++
+ private:
+     // -------------------------------------------------------------------------
+     // DPP Session state
+diff --git a/controller/src/beerocks/master/tasks/dpp_key_store.cpp b/controller/src/beerocks/master/tasks/dpp_key_store.cpp
+index 20b6409c0..77d0da73e 100644
+--- a/controller/src/beerocks/master/tasks/dpp_key_store.cpp
++++ b/controller/src/beerocks/master/tasks/dpp_key_store.cpp
+@@ -486,6 +486,61 @@ bool DppKeyStore::write_dpp_uris(const std::vector<std::string> &uris) const
+     return ok;
+ }
+ 
++bool DppKeyStore::clear_peer_uris() const
++{
++    constexpr const char *uris_file       = "/etc/prplmesh/dpp_uri";
++    constexpr const char *local_agent_tag = "# local-agent";
++
++    if (access(uris_file, F_OK) != 0) {
++        return true; // nothing to clear
++    }
++
++    FILE *f = fopen(uris_file, "r+");
++    if (!f) {
++        MAPF_ERR("DppKeyStore: failed to open " << uris_file << " to clear peer URIs");
++        return false;
++    }
++    flock(fileno(f), LOCK_EX);
++
++    // Preserve only the co-located agent's own "# local-agent"-tagged line, if present -
++    // never wipe it: regenerating it would change the chirp hash already provisioned on
++    // some other controller (see dpp_bootstrap_utils.cpp).
++    std::string local_agent_line;
++    {
++        char rd_buf[1024];
++        std::string prev;
++        while (fgets(rd_buf, sizeof(rd_buf), f)) {
++            std::string line(rd_buf);
++            while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
++                line.pop_back();
++            if (prev == local_agent_tag) {
++                local_agent_line = line;
++            }
++            prev = line;
++        }
++    }
++
++    if (ftruncate(fileno(f), 0) != 0) {
++        MAPF_ERR("DppKeyStore: failed to truncate " << uris_file);
++        flock(fileno(f), LOCK_UN);
++        fclose(f);
++        return false;
++    }
++    rewind(f);
++
++    if (!local_agent_line.empty()) {
++        fprintf(f, "%s\n%s\n", local_agent_tag, local_agent_line.c_str());
++    }
++    fflush(f);
++    bool ok = (ferror(f) == 0);
++    flock(fileno(f), LOCK_UN);
++    fclose(f);
++    if (ok) {
++        LOG(INFO) << "DppKeyStore: cleared all peer-provisioned URIs from " << uris_file;
++    }
++    return ok;
++}
++
+ bool DppKeyStore::file_exists(const std::string &filename) const
+ {
+     struct stat st;
+diff --git a/controller/src/beerocks/master/tasks/dpp_key_store.h b/controller/src/beerocks/master/tasks/dpp_key_store.h
+index b5acbc2ce..88e32bd25 100644
+--- a/controller/src/beerocks/master/tasks/dpp_key_store.h
++++ b/controller/src/beerocks/master/tasks/dpp_key_store.h
+@@ -127,6 +127,17 @@ public:
+      */
+     bool write_dpp_uris(const std::vector<std::string> &uris) const;
+ 
++    /**
++     * @brief Wipe all peer/enrollee-provisioned URIs from /etc/prplmesh/dpp_uri, preserving
++     * only the "# local-agent" line (the co-located agent's own bootstrapping URI, if any -
++     * never touched, since regenerating it would change its chirp hash).
++     *
++     * Unlike write_dpp_uris(), this always truncates unconditionally - used by
++     * "dev_reset_default" to start a fresh certification test run with no stale
++     * SetPeerBootstrap/wire-notification URIs left over from a previous test case.
++     */
++    bool clear_peer_uris() const;
++
+     // -------------------------------------------------------------------------
+     // Connector signing
+     // -------------------------------------------------------------------------
+diff --git a/framework/platform/bpl/cfg/dm/bpl_cfg.cpp b/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
+index b92e8d2ec..61f745907 100644
+--- a/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include <bcl/beerocks_string_utils.h>
+ #include <bpl/bpl_cfg.h>
++#include <bpl/bpl_running_mode.h>
+ #include <mapf/common/logger.h>
+ 
+ #include <bcl/beerocks_os_utils.h>
+@@ -76,7 +77,12 @@ bool cfg_set_daisy_chaining_disabled(bool daisy_chaining_disabled)
+ 
+ bool cfg_set_onboarding_type(const std::string &onboarding_type)
+ {
+-    return set_controller_config_param("OnboardingType", onboarding_type);
++    if (get_running_mode() == eRunningMode::CONTROLLER) {
++        return set_controller_config_param("OnboardingType", onboarding_type);
++    } else if (get_running_mode() == eRunningMode::AGENT) {
++        return set_agent_config_param("OnboardingType", onboarding_type);
++    }
++    return false;
+ }
+ 
+ bool cfg_set_1905_security_enabled(bool link_encryption_enable)
+-- 
+2.34.1
+
