@@ -1,0 +1,130 @@
+From 29947c024e27df443e245861de9a1212d10e34cc Mon Sep 17 00:00:00 2001
+From: Suvidh Subodh Hegde <suvidhsu@qti.qualcomm.com>
+Date: Sat, 10 Oct 2026 14:23:52 +0530
+Subject: [PATCH] Fix for CPU increase due to continuous FSM retrigger while in
+ CAC
+
+When a radio is in DFS CAC, hostapd reports state DFS, so update_vap_credentials() skips the update but still reports success.
+The radio then reaches CONFIGURED with mld_id unset, and the MLD_RACE_RETRIGGER check keeps restarting autoconfiguration (M1/M2) for the whole CAC.
+Each restart triggers nl80211 dumps with heavy DEBUG logging, which pushes CPU up and hangs emt.
+The fix has ap_manager record that the update was deferred because of CAC and pass it to the agent in VAPS_LIST_UPDATE_NOTIFICATION.
+The agent then skips the MLD retrigger for that radio. The existing DFS-CAC-completed handler restarts autoconfiguration once, so mld_id is applied after CAC ends.
+
+Signed-off-by: Suvidh Subodh Hegde <suvidhsu@qti.qualcomm.com>
+---
+ .../beerocks/fronthaul_manager/ap_manager/ap_manager.cpp | 1 +
+ agent/src/beerocks/slave/agent_db.h                      | 4 ++++
+ agent/src/beerocks/slave/son_slave_thread.cpp            | 1 +
+ .../beerocks/slave/tasks/ap_autoconfiguration_task.cpp   | 9 +++++++++
+ common/beerocks/bwl/include/bwl/base_wlan_hal_types.h    | 2 ++
+ common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp      | 2 ++
+ .../yaml/beerocks/tlvf/beerocks_message_apmanager.yaml   | 1 +
+ 7 files changed, 20 insertions(+)
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index d68ff8639..c398deb87 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -5759,6 +5759,7 @@ bool ApManager::handle_aps_update_list()
+ 
+     copy_vaps_info_and_type(ap_wlan_hal, notification->params().vaps,
+                             notification->vap_type_list().vap_types);
++    notification->radio_in_cac() = ap_wlan_hal->get_radio_info().update_deferred_for_cac;
+ 
+     LOG(DEBUG) << "Sending Vap List update to controller";
+     if (!send_cmdu(cmdu_tx)) {
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 2ceac17cb..42bc02a0b 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -557,6 +557,10 @@ public:
+ 
+             // When set, radio can only be used for ZWDFS purpose.
+             bool zwdfs;
++
++            // Set while the radio's credentials update is deferred by CAC. Cleared on
++            // DFS CAC completed, which restarts the autoconfiguration.
++            bool cac_in_progress = false;
+             bool hybrid_mode_supported;
+             bool combined_profile1_and_profile2_supported = false;
+ 
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index bda6b8c03..77e2a32ed 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -5360,6 +5360,7 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+         if (!radio) {
+             return false;
+         }
++        radio->front.cac_in_progress = false;
+ 
+         // Existing channel is used to prevent overwritting of the channel issue (PPM-2858)
+         radio->wifi_channel = beerocks::WifiChannel(
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 2cdb09829..762d30811 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -615,6 +615,13 @@ void ApAutoConfigurationTask::work()
+                                              return b.ssid == ap_mld_conf.mld_config.mld_ssid &&
+                                                     b.mld_id == DISABLED_MLDUNIT;
+                                          });
++                if (radio_needs_retrigger && radio->front.cac_in_progress) {
++                    // Credentials update was deferred while the radio is in CAC, so mld_id is
++                    // expected to be unset. DFS CAC completed restarts the autoconfiguration.
++                    LOG(DEBUG) << "MLD retrigger deferred: radio=" << radio->front.iface_name
++                               << " is in CAC, waiting for DFS CAC completed";
++                    continue;
++                }
+                 auto conf_it = radio_needs_retrigger
+                                   ? m_radios_conf_params.find(radio->front.iface_name)
+                                   : m_radios_conf_params.end();
+@@ -6110,6 +6117,8 @@ void ApAutoConfigurationTask::handle_vs_vaps_list_update_notification(
+ 
+     const auto &fronthaul_iface = radio->front.iface_name;
+ 
++    radio->front.cac_in_progress = notification_in->radio_in_cac();
++
+     auto &radio_conf_params = m_radios_conf_params[radio_iface];
+     LOG(INFO) << "received ACTION_APMANAGER_HOSTAP_VAPS_LIST_UPDATE_NOTIFICATION "
+               << fronthaul_iface << " waiting for it? " << radio_conf_params.sent_vaps_list_update;
+diff --git a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+index 68bbfb099..11632303d 100644
+--- a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
++++ b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+@@ -260,6 +260,8 @@ struct RadioInfo {
+     bool mscs_supported             = false;
+     bool scs_supported              = false;
+     bool qos_map_supported                    = false;
++    /**< update_vap_credentials() was skipped as hostapd is in DFS (CAC in progress) */
++    bool update_deferred_for_cac              = false;
+     bool dscp_policy_supported                = false;
+     bool qm_scs_traffic_description_supported = false;
+     std::string chipset_vendor;
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 28d8163af..af8a6ddab 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -5469,6 +5469,8 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+         parsed_obj_map_t status_result;
+         if (wpa_ctrl_send_msg("STATUS", status_result)) {
+             auto state_it = status_result.find("state");
++            m_radio_info.update_deferred_for_cac =
++                (state_it != status_result.end() && state_it->second == "DFS");
+             if (state_it != status_result.end() && state_it->second != "ENABLED") {
+                 LOG(WARNING) << "update_vap_credentials: hostapd state='"
+                              << state_it->second << "' on " << m_radio_info.iface_name
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+index 429fab614..a7b352487 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_apmanager.yaml
+@@ -111,6 +111,7 @@ cACTION_APMANAGER_HOSTAP_VAPS_LIST_UPDATE_NOTIFICATION:
+   _type: class
+   params: sVapsList
+   vap_type_list: sVapTypesList
++  radio_in_cac: uint8_t # bool, credentials update deferred because radio is in DFS CAC
+ 
+ cACTION_APMANAGER_HOSTAP_CHANNEL_SWITCH_ACS_START:
+   _type: class
+-- 
+2.34.1
+
