@@ -1,0 +1,2867 @@
+From 20eb4f4f29ee2296d1141a2036a6f8c5a6989c59 Mon Sep 17 00:00:00 2001
+From: Girija P <gpandiya@qti.qualcomm.com>
+Date: Thu, 8 Oct 2026 09:31:45 +0530
+Subject: [PATCH] Fix powersave recovery ordering and MLD BSSID allocation
+
+- Extend radio powersave control to WHM and order requests by topology.
+- Support wired teardown powersave for local gateways without backhaul.
+- Avoid reconnect watchdog handling for local gateway radios.
+- Add shared MLD BSSID reservations across NL80211 AP managers.
+- Release stale reservations and prevent cross-radio BSSID reuse.
+
+Signed-off-by: Girija P <gpandiya@qti.qualcomm.com>
+---
+ .../ap_manager/ap_manager.cpp                 |  62 +-
+ .../fronthaul_manager/ap_manager/ap_manager.h |  15 +
+ .../fronthaul_manager_main.cpp                |   6 +-
+ .../fronthaul_manager/monitor/monitor.cpp     |  25 +-
+ .../fronthaul_manager/monitor/monitor.h       |   4 +-
+ agent/src/beerocks/slave/agent_db.cpp         |  39 +-
+ .../backhaul_manager/backhaul_manager.cpp     | 106 +++-
+ .../slave/backhaul_manager/backhaul_manager.h |   2 +
+ agent/src/beerocks/slave/son_slave_thread.cpp |   2 +-
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  10 +-
+ common/beerocks/bwl/include/bwl/ap_wlan_hal.h |   9 +
+ .../bwl/nl80211/ap_wlan_hal_nl80211.cpp       | 544 +++++++++++++++---
+ .../bwl/nl80211/ap_wlan_hal_nl80211.h         |   6 +
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     | 286 +++++++--
+ .../bwl/nl80211/base_wlan_hal_nl80211.h       |  35 ++
+ .../bwl/nl80211/bssid_pool_registry.cpp       | 486 ++++++++++++++++
+ .../bwl/nl80211/bssid_pool_registry.h         |  87 +++
+ .../bwl/nl80211/sta_wlan_hal_nl80211.cpp      |  82 ++-
+ .../bwl/nl80211/sta_wlan_hal_nl80211.h        |  15 +
+ .../beerocks/bwl/nl80211/wpa_ctrl_client.cpp  |  10 +
+ common/beerocks/bwl/nl80211/wpa_ctrl_client.h |   9 +
+ .../src/beerocks/cli/beerocks_cli_socket.cpp  |   8 +-
+ .../src/beerocks/cli/beerocks_cli_socket.h    |   4 +-
+ .../src/beerocks/master/son_management.cpp    |  42 +-
+ .../platform/bpl/cfg/dm/bpl_cfg_wifi.cpp      |   5 +
+ .../platform/bpl/cfg/linux/bpl_cfg_wifi.cpp   |   5 +
+ framework/platform/bpl/cfg/rdk/bpl_cfg.cpp    |   5 +
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     |  28 +
+ framework/platform/bpl/include/bpl/bpl_cfg.h  |   8 +
+ 29 files changed, 1751 insertions(+), 194 deletions(-)
+ create mode 100644 common/beerocks/bwl/nl80211/bssid_pool_registry.cpp
+ create mode 100644 common/beerocks/bwl/nl80211/bssid_pool_registry.h
+
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+index 147ad1462..af817b496 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -77,6 +77,15 @@ constexpr auto vbss_deauth_unknown_stas_grace_period = std::chrono::milliseconds
+ 
+ constexpr auto wait_for_vaps_enable_timeout_sec = std::chrono::seconds(30);
+ 
++class ScopedAtomicFlagReset {
++public:
++    explicit ScopedAtomicFlagReset(std::atomic<bool> &flag) : m_flag(flag) {}
++    ~ScopedAtomicFlagReset() { m_flag.store(false, std::memory_order_release); }
++
++private:
++    std::atomic<bool> &m_flag;
++};
++
+ #define SELECT_TIMEOUT_MSC 1000
+ #define ACS_READ_SLEEP_USC 1000
+ #define READ_ACS_ATTEMPT_MAX 5
+@@ -2429,17 +2438,6 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+ 
+         std::string bridge_name = request->bridge_ifname_str();
+ 
+-#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+-        auto powersave_wait = m_powersave_disable_wait_until - std::chrono::steady_clock::now();
+-        if (powersave_wait > std::chrono::steady_clock::duration::zero()) {
+-            auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(powersave_wait);
+-            LOG(INFO) << "Waiting " << wait_ms.count()
+-                      << " ms before applying M2 VAP credentials after powersave-disable";
+-            UTILS_SLEEP_MSEC(static_cast<unsigned int>(wait_ms.count()));
+-            m_powersave_disable_wait_until = {};
+-        }
+-#endif
+-
+         LOG(DEBUG) << "handle ACTION_APMANAGER_WIFI_CREDENTIALS_UPDATE_REQUEST";
+         std::list<son::wireless_utils::sBssInfoConf> bss_info_conf_list;
+         auto wifi_credentials_size = request->wifi_credentials_size();
+@@ -2684,6 +2682,35 @@ void ApManager::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx)
+             bss_info_conf_list.push_back(bss_info_conf);
+         }
+ 
++        // Keep the monitor from interpreting the intentionally empty authoritative hostapd
++        // config as a permanent no-VAP/disabled state while a valid M2 re-enable is waiting for
++        // the powersave settle interval or is being applied.  Teardown-only updates do not set
++        // this guard because no VAP can legitimately appear from those credentials.
++        const bool has_valid_vap_credentials = std::any_of(
++            bss_info_conf_list.begin(), bss_info_conf_list.end(),
++            [](const son::wireless_utils::sBssInfoConf &bss) {
++                return !bss.teardown && !bss.ssid.empty();
++            });
++        std::unique_ptr<ScopedAtomicFlagReset> pending_vap_configuration_guard;
++        if (has_valid_vap_credentials) {
++            m_vap_configuration_pending->store(true, std::memory_order_release);
++            pending_vap_configuration_guard =
++                std::make_unique<ScopedAtomicFlagReset>(*m_vap_configuration_pending);
++            LOG(DEBUG) << "Valid M2 VAP credentials pending on " << m_iface
++                       << " - monitor will preserve radio_disable until update completes";
++        }
++
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
++        auto powersave_wait = m_powersave_disable_wait_until - std::chrono::steady_clock::now();
++        if (powersave_wait > std::chrono::steady_clock::duration::zero()) {
++            auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(powersave_wait);
++            LOG(INFO) << "Waiting " << wait_ms.count()
++                      << " ms before applying M2 VAP credentials after powersave-disable";
++            UTILS_SLEEP_MSEC(static_cast<unsigned int>(wait_ms.count()));
++            m_powersave_disable_wait_until = {};
++        }
++#endif
++
+         // Resolve the hostapd bridge per BSS. An empty effective_bridge means that
+         // classification is still unknown; existing hostapd configuration should then
+         // be preserved, while new BSS creation will use bridge_name as a safe fallback.
+@@ -5553,6 +5580,19 @@ void ApManager::handle_hostapd_attached()
+         return;
+     }
+ 
++    // The RUID is copied into AgentDB by JOINED_NOTIFICATION and is then used for
++    // controller discovery. Validate it before constructing the notification so a
++    // collision with the local bSTA MLD/link namespace cannot strand this radio in
++    // discovery retries.
++    if (!ap_wlan_hal->validate_radio_mac()) {
++        LOG(ERROR) << "Failed to validate radio MAC before JOINED_NOTIFICATION";
++        return;
++    }
++
++    // A previous attach may have cached the old identity. Re-read it after validation
++    // so a replacement persisted by the HAL is also the identity sent to AgentDB.
++    m_radio_iface_mac.clear();
++
+     if (acs_enabled) {
+         LOG(DEBUG) << "retrieving ACS report";
+         int read_acs_attempt = 0;
+diff --git a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
+index 82523666f..11a551f64 100644
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
+@@ -24,6 +24,7 @@
+ #include <tlvf/tlvftypes.h>
+ 
+ #include <chrono>
++#include <atomic>
+ #include <list>
+ #include <map>
+ #include <memory>
+@@ -83,6 +84,18 @@ public:
+      */
+     bool is_radio_disabled() const { return m_radio_disable; }
+ 
++    /**
++     * @brief Returns the shared state of a pending M2 VAP credential update.
++     *
++     * The monitor runs in a separate thread and must not infer a permanent
++     * no-VAP/radio-disabled state while ap_manager is still applying valid
++     * credentials after a radio re-enable.
++     */
++    std::shared_ptr<std::atomic<bool>> vap_configuration_pending() const
++    {
++        return m_vap_configuration_pending;
++    }
++
+ private:
+     /**
+      * @brief Sends given CMDU message to the slave.
+@@ -273,6 +286,8 @@ private:
+     bool m_ap_support_zwdfs;
+     bool m_local_gw    = false;
+     bool m_radio_disable = false;
++    std::shared_ptr<std::atomic<bool>> m_vap_configuration_pending =
++        std::make_shared<std::atomic<bool>>(false);
+     wfa_map::tlvProfile2MultiApProfile::eMultiApProfile m_multiap_controller_profile =
+         wfa_map::tlvProfile2MultiApProfile::eMultiApProfile::PRPLMESH_PROFILE_UNKNOWN;
+ 
+diff --git a/agent/src/beerocks/fronthaul_manager/fronthaul_manager_main.cpp b/agent/src/beerocks/fronthaul_manager/fronthaul_manager_main.cpp
+index c29ce92be..b76ff7049 100644
+--- a/agent/src/beerocks/fronthaul_manager/fronthaul_manager_main.cpp
++++ b/agent/src/beerocks/fronthaul_manager/fronthaul_manager_main.cpp
+@@ -341,7 +341,8 @@ int main(int argc, char *argv[])
+                     e.monitor = std::make_unique<son::Monitor>(e.iface, beerocks_slave_conf,
+                                                                *e.logger_monitor,
+                                                                e.ap_manager->is_radio_disabled(),
+-                                                               mlo_sta_registry);
++                                                               mlo_sta_registry,
++                                                               e.ap_manager->vap_configuration_pending());
+                 }
+                 if (e.monitor_is_running || e.ap_manager->zwdfs_ap()) {
+                     if (!e.monitor->is_running()) {
+@@ -475,7 +476,8 @@ int main(int argc, char *argv[])
+                 monitor = std::make_unique<son::Monitor>(fronthaul_iface, beerocks_slave_conf,
+                                                          *g_logger_monitor,
+                                                          ap_manager.is_radio_disabled(),
+-                                                         mlo_sta_registry);
++                                                         mlo_sta_registry,
++                                                         ap_manager.vap_configuration_pending());
+             }
+             // Keep the Monitor thread's radio-disable state in sync with the AP manager's live
+             // state, so Monitor stops querying hostapd as soon as a disable is requested and
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+index 0ce04467d..064d07ed1 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+@@ -58,14 +58,17 @@ static constexpr uint8_t ap_metrics_channel_utilization_measurement_period_s = 1
+ Monitor::Monitor(const std::string &monitor_iface_,
+                  beerocks::config_file::sConfigSlave &beerocks_slave_conf_,
+                  beerocks::logging &logger_, bool radio_disable_,
+-                 std::shared_ptr<beerocks::MloStaRegistry> mlo_sta_registry)
++                 std::shared_ptr<beerocks::MloStaRegistry> mlo_sta_registry,
++                 std::shared_ptr<std::atomic<bool>> vap_configuration_pending)
+     : EventLoopThread(), monitor_iface(monitor_iface_), beerocks_slave_conf(beerocks_slave_conf_),
+       bridge_iface(beerocks_slave_conf.bridge_iface), cmdu_tx(m_tx_buffer, sizeof(m_tx_buffer)),
+       logger(logger_), mon_rssi(cmdu_tx),
+ #ifdef FEATURE_PRE_ASSOCIATION_STEERING
+       mon_pre_association_steering_hal(cmdu_tx),
+ #endif
+-      mon_stats(cmdu_tx), m_radio_disable(radio_disable_), m_mlo_sta_registry(mlo_sta_registry)
++      mon_stats(cmdu_tx), m_radio_disable(radio_disable_),
++      m_vap_configuration_pending(vap_configuration_pending),
++      m_mlo_sta_registry(mlo_sta_registry)
+ {
+     /**
+      * Get the MAC address of the radio interface that this monitor instance operates on.
+@@ -1390,6 +1393,15 @@ bool Monitor::update_ap_stats()
+ 
+             std::string updated_iface;
+             if (!mon_wlan_hal->get_hostapd_conf_iface_name(updated_iface)) {
++                if (m_vap_configuration_pending &&
++                    m_vap_configuration_pending->load(std::memory_order_acquire)) {
++                    LOG(DEBUG) << "No interface found in hostapd conf while a valid M2 VAP "
++                                  "configuration is pending - preserving radio_disable state";
++                    std::string empty_iface;
++                    mon_wlan_hal->set_base_radio_iface_name(empty_iface);
++                    mon_wlan_hal->set_iface_name(empty_iface);
++                    return true;
++                }
+                 LOG(ERROR) << "No interface found in hostapd conf file for this radio - "
+                           << "treating as no-VAP mode and marking radio_disable";
+                 // Keep both the Monitor FSM and the HAL in no-VAP mode. Updating only the HAL
+@@ -2173,6 +2185,15 @@ void Monitor::handle_cmdu_vs_message(ieee1905_1::CmduMessageRx &cmdu_rx)
+ 
+         std::string hostapd_iface;
+         if (!mon_wlan_hal->get_hostapd_conf_iface_name(hostapd_iface)) {
++            if (m_vap_configuration_pending &&
++                m_vap_configuration_pending->load(std::memory_order_acquire)) {
++                LOG(DEBUG) << "No interface found in hostapd conf while a valid M2 VAP "
++                              "configuration is pending - preserving radio_disable state";
++                std::string empty_iface;
++                mon_wlan_hal->set_base_radio_iface_name(empty_iface);
++                mon_wlan_hal->set_iface_name(empty_iface);
++                return;
++            }
+             LOG(ERROR) << "No interface found in hostapd conf file for this radio - "
+                       << "treating as no-VAP mode and marking radio_disable";
+             set_radio_disable(true);
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.h b/agent/src/beerocks/fronthaul_manager/monitor/monitor.h
+index 3902b0f9d..fd9fb5742 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.h
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.h
+@@ -37,7 +37,8 @@ public:
+     Monitor(const std::string &monitor_iface_,
+             beerocks::config_file::sConfigSlave &beerocks_slave_conf_, beerocks::logging &logger_,
+             bool radio_disable_ = false,
+-            std::shared_ptr<beerocks::MloStaRegistry> mlo_sta_registry = {});
++            std::shared_ptr<beerocks::MloStaRegistry> mlo_sta_registry = {},
++            std::shared_ptr<std::atomic<bool>> vap_configuration_pending = {});
+ 
+     /**
+      * @brief Initialize monitor.
+@@ -222,6 +223,7 @@ private:
+     std::shared_ptr<bwl::mon_wlan_hal> mon_wlan_hal;
+     bool mon_hal_attached           = false;
+     std::atomic<bool> m_radio_disable{false};
++    std::shared_ptr<std::atomic<bool>> m_vap_configuration_pending;
+     bwl::HALState last_attach_state = bwl::HALState::Uninitialized;
+ 
+     /**
+diff --git a/agent/src/beerocks/slave/agent_db.cpp b/agent/src/beerocks/slave/agent_db.cpp
+index afc71e805..163624e20 100644
+--- a/agent/src/beerocks/slave/agent_db.cpp
++++ b/agent/src/beerocks/slave/agent_db.cpp
+@@ -83,9 +83,26 @@ void AgentDB::remove_radio_from_radios_list(const std::string &iface_name)
+ AgentDB::sRadio *AgentDB::get_radio_by_mac(const sMacAddr &mac, eMacType mac_type_hint)
+ {
+     bool all_mac_types = mac_type_hint == eMacType::ALL;
++
++    // A RUID identifies the AP/front radio.  Prefer an exact front-radio match before
++    // considering backhaul/BSSID/client addresses.  In MLO deployments a backhaul STA MAC can
++    // be identical to another radio's RUID; the old single-pass lookup returned the earlier
++    // backhaul radio in that case and attached the RUID to the wrong radio.
++    if (all_mac_types || mac_type_hint == eMacType::RADIO) {
++        auto front_radio_it = std::find_if(
++            m_radios.begin(), m_radios.end(),
++            [&](const sRadio &radio_entry) { return radio_entry.front.iface_mac == mac; });
++        if (front_radio_it != m_radios.end()) {
++            return &(*front_radio_it);
++        }
++        if (mac_type_hint == eMacType::RADIO) {
++            return nullptr;
++        }
++    }
++
+     auto radio_it = std::find_if(m_radios.begin(), m_radios.end(), [&](const sRadio &radio_entry) {
+-        if (all_mac_types || mac_type_hint == eMacType::RADIO) {
+-            if (radio_entry.front.iface_mac == mac || radio_entry.back.iface_mac == mac) {
++        if (all_mac_types) {
++            if (radio_entry.back.iface_mac == mac) {
+                 return true;
+             }
+         }
+@@ -112,9 +129,23 @@ AgentDB::sRadio *AgentDB::get_radio_by_mac(const sMacAddr &mac, eMacType mac_typ
+ const AgentDB::sRadio *AgentDB::get_radio_by_mac(const sMacAddr &mac, eMacType mac_type_hint) const
+ {
+     bool all_mac_types = mac_type_hint == eMacType::ALL;
++
++    // Keep RUID/front-radio matching ahead of backhaul matching. See the non-const overload.
++    if (all_mac_types || mac_type_hint == eMacType::RADIO) {
++        auto front_radio_it = std::find_if(
++            m_radios.begin(), m_radios.end(),
++            [&](const sRadio &radio_entry) { return radio_entry.front.iface_mac == mac; });
++        if (front_radio_it != m_radios.end()) {
++            return &(*front_radio_it);
++        }
++        if (mac_type_hint == eMacType::RADIO) {
++            return nullptr;
++        }
++    }
++
+     auto radio_it = std::find_if(m_radios.begin(), m_radios.end(), [&](const sRadio &radio_entry) {
+-        if (all_mac_types || mac_type_hint == eMacType::RADIO) {
+-            if (radio_entry.front.iface_mac == mac || radio_entry.back.iface_mac == mac) {
++        if (all_mac_types) {
++            if (radio_entry.back.iface_mac == mac) {
+                 return true;
+             }
+         }
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 698846ef4..b148097de 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -1333,7 +1333,7 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+             }
+ 
+ #if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+-            if (m_eth_link_up) {
++            if (m_eth_link_up || is_local_agent_without_backhaul()) {
+                 schedule_wired_teardown_powersave_enable();
+             }
+             // Backend-generic backhaul-loss recovery cycle: if there's no backhaul
+@@ -1437,11 +1437,29 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+                     }
+ 
+                     if (should_reconnect_sta) {
++                        std::string selected_wireless_iface;
++                        sMacAddr selected_wireless_radio_mac = net::network_utils::ZERO_MAC;
++
+                         // Reconnect STA interfaces that have an initialized STA HAL
+                         for (auto &radio_info : m_radios_info) {
+                             if (radio_info->sta_hal_initialized && radio_info->sta_wlan_hal &&
+                                 radio_info->sta_hal_disconnected_for_eth) {
+ 
++                                // This path is entered after the previous wired connection
++                                // replaced AgentDB::backhaul.selected_iface_name with the
++                                // Ethernet interface. Restore the actual wireless STA identity
++                                // while switching back, otherwise users of AgentDB will try to
++                                // resolve the Ethernet name as a radio.
++                                auto radio = db->radio(radio_info->sta_iface);
++                                if (!radio) {
++                                    LOG(ERROR) << "Cannot restore wireless backhaul: STA interface "
++                                               << radio_info->sta_iface
++                                               << " is not present in AgentDB radios";
++                                } else if (selected_wireless_iface.empty()) {
++                                    selected_wireless_iface      = radio_info->sta_iface;
++                                    selected_wireless_radio_mac = radio->front.iface_mac;
++                                }
++
+                                 LOG(INFO) << "Reconnecting STA interface " << radio_info->sta_iface
+                                          << " after ethernet backhaul disconnection";
+ 
+@@ -1484,13 +1502,28 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+                                 }
+                             }
+                         }
+-                        // Mark the connection as WIRELESS
+-                        db->backhaul.connection_type = AgentDB::sBackhaul::eConnectionType::Wireless;
+ 
+-                        reset_1905_security_for_connection_switch();
++                        if (!selected_wireless_iface.empty()) {
++                            // Mark the connection as WIRELESS only after restoring a valid
++                            // AgentDB radio identity.  This avoids exposing a Wireless state
++                            // with an empty/stale selected interface to AP auto-configuration.
++                            db->backhaul.connection_type =
++                                AgentDB::sBackhaul::eConnectionType::Wireless;
++                            db->backhaul.selected_iface_name      = selected_wireless_iface;
++                            db->backhaul.selected_iface_radio_mac = selected_wireless_radio_mac;
+ 
+-                        // Don't restart FSM, stay in current state to allow reconnection
+-                        break;
++                            LOG(INFO) << "Moved to WIRELESS BACKHAUL using STA interface "
++                                      << db->backhaul.selected_iface_name << " (radio MAC="
++                                      << db->backhaul.selected_iface_radio_mac << ")";
++
++                            reset_1905_security_for_connection_switch();
++
++                            // Don't restart FSM, stay in current state to allow reconnection.
++                            break;
++                        }
++
++                        LOG(ERROR) << "Cannot switch to wireless backhaul in place: no valid STA "
++                                      "radio is available in AgentDB; restarting wireless FSM";
+                     }
+                 }
+ 
+@@ -2838,12 +2871,6 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+                    << radio_mac << ", disable=" << disable;
+ 
+         auto db = AgentDB::get();
+-        if (db->device_conf.local_gw) {
+-            LOG(DEBUG) << "local_gw is set - ignoring ACTION_BACKHAUL_RADIO_STATE_NOTIFICATION "
+-                          "(radio-disable reconnect watchdog only applies to non-gateway agents "
+-                          "with a backhaul STA link)";
+-            break;
+-        }
+ 
+         bool matched = false;
+         for (auto &radio_info : m_radios_info) {
+@@ -2870,7 +2897,9 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+                 }
+                 radio_info->powersave_disable_endpoint_wait_until = {};
+ #endif
+-                start_backhaul_reconnect_watchdog(radio_info);
++                if (!db->device_conf.local_gw) {
++                    start_backhaul_reconnect_watchdog(radio_info);
++                }
+             } else {
+ #if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+                 if (m_wired_teardown_powersave_enabled) {
+@@ -2911,6 +2940,10 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+ #endif
+                 handle_backhaul_radio_enabled(radio_info);
+             }
++
++            if (disable && (m_eth_link_up || is_local_agent_without_backhaul())) {
++                schedule_wired_teardown_powersave_enable();
++            }
+         }
+         if (!matched) {
+             LOG(DEBUG) << "No matching radio_info found for radio_mac=" << radio_mac
+@@ -2948,7 +2981,7 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+             LOG(INFO) << "backhaul_manager vaps_teardown_confirmed=" << disable
+                       << " for radio " << radio_mac;
+ 
+-            if (disable && m_eth_link_up) {
++            if (disable && (m_eth_link_up || is_local_agent_without_backhaul())) {
+                 schedule_wired_teardown_powersave_enable();
+             }
+             maybe_start_backhaul_recovery_cycle_if_ready();
+@@ -4975,6 +5008,19 @@ bool BackhaulManager::all_radios_teardown_confirmed()
+                        });
+ }
+ 
++bool BackhaulManager::is_local_agent_without_backhaul()
++{
++    auto db = AgentDB::get();
++    if (!db->device_conf.local_gw || m_eth_link_up) {
++        return false;
++    }
++
++    return std::none_of(m_radios_info.begin(), m_radios_info.end(),
++                        [](const std::shared_ptr<sRadioInfo> &radio_info) {
++                            return !!radio_info->sta_wlan_hal;
++                        });
++}
++
+ void BackhaulManager::maybe_start_backhaul_recovery_cycle_if_ready()
+ {
+     LOG(DEBUG) << "Recovery readiness: all_radios_disabled=" << all_radios_disabled()
+@@ -5086,7 +5132,7 @@ void BackhaulManager::schedule_wired_teardown_powersave_enable()
+     // AP Manager's per-radio teardown confirmation. A teardown-flagged credentials update
+     // can be discarded when the radio-disable request arrives first, so the teardown
+     // confirmation is not guaranteed to arrive.
+-    if (!m_eth_link_up || !all_radios_disabled()) {
++    if ((!m_eth_link_up && !is_local_agent_without_backhaul()) || !all_radios_disabled()) {
+         return;
+     }
+ 
+@@ -5095,15 +5141,16 @@ void BackhaulManager::schedule_wired_teardown_powersave_enable()
+         return;
+     }
+ 
+-    LOG(INFO) << "All APs/endpoints are torn down with wired backhaul available - scheduling "
+-                 "powersave-enable after 15 seconds";
++    LOG(INFO) << "All APs/endpoints are torn down - scheduling powersave-enable after 15 seconds"
++              << (is_local_agent_without_backhaul() ? " for local agent without backhaul" : "");
+     m_wired_teardown_powersave_timer = m_timer_manager->add_timer(
+         "Wired Teardown Powersave Enable", std::chrono::seconds(15),
+         std::chrono::milliseconds::zero(), [this](int fd, beerocks::EventLoop &loop) {
+             m_timer_manager->remove_timer(fd);
+             m_wired_teardown_powersave_timer = beerocks::net::FileDescriptor::invalid_descriptor;
+-            if (!m_eth_link_up || !all_radios_disabled()) {
+-                LOG(INFO) << "Wired teardown powersave-enable cancelled because conditions changed";
++            if ((!m_eth_link_up && !is_local_agent_without_backhaul()) ||
++                !all_radios_disabled()) {
++                LOG(INFO) << "Teardown powersave-enable cancelled because conditions changed";
+                 return true;
+             }
+ 
+@@ -5121,9 +5168,10 @@ void BackhaulManager::schedule_wired_teardown_powersave_enable()
+                         m_timer_manager->remove_timer(secondary_fd);
+                         m_wired_teardown_powersave_timer =
+                             beerocks::net::FileDescriptor::invalid_descriptor;
+-                        if (!m_eth_link_up || !all_radios_disabled()) {
++                        if ((!m_eth_link_up && !is_local_agent_without_backhaul()) ||
++                            !all_radios_disabled()) {
+                             m_wired_teardown_powersave_enabled = false;
+-                            LOG(INFO) << "Wired teardown 6 GHz powersave-enable cancelled because "
++                            LOG(INFO) << "Teardown 6 GHz powersave-enable cancelled because "
+                                          "conditions changed";
+                             return true;
+                         }
+@@ -5779,8 +5827,22 @@ void BackhaulManager::handle_backhaul_radio_enabled(std::shared_ptr<sRadioInfo>
+     }
+ #endif
+ 
++    auto db = AgentDB::get();
++    const bool wired_backhaul_active =
++        !db->device_conf.local_gw && m_eth_link_up &&
++        db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wired;
++
+     bool is_connected = radio_info->sta_wlan_hal && radio_info->sta_wlan_hal->is_connected();
+-    if (!is_connected) {
++    if (wired_backhaul_active) {
++        LOG(INFO) << "Skipping bSTA enable/reconnect for " << radio_info->sta_iface
++                  << " on radio_enable because wired backhaul is already active";
++
++        if (is_connected && radio_info->sta_wlan_hal &&
++            !radio_info->sta_wlan_hal->disconnect_backhaul_sta()) {
++            LOG(ERROR) << "Failed to disconnect redundant bSTA " << radio_info->sta_iface
++                       << " while wired backhaul is active";
++        }
++    } else if (!is_connected) {
+         LOG(INFO) << "bSTA " << radio_info->sta_iface
+                   << " not active on radio_enable - enabling/reconnecting";
+         if (radio_info->sta_wlan_hal) {
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+index 5e111d55a..955a7012c 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+@@ -308,6 +308,8 @@ private:
+     /** @brief true if m_radios_info is non-empty and every radio's radio_disabled flag is set. */
+     bool all_radios_disabled();
+     bool all_radios_teardown_confirmed();
++    /** @brief true for a local gateway with no configured wireless backhaul endpoint. */
++    bool is_local_agent_without_backhaul();
+     bool is_wifi8_platform();
+     void send_powersave_request(eFreqType freq, bool enable);
+     /** @brief Send powersave request for the selected radio band. */
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 3db123618..426684aad 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -3078,7 +3078,7 @@ bool slave_thread::handle_cmdu_backhaul_manager_message(
+         }
+         break;
+     }
+-#if defined(USE_PRPLMESH_NLHAL) && !defined(USE_PRPLMESH_WHM)
++#if defined(USE_PRPLMESH_NLHAL) || defined(USE_PRPLMESH_WHM)
+     case beerocks_message::ACTION_BACKHAUL_CLI_RADIO_POWERSAVE_REQUEST: {
+         auto request_in = beerocks_header->addClass<
+             beerocks_message::cACTION_BACKHAUL_CLI_RADIO_POWERSAVE_REQUEST>();
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 1d78dbe7a..d01c90a7f 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -945,7 +945,7 @@ void ApAutoConfigurationTask::handle_event(uint8_t event_enum_value, const void
+                   << " security_ies_len=" << config->security_ies.size();
+         break;
+     }
+-#ifdef USE_PRPLMESH_WHM
++#if defined(USE_PRPLMESH_WHM) || defined(USE_PRPLMESH_NLHAL)
+     case static_cast<uint8_t>(eEvent::RESTART_AUTOCONFIG_ALL_RADIOS): {
+         LOG(INFO) << "RESTART_AUTOCONFIG_ALL_RADIOS: re-onboarding all radios after backhaul "
+                      "recovery";
+@@ -1800,7 +1800,13 @@ bool ApAutoConfigurationTask::send_ap_autoconfiguration_wsc_m1_message(
+     }
+ 
+     if (db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wireless) {
+-        auto wireless_bh_radio                       = db->radio(db->backhaul.selected_iface_name);
++        auto wireless_bh_radio = db->radio(db->backhaul.selected_iface_name);
++        if (!wireless_bh_radio) {
++            LOG(ERROR) << "Cannot build WSC M1 for " << radio_iface
++                       << ": wireless backhaul interface '"
++                       << db->backhaul.selected_iface_name << "' is not a known radio";
++            return false;
++        }
+         notification->backhaul_params().backhaul_mac = wireless_bh_radio->back.iface_mac;
+         notification->backhaul_params().backhaul_channel =
+             wireless_bh_radio->wifi_channel.get_channel();
+diff --git a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+index 519ac6557..0fa3afe14 100644
+--- a/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/ap_wlan_hal.h
+@@ -125,6 +125,15 @@ public:
+      */
+     virtual bool disable() = 0;
+ 
++    /**
++     * @brief Validate and, if necessary, replace the radio MAC before onboarding.
++     *
++     * Most backends do not need to perform any validation. NL80211 uses this hook
++     * to avoid advertising a radio RUID that is already used by a STA MLD/link or
++     * another AP MLD.
++     */
++    virtual bool validate_radio_mac() { return true; }
++
+     /**
+      * @brief Put the radio into powersave mode.
+      * @param force Issue the operation even when the local HAL state is unchanged.
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 5cc9756e6..2a1677e26 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -7,9 +7,11 @@
+  */
+ 
+ #include "ap_wlan_hal_nl80211.h"
++#include "bssid_pool_registry.h"
+ #include "mlo_utils.h"
+ #include <bwl/assoc_frame_db.h>
+ #include <bcl/beerocks_os_utils.h>
++#include <bcl/beerocks_defines.h>
+ #include <bcl/beerocks_string_utils.h>
+ #include <bcl/beerocks_utils.h>
+ #include <bcl/network/file_descriptor.h>
+@@ -22,6 +24,7 @@
+ #include <cctype>
+ #include <cerrno>
+ #include <chrono>
++#include <cstdint>
+ #include <cmath>
+ #include <fcntl.h>
+ #include <cstring>
+@@ -40,6 +43,7 @@
+ #include <netlink/genl/genl.h>
+ #include <netlink/msg.h>
+ #include <netlink/netlink.h>
++#include <set>
+ #include <type_traits>
+ #include <dirent.h>
+ #include <fstream>
+@@ -79,6 +83,103 @@ static constexpr char MLD_RECONFIG_LOCK_PATH[] =
+ static constexpr const char *VAP_CREDENTIALS_LOCK_PATH =
+     "/var/lock/prplmesh-update-vap-credentials.lock";
+ 
++/**
++ * Derive one address from the generated AP BSSID pool.
++ *
++ * This transformation is used both before onboarding (when a colliding RUID is
++ * replaced) and when the pool is populated after hostapd has attached.
++ */
++static sMacAddr derive_bssid_pool_address(sMacAddr candidate_base, int idx, bool mbssid,
++                                          int mbssid_group_size)
++{
++    int bss_idx = idx;
++
++    int maxbssid_ind  = 0;
++    int num_bss_nontx = mbssid ? mbssid_group_size - 1 : 0;
++    while (num_bss_nontx > 0) {
++        maxbssid_ind++;
++        num_bss_nontx >>= 1;
++    }
++
++    const int maxbssid = std::pow(2, maxbssid_ind);
++    if (mbssid && bss_idx >= maxbssid) {
++        candidate_base.oct[5] = ((candidate_base.oct[5] >> maxbssid_ind)
++                                 << maxbssid_ind);
++        candidate_base.oct[5] += (bss_idx / maxbssid) * maxbssid;
++        bss_idx %= maxbssid;
++    }
++
++    if (mbssid) {
++        const int size = maxbssid;
++        const int B    = candidate_base.oct[5] % size;
++        const int loct = candidate_base.oct[5];
++        candidate_base.oct[0] |= 2;
++        candidate_base.oct[5] = loct - B + ((B + bss_idx) % size);
++    } else {
++        // The generated pool uses the locally-administered bit and then advances
++        // the first octet in the same way as the original pool implementation.
++        if (!(candidate_base.oct[0] & 2)) {
++            bss_idx--;
++        }
++        candidate_base.oct[0] |= 2;
++        candidate_base.oct[0] ^= bss_idx << 2;
++    }
++
++    return candidate_base;
++}
++
++static size_t get_current_radio_count()
++{
++    beerocks::bpl::BPL_WLAN_IFACE interfaces[BPL_NUM_OF_INTERFACES] = {};
++    int interface_count = BPL_NUM_OF_INTERFACES;
++    if (beerocks::bpl::cfg_get_all_prplmesh_wifi_interfaces(interfaces, &interface_count) == 0 &&
++        interface_count > 0) {
++        return static_cast<size_t>(interface_count);
++    }
++
++    // Keep range allocation available during early startup, when the platform configuration
++    // may not yet expose the hostap interfaces. The configured platform maximum is only a
++    // fallback; normal operation uses the current device radio count above.
++    LOG(WARNING) << "Could not determine current radio count; using platform maximum "
++                 << beerocks::MAX_RADIOS_PER_AGENT << " for BSSID range candidates";
++    return static_cast<size_t>(beerocks::MAX_RADIOS_PER_AGENT);
++}
++
++/**
++ * Build disjoint range candidates for one radio.  The first-octet high bits and the second
++ * octet provide the global range number; the remaining bytes come from the radio's preferred
++ * BSSID base.  Each candidate is still generated with the normal MBSSID/non-MBSSID transform,
++ * so all addresses in one range retain the prefix rules expected by hostapd.
++ */
++static std::vector<std::vector<std::string>> build_bssid_range_candidates(
++    sMacAddr preferred_base, size_t radio_count, bool mbssid, int mbssid_group_size)
++{
++    std::vector<std::vector<std::string>> candidates;
++
++    // Create one global candidate slot per currently configured radio manager. Each slot contains
++    // exactly the 16 BSSID addresses available to one radio. Only the selected slot is persisted
++    // and exposed to this radio manager.
++    const size_t range_candidate_count = std::max<size_t>(1, radio_count);
++    candidates.reserve(range_candidate_count);
++    for (size_t range_id = 0; range_id < range_candidate_count; ++range_id) {
++        auto range_base = preferred_base;
++        range_base.oct[0] = static_cast<uint8_t>(((range_id & 0x3) << 6) |
++                                                  (preferred_base.oct[0] & 0x3c) | 0x2);
++        range_base.oct[1] = static_cast<uint8_t>(preferred_base.oct[1] ^ (range_id >> 2));
++
++        std::vector<std::string> range;
++        range.reserve(bssid_pool_registry::MAX_BSSID_ADDRESSES_PER_RADIO);
++        range.push_back(tlvf::mac_to_string(range_base));
++        for (int idx = 1;
++             idx < static_cast<int>(bssid_pool_registry::MAX_BSSID_ADDRESSES_PER_RADIO); ++idx) {
++            range.push_back(tlvf::mac_to_string(
++                derive_bssid_pool_address(range_base, idx, mbssid, mbssid_group_size)));
++        }
++        candidates.push_back(std::move(range));
++    }
++    return candidates;
++}
++
+ class vap_credentials_lock_guard {
+ public:
+     explicit vap_credentials_lock_guard(const char *path)
+@@ -155,9 +256,9 @@ int ap_wlan_hal_nl80211::wait_for_added_bss_ready(const std::string &ifname)
+         const auto ifindex = if_nametoindex(kernel_ifname.c_str());
+ 
+         if (ifindex != 0) {
+-            // add_interface() also waits for the dedicated hostapd socket and
+-            // rebinds a temporary global-socket registration when it appears.
+-            const int fd = base_wlan_hal_nl80211::add_interface(ifname);
++            // Refresh both command and event sockets when hostapd recreated this BSS at the
++            // same pathname. This also prevents add_interface() from falling back to global.
++            const int fd = base_wlan_hal_nl80211::refresh_wpa_ctrl_interface(ifname);
+             if (fd >= 0) {
+                 parsed_obj_map_t status;
+ 
+@@ -3113,6 +3214,15 @@ bool ap_wlan_hal_nl80211::set_channel(int chan, beerocks::eWiFiBandwidth bw, int
+         return false;
+     }
+ 
++    // A zero-VAP radio has no hostapd radio configuration to update yet. The
++    // first real VAP configuration will provide the channel when onboarding
++    // creates the hostapd interface.
++    if (m_radio_info.iface_name.empty()) {
++        LOG(DEBUG) << "No AP interface available for radio " << m_radio_info.phy_name
++                   << "; skipping channel update in zero-VAP state";
++        return true;
++    }
++
+     // ACS is triggered in BackhaulManager::send_slaves_enable() on radio which does not have BH link
+     if (chan == 0) {
+         LOG(INFO) << "ACS is not supported";
+@@ -5032,7 +5142,7 @@ bool ap_wlan_hal_nl80211::handle_wifi_compat_mode(
+              // Register the new SLO interface control socket before releasing the reconfig lock,
+              // so a sibling radio cannot immediately issue a conflicting hostapd reconfig command
+              // while this BSS is still settling.
+-             int fd = base_wlan_hal_nl80211::add_interface(new_bss_name);
++             int fd = base_wlan_hal_nl80211::refresh_wpa_ctrl_interface(new_bss_name);
+              if (fd < 0) {
+                  LOG(WARNING) << "handle_wifi_compat_mode: failed to register new BSS interface "
+                               << new_bss_name;
+@@ -5613,7 +5723,9 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+     // restarted once CAC completes successfully.
+     {
+         parsed_obj_map_t status_result;
+-        if (wpa_ctrl_send_msg("STATUS", status_result)) {
++        const bool have_status_iface = !get_iface_name().empty() &&
++                                       !m_radio_info.iface_name.empty();
++        if (have_status_iface && wpa_ctrl_send_msg("STATUS", status_result)) {
+             auto state_it = status_result.find("state");
+             if (state_it != status_result.end() && state_it->second != "ENABLED") {
+                 LOG(WARNING) << "update_vap_credentials: hostapd state='"
+@@ -5697,8 +5809,11 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+ 
+     m_radio_info.hostapd_radio_config = base_conf.get_hostapd_radio_config();
+ 
+-    // generate BSSID pool
+-    if (m_radio_info.bssid_pool.empty()) {
++    // Rebuild the local allocation view whenever the globally assigned range is missing. A
++    // zero-VAP teardown can leave the old pool map populated while the range ownership state was
++    // never restored (for example after a manager restart or an older registry format). Keeping
++    // the non-empty map in that state makes every new BSSID allocation fail.
++    if (m_radio_info.bssid_pool.empty() || m_bssid_pool_range.empty()) {
+         ap_wlan_hal_nl80211::generate_bssid_pool();
+     }
+ 
+@@ -5746,6 +5861,14 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+     bool new_radio_iface_name_updated = false;
+     bool prpl_config_update = false;
+ 
++    const size_t requested_new_vap_count = std::count_if(
++        bss_info_conf_list.begin(), bss_info_conf_list.end(),
++        [](const son::wireless_utils::sBssInfoConf &bss) {
++            return !bss.teardown &&
++                   tlvf::mac_to_string(bss.bssid) == beerocks::net::network_utils::WILD_MAC_STRING;
++        });
++    size_t created_new_vap_count = 0;
++
+     //Exacting radio name to get only the base interface
+     std::string base_radio_iface_name;
+     extractLinkBaseInterface(m_radio_info.iface_name, base_radio_iface_name);
+@@ -5994,6 +6117,8 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+                 }
+             }
+ 
++            ++created_new_vap_count;
++
+             prplmesh::hostapd::Configuration updated_base_conf = load_hostapd_config(m_radio_info.iface_name,"");
+             // Add new bss configuration to default hostapd_config file
+             if (!m_radio_info.hostapd_new_bss_config.empty()) {
+@@ -6733,6 +6858,12 @@ bool ap_wlan_hal_nl80211::update_vap_credentials(
+         abort = true;
+     }
+ 
++    if (created_new_vap_count < requested_new_vap_count) {
++        LOG(ERROR) << "Autoconfiguration: created " << created_new_vap_count << " of "
++                   << requested_new_vap_count << " requested new VAPs";
++        abort = true;
++    }
++
+     if (new_radio_iface_name_update_req != 0 && !new_radio_iface_name.empty() && (prpl_config_update != true)) {
+ 	    // Extract the suffix from the original iface name
+ 
+@@ -9584,6 +9715,29 @@ bool ap_wlan_hal_nl80211::remove_mld_link(std::string &link_iface_name, sMacAddr
+         for (const auto &family_iface : family) {
+             base_wlan_hal_nl80211::remove_interface(family_iface);
+         }
++
++        // remove_mld_link() is also used for the last link of a radio's primary MLD BSS. In
++        // that case there is no remove_bss() call to clear the primary interface state, so the
++        // next zero-VAP refresh would keep querying the removed link and repeatedly rebuild a
++        // dead per-interface control socket. Remove the corresponding family from the local VAP
++        // view and clear the primary only when no other VAP remains on this radio.
++        for (auto vap_it = m_radio_info.available_vaps.begin();
++             vap_it != m_radio_info.available_vaps.end();) {
++            std::string vap_base;
++            extractLinkBaseInterface(vap_it->second.bss, vap_base);
++            if (vap_base == base_iface) {
++                vap_it = m_radio_info.available_vaps.erase(vap_it);
++            } else {
++                ++vap_it;
++            }
++        }
++
++        if (m_radio_info.active_BSSs.empty() && m_radio_info.available_vaps.empty()) {
++            LOG(INFO) << __func__ << ": last MLD BSS removed; clearing stale primary interface "
++                      << m_radio_info.iface_name;
++            set_iface_name(std::string());
++            m_radio_info.iface_name.clear();
++        }
+     } else {
+         base_wlan_hal_nl80211::remove_interface(link_iface_name);
+         family.push_back(link_iface_name);
+@@ -9687,7 +9841,7 @@ bool ap_wlan_hal_nl80211::add_mld_link(std::string &new_iface,std::string &prev_
+             beerocks::os_utils::wpa_ctrl_skt_exists(target_ctrl_path)) {
+             // Re-register here so a socket initially registered against global is rebound
+             // to the dedicated interface socket once hostapd has created it.
+-            if (base_wlan_hal_nl80211::add_interface(new_iface) >= 0) {
++            if (base_wlan_hal_nl80211::refresh_wpa_ctrl_interface(new_iface) >= 0) {
+                 parsed_obj_map_t status;
+                 if (wpa_ctrl_send_msg("STATUS", status, new_iface)) {
+                     auto state_it = status.find("state");
+@@ -10537,37 +10691,173 @@ bool ap_wlan_hal_nl80211::update_mld_unit(std::string ssid_alias, int8_t mld_uni
+     return false;
+ }
+ 
+-void ap_wlan_hal_nl80211::generate_bssid_pool()
++bool ap_wlan_hal_nl80211::validate_radio_mac()
+ {
+-    VAPElement vap_element;
++    std::string radio_mac = get_radio_mac();
++    std::string normalized_radio_mac;
++    if (!bssid_pool_registry::normalize_mac_address(radio_mac, normalized_radio_mac)) {
++        LOG(ERROR) << __func__ << " cannot validate an empty or invalid radio MAC for phy "
++                   << m_radio_info.phy_name;
++        return false;
++    }
+ 
+-    parsed_obj_map_t reply;
++    // The shared registry is normally populated by the STA HAL after STATUS/MLO_STATUS.
++    // During a zero-VAP startup the AP manager can attach first, so also read the live STA
++    // interfaces directly. This covers the STA MLD and link addresses before the first STA
++    // STATUS refresh has reached the registry.
++    std::set<std::string> live_sta_addresses;
++    for (int radio_id = 0; radio_id < 4; ++radio_id) {
++        char sta_iface[BPL_IFNAME_LEN] = "";
++        if (beerocks::bpl::cfg_get_sta_iface_with_radio_id(radio_id, sta_iface) < 0 ||
++            sta_iface[0] == '\0') {
++            continue;
++        }
++
++        const std::string sta_iface_name(sta_iface);
++        if (!beerocks::net::network_utils::linux_iface_exists(sta_iface_name)) {
++            continue;
++        }
+ 
+-    int mbssid = 0;
++        std::vector<std::string> sta_mac_list;
++        if (!m_nl80211_client->get_sta_iface_mac(sta_iface_name, sta_mac_list)) {
++            LOG(DEBUG) << __func__ << " could not read live STA addresses from "
++                       << sta_iface_name;
++            continue;
++        }
+ 
+-    int mbssid_group_size = 0;
++        for (const auto &sta_mac : sta_mac_list) {
++            std::string normalized_sta_mac;
++            if (bssid_pool_registry::normalize_mac_address(sta_mac, normalized_sta_mac)) {
++                live_sta_addresses.insert(normalized_sta_mac);
++            }
++        }
++    }
+ 
+-    sMacAddr mask;
++    // Do not treat this radio's own AP MLD snapshot from an earlier attach as a collision.
++    // Reservations from other radio managers remain in the shared registry.
++    const std::string radio_registry_id = !m_radio_info.phy_name.empty()
++                                              ? m_radio_info.phy_name
++                                              : m_radio_info.iface_name;
++    if (!radio_registry_id.empty()) {
++        bssid_pool_registry::sync_ap_addresses(radio_registry_id, {});
++    }
+ 
+-    std::string type;
++    const bool radio_mac_collision =
++        bssid_pool_registry::is_address_reserved(normalized_radio_mac) ||
++        live_sta_addresses.count(normalized_radio_mac) != 0;
++    if (!radio_mac_collision) {
++        return true;
++    }
+ 
+-    std::string base_mask = "ff:ff:ff:ff:ff:ff";
++    LOG(WARNING) << __func__ << " radio RUID " << normalized_radio_mac
++                 << " is already used by a STA/AP MLD or STA link; selecting the next free "
++                    "address from the pool for phy "
++                 << m_radio_info.phy_name;
+ 
+-    mask = tlvf::mac_from_string(base_mask);
++    const bool mbssid = m_radio_info.frequency_band == beerocks::eFreqType::FREQ_6G;
++    const int mbssid_group_size = mbssid ? 4 : 0;
++    if (bssid_pool_registry::MAX_BSSID_ADDRESSES_PER_RADIO <= 1) {
++        LOG(ERROR) << __func__ << " no generated BSSID entries are available for phy "
++                   << m_radio_info.phy_name;
++        return false;
++    }
++
++    // The first BSS uses the radio MAC as its base address. The generated entries use the
++    // locally-administered form, so use the same base normalization as generate_bssid_pool().
++    const auto pool_base = [&]() {
++        auto base = tlvf::mac_from_string(normalized_radio_mac);
++        base.oct[0] |= 2;
++        return base;
++    }();
++
++    for (int idx = 1;
++         idx < static_cast<int>(bssid_pool_registry::MAX_BSSID_ADDRESSES_PER_RADIO); ++idx) {
++        const auto candidate =
++            derive_bssid_pool_address(pool_base, idx, mbssid, mbssid_group_size);
++        const auto candidate_string = tlvf::mac_to_string(candidate);
++
++        if (bssid_pool_registry::is_address_reserved(candidate_string) ||
++            live_sta_addresses.count(candidate_string) != 0) {
++            LOG(DEBUG) << __func__ << " skipping reserved pool candidate " << candidate_string
++                       << " for phy " << m_radio_info.phy_name;
++            continue;
++        }
++
++        if (!beerocks::bpl::bpl_cfg_set_radio_mac_by_phy(m_radio_info.phy_name,
++                                                          candidate_string)) {
++            LOG(WARNING) << __func__ << " could not persist replacement RUID " << candidate_string
++                         << " for phy " << m_radio_info.phy_name
++                         << "; using it for this runtime instance";
++        } else {
++            LOG(INFO) << __func__ << " persisted replacement RUID " << candidate_string
++                      << " for phy " << m_radio_info.phy_name;
++        }
++
++        // get_radio_mac() may already have cached the old UCI value. Keep this HAL and the AP
++        // manager notification aligned with the replacement selected above.
++        set_cached_uci_radio_mac(candidate_string);
++        LOG(INFO) << __func__ << " selected replacement RUID " << candidate_string
++                  << " for phy " << m_radio_info.phy_name << " from pool index " << idx;
++        return true;
++    }
++
++    LOG(ERROR) << __func__ << " no unreserved replacement RUID is available in the generated "
++               << "pool for phy " << m_radio_info.phy_name;
++    return false;
++}
++
++void ap_wlan_hal_nl80211::generate_bssid_pool()
++{
++    VAPElement vap_element;
++
++    parsed_obj_map_t reply;
++
++    bool mbssid             = false;
++    int mbssid_group_size   = 0;
+ 
+     sMacAddr base_mac;
+ 
+-    sMacAddr new_bssid;
++    bool base_mac_collision = false;
++    std::set<std::string> reported_ap_addresses;
+ 
+     if (m_radio_info.frequency_band == beerocks::eFreqType::FREQ_6G) {
+-        mbssid = 3;
++        mbssid = true;
+         mbssid_group_size = 4;
+     }
+ 
+-
+-    if (wpa_ctrl_send_msg("STATUS", reply)) {
++    // A zero-VAP radio has no per-interface STATUS endpoint. The global socket remains useful
++    // for ADD/REMOVE, but hostapd does not provide this per-BSS snapshot through it. Use the
++    // radio-MAC fallback below until the first VAP creates a dedicated socket.
++    const bool have_status_iface = !get_iface_name().empty() && !m_radio_info.iface_name.empty();
++    if (have_status_iface && wpa_ctrl_send_msg("STATUS", reply)) {
+         LOG(INFO) << __func__ << " STATUS Success";
+ 
++        // Reserve both ordinary BSSIDs and MLD addresses globally before creating this radio's
++        // local candidate pool.  MLD addresses can be allocated from another radio's range, and
++        // ordinary BSSIDs must also remain unavailable to a zero-VAP radio.
++        std::set<std::string> reported_mld_addresses;
++        for (const auto &entry : reply) {
++            std::string normalized_mld_address;
++            if (entry.first.find("mld_addr[") == 0 &&
++                bssid_pool_registry::normalize_mac_address(entry.second, normalized_mld_address)) {
++                reported_mld_addresses.insert(normalized_mld_address);
++                reported_ap_addresses.insert(normalized_mld_address);
++            }
++
++            std::string normalized_bssid;
++            if (entry.first.find("bssid[") == 0 &&
++                bssid_pool_registry::normalize_mac_address(entry.second, normalized_bssid)) {
++                reported_ap_addresses.insert(normalized_bssid);
++            }
++        }
++        const std::string radio_registry_id = !m_radio_info.phy_name.empty()
++                                                  ? m_radio_info.phy_name
++                                                  : m_radio_info.iface_name;
++        if (!radio_registry_id.empty()) {
++            bssid_pool_registry::sync_ap_addresses(radio_registry_id, reported_ap_addresses);
++        }
++        mld_status_bssids = reported_mld_addresses;
++
+         // Try reading values of base bss mac
+         vap_element.mac  = reply["bssid[" + std::to_string(0) + "]"];
+ 
+@@ -10594,7 +10884,24 @@ void ap_wlan_hal_nl80211::generate_bssid_pool()
+         // allocator hands this same address to the next VAP as its BSSID and hostapd
+         // rejects it ("may not have BSSID set to the MAC address of the radio").
+ 
+-        base_mac = tlvf::mac_from_string(radio_mac);
++        std::string normalized_radio_mac;
++        if (!bssid_pool_registry::normalize_mac_address(radio_mac, normalized_radio_mac)) {
++            LOG(ERROR) << __func__ << " invalid radio mac " << radio_mac;
++            return;
++        }
++
++        // The raw radio RUID must be checked before setting the locally-administered bit for the
++        // AP BSSID.  A STA address such as 00:03:... collides with the RUID lookup even though
++        // its derived AP BSSID 02:03:... is a different address.
++        base_mac_collision =
++            bssid_pool_registry::is_address_reserved(normalized_radio_mac);
++        if (base_mac_collision) {
++            LOG(WARNING) << __func__ << " radio RUID " << normalized_radio_mac
++                         << " is reserved by another STA/AP address; selecting a replacement "
++                            "RUID from this radio's generated MAC pool";
++        }
++
++        base_mac = tlvf::mac_from_string(normalized_radio_mac);
+         // Every non-primary BSSID generated below (the "b5" branch) has the
+         // locally-administered bit forced on to satisfy hostapd's MBSSID prefix
+         // requirement (all group members must share the same bits outside the
+@@ -10604,79 +10911,114 @@ void ap_wlan_hal_nl80211::generate_bssid_pool()
+         // on that bit and hostapd rejects every secondary with "doesn't satisfy
+         // prefix requirement for the MBSSID groups".
+         base_mac.oct[0] |= 2;
+-        m_radio_info.bssid_pool[tlvf::mac_to_string(base_mac)] = true;
+-    }
+-
+-
+-    // Generate BSSID based on maximum BSS support (1 For STA Vap + 15 AP Vap) on the radio
+-    for (int idx = 1; idx < m_radio_info.radio_max_bss_supported; idx++) {
+-
+-        int bss_idx = idx;
+ 
+-        // first assign base mac as new_bssid
+-        new_bssid = base_mac;
++        // The radio MAC is also the first BSSID after a zero-VAP radio is brought back. It can
++        // now be reserved by a bSTA MLD/link or by an AP MLD on another radio, so validate it
++        // against the same global namespace used by generate_new_bssid(). The local AP snapshot
++        // is unavailable on this path, therefore clear this radio's stale AP reservations first.
++        const std::string radio_registry_id = !m_radio_info.phy_name.empty()
++                                                  ? m_radio_info.phy_name
++                                                  : m_radio_info.iface_name;
++        if (!radio_registry_id.empty()) {
++            bssid_pool_registry::sync_ap_addresses(radio_registry_id, {});
++        }
+ 
+-        //int num_global = 0;
+-        int use_global = 0;
++        const bool base_bssid_collision =
++            bssid_pool_registry::is_address_reserved(tlvf::mac_to_string(base_mac));
++        if (base_bssid_collision) {
++            // Keep the radio/base address occupied and let generate_new_bssid() select one of
++            // the 15 generated pool entries below. Each pool entry is checked against the
++            // unified AP/STA reservation registry, so no synthetic address is introduced here.
++            LOG(WARNING) << __func__ << " radio base BSSID " << tlvf::mac_to_string(base_mac)
++                         << " is globally reserved; allocating from the generated BSSID pool";
++        }
++        base_mac_collision = base_mac_collision || base_bssid_collision;
+ 
+-        int maxbssid_ind = 0;
++        m_radio_info.bssid_pool[tlvf::mac_to_string(base_mac)] = true;
++    }
+ 
+-        int num_bss_nontx = 0;
++    if (base_mac_collision) {
++        bool replacement_selected = false;
++        for (int idx = 1;
++             idx < static_cast<int>(bssid_pool_registry::MAX_BSSID_ADDRESSES_PER_RADIO); ++idx) {
++            const auto candidate =
++                derive_bssid_pool_address(base_mac, idx, mbssid, mbssid_group_size);
++            const auto candidate_string = tlvf::mac_to_string(candidate);
+ 
+-        int maxbssid = 0;
++            if (bssid_pool_registry::is_address_reserved(candidate_string)) {
++                continue;
++            }
+ 
+-        if (mbssid) {
+-            num_bss_nontx = mbssid_group_size - 1;
+-            while (num_bss_nontx > 0) {
+-                    maxbssid_ind++;
+-                    num_bss_nontx >>= 1;
++            base_mac = candidate;
++            replacement_selected = true;
++            m_radio_info.bssid_pool[candidate_string] = true;
++            const auto phy_name = m_radio_info.phy_name;
++            if (beerocks::bpl::bpl_cfg_set_radio_mac_by_phy(phy_name, candidate_string)) {
++                // get_radio_mac() may already have cached the old UCI value while entering the
++                // zero-VAP fallback path. Keep the current AP manager identity consistent with
++                // the persisted RUID and with the generated pool base.
++                set_cached_uci_radio_mac(candidate_string);
++                LOG(INFO) << __func__ << " updated persisted RUID for " << phy_name << " to "
++                          << candidate_string;
++            } else {
++                LOG(WARNING) << __func__ << " could not persist replacement RUID "
++                             << candidate_string << " for " << phy_name
++                             << "; using it only for the runtime BSSID pool";
+             }
++            break;
+         }
+-        maxbssid = std::pow(2,maxbssid_ind);
+-        if (mbssid && bss_idx >= maxbssid) {
+-            new_bssid.oct[5] = ((new_bssid.oct[5] >> maxbssid_ind) << maxbssid_ind);
+-            new_bssid.oct[5] = new_bssid.oct[5] + (bss_idx / maxbssid) * maxbssid;
+-            bss_idx = bss_idx % maxbssid;
++
++        if (!replacement_selected) {
++            LOG(ERROR) << __func__ << " no unreserved replacement RUID is available in the BSSID "
++                       << "pool for radio " << m_radio_info.phy_name;
+         }
++    }
+ 
+-        if (mbssid){
+-            type = "b5";
+-        } else if (use_global) {
+-            type = "add";
+-        } else if (mask.oct[0] > 0) {
+-            type = "b1";
+-        } else if (mask.oct[5] < 0xff){
+-            type = "b5";
+-        } else {
+-            type = "add";
+-        }
+-        LOG(INFO) << "type: " << type;
+-
+-        if (type == "b1") {
+-            if (!(new_bssid.oct[0] & 2)){
+-                bss_idx--;
+-            }
+-            new_bssid.oct[0] |= 2;
+-            new_bssid.oct[0] ^= bss_idx << 2;
+-        } else if (type == "b5") {
+-            if (mbssid) {
+-                new_bssid.oct[0] |= 2;
+-                int size = maxbssid;
+-                int B = new_bssid.oct[5] % size;
+-                int loct = new_bssid.oct[5];
+-                new_bssid.oct[5] = loct - B + ((B+bss_idx) % size);
+-            } else {
+-                new_bssid.oct[5] ^= bss_idx;
+-            }
++    const std::string radio_registry_id = !m_radio_info.phy_name.empty()
++                                              ? m_radio_info.phy_name
++                                              : m_radio_info.iface_name;
++    const auto range_candidates = build_bssid_range_candidates(
++        base_mac, get_current_radio_count(), mbssid, mbssid_group_size);
++    std::vector<std::string> assigned_range;
++    if (radio_registry_id.empty() ||
++        !bssid_pool_registry::claim_bssid_range(radio_registry_id, range_candidates,
++                                                assigned_range)) {
++        LOG(ERROR) << __func__ << " could not claim a globally disjoint BSSID range for radio "
++                   << m_radio_info.phy_name;
++        return;
++    }
++
++    LOG(INFO) << __func__ << " claimed global BSSID range for radio " << radio_registry_id
++              << " with " << assigned_range.size() << " addresses";
++
++    // The local map is only an allocation view of this manager's assigned range. Existing BSS and
++    // MLD addresses reported by hostapd may be outside the newly assigned range; retain them as
++    // occupied entries, but never make them available for new allocations.
++    m_radio_info.bssid_pool.clear();
++    m_bssid_pool_range.clear();
++    m_bssid_pool_range.insert(assigned_range.begin(), assigned_range.end());
++    for (const auto &address : reported_ap_addresses) {
++        m_radio_info.bssid_pool[address] = true;
++    }
++    for (size_t index = 0; index < assigned_range.size(); ++index) {
++        const auto &address = assigned_range[index];
++        if (index == 0 || reported_ap_addresses.count(address) != 0) {
++            m_radio_info.bssid_pool[address] = true;
+         } else {
+-            for (int i = 5; i > 0; i--) {
+-                new_bssid.oct[i] += bss_idx;
+-                new_bssid.oct[i] %= 256;
+-            }
++            m_radio_info.bssid_pool[address] = false;
++        }
++        LOG(INFO) << "generated global-range bssid: " << address << " idx: " << index;
++    }
++
++    // Keep the generated pool local to this radio. Addresses reported by this radio are marked
++    // occupied here; addresses used by other AP/STA managers are filtered by the shared registry
++    // in generate_new_bssid().
++    for (auto &pool_entry : m_radio_info.bssid_pool) {
++        if (mld_status_bssids.count(pool_entry.first) != 0) {
++            pool_entry.second = true;
++            LOG(DEBUG) << __func__ << " marking hostapd MLD address " << pool_entry.first
++                       << " occupied in radio " << m_radio_info.phy_name;
+         }
+-        LOG(INFO) << "generated new_bssid: " << new_bssid << " idx: " << idx;
+-        std::string bssid = tlvf::mac_to_string(new_bssid);
+-        m_radio_info.bssid_pool[bssid] = false;
+     }
+ 
+     // check for STA vap bssid in radio
+@@ -10718,14 +11060,29 @@ void ap_wlan_hal_nl80211::generate_bssid_pool()
+ bool ap_wlan_hal_nl80211::generate_new_bssid(sMacAddr &new_bssid)
+ {
+     bool found = false;
++    const std::string radio_registry_id = !m_radio_info.phy_name.empty()
++                                              ? m_radio_info.phy_name
++                                              : m_radio_info.iface_name;
+     if (!m_radio_info.bssid_pool.empty()) {
+         for (auto &bssid_pool : m_radio_info.bssid_pool) {
+-            if (!bssid_pool.second) {
++            // Allocation always remains within this radio's globally assigned range. The shared
++            // registry is a blacklist for live AP BSS/MLD and STA/STA-link addresses owned by
++            // other managers.
++            const bool globally_reserved =
++                !bssid_pool.second && m_bssid_pool_range.count(bssid_pool.first) != 0 &&
++                bssid_pool_registry::is_address_reserved_by_other(radio_registry_id,
++                                                                    bssid_pool.first);
++            if (bssid_pool.second || m_bssid_pool_range.count(bssid_pool.first) == 0) {
++                continue;
++            }
++            if (!globally_reserved) {
+                 LOG(INFO) << "assign new_bssid: " << bssid_pool.first;
+                 new_bssid = tlvf::mac_from_string(bssid_pool.first);
+                 bssid_pool.second = true;
+                 found = true;
+                 break;
++            } else if (globally_reserved) {
++                LOG(DEBUG) << "skip globally reserved MLD BSSID: " << bssid_pool.first;
+             }
+         }
+     } else {
+@@ -10738,9 +11095,20 @@ bool ap_wlan_hal_nl80211::reload_all_ap_vaps()
+ {
+     LOG(TRACE) << __func__;
+ 
+-    std::string base_interface="";
++    // A radio manager is started before its first VAP is created. In that
++    // zero-VAP state iface_name is intentionally empty and there is no
++    // interface-specific hostapd reload to perform. Treat this as a
++    // successful no-op; sending RELOAD with an empty interface makes the
++    // global control-socket request fail and incorrectly aborts AP enable.
++    std::string base_interface;
+     extractLinkBaseInterface(m_radio_info.iface_name, base_interface);
+ 
++    if (m_radio_info.iface_name.empty() || base_interface.empty()) {
++        LOG(DEBUG) << "No AP interface available for radio " << m_radio_info.phy_name
++                   << "; skipping reload_all_ap_vaps in zero-VAP state";
++        return true;
++    }
++
+     if (!beerocks::net::network_utils::linux_iface_is_up_and_running(base_interface)) {
+         LOG(ERROR) << "iface " << base_interface << " is not in up state, trigger reload";
+         if (!wpa_ctrl_send_msg("RELOAD")) {
+@@ -11484,7 +11852,7 @@ bool ap_wlan_hal_nl80211::handle_mld_reconfig(std::string target_ssid, int8_t ml
+                                   << " after clearing stale state";
+                     }
+ 
+-                    int fd = base_wlan_hal_nl80211::add_interface(new_vap_name);
++                    int fd = base_wlan_hal_nl80211::refresh_wpa_ctrl_interface(new_vap_name);
+                     if (fd < 0) {
+                         LOG(DEBUG) << "Failed to register and connect the new BSS interface!";
+                         return false;
+@@ -11659,7 +12027,7 @@ bool ap_wlan_hal_nl80211::handle_mld_reconfig(std::string target_ssid, int8_t ml
+                 m_radio_info.hostapd_new_bss_config = new_conf.get_hostapd_bss_config();
+             }
+             // Create a WPA control socket for the existing interface where a new link is being added
+-            int fd = base_wlan_hal_nl80211::add_interface(mld_iface);
++            int fd = base_wlan_hal_nl80211::refresh_wpa_ctrl_interface(mld_iface);
+             if (fd < 0) {
+                 LOG(ERROR) << "Failed to register and connect the new BSS interface!";
+                 return false;
+@@ -11702,7 +12070,7 @@ bool ap_wlan_hal_nl80211::handle_mld_reconfig(std::string target_ssid, int8_t ml
+ 
+                 LOG(INFO) << "link_id updated to: " << link_id;
+                 LOG(INFO) << "bss updated to: " << new_bss_link;
+-                fd = base_wlan_hal_nl80211::add_interface(new_bss_link);
++                fd = base_wlan_hal_nl80211::refresh_wpa_ctrl_interface(new_bss_link);
+                 if (fd < 0) {
+                     LOG(ERROR) << "Failed to register and connect the Link of new BSS interface!";
+                     return false;
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+index 4c2fbefd8..c0f5ed434 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+@@ -67,6 +67,7 @@ public:
+ 
+     virtual HALState attach(bool block = false) override;
+     bool refresh_radio_info() override;
++    bool validate_radio_mac() override;
+     virtual bool enable() override;
+     virtual bool disable() override;
+     virtual bool powersave_enable(bool allow_non_6g = false, bool force = false) override;
+@@ -322,6 +323,11 @@ private:
+ 
+     bool m_powersave_enabled = false;
+ 
++    // Addresses that this radio manager is allowed to allocate. Existing BSS/MLD/STA addresses
++    // may also appear in m_radio_info.bssid_pool as occupied entries, but only this set may ever
++    // transition from free to allocated.
++    std::set<std::string> m_bssid_pool_range;
++
+     // Unassociated measurement state variables
+     std::chrono::steady_clock::time_point m_unassoc_measure_start;
+     int m_unassoc_measure_window_size = 0;
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index cfbd96d73..097b1ca32 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "base_wlan_hal_nl80211.h"
++#include "bssid_pool_registry.h"
+ 
+ #include "wpa_ctrl_client.h"
+ #include <bcl/beerocks_string_utils.h>
+@@ -35,6 +36,7 @@
+ #include <netlink/genl/genl.h>
+ #include <netlink/msg.h>
+ #include <netlink/netlink.h>
++#include <set>
+ 
+ // --- nl80211 generic-netlink multicast group resolution helpers ---------------------------
+ // Used to look up the numeric id of the "scan" multicast group so the event socket can
+@@ -148,6 +150,13 @@ namespace nl80211 {
+ #define AP_ENABELED_TIMEOUT_SEC 15
+ #define AP_ENABELED_FIXED_DFS_TIMEOUT_SEC 660
+ 
++static std::string bssid_registry_radio_id(const RadioInfo &radio_info)
++{
++    // phy_name is stable across VAP/link changes.  The iface name is a fallback for
++    // transitional/no-VAP states where phy_name has not been populated yet.
++    return !radio_info.phy_name.empty() ? radio_info.phy_name : radio_info.iface_name;
++}
++
+ //////////////////////////////////////////////////////////////////////////////
+ ////////////////////////// Local Module Functions ////////////////////////////
+ //////////////////////////////////////////////////////////////////////////////
+@@ -794,6 +803,30 @@ bool base_wlan_hal_nl80211::wpa_ctrl_send_msg(const std::string &cmd,
+         iface_name = get_iface_name();
+     }
+ 
++    // STATUS/GET_CONFIG are per-interface commands and cannot be redirected to hostapd's
++    // global socket. PING, ADD, and REMOVE are global-control commands and remain valid while
++    // the radio has zero VAPs, so route them through the registered global endpoint when the
++    // caller has no local interface name.
++    if (iface_name.empty()) {
++        const bool is_global_command =
++            cmd == "PING" || cmd.compare(0, 4, "ADD ") == 0 ||
++            cmd.compare(0, 7, "REMOVE ") == 0;
++        if (is_global_command) {
++            iface_name = global_iface;
++        } else {
++            // In zero-VAP mode there is no valid per-interface endpoint yet; callers must use
++            // their no-VAP fallback instead of looking up the empty-string map key.
++            LOG(DEBUG) << "No per-interface control socket available for command '" << cmd
++                       << "' while the radio has zero VAPs";
++            return false;
++        }
++    }
++
++    if (iface_name == global_iface && !ensure_global_wpa_ctrl_socket()) {
++        LOG(ERROR) << "Global hostapd control socket is not available";
++        return false;
++    }
++
+     auto wpa_ctrl_cmd = m_wpa_ctrl_client.get_socket_cmd(iface_name);
+     if (!wpa_ctrl_cmd) {
+         LOG(ERROR) << "Control socket not available!";
+@@ -819,6 +852,30 @@ bool base_wlan_hal_nl80211::wpa_ctrl_send_msg(const std::string &cmd,
+     return true;
+ }
+ 
++bool base_wlan_hal_nl80211::ensure_global_wpa_ctrl_socket()
++{
++    if (!m_wpa_ctrl_client.has_interface(global_iface) &&
++        !register_wpa_ctrl_interface(global_iface)) {
++        return false;
++    }
++
++    auto global_cmd = m_wpa_ctrl_client.get_socket_cmd(global_iface);
++    if (!global_cmd || !global_cmd->connect()) {
++        return false;
++    }
++
++    // The event socket is needed for AP-ENABLED/AP-DISABLED notifications. Keep command
++    // availability independent of event attachment, but repair the event side whenever it is
++    // missing or stale as well.
++    auto global_event = m_wpa_ctrl_client.get_socket_event(global_iface);
++    if (!global_event || !global_event->connect()) {
++        LOG(WARNING) << "Global hostapd command socket is usable, but event socket could not be "
++                        "connected";
++    }
++
++    return true;
++}
++
+ bool base_wlan_hal_nl80211::reconnect_wpa_ctrl_cmd_socket(const std::string &interface)
+ {
+     auto cmd_socket = m_wpa_ctrl_client.get_socket_cmd(interface);
+@@ -829,6 +886,67 @@ bool base_wlan_hal_nl80211::reconnect_wpa_ctrl_cmd_socket(const std::string &int
+     return cmd_socket->connect();
+ }
+ 
++int base_wlan_hal_nl80211::refresh_wpa_ctrl_interface(const std::string &interface)
++{
++    if (interface.empty()) {
++        return beerocks::net::FileDescriptor::invalid_descriptor;
++    }
++
++    // The pathname can be unchanged while hostapd has replaced the underlying Unix socket.
++    // Reconnecting only the command socket is insufficient because the event socket and its
++    // poll fd may refer to the old endpoint as well. Remove the complete mapping first; the
++    // wpa_ctrl_client destructor path closes both sockets and unregisters the event fd.
++    if (m_wpa_ctrl_client.has_interface(interface)) {
++        LOG(INFO) << "Refreshing recreated WPA ctrl sockets for " << interface;
++        if (!m_wpa_ctrl_client.del_interface(interface)) {
++            LOG(WARNING) << "Could not remove stale WPA ctrl mapping for " << interface;
++        }
++    }
++
++    // A recreated netdev may have a new ifindex even when its name is unchanged. Force
++    // add_interface() to resolve the current index instead of reusing the cached one.
++    std::string base_iface_name;
++    extractLinkBaseInterface(interface, base_iface_name);
++    m_iface_index.erase(base_iface_name);
++
++    // ADD BSS is sent through the global socket, and hostapd creates the dedicated socket
++    // asynchronously. Do not let add_interface() fall back to the global socket for a newly
++    // created BSS: STATUS is a per-interface command and would then fail even though the path
++    // appears a moment later.
++    if (interface != global_iface) {
++        std::string ctrl_dir;
++        const auto path_pos = m_hal_conf.wpa_ctrl_path.find_last_of('/');
++        if (path_pos != std::string::npos) {
++            ctrl_dir = m_hal_conf.wpa_ctrl_path.substr(0, path_pos + 1);
++        }
++        if (ctrl_dir.empty()) {
++            ctrl_dir = "/var/run/hostapd/";
++        }
++
++        const auto dedicated_path = ctrl_dir + interface;
++        bool dedicated_socket_ready = false;
++        constexpr int CTRL_SOCKET_READY_RETRIES = 10;
++        constexpr auto CTRL_SOCKET_READY_DELAY = std::chrono::milliseconds(100);
++        for (int attempt = 0; attempt < CTRL_SOCKET_READY_RETRIES; ++attempt) {
++            if (beerocks::os_utils::wpa_ctrl_skt_exists(dedicated_path)) {
++                dedicated_socket_ready = true;
++                break;
++            }
++            if (attempt + 1 < CTRL_SOCKET_READY_RETRIES) {
++                std::this_thread::sleep_for(CTRL_SOCKET_READY_DELAY);
++            }
++        }
++
++        if (!dedicated_socket_ready) {
++            LOG(WARNING) << "Dedicated WPA ctrl socket did not appear for recreated interface "
++                         << interface << " at " << dedicated_path;
++            return beerocks::net::FileDescriptor::invalid_descriptor;
++        }
++    }
++
++    return add_interface(interface);
++}
++
+ bool base_wlan_hal_nl80211::wpa_ctrl_send_msg(const std::string &cmd, parsed_obj_map_t &reply,
+                                               const std::string &ifname)
+ {
+@@ -889,6 +1007,17 @@ bool base_wlan_hal_nl80211::wpa_ctrl_send_msg_bufsize(const std::string &cmd, st
+         iface_name = get_iface_name();
+     }
+ 
++    if (iface_name.empty()) {
++        LOG(DEBUG) << "No per-interface control socket available for command '" << cmd
++                   << "' while the radio has zero VAPs";
++        return false;
++    }
++
++    if (iface_name == global_iface && !ensure_global_wpa_ctrl_socket()) {
++        LOG(ERROR) << "Global hostapd control socket is not available";
++        return false;
++    }
++
+     auto wpa_ctrl_cmd = m_wpa_ctrl_client.get_socket_cmd(iface_name);
+     if (!wpa_ctrl_cmd) {
+         LOG(ERROR) << "Control socket not available for iface " << iface_name;
+@@ -1274,8 +1403,10 @@ bool base_wlan_hal_nl80211::refresh_radio_info()
+         }
+     }
+ 
+-    // TODO: To be replaced with proper NL call
+-    m_radio_info.radio_max_bss_supported = 16;
++    // TODO: To be replaced with proper NL call. Keep the reported NL80211 pool size aligned
++    // with the global allocator: one radio manager owns at most 16 BSSID addresses.
++    m_radio_info.radio_max_bss_supported =
++        static_cast<uint8_t>(bssid_pool_registry::MAX_BSSID_ADDRESSES_PER_RADIO);
+ 
+ 
+     LOG(DEBUG) << "radio " << m_radio_info.iface_name
+@@ -1313,59 +1444,37 @@ bool base_wlan_hal_nl80211::get_vap_status(
+ {
+     if (!refresh_vaps_info(beerocks::IFACE_RADIO_ID)) {
+         LOG(ERROR) << "Refresh vap info failed for " << m_radio_info.iface_name;
+-        // remove_interface() erases the event fd from m_fds_ext_events. Do not
+-        // iterate that vector while removing its entries: the old range-based
+-        // loop invalidated its iterator and skipped entries, leaving their
+-        // wpa_ctrl command/event sockets open. Repeated STATUS failures then
+-        // exhausted the system file table and hostapd started returning EMFILE
+-        // for otherwise valid ADD requests.
+-        std::vector<std::string> interfaces_to_remove;
+-        for (const auto &fd : m_fds_ext_events) {
+-            if (fd > 0) {
+-                const auto interface = m_wpa_ctrl_client.get_interface(fd);
+-                if (!interface.empty() &&
+-                    std::find(interfaces_to_remove.begin(), interfaces_to_remove.end(),
+-                              interface) == interfaces_to_remove.end()) {
+-                    interfaces_to_remove.push_back(interface);
+-                }
++        // Snapshot the complete control-client map before removing anything. Looking only at
++        // m_fds_ext_events misses command-only or partially-connected entries; those entries
++        // retain their command/event socket objects and leak descriptors on every failed STATUS
++        // recovery. The global mapping is also included in the snapshot and is restored below.
++        const auto registered_interfaces = m_wpa_ctrl_client.get_interfaces();
++        for (const auto &interface : registered_interfaces) {
++            LOG(INFO) << "Removing interface " << (interface.empty() ? "<empty>" : interface);
++
++            if (interface.empty()) {
++                // An empty logical interface is never a valid hostapd endpoint. Remove it
++                // directly instead of entering remove_interface(), which would wait for the
++                // hostapd directory itself to disappear.
++                m_wpa_ctrl_client.del_interface(interface);
++                continue;
+             }
+-        }
+ 
+-        for (const auto &interface : interfaces_to_remove) {
+-            LOG(INFO) << "Removing interface " << interface;
+             remove_interface(interface);
+         }
+ 
+-        int fd = add_interface(m_radio_info.iface_name);
+-        LOG(DEBUG) << "get_vap_status: add iface fd: " << fd;
++        if (!m_radio_info.iface_name.empty()) {
++            int fd = add_interface(m_radio_info.iface_name);
++            LOG(DEBUG) << "get_vap_status: add iface fd: " << fd;
++        }
+ 
+-        // The loop above tears down every registered wpa_ctrl socket whose event fd is
+-        // tracked in m_fds_ext_events, including the "global" hostapd control socket -
+-        // its fd lives in the same list as the per-BSS ones. Unlike the radio's own base
+-        // iface, "global" is never re-added by anything else on this path, so without
+-        // this call it stays unregistered for the remainder of the process (until a full
+-        // Detach/Init cycle), causing every later ADD/MLD_ADD_LINK targeting "global" to
+-        // fail with "Control socket not available!".
+-        if (!register_wpa_ctrl_interface(global_iface)) {
+-            LOG(ERROR) << "get_vap_status: failed to re-register " << global_iface
++        // Recreate the global mapping after the failed per-interface recovery. The hostapd
++        // global socket normally survived; only this HAL's local mapping was removed. The
++        // helper reconnects both command and event sockets and is also used by explicit global
++        // commands such as ADD/REMOVE.
++        if (!ensure_global_wpa_ctrl_socket()) {
++            LOG(ERROR) << "get_vap_status: failed to restore " << global_iface
+                        << " control socket";
+-        } else {
+-            // register_wpa_ctrl_interface() only builds the socket path and inserts the
+-            // cmd/event socket objects into m_wpa_ctrl_client - it does not open them.
+-            // add_interface() (used for every other re-registration path) explicitly
+-            // connects both sockets after registering; without the same here, "global"'s
+-            // sockets stay unopened and every later ADD/MLD_ADD_LINK still fails with
+-            // "Control socket not available!"/"WPA ctrl sock ... not opened.".
+-            auto global_cmd = m_wpa_ctrl_client.get_socket_cmd(global_iface);
+-            if (!global_cmd || !global_cmd->connect()) {
+-                LOG(ERROR) << "get_vap_status: failed to connect " << global_iface
+-                           << " cmd socket";
+-            }
+-            auto global_event = m_wpa_ctrl_client.get_socket_event(global_iface);
+-            if (!global_event || !global_event->connect()) {
+-                LOG(ERROR) << "get_vap_status: failed to connect " << global_iface
+-                           << " event socket";
+-            }
+         }
+         return false;
+     } else {
+@@ -1412,6 +1521,17 @@ bool base_wlan_hal_nl80211::refresh_vaps_info(int id)
+     // recreate the first VAP.
+     if (m_hal_conf.radio_disable || get_iface_name().empty() ||
+         m_radio_info.iface_name.empty()) {
++        const auto radio_id = bssid_registry_radio_id(m_radio_info);
++        if (!radio_id.empty()) {
++            bssid_pool_registry::sync_ap_addresses(radio_id, {});
++        }
++        for (const auto &mld_address : mld_status_bssids) {
++            auto pool_entry = m_radio_info.bssid_pool.find(mld_address);
++            if (pool_entry != m_radio_info.bssid_pool.end()) {
++                pool_entry->second = false;
++            }
++        }
++        mld_status_bssids.clear();
+         m_radio_info.available_vaps.clear();
+         return true;
+     }
+@@ -1478,6 +1598,65 @@ bool base_wlan_hal_nl80211::refresh_vaps_info(int id)
+         return false;
+     }
+ 
++    // hostapd reports the MLD address separately from each BSSID. Both address classes belong in
++    // the device-wide registry: an MLD address may be allocated from another radio's BSSID
++    // range, and an ordinary BSSID must not be reused by a zero-VAP radio. A complete snapshot is
++    // required here so a transiently incomplete STATUS reply cannot accidentally release a live
++    // reservation.
++    std::set<std::string> reported_mld_addresses;
++    std::set<std::string> reported_bssids;
++    for (const auto &entry : reply) {
++        std::string normalized_mld_address;
++        if (entry.first.find("mld_addr[") == 0 &&
++            bssid_pool_registry::normalize_mac_address(entry.second, normalized_mld_address)) {
++            reported_mld_addresses.insert(normalized_mld_address);
++        }
++
++        std::string normalized_bssid;
++        if (entry.first.find("bssid[") == 0 &&
++            bssid_pool_registry::normalize_mac_address(entry.second, normalized_bssid)) {
++            reported_bssids.insert(normalized_bssid);
++        }
++    }
++
++    // A complete STATUS snapshot is also the point at which a previously reported local MLD
++    // address can be released.  Keep an address occupied if it is still an ordinary BSSID in
++    // the snapshot; otherwise return it to this radio's local pool.
++    for (const auto &previous_mld_address : mld_status_bssids) {
++        if (reported_mld_addresses.count(previous_mld_address) != 0 ||
++            reported_bssids.count(previous_mld_address) != 0) {
++            continue;
++        }
++        auto pool_entry = m_radio_info.bssid_pool.find(previous_mld_address);
++        if (pool_entry != m_radio_info.bssid_pool.end()) {
++            pool_entry->second = false;
++        }
++    }
++    mld_status_bssids = reported_mld_addresses;
++
++    std::set<std::string> reported_ap_addresses = reported_mld_addresses;
++    reported_ap_addresses.insert(reported_bssids.begin(), reported_bssids.end());
++
++    const auto radio_id = bssid_registry_radio_id(m_radio_info);
++    if (!radio_id.empty()) {
++        bssid_pool_registry::sync_ap_addresses(radio_id, reported_ap_addresses);
++    }
++
++    for (const auto &mld_address : reported_mld_addresses) {
++        auto pool_entry = m_radio_info.bssid_pool.find(mld_address);
++        if (pool_entry != m_radio_info.bssid_pool.end()) {
++            pool_entry->second = true;
++            LOG(DEBUG) << __func__ << " reserved local BSSID pool entry " << mld_address
++                       << " from hostapd MLD status on radio " << radio_id;
++        } else {
++            // Do not add a foreign address to this radio's pool.  It remains globally reserved
++            // and the radio that owns the address will mark its own pool entry when it refreshes
++            // or regenerates its pool.
++            LOG(DEBUG) << __func__ << " reserved foreign MLD address " << mld_address
++                       << " in the shared BSSID registry for radio " << radio_id;
++        }
++    }
++
+     // clear the available vaps
+     m_radio_info.available_vaps.clear();
+ 
+@@ -1765,6 +1944,15 @@ bool base_wlan_hal_nl80211::process_ext_events(int fd)
+ 
+ std::string base_wlan_hal_nl80211::get_radio_mac()
+ {
++    // A collision remediation may update the persisted RUID while the old AP interface
++    // is still present. Once a replacement has been selected, it is the canonical identity
++    // that must be reported to AgentDB; do not let the transient interface MAC override it.
++    if (!m_cached_uci_radio_mac.empty()) {
++        LOG(DEBUG) << "radio_mac of iface " << m_radio_info.iface_name << " from cached identity "
++                   << m_cached_uci_radio_mac;
++        return m_cached_uci_radio_mac;
++    }
++
+     std::string mac;
+     nl80211_client::interface_info if_info;
+     if(m_nl80211_client->get_interface_info(m_radio_info.iface_name, if_info)){
+@@ -2083,7 +2271,7 @@ bool base_wlan_hal_nl80211::register_wpa_ctrl_interface(const std::string &inter
+     case HALType::Monitor: {
+ 
+         // If configured, allow only BSSs to be monitored.
+-        if ((!m_hal_conf.monitored_BSSs.empty()) &&
++        if (interface != global_iface && (!m_hal_conf.monitored_BSSs.empty()) &&
+             (m_hal_conf.monitored_BSSs.find(interface) == m_hal_conf.monitored_BSSs.end())) {
+             return false;
+         }
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
+index 7ee7e4f87..7f0d336d2 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
+@@ -18,6 +18,7 @@
+ #include <chrono>
+ #include <list>
+ #include <memory>
++#include <set>
+ #include <thread>
+ #include <unordered_map>
+ 
+@@ -164,6 +165,18 @@ protected:
+      */
+     bool reconnect_wpa_ctrl_cmd_socket(const std::string &interface);
+ 
++    /**
++     * @brief Replace both command and event sockets for an interface.
++     *
++     * Hostapd can remove and recreate a per-interface control socket at the same pathname.
++     * In that case an existing wpa_ctrl object still refers to the old Unix socket endpoint.
++     * This method drops the complete mapping and registers fresh command/event sockets.
++     *
++     * @param[in] interface Interface whose control socket was recreated by hostapd.
++     * @return The event-socket file descriptor on success, invalid_descriptor on failure.
++     */
++    int refresh_wpa_ctrl_interface(const std::string &interface);
++
+     /**
+      * @brief Check whether a WPA control interface is registered (has a control socket).
+      *
+@@ -307,6 +320,19 @@ protected:
+     uint32_t m_cached_wiphy = 0;
+     bool m_cached_wiphy_valid = false;
+ 
++    // MLD addresses reported by the last complete hostapd STATUS snapshot for this radio.  This
++    // lets refresh_vaps_info() release a local pool entry when an MLD disappears, without
++    // affecting normal VAP/link occupancy tracking.
++    std::set<std::string> mld_status_bssids;
++
++    /**
++     * @brief Update the cached UCI radio MAC after a zero-VAP collision is remediated.
++     *
++     * The cache remains private because callers should not depend on its storage, but derived
++     * HALs may need to keep it synchronized with a newly persisted radio identity.
++     */
++    void set_cached_uci_radio_mac(const std::string &mac) { m_cached_uci_radio_mac = mac; }
++
+     // Private data-members:
+ private:
+     bool fsm_setup();
+@@ -358,6 +384,15 @@ private:
+      */
+     bool register_wpa_ctrl_interface(const std::string &interface);
+ 
++    /**
++     * @brief Ensure the hostapd global command/event sockets are registered and connected.
++     *
++     * Recovery paths can temporarily unregister the global mapping while removing failed
++     * per-BSS sockets. The hostapd global socket itself remains valid, so restore the local
++     * mapping before sending a global command.
++     */
++    bool ensure_global_wpa_ctrl_socket();
++
+     /**
+      * @brief Get current network configuration information
+      * 
+diff --git a/common/beerocks/bwl/nl80211/bssid_pool_registry.cpp b/common/beerocks/bwl/nl80211/bssid_pool_registry.cpp
+new file mode 100644
+index 000000000..f5e49145c
+--- /dev/null
++++ b/common/beerocks/bwl/nl80211/bssid_pool_registry.cpp
+@@ -0,0 +1,486 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++   SPDX-License-Identifier: ISC */
++
++#include "bssid_pool_registry.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cerrno>
++#include <bcl/network/network_utils.h>
++#include <fcntl.h>
++#include <signal.h>
++#include <sstream>
++#include <sys/types.h>
++#include <thread>
++#include <tlvf/tlvftypes.h>
++#include <unistd.h>
++#include <utility>
++#include <vector>
++
++namespace bwl {
++namespace nl80211 {
++namespace bssid_pool_registry {
++
++namespace {
++
++constexpr auto REGISTRY_LOCK_TIMEOUT       = std::chrono::seconds(2);
++constexpr auto REGISTRY_LOCK_POLL_INTERVAL = std::chrono::milliseconds(20);
++
++std::string registry_path()
++{
++#ifdef BEEROCKS_TMP_PATH
++    return std::string(BEEROCKS_TMP_PATH) + "/bssid_pool_mld_reservations";
++#else
++    return "/tmp/beerocks/bssid_pool_mld_reservations";
++#endif
++}
++
++struct Reservation {
++    pid_t pid;
++    std::string radio_id;
++    std::string mac_address;
++};
++
++struct RangeReservation {
++    pid_t pid;
++    std::string owner_id;
++    std::vector<std::string> addresses;
++};
++
++class ScopedRegistryLock {
++public:
++    ScopedRegistryLock()
++    {
++        m_fd = open(registry_path().c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
++        if (m_fd < 0) {
++            return;
++        }
++
++        struct flock lock {};
++        lock.l_type   = F_WRLCK;
++        lock.l_whence = SEEK_SET;
++        lock.l_start  = 0;
++        lock.l_len    = 0;
++
++        const auto deadline = std::chrono::steady_clock::now() + REGISTRY_LOCK_TIMEOUT;
++        while (true) {
++            const int ret = fcntl(m_fd, F_SETLK, &lock);
++            if (ret == 0) {
++                m_locked = true;
++                return;
++            }
++            if (errno != EAGAIN && errno != EACCES && errno != EINTR) {
++                break;
++            }
++            if (std::chrono::steady_clock::now() >= deadline) {
++                break;
++            }
++            std::this_thread::sleep_for(REGISTRY_LOCK_POLL_INTERVAL);
++        }
++
++        close(m_fd);
++        m_fd = -1;
++    }
++
++    ~ScopedRegistryLock()
++    {
++        if (m_fd < 0) {
++            return;
++        }
++
++        if (m_locked) {
++            struct flock lock {};
++            lock.l_type   = F_UNLCK;
++            lock.l_whence = SEEK_SET;
++            lock.l_start  = 0;
++            lock.l_len    = 0;
++            fcntl(m_fd, F_SETLK, &lock);
++        }
++        close(m_fd);
++    }
++
++    bool valid() const { return m_fd >= 0 && m_locked; }
++    int fd() const { return m_fd; }
++
++private:
++    int m_fd       = -1;
++    bool m_locked  = false;
++};
++
++bool owner_is_alive(pid_t pid)
++{
++    if (pid <= 0) {
++        return false;
++    }
++
++    if (kill(pid, 0) == 0) {
++        return true;
++    }
++    return errno == EPERM;
++}
++
++bool read_registry(int fd, std::vector<Reservation> &reservations,
++                   std::vector<RangeReservation> &ranges)
++{
++    reservations.clear();
++    ranges.clear();
++    if (lseek(fd, 0, SEEK_SET) < 0) {
++        return false;
++    }
++
++    std::string content;
++    char buffer[512];
++    while (true) {
++        const ssize_t bytes_read = read(fd, buffer, sizeof(buffer));
++        if (bytes_read == 0) {
++            break;
++        }
++        if (bytes_read < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            return false;
++        }
++        content.append(buffer, static_cast<size_t>(bytes_read));
++    }
++
++    std::istringstream input(content);
++    std::string line;
++    while (std::getline(input, line)) {
++        std::istringstream line_stream(line);
++        std::string record_type;
++        if (!(line_stream >> record_type)) {
++            continue;
++        }
++
++        if (record_type == "R") {
++            RangeReservation range {};
++            std::string addresses;
++            if (!(line_stream >> range.pid >> range.owner_id >> addresses) ||
++                !owner_is_alive(range.pid) || range.owner_id.empty() || addresses.empty()) {
++                continue;
++            }
++
++            std::stringstream address_stream(addresses);
++            std::string address;
++            while (std::getline(address_stream, address, ',')) {
++                std::string normalized;
++                if (normalize_mac_address(address, normalized)) {
++                    range.addresses.push_back(normalized);
++                }
++            }
++            if (!range.addresses.empty()) {
++                ranges.push_back(std::move(range));
++            }
++            continue;
++        }
++
++        Reservation reservation {};
++        if (record_type == "A") {
++            if (!(line_stream >> reservation.pid >> reservation.radio_id >> reservation.mac_address)) {
++                continue;
++            }
++        } else {
++            // The first token was the legacy PID.
++            std::istringstream pid_stream(record_type);
++            if (!(pid_stream >> reservation.pid)) {
++                continue;
++            }
++            std::string rest;
++            std::getline(line_stream, rest);
++            std::istringstream legacy_stream(rest);
++            if (!(legacy_stream >> reservation.radio_id >> reservation.mac_address)) {
++                continue;
++            }
++        }
++
++        if (owner_is_alive(reservation.pid) && !reservation.radio_id.empty() &&
++            !reservation.mac_address.empty()) {
++            std::string normalized;
++            if (normalize_mac_address(reservation.mac_address, normalized)) {
++                reservation.mac_address = normalized;
++                reservations.push_back(std::move(reservation));
++            }
++        }
++    }
++    return true;
++}
++
++bool write_registry(int fd, const std::vector<Reservation> &reservations,
++                    const std::vector<RangeReservation> &ranges)
++{
++    std::ostringstream output;
++    for (const auto &reservation : reservations) {
++        output << "A " << reservation.pid << ' ' << reservation.radio_id << ' '
++               << reservation.mac_address << '\n';
++    }
++    for (const auto &range : ranges) {
++        output << "R " << range.pid << ' ' << range.owner_id << ' ';
++        for (size_t index = 0; index < range.addresses.size(); ++index) {
++            if (index != 0) {
++                output << ',';
++            }
++            output << range.addresses[index];
++        }
++        output << '\n';
++    }
++
++    const std::string content = output.str();
++    if (ftruncate(fd, 0) < 0 || lseek(fd, 0, SEEK_SET) < 0) {
++        return false;
++    }
++
++    size_t offset = 0;
++    while (offset < content.size()) {
++        const ssize_t bytes_written =
++            write(fd, content.data() + offset, content.size() - offset);
++        if (bytes_written < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            return false;
++        }
++        offset += static_cast<size_t>(bytes_written);
++    }
++    return true;
++}
++
++} // namespace
++
++bool normalize_mac_address(const std::string &value, std::string &normalized)
++{
++    if (value.empty()) {
++        return false;
++    }
++
++    const auto mac = tlvf::mac_from_string(value);
++    if (mac == beerocks::net::network_utils::ZERO_MAC) {
++        return false;
++    }
++
++    normalized = tlvf::mac_to_string(mac);
++    return !normalized.empty();
++}
++
++void sync_addresses(const std::string &owner_id, const std::set<std::string> &addresses)
++{
++    if (owner_id.empty()) {
++        return;
++    }
++
++    ScopedRegistryLock lock;
++    if (!lock.valid()) {
++        return;
++    }
++
++    std::vector<Reservation> reservations;
++    std::vector<RangeReservation> ranges;
++    if (!read_registry(lock.fd(), reservations, ranges)) {
++        return;
++    }
++
++    const pid_t current_pid = getpid();
++    reservations.erase(std::remove_if(reservations.begin(), reservations.end(),
++                                      [&](const Reservation &reservation) {
++                                          return reservation.pid == current_pid &&
++                                                 reservation.radio_id == owner_id;
++                                      }),
++                       reservations.end());
++
++    for (const auto &mac_address : addresses) {
++        std::string normalized_mac_address;
++        if (normalize_mac_address(mac_address, normalized_mac_address)) {
++            reservations.push_back({current_pid, owner_id, normalized_mac_address});
++        }
++    }
++
++    write_registry(lock.fd(), reservations, ranges);
++}
++
++void sync_mld_addresses(const std::string &radio_id,
++                        const std::set<std::string> &mld_addresses)
++{
++    sync_ap_addresses(radio_id, mld_addresses);
++}
++
++void sync_ap_addresses(const std::string &radio_id,
++                       const std::set<std::string> &ap_addresses)
++{
++    sync_addresses("ap:" + radio_id, ap_addresses);
++}
++
++void sync_sta_addresses(const std::string &sta_iface,
++                        const std::set<std::string> &sta_addresses)
++{
++    sync_addresses("sta:" + sta_iface, sta_addresses);
++}
++
++bool is_address_reserved(const std::string &mac_address)
++{
++    std::string normalized_mac_address;
++    if (!normalize_mac_address(mac_address, normalized_mac_address)) {
++        return false;
++    }
++
++    ScopedRegistryLock lock;
++    if (!lock.valid()) {
++        return false;
++    }
++
++    std::vector<Reservation> reservations;
++    std::vector<RangeReservation> ranges;
++    if (!read_registry(lock.fd(), reservations, ranges)) {
++        return false;
++    }
++
++    for (const auto &reservation : reservations) {
++        if (reservation.mac_address == normalized_mac_address) {
++            return true;
++        }
++    }
++    for (const auto &range : ranges) {
++        if (std::find(range.addresses.begin(), range.addresses.end(), normalized_mac_address) !=
++            range.addresses.end()) {
++            return true;
++        }
++    }
++    return false;
++}
++
++bool is_address_reserved_by_other(const std::string &owner_id,
++                                  const std::string &mac_address)
++{
++    std::string normalized_mac_address;
++    if (!normalize_mac_address(mac_address, normalized_mac_address)) {
++        return false;
++    }
++
++    ScopedRegistryLock lock;
++    if (!lock.valid()) {
++        return false;
++    }
++
++    std::vector<Reservation> reservations;
++    std::vector<RangeReservation> ranges;
++    if (!read_registry(lock.fd(), reservations, ranges)) {
++        return false;
++    }
++
++    const pid_t current_pid = getpid();
++    const std::string reservation_owner = "ap:" + owner_id;
++    for (const auto &reservation : reservations) {
++        if (reservation.mac_address == normalized_mac_address &&
++            !(reservation.pid == current_pid && reservation.radio_id == reservation_owner)) {
++            return true;
++        }
++    }
++    for (const auto &range : ranges) {
++        if (range.owner_id != reservation_owner &&
++            std::find(range.addresses.begin(), range.addresses.end(), normalized_mac_address) !=
++                range.addresses.end()) {
++            return true;
++        }
++    }
++    return false;
++}
++
++bool claim_bssid_range(const std::string &owner_id,
++                       const std::vector<std::vector<std::string>> &candidate_ranges,
++                       std::vector<std::string> &assigned_range)
++{
++    assigned_range.clear();
++    if (owner_id.empty() || candidate_ranges.empty()) {
++        return false;
++    }
++
++    ScopedRegistryLock lock;
++    if (!lock.valid()) {
++        return false;
++    }
++
++    std::vector<Reservation> reservations;
++    std::vector<RangeReservation> ranges;
++    if (!read_registry(lock.fd(), reservations, ranges)) {
++        return false;
++    }
++
++    const pid_t current_pid = getpid();
++    const std::string range_owner = "ap:" + owner_id;
++
++    // A manager keeps the same range for its lifetime. This is important when the local pool is
++    // rebuilt after a hostapd reconfiguration: changing the range would make already configured
++    // BSSIDs appear to belong to a different radio. Discard an old/malformed record rather than
++    // allowing a previous implementation to expand this manager's allocation beyond 16 entries.
++    for (auto range_it = ranges.begin(); range_it != ranges.end();) {
++        if (range_it->pid == current_pid && range_it->owner_id == range_owner) {
++            const std::set<std::string> unique_addresses(range_it->addresses.begin(),
++                                                         range_it->addresses.end());
++            if (range_it->addresses.size() == MAX_BSSID_ADDRESSES_PER_RADIO &&
++                unique_addresses.size() == MAX_BSSID_ADDRESSES_PER_RADIO) {
++                assigned_range = range_it->addresses;
++                return true;
++            }
++            range_it = ranges.erase(range_it);
++        } else {
++            ++range_it;
++        }
++    }
++
++    std::set<std::string> used_by_other_managers;
++    for (const auto &reservation : reservations) {
++        if (!(reservation.pid == current_pid && reservation.radio_id == range_owner)) {
++            used_by_other_managers.insert(reservation.mac_address);
++        }
++    }
++
++    std::set<std::string> range_addresses;
++    for (const auto &range : ranges) {
++        if (!(range.pid == current_pid && range.owner_id == range_owner)) {
++            range_addresses.insert(range.addresses.begin(), range.addresses.end());
++        }
++    }
++
++    for (const auto &candidate : candidate_ranges) {
++        std::vector<std::string> normalized_candidate;
++        std::set<std::string> candidate_set;
++        bool valid = candidate.size() == MAX_BSSID_ADDRESSES_PER_RADIO;
++        for (const auto &address : candidate) {
++            std::string normalized;
++            if (!normalize_mac_address(address, normalized) ||
++                !candidate_set.insert(normalized).second) {
++                valid = false;
++                break;
++            }
++            normalized_candidate.push_back(normalized);
++        }
++
++        if (!valid || candidate_set.size() != candidate.size()) {
++            continue;
++        }
++
++        bool overlaps = false;
++        for (const auto &address : candidate_set) {
++            if (used_by_other_managers.count(address) != 0 ||
++                range_addresses.count(address) != 0) {
++                overlaps = true;
++                break;
++            }
++        }
++        if (overlaps) {
++            continue;
++        }
++
++        ranges.push_back({current_pid, range_owner, normalized_candidate});
++        if (!write_registry(lock.fd(), reservations, ranges)) {
++            return false;
++        }
++        assigned_range = std::move(normalized_candidate);
++        return true;
++    }
++
++    return false;
++}
++
++} // namespace bssid_pool_registry
++} // namespace nl80211
++} // namespace bwl
+diff --git a/common/beerocks/bwl/nl80211/bssid_pool_registry.h b/common/beerocks/bwl/nl80211/bssid_pool_registry.h
+new file mode 100644
+index 000000000..05b79818b
+--- /dev/null
++++ b/common/beerocks/bwl/nl80211/bssid_pool_registry.h
+@@ -0,0 +1,87 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++   SPDX-License-Identifier: ISC */
++
++#ifndef _BWL_NL80211_BSSID_POOL_REGISTRY_H_
++#define _BWL_NL80211_BSSID_POOL_REGISTRY_H_
++
++#include <set>
++#include <cstddef>
++#include <string>
++#include <vector>
++
++namespace bwl {
++namespace nl80211 {
++namespace bssid_pool_registry {
++
++// The NL80211 AP implementation allocates a fixed 16-address BSSID range to each
++// radio manager. A manager must never claim or expose a larger range.
++constexpr std::size_t MAX_BSSID_ADDRESSES_PER_RADIO = 16;
++
++/**
++ * @brief Normalize a hostapd MAC value and reject empty/zero addresses.
++ */
++bool normalize_mac_address(const std::string &value, std::string &normalized);
++
++/**
++ * @brief Legacy alias for replacing AP-side addresses reported by one radio manager.
++ */
++void sync_mld_addresses(const std::string &radio_id,
++                        const std::set<std::string> &mld_addresses);
++
++/**
++ * @brief Replace all AP-side addresses reported by one radio manager.
++ *
++ * The set must include ordinary BSSIDs as well as AP MLD addresses.  Keeping both in the
++ * shared namespace prevents a zero-VAP radio from reusing a BSSID that is already live on
++ * another radio.
++ */
++void sync_ap_addresses(const std::string &radio_id,
++                       const std::set<std::string> &ap_addresses);
++
++/**
++ * @brief Replace the station-side addresses reported by one supplicant interface.
++ *
++ * The set may contain the local STA MLD address, its affiliated link addresses, and the
++ * associated AP MLD address. All entries share the same global reservation namespace as AP MLD
++ * addresses so an AP BSSID candidate cannot collide with any of them.
++ */
++void sync_sta_addresses(const std::string &sta_iface,
++                        const std::set<std::string> &sta_addresses);
++
++/**
++ * @brief Check whether an address is reserved by any AP or STA manager.
++ */
++bool is_address_reserved(const std::string &mac_address);
++
++/**
++ * @brief Check whether an address is reserved by a different manager.
++ */
++bool is_address_reserved_by_other(const std::string &owner_id,
++                                  const std::string &mac_address);
++
++/**
++ * @brief Claim one globally disjoint BSSID range for an AP radio manager.
++ *
++ * @param owner_id Stable AP owner identity, normally the phy name.
++ * @param candidate_ranges Ordered 16-address range candidates generated for this radio. The
++ *                         first range that does not overlap another live range or address
++ *                         reservation wins.
++ * @param assigned_range Existing range is returned for an already-registered owner.
++ */
++bool claim_bssid_range(const std::string &owner_id,
++                       const std::vector<std::vector<std::string>> &candidate_ranges,
++                       std::vector<std::string> &assigned_range);
++
++/**
++ * @brief Backward-compatible name for callers that only deal with AP MLD addresses.
++ */
++inline bool is_mld_address_reserved(const std::string &mac_address)
++{
++    return is_address_reserved(mac_address);
++}
++
++} // namespace bssid_pool_registry
++} // namespace nl80211
++} // namespace bwl
++
++#endif // _BWL_NL80211_BSSID_POOL_REGISTRY_H_
+diff --git a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
+index 8c7e0187a..2feb35923 100644
+--- a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
+@@ -7,8 +7,10 @@
+  */
+ 
+ #include "sta_wlan_hal_nl80211.h"
++#include "bssid_pool_registry.h"
+ 
+ #include <sstream>
++#include <set>
+ 
+ #include <bcl/beerocks_string_utils.h>
+ #include <bcl/beerocks_utils.h>
+@@ -74,12 +76,20 @@ sta_wlan_hal_nl80211::sta_wlan_hal_nl80211(const std::string &iface_name, hal_ev
+     : base_wlan_hal(bwl::HALType::Station, iface_name, IfaceType::Intel, callback, hal_conf),
+       base_wlan_hal_nl80211(bwl::HALType::Station, iface_name, callback, BUFFER_SIZE, hal_conf)
+ {
++    m_sta_registry_iface = iface_name;
+     m_filtered_events.insert({});
+ }
+ 
+ sta_wlan_hal_nl80211::~sta_wlan_hal_nl80211() { sta_wlan_hal_nl80211::detach(); }
+ 
+-bool sta_wlan_hal_nl80211::detach() { return true; }
++bool sta_wlan_hal_nl80211::detach()
++{
++    if (!m_sta_registry_iface.empty()) {
++        bssid_pool_registry::sync_sta_addresses(m_sta_registry_iface, {});
++    }
++    m_sta_reservation_snapshot_valid = false;
++    return true;
++}
+ 
+ bool sta_wlan_hal_nl80211::start_wps_pbc()
+ {
+@@ -837,6 +847,11 @@ bool sta_wlan_hal_nl80211::read_status(ConnectionStatus &connection_status)
+     connection_status.wpa_state       = reply["wpa_state"];
+     connection_status.address         = reply["address"];
+     connection_status.uuid            = reply["uuid"];
++
++    // Keep STA MLD/link addresses out of the global AP BSSID candidate namespace. This is done
++    // from every successful STATUS read so association, roaming, and disconnect transitions all
++    // refresh the reservation snapshot.
++    sync_bssid_pool_reservations(reply);
+     // Extract Multi-AP profile and primary VLAN ID if exposed by WPA supplicant STATUS command.
+     // Validate with endptr to reject empty, non-numeric, or partial strings (e.g. "123abc"),
+     // and range-check before narrowing cast to avoid silent wrap-around.
+@@ -874,6 +889,71 @@ bool sta_wlan_hal_nl80211::read_status(ConnectionStatus &connection_status)
+     return true;
+ }
+ 
++void sta_wlan_hal_nl80211::sync_bssid_pool_reservations(const parsed_obj_map_t &status)
++{
++    if (m_sta_registry_iface.empty()) {
++        return;
++    }
++
++    std::set<std::string> addresses;
++    std::string normalized_address;
++    if (bssid_pool_registry::normalize_mac_address(status.count("address")
++                                                        ? status.at("address")
++                                                        : std::string(),
++                                                    normalized_address)) {
++        addresses.insert(normalized_address);
++    }
++
++    std::string normalized_ap_mld_address;
++    const bool has_ap_mld_address =
++        bssid_pool_registry::normalize_mac_address(status.count("ap_mld_addr")
++                                                       ? status.at("ap_mld_addr")
++                                                       : std::string(),
++                                                   normalized_ap_mld_address);
++    if (!has_ap_mld_address) {
++        // Without a valid AP MLD address, this is a non-MLO/disconnected snapshot. Any old
++        // affiliated-link reservations must therefore be released, while the local STA address
++        // remains reserved when STATUS still reports it.
++        bssid_pool_registry::sync_sta_addresses(m_sta_registry_iface, addresses);
++        m_sta_reservation_snapshot_valid = true;
++        return;
++    }
++
++    addresses.insert(normalized_ap_mld_address);
++
++    parsed_obj_listed_map_t mlo_status;
++    if (!wpa_ctrl_send_msg("MLO_STATUS", mlo_status, m_sta_registry_iface)) {
++        // Do not replace a known complete MLO snapshot with a partial one while supplicant is
++        // transiently restarting/reconfiguring. If this is the first snapshot, retain at least
++        // the STA and AP MLD reservations; a later successful MLO_STATUS replaces them with the
++        // complete link set.
++        if (!m_sta_reservation_snapshot_valid) {
++            bssid_pool_registry::sync_sta_addresses(m_sta_registry_iface, addresses);
++            m_sta_reservation_snapshot_valid = true;
++        }
++        LOG(DEBUG) << __func__ << " MLO_STATUS failed for " << m_sta_registry_iface
++                   << ", retaining previous STA address reservation snapshot";
++        return;
++    }
++
++    for (const auto &entry : mlo_status) {
++        for (const auto &field : entry) {
++            if (field.first != "sta_link_addr" && field.first.find("sta_link_addr[") != 0) {
++                continue;
++            }
++
++            std::string normalized_link_address;
++            if (bssid_pool_registry::normalize_mac_address(field.second,
++                                                            normalized_link_address)) {
++                addresses.insert(normalized_link_address);
++            }
++        }
++    }
++
++    bssid_pool_registry::sync_sta_addresses(m_sta_registry_iface, addresses);
++    m_sta_reservation_snapshot_valid = true;
++}
++
+ void sta_wlan_hal_nl80211::update_status(const ConnectionStatus &connection_status)
+ {
+     m_active_network_id = connection_status.id;
+diff --git a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h
+index c4b757887..14e62877b 100644
+--- a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.h
+@@ -259,6 +259,12 @@ private:
+      */
+     void update_status(const ConnectionStatus &connection_status);
+ 
++    /**
++     * @brief Synchronize this supplicant interface's STA/AP MLD and STA-link addresses with the
++     *        device-wide BSSID reservation registry.
++     */
++    void sync_bssid_pool_reservations(const parsed_obj_map_t &status);
++
+     /**
+      * @brief Enables a network.
+      *
+@@ -328,6 +334,15 @@ private:
+     int m_unassoc_measure_delay       = 0;
+ 
+     son::wireless_utils::sBssInfoConf m_bSta_conf;
++
++    // Keep the original supplicant interface name. The base HAL may resolve and replace its
++    // default interface name with an MLO-link suffix, while MLO_STATUS must be queried on the
++    // original interface that owns the complete STA connection.
++    std::string m_sta_registry_iface;
++
++    // A valid snapshot prevents a transient MLO_STATUS failure from clearing known STA-link
++    // reservations. It is reset when the HAL instance is detached.
++    bool m_sta_reservation_snapshot_valid = false;
+ };
+ 
+ } // namespace nl80211
+diff --git a/common/beerocks/bwl/nl80211/wpa_ctrl_client.cpp b/common/beerocks/bwl/nl80211/wpa_ctrl_client.cpp
+index 255bccbc5..e47eccb6f 100644
+--- a/common/beerocks/bwl/nl80211/wpa_ctrl_client.cpp
++++ b/common/beerocks/bwl/nl80211/wpa_ctrl_client.cpp
+@@ -284,6 +284,16 @@ bool wpa_ctrl_client::has_interface(const std::string &interface) const
+     return (m_wpa_ctrl.find(interface) != m_wpa_ctrl.end());
+ }
+ 
++std::vector<std::string> wpa_ctrl_client::get_interfaces() const
++{
++    std::vector<std::string> interfaces;
++    interfaces.reserve(m_wpa_ctrl.size());
++    for (const auto &entry : m_wpa_ctrl) {
++        interfaces.push_back(entry.first);
++    }
++    return interfaces;
++}
++
+ void wpa_ctrl_client::clear_interfaces() { m_wpa_ctrl.clear(); }
+ 
+ const std::shared_ptr<wpa_ctrl_socket_cmd>
+diff --git a/common/beerocks/bwl/nl80211/wpa_ctrl_client.h b/common/beerocks/bwl/nl80211/wpa_ctrl_client.h
+index 773f620c9..819f9140f 100644
+--- a/common/beerocks/bwl/nl80211/wpa_ctrl_client.h
++++ b/common/beerocks/bwl/nl80211/wpa_ctrl_client.h
+@@ -357,6 +357,15 @@ public:
+      */
+     bool has_interface(const std::string &interface) const;
+ 
++    /**
++     * @brief Returns a snapshot of all registered interface names.
++     *
++     * The snapshot is used by recovery paths before unregistering interfaces. Looking only at
++     * the event-fd vector misses command-only or partially-connected sockets, which can leak file
++     * descriptors after a failed STATUS/re-registration cycle.
++     */
++    std::vector<std::string> get_interfaces() const;
++
+     /**
+      * @brief Clears (enforced) all registered interface in wpa_ctrl client.
+      *
+diff --git a/controller/src/beerocks/cli/beerocks_cli_socket.cpp b/controller/src/beerocks/cli/beerocks_cli_socket.cpp
+index b3131ebf9..f570f525e 100644
+--- a/controller/src/beerocks/cli/beerocks_cli_socket.cpp
++++ b/controller/src/beerocks/cli/beerocks_cli_socket.cpp
+@@ -191,10 +191,10 @@ void cli_socket::setFunctionsMapAndArray()
+         "trigger_ap_config_renew", "",
+         "Trigger an Autoconfig Renew to propagate pending set_bss_state changes to agents.",
+         static_cast<pFunction>(&cli_socket::trigger_ap_config_renew_caller), 0, 0);
+-#if defined(USE_PRPLMESH_NLHAL) && !defined(USE_PRPLMESH_WHM)
++#if defined(USE_PRPLMESH_NLHAL) || defined(USE_PRPLMESH_WHM)
+     insertCommandToMap(
+         "radio_powersave", "<phy_name> <enable 0/1>",
+-        "Directly enable or disable the nl80211 radio WSI powersave command for one PHY.",
++        "Enable or disable radio powersave for one PHY across the topology.",
+         static_cast<pFunction>(&cli_socket::radio_powersave_caller), 2, 2, STRING_ARG, INT_ARG);
+ #endif
+ }
+@@ -552,7 +552,7 @@ int cli_socket::trigger_ap_config_renew_caller(int numOfArgs)
+     return trigger_ap_config_renew();
+ }
+ 
+-#if defined(USE_PRPLMESH_NLHAL) && !defined(USE_PRPLMESH_WHM)
++#if defined(USE_PRPLMESH_NLHAL) || defined(USE_PRPLMESH_WHM)
+ int cli_socket::radio_powersave_caller(int numOfArgs)
+ {
+     if (numOfArgs != 2 || (args.intArgs[1] != 0 && args.intArgs[1] != 1)) {
+@@ -940,7 +940,7 @@ int cli_socket::trigger_ap_config_renew()
+     return 0;
+ }
+ 
+-#if defined(USE_PRPLMESH_NLHAL) && !defined(USE_PRPLMESH_WHM)
++#if defined(USE_PRPLMESH_NLHAL) || defined(USE_PRPLMESH_WHM)
+ int cli_socket::radio_powersave(const std::string &phy_name, int enable)
+ {
+     auto request = message_com::create_vs_message<
+diff --git a/controller/src/beerocks/cli/beerocks_cli_socket.h b/controller/src/beerocks/cli/beerocks_cli_socket.h
+index 2b265a4a7..8c984806f 100644
+--- a/controller/src/beerocks/cli/beerocks_cli_socket.h
++++ b/controller/src/beerocks/cli/beerocks_cli_socket.h
+@@ -85,7 +85,7 @@ private:
+ 
+     int trigger_ap_config_renew_caller(int numOfArgs);
+ 
+-#if defined(USE_PRPLMESH_NLHAL) && !defined(USE_PRPLMESH_WHM)
++#if defined(USE_PRPLMESH_NLHAL) || defined(USE_PRPLMESH_WHM)
+     int radio_powersave_caller(int numOfArgs);
+ #endif
+ 
+@@ -137,7 +137,7 @@ private:
+ 
+     int trigger_ap_config_renew();
+ 
+-#if defined(USE_PRPLMESH_NLHAL) && !defined(USE_PRPLMESH_WHM)
++#if defined(USE_PRPLMESH_NLHAL) || defined(USE_PRPLMESH_WHM)
+     int radio_powersave(const std::string &phy_name, int enable);
+ #endif
+ 
+diff --git a/controller/src/beerocks/master/son_management.cpp b/controller/src/beerocks/master/son_management.cpp
+index 5fa618ab9..04774b2f1 100644
+--- a/controller/src/beerocks/master/son_management.cpp
++++ b/controller/src/beerocks/master/son_management.cpp
+@@ -39,6 +39,7 @@
+ #include <easylogging++.h>
+ #include <bpl/bpl_cfg.h>
+ 
++#include <algorithm>
+ #include <unordered_map>
+ 
+ using namespace beerocks;
+@@ -890,7 +891,7 @@ void son_management::handle_cli_message(int sd, std::shared_ptr<beerocks_header>
+         }
+         break;
+     }
+-#if defined(USE_PRPLMESH_NLHAL) && !defined(USE_PRPLMESH_WHM)
++#if defined(USE_PRPLMESH_NLHAL) || defined(USE_PRPLMESH_WHM)
+     case beerocks_message::ACTION_CLI_RADIO_POWERSAVE_REQUEST: {
+         LOG(TRACE) << "ACTION_CLI_RADIO_POWERSAVE_REQUEST";
+ 
+@@ -903,8 +904,37 @@ void son_management::handle_cli_message(int sd, std::shared_ptr<beerocks_header>
+         }
+ 
+         const std::string phy_name = request->phy_name_str();
+-        bool sent_to_agent        = false;
+-        for (const auto &agent : database.get_all_connected_agents()) {
++        const bool enable = request->enable();
++
++        // A powersave-enable can remove the radio which carries the topology path.  Apply it
++        // from the farthest agent towards the controller and leave the co-located/local agent
++        // until last.  Recovery is the inverse: wake the local agent first, then progress from
++        // the controller towards the farthest agent so the topology path is restored before
++        // dependent agents are touched.
++        auto ordered_agents = son_actions::get_agents_farthest_to_nearest(database);
++        ordered_agents.erase(
++            std::remove_if(ordered_agents.begin(), ordered_agents.end(), [&](const sMacAddr &mac) {
++                auto agent = database.get_agent(mac);
++                return !agent || agent->state != beerocks::STATE_CONNECTED;
++            }),
++            ordered_agents.end());
++
++        const auto local_agent = database.get_local_bridge_mac();
++        ordered_agents.erase(
++            std::remove(ordered_agents.begin(), ordered_agents.end(), local_agent),
++            ordered_agents.end());
++
++        if (enable) {
++            // Local/co-located agent is deliberately last for enable.
++            ordered_agents.push_back(local_agent);
++        } else {
++            // Local/co-located agent is deliberately first for recovery/disable.
++            ordered_agents.insert(ordered_agents.begin(), local_agent);
++            std::reverse(ordered_agents.begin() + 1, ordered_agents.end());
++        }
++
++        bool sent_to_agent = false;
++        for (const auto &agent_mac : ordered_agents) {
+             auto request_out = message_com::create_vs_message<
+                 beerocks_message::cACTION_BACKHAUL_CLI_RADIO_POWERSAVE_REQUEST>(cmdu_tx);
+             if (request_out == nullptr) {
+@@ -913,9 +943,11 @@ void son_management::handle_cli_message(int sd, std::shared_ptr<beerocks_header>
+                 break;
+             }
+             request_out->set_phy_name(phy_name);
+-            request_out->enable() = request->enable() ? 1 : 0;
++            request_out->enable() = enable ? 1 : 0;
+             sent_to_agent |=
+-                son_actions::send_cmdu_to_agent(agent->al_mac, cmdu_tx, database);
++                son_actions::send_cmdu_to_agent(agent_mac, cmdu_tx, database);
++            LOG(INFO) << "Sent radio powersave-" << (enable ? "enable" : "disable")
++                      << " for PHY " << phy_name << " to agent " << agent_mac;
+         }
+         if (!sent_to_agent) {
+             LOG(ERROR) << "Failed sending radio powersave request for PHY " << phy_name;
+diff --git a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+index a6d0bfd9b..7e285b57e 100644
+--- a/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/dm/bpl_cfg_wifi.cpp
+@@ -735,6 +735,11 @@ bool bpl_cfg_get_radio_mac_by_phy(const std::string & /*phy_name*/, std::string
+     return false;
+ }
+ 
++bool bpl_cfg_set_radio_mac_by_phy(const std::string & /*phy_name*/, const std::string & /*mac*/)
++{
++    return false;
++}
++
+ bool bpl_cfg_get_freq_band_by_phy(const std::string & /*phy_name*/, std::string & /*freq_band*/)
+ {
+     return false;
+diff --git a/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
+index 4f233ffa4..40c10be31 100644
+--- a/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/linux/bpl_cfg_wifi.cpp
+@@ -309,6 +309,11 @@ bool bpl_cfg_get_radio_mac_by_phy(const std::string & /*phy_name*/, std::string
+     return false;
+ }
+ 
++bool bpl_cfg_set_radio_mac_by_phy(const std::string & /*phy_name*/, const std::string & /*mac*/)
++{
++    return false;
++}
++
+ bool bpl_cfg_get_freq_band_by_phy(const std::string & /*phy_name*/, std::string & /*freq_band*/)
+ {
+     return false;
+diff --git a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+index 38a5f020c..e31e651f9 100644
+--- a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+@@ -852,6 +852,11 @@ bool bpl_cfg_get_radio_mac_by_phy(const std::string & /*phy_name*/, std::string
+     return false;
+ }
+ 
++bool bpl_cfg_set_radio_mac_by_phy(const std::string & /*phy_name*/, const std::string & /*mac*/)
++{
++    return false;
++}
++
+ bool bpl_cfg_get_freq_band_by_phy(const std::string & /*phy_name*/, std::string & /*freq_band*/)
+ {
+     return false;
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index 44576cec7..9ad8d4314 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -2386,6 +2386,34 @@ bool bpl_cfg_get_radio_mac_by_phy(const std::string &phy_name, std::string &mac)
+     return true;
+ }
+ 
++bool bpl_cfg_set_radio_mac_by_phy(const std::string &phy_name, const std::string &mac)
++{
++    if (phy_name.empty() || mac.empty()) {
++        LOG(ERROR) << "bpl_cfg_set_radio_mac_by_phy: empty PHY or MAC";
++        return false;
++    }
++
++    std::string section_name;
++    if (!uci_find_section_by_option("prplmesh", "wifi-device", "phy_name", phy_name,
++                                    section_name) ||
++        section_name.empty()) {
++        LOG(ERROR) << "bpl_cfg_set_radio_mac_by_phy: no wifi-device section for phy_name="
++                   << phy_name;
++        return false;
++    }
++
++    OptionsUnorderedMap options;
++    options["macaddr"] = mac;
++    if (!uci_set_section("prplmesh", "wifi-device", section_name, options, true)) {
++        LOG(ERROR) << "bpl_cfg_set_radio_mac_by_phy: failed to persist macaddr=" << mac
++                   << " for " << section_name;
++        return false;
++    }
++
++    LOG(INFO) << "bpl_cfg_set_radio_mac_by_phy: persisted RUID " << mac << " for " << phy_name;
++    return true;
++}
++
+ bool bpl_cfg_get_freq_band_by_phy(const std::string &phy_name, std::string &freq_band)
+ {
+     std::string section_name;
+diff --git a/framework/platform/bpl/include/bpl/bpl_cfg.h b/framework/platform/bpl/include/bpl/bpl_cfg.h
+index cf9887cd7..bbb445a1d 100644
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -993,6 +993,14 @@ bool bpl_cfg_get_radio_htmode(const std::string &iface, std::string &htmode);
+  */
+ bool bpl_cfg_get_radio_mac_by_phy(const std::string &phy_name, std::string &mac);
+ 
++/**
++ * @brief Persist the radio RUID MAC in the prplmesh wifi-device section identified by PHY.
++ *
++ * UCI platforms update prplmesh.wifi-device.<section>.macaddr. Other platform backends return
++ * false because their radio identity is not stored in this configuration database.
++ */
++bool bpl_cfg_set_radio_mac_by_phy(const std::string &phy_name, const std::string &mac);
++
+ /**
+  * @brief Returns the phy_name configured in the prplmesh UCI wifi-device section that owns the
+  * given Linux interface name (matched against either its "hostap_iface" or "sta_iface" option).
+-- 
+2.34.1
+
