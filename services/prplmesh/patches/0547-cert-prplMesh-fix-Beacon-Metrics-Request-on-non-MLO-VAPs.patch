@@ -1,0 +1,200 @@
+From e734f9914bb076a87790a19be57933fae6de398d Mon Sep 17 00:00:00 2001
+From: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+Date: Fri, 16 Oct 2026 21:36:44 +0530
+Subject: [PATCH] prplMesh: fix Beacon Metrics Request on non-MLO VAPs
+
+Problem:
+
+MAUT acknowledged a 1905 Beacon Metrics Query but did not transmit
+the corresponding 802.11k Beacon Request to an associated non-MLO STA.
+
+Root cause:
+
+The nl80211 monitor only probed registered _linkN control interfaces,
+while SLO hostapd exposed the valid control socket on the base VAP.
+In addition, AP Channel Report data was converted into per-channel
+requests without preserving the optional report for channel 255.
+
+Fix:
+
+Register and try the base VAP alongside the preferred and remaining MLO
+link interfaces, stopping after the first successful request. Preserve
+validated AP Channel Report data for channel-255 requests and suppress it
+from individual per-channel requests.
+
+Change-Id: I4e9c7b2d6a1f8c3e5b0d4a7f9c2e6b1d3f5a8c0e
+Signed-off-by: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+---
+ .../tasks/link_metrics_collection_task.cpp    | 52 ++++++++++++++++-
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 58 ++++++++++++-------
+ 2 files changed, 88 insertions(+), 22 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+index 4b889a4b7..128c3f2f8 100644
+--- a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+@@ -462,6 +462,14 @@ bool LinkMetricsCollectionTask::beacon_metrics_query_cb(int fd)
+     params_out.channel  = query.chan_report_list.at(query.curr_chan_idx).channel;
+     params_out.op_class = query.chan_report_list.at(query.curr_chan_idx).op_class;
+ 
++    // The AP Channel Report subelement is meaningful only when the Beacon
++    // Request channel is 255. The multi-channel flow sends individual
++    // channel requests first; do not carry the optional report into those
++    // requests, otherwise the monitor rejects the inconsistent combination.
++    if (params_out.channel != 255) {
++        params_out.use_optional_ap_ch_report = 0;
++    }
++
+     LOG(DEBUG) << "[multi " << query.curr_chan_idx + 1 << "/" << query.chan_report_list.size()
+                << "] Sending beacon metrics query - sta_mac: " << params_out.sta_mac
+                << ", channel: " << params_out.channel;
+@@ -572,6 +580,41 @@ bool LinkMetricsCollectionTask::schedule_beacon_metrics_query(
+         return false;
+     }
+ 
++    // Preserve the AP Channel Report for a channel-255 Beacon Request. The
++    // monitor serializes this field as the AP Channel Report subelement and
++    // hostapd uses it to select the requested operating classes/channels.
++    // The per-channel requests below clear this field temporarily, while a
++    // channel-255 request (including certification-mode requests) retains it.
++    if (ap_channel_reports_list_length > 1) {
++        // hostapd accepts only one AP Channel Report structure in the
++        // beerocks request format.
++        LOG(ERROR) << "too many channel reports requested (maximum is 1): "
++                   << +ap_channel_reports_list_length;
++        return false;
++    }
++
++    if (ap_channel_reports_list_length == 1) {
++        auto channel_report = beacon_metrics_query.ap_channel_reports_list(0);
++        if (!std::get<0>(channel_report)) {
++            LOG(ERROR) << "there should be a structure at index 0, but it wasn't found";
++            return false;
++        }
++
++        const auto report_length =
++            std::get<1>(channel_report).ap_channel_report_list_length();
++        if (report_length == 0 || report_length > sizeof(params.ap_ch_report)) {
++            LOG(ERROR) << "invalid AP Channel Report length: " << +report_length
++                       << " (maximum is " << sizeof(params.ap_ch_report) << ")";
++            return false;
++        }
++
++        params.use_optional_ap_ch_report = static_cast<uint8_t>(report_length);
++        for (size_t idx = 0; idx < report_length; ++idx) {
++            params.ap_ch_report[idx] =
++                *std::get<1>(channel_report).ap_channel_report_list(idx);
++        }
++    }
++
+     /* multi channel: parse channel report list */
+     for (size_t i = 0; i < static_cast<size_t>(ap_channel_reports_list_length); i++) {
+         auto channel_report = beacon_metrics_query.ap_channel_reports_list(i);
+@@ -581,8 +624,15 @@ bool LinkMetricsCollectionTask::schedule_beacon_metrics_query(
+         }
+ 
+         /* The first index(0) is op_class, and the rest contains the channels */
++        const auto report_length =
++            std::get<1>(channel_report).ap_channel_report_list_length();
++        if (report_length < 1) {
++            LOG(ERROR) << "AP Channel Report has no operating class";
++            return false;
++        }
++
+         auto op_class       = *std::get<1>(channel_report).ap_channel_report_list(0);
+-        auto tmp_chan_count = std::get<1>(channel_report).ap_channel_report_list_length() - 1;
++        auto tmp_chan_count = report_length - 1;
+ 
+         for (size_t j = 0; j < static_cast<size_t>(tmp_chan_count); j++) {
+             sBeaconMetricsQuery::sChanReport new_report = {};
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 62ff56d37..94b0469ff 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -1262,46 +1262,62 @@ bool mon_wlan_hal_nl80211::sta_beacon_11k_request(const std::string &vap_iface_n
+                << ", link_id=" << int(link_id)
+                << ", cmd=[" << cmd << "]";
+ 
+-    // Send REQ_BEACON to link interfaces, trying the STA's resolved associated
+-    // link first (preferred_link_idx, computed above) and only falling back to
+-    // the remaining registered links in _link0, _link1, ... order if that
+-    // attempt fails. For a non-MLD client (single associated link), this sends
+-    // the request directly on that link instead of absorbing guaranteed
+-    // "not connected" failures on the other links first.
++    // Send REQ_BEACON to the resolved link first, then the base VAP, and
++    // finally the remaining registered MLO links. Non-MLO hostapd instances
++    // expose only the base VAP socket (for example wlan1.1), while MLO
++    // instances may expose only link-specific sockets. Register the base VAP
++    // on demand so a non-MLO request is not lost merely because no _linkN
++    // socket was registered by the MLO discovery path.
+     // Stop immediately on the first success — no duplicate queries are sent.
+     // Responses (BEACON-REQ-TX-STATUS, BEACON-RESP-RX, RADIO_MEASUREMENT_REPORT)
+     // will arrive on any link interface socket and are handled by the event processing
+     // path (process_nl80211_event for the monitor, MGMT_Frame for the ap_manager).
+     parsed_obj_map_t reply;
+     bool succeeded = false;
+-    std::vector<int> link_try_order;
++    if (!is_wpa_ctrl_interface_registered(base_vap_iface)) {
++        if (add_interface(base_vap_iface) < 0) {
++            LOG(DEBUG) << __func__ << " - unable to register base VAP interface "
++                       << base_vap_iface;
++        }
++    }
++
++    std::vector<std::string> interface_try_order;
++    auto add_interface_candidate = [&interface_try_order](const std::string &interface) {
++        if (interface.empty() ||
++            std::find(interface_try_order.begin(), interface_try_order.end(), interface) !=
++                interface_try_order.end()) {
++            return;
++        }
++        interface_try_order.push_back(interface);
++    };
++
+     if (preferred_link_idx >= 0) {
+-        link_try_order.push_back(preferred_link_idx);
++        add_interface_candidate(base_vap_iface + "_link" +
++                                std::to_string(preferred_link_idx));
+     }
++    add_interface_candidate(base_vap_iface);
+     for (int link_idx = 0; link_idx < 8; link_idx++) {
+-        if (link_idx != preferred_link_idx) {
+-            link_try_order.push_back(link_idx);
+-        }
++        add_interface_candidate(base_vap_iface + "_link" + std::to_string(link_idx));
+     }
+-    for (int link_idx : link_try_order) {
++
++    for (const auto &interface : interface_try_order) {
+         if (succeeded) {
+             break;
+         }
+-        std::string link_iface = base_vap_iface + "_link" + std::to_string(link_idx);
+-        if (!is_wpa_ctrl_interface_registered(link_iface)) {
+-            continue; // skip unregistered interfaces — registered ones may not start at _link0
++        if (!is_wpa_ctrl_interface_registered(interface)) {
++            continue;
+         }
+-        LOG(DEBUG) << __func__ << " - trying REQ_BEACON on link interface " << link_iface;
+-        if (wpa_ctrl_send_msg(cmd, reply, link_iface)) {
+-            LOG(DEBUG) << __func__ << " - REQ_BEACON succeeded on link interface " << link_iface;
++        LOG(DEBUG) << __func__ << " - trying REQ_BEACON on interface " << interface;
++        if (wpa_ctrl_send_msg(cmd, reply, interface)) {
++            LOG(DEBUG) << __func__ << " - REQ_BEACON succeeded on interface " << interface;
+             succeeded = true; // stop here — no duplicate to other links
+         } else {
+-            LOG(WARNING) << __func__ << " - REQ_BEACON failed on " << link_iface
+-                         << ", trying next link interface";
++            LOG(WARNING) << __func__ << " - REQ_BEACON failed on " << interface
++                         << ", trying next interface";
+         }
+     }
+     if (!succeeded) {
+-        LOG(ERROR) << __func__ << " - REQ_BEACON failed on all registered link interfaces for "
++        LOG(ERROR) << __func__ << " - REQ_BEACON failed on all registered interfaces for "
+                    << base_vap_iface;
+         return false;
+     }
+-- 
+2.34.1
+
