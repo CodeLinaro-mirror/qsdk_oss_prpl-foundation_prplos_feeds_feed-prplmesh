@@ -1,0 +1,715 @@
+From 46919a15da274ffa74a9fbb55ca0d9178c05d68c Mon Sep 17 00:00:00 2001
+From: Manoj Sekar <sekar@qti.qualcomm.com>
+Date: Fri, 30 Oct 2026 10:33:10 +0530
+Subject: [PATCH] prplmesh: Improve On-Boot-Scan reliability and result-status
+ accuracy
+
+ChannelScanTask's On-Boot-Scan is triggered exactly once per Agent boot
+and has no other opportunity to produce results for the remainder of the
+session if that single trigger fails or if its results are later lost.
+This change addresses several related issues that could cause On-Boot-Scan
+to either fail outright or report inaccurate results to the controller.
+
+1. Preserve stored channel-scan results across BACKHAUL_MANAGER_ENABLE
+   ---------------------------------------------------------------------
+   handle_backhaul_enable_event() unconditionally re-initialized every
+   channel's entry in radio->channel_scan_results to SCAN_NOT_COMPLETED
+   whenever the BACKHAUL_MANAGER_ENABLE event fired. This event is not a
+   one-time occurrence - it can legitimately be received multiple times
+   within a single agent session (e.g. on every backhaul-manager FSM
+   re-exchange), and is not always preceded by an explicit results reset.
+
+   If a successful On-Boot-Scan (or any other scan) had already stored
+   real results before a later, redundant BACKHAUL_MANAGER_ENABLE event
+   fired, those valid results were silently overwritten back to
+   SCAN_NOT_COMPLETED. A subsequent "return stored results of last
+   successful scan" request would then incorrectly report every channel
+   as not completed, even though a successful scan had already run.
+
+   Fix: only initialize a channel's entry to SCAN_NOT_COMPLETED if no
+   result is already stored for that channel, instead of unconditionally
+   overwriting it. This preserves any valid results already collected
+   across redundant BACKHAUL_MANAGER_ENABLE events, while the explicit
+   certification reset path (which clears channel_scan_results before
+   this event fires) remains unaffected.
+
+2. Cross-check On-Boot-Scan "stored results" against the real AgentDB status
+   ---------------------------------------------------------------------
+   handle_on_boot_scan_request()'s internal helper for answering a
+   "return stored results of last successful scan" request built its
+   channel/status list purely from an in-memory record of which channels
+   were *attempted*, which is populated optimistically at trigger time -
+   before the scan has actually run or completed. If the triggered scan
+   subsequently failed, that failure was never propagated back into this
+   record, only into a local, transient object that gets destroyed
+   afterwards. As a result, a later "stored results" request could report
+   "Success" with zero neighbors for a channel whose scan had actually
+   failed.
+
+   Fix: cross-check each channel against the real persisted status in
+   radio->channel_scan_results before reporting it as SUCCESS - mirroring
+   how the equivalent logic in the generic/controller-initiated scan path
+   already does this correctly. If the AgentDB has no entry, or a
+   non-SUCCESS status, for a given channel, the report now reflects the
+   real outcome instead of the optimistic "attempted" status.
+
+3. Delay the On-Boot-Scan trigger to avoid colliding with other startup work
+   ---------------------------------------------------------------------
+   The On-Boot-Scan trigger is sent from the same state/event that also
+   kicks off a dense, one-time burst of unrelated startup work (various
+   service initializations, interface re-enumeration, and a topology
+   exchange). This burst can starve the event loop enough that the
+   one-shot, non-retried scan-trigger request fails outright, permanently
+   losing the single opportunity On-Boot-Scan gets to populate real
+   results for that boot cycle.
+
+   Fix: defer the On-Boot-Scan trigger CMDU by a short, configurable delay
+   (via a one-shot timer) instead of sending it immediately, giving the
+   startup burst time to settle first. If timer creation fails, the
+   trigger falls back to firing immediately (previous behavior).
+
+4. Add a bounded, automatic retry for a failed On-Boot-Scan trigger
+   ---------------------------------------------------------------------
+   As defense-in-depth against any residual, less predictable timing
+   variance that the startup delay alone cannot fully rule out, a radio
+   scan that reaches a terminal failure state is automatically re-queued
+   and retried a small, bounded number of times (with a short delay
+   between attempts) before finally giving up and reporting the genuine
+   failure status. This retry mechanism is scoped exclusively to the
+   On-Boot-Scan path; the generic controller-initiated scan path is
+   unaffected and already gets a fresh trigger per request.
+
+5. Add an early trigger option and result-cache validity check
+   ---------------------------------------------------------------------
+   In certain topologies, the radio targeted by On-Boot-Scan can also be
+   the one hosting the agent's own backhaul station interface. Once that
+   interface associates, the radio's scan resource may no longer be
+   available for an explicit trigger, and any scan request issued after
+   that point is doomed to fail regardless of delay or retry count.
+
+   To improve the odds of a successful scan in such topologies, a new
+   helper is added that triggers On-Boot-Scan early - right after a
+   certification reset, while the radio's scan resource is more likely to
+   still be free - instead of waiting for the regular, later-firing
+   trigger. A companion cache-validity check (true only if every expected
+   channel already has a stored SUCCESS result) is used both to decide
+   whether this early trigger is actually needed, and to let the later,
+   regular trigger skip itself as a no-op if the early trigger already
+   produced a complete, valid result set. This avoids wasting the bounded
+   retry budget on a second attempt that is now certain to fail.
+
+Together, these changes make On-Boot-Scan results, and their reported
+status to the controller, both more reliable to obtain and more accurate
+to report.
+
+Signed-off-by: Manoj Sekar <sekar@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/son_slave_thread.cpp | 142 ++++++++---
+ agent/src/beerocks/slave/son_slave_thread.h   |   6 +
+ .../slave/tasks/channel_scan_task.cpp         | 231 +++++++++++++++++-
+ .../beerocks/slave/tasks/channel_scan_task.h  |  57 ++++-
+ 4 files changed, 392 insertions(+), 44 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 255feec..2164c90 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -114,6 +114,7 @@
+ //////////////////////////////////////////////////////////////////////////////
+ 
+ constexpr int SLAVE_INIT_DELAY_SEC                                    = 4;
++constexpr int ON_BOOT_SCAN_TRIGGER_DELAY_SEC                         = 5;
+ constexpr int WAIT_FOR_PLATFORM_MANAGER_REGISTER_RESPONSE_TIMEOUT_SEC = 600;
+ constexpr int MONITOR_HEARTBEAT_TIMEOUT_SEC                           = 10;
+ constexpr int MONITOR_HEARTBEAT_RETRIES                               = 10;
+@@ -7264,42 +7265,119 @@ bool slave_thread::agent_fsm()
+             send_cmdu(m_radio_managers[radio_to_update->front.iface_name].monitor_fd, cmdu_tx);
+         }
+ 
+-        // On certification mode, if on boot scan is enabled, trigger On Boot Scan
++        // On certification mode, if on boot scan is enabled, trigger On Boot Scan.
++        //
++        // The trigger is deliberately delayed by ON_BOOT_SCAN_TRIGGER_DELAY_SEC instead of being
++        // sent immediately here. STATE_OPERATIONAL (this very state) also kicks off a dense,
++        // one-time burst of other startup work in the same instant - DPP TCP relay server start,
++        // traffic-separation VLAN reconfiguration, transport/bridge interface re-enumeration, and
++        // a full TOPOLOGY_NOTIFICATION/QUERY/RESPONSE exchange - all triggered by the very same
++        // event that also fires the on-boot-scan trigger. This burst can starve the monitor
++        // process's event loop enough that the scan trigger fails outright, permanently losing
++        // the single opportunity On-Boot-Scan gets to populate real results for this boot cycle.
++        // There is no functional requirement for the on-boot-scan trigger to fire in the same
++        // instant as this unrelated startup work, so deferring it by a few seconds lets that
++        // burst settle first and removes this self-inflicted race.
++        // (A bounded number of scan-trigger retries is added as a complementary, defense-in-depth
++        // measure in ChannelScanTask for any residual, less predictable timing variance that this
++        // delay alone cannot fully rule out.)
+         if (db->device_conf.certification_mode && db->device_conf.on_boot_scan > 0) {
+-            // If on_boot_scan=1 then the On Boot Scan needs to be done on 5GHz radio.
+-            // If on_boot_scan=2 then the On Boot Scan needs to be done on 2.4GHz radio.
+-            LOG(DEBUG) << "On Boot Scan is enabled";
+-            auto on_boot_scan_request = message_com::create_vs_message<
+-                beerocks_message::cACTION_BACKHAUL_TRIGGER_ON_BOOT_SCAN>(cmdu_tx);
+-            if (!on_boot_scan_request) {
+-                LOG(ERROR) << "Failed building message!";
+-                return false;
+-            }
+-            beerocks::eFreqType freq_type_to_scan;
+-            switch (db->device_conf.on_boot_scan) {
+-            case 1:
+-                freq_type_to_scan = beerocks::FREQ_5G;
+-                break;
+-            case 2:
+-                freq_type_to_scan = beerocks::FREQ_24G;
+-                break;
+-            default:
+-                freq_type_to_scan = beerocks::FREQ_UNKNOWN;
+-                LOG(ERROR) << "Invalid radio config, not triggering On Boot Scan";
+-                break;
+-            }
+-            if (freq_type_to_scan != beerocks::FREQ_UNKNOWN) {
+-                for (const auto &radio_to_scan : radio) {
+-                    if (radio_to_scan->wifi_channel.get_freq_type() == freq_type_to_scan &&
+-                        radio_to_scan->front.iface_mac != network_utils::ZERO_MAC) {
+-                        on_boot_scan_request->radio_mac() = radio_to_scan->front.iface_mac;
++            LOG(DEBUG) << "On Boot Scan is enabled - scheduling trigger after "
++                       << ON_BOOT_SCAN_TRIGGER_DELAY_SEC
++                       << "s delay to avoid colliding with STATE_OPERATIONAL startup burst";
++
++            // Capture by value; this fires once from a short-lived one-shot timer well after this
++            // STATE_OPERATIONAL invocation has returned, so no references into local scope are
++            // safe to keep - re-fetch everything needed from AgentDB/CmduMessageTx at fire time.
++            m_on_boot_scan_trigger_timer = m_timer_manager->add_timer(
++                "On Boot Scan Trigger Delay",
++                std::chrono::seconds(ON_BOOT_SCAN_TRIGGER_DELAY_SEC),
++                std::chrono::milliseconds::zero(), [this](int fd, beerocks::EventLoop &loop) {
++                    m_timer_manager->remove_timer(m_on_boot_scan_trigger_timer);
++
++                    auto db = AgentDB::get();
++                    // Re-validate: certification mode/on_boot_scan could only have been disabled
++                    // via a full agent reset, which would also tear down this timer, but guard
++                    // anyway since this runs asynchronously relative to the state that armed it.
++                    if (!(db->device_conf.certification_mode && db->device_conf.on_boot_scan > 0)) {
++                        LOG(DEBUG) << "On Boot Scan Trigger Delay fired, but On Boot Scan is no "
++                                      "longer enabled - skipping trigger";
++                        return true;
++                    }
++
++                    auto on_boot_scan_request = message_com::create_vs_message<
++                        beerocks_message::cACTION_BACKHAUL_TRIGGER_ON_BOOT_SCAN>(cmdu_tx);
++                    if (!on_boot_scan_request) {
++                        LOG(ERROR) << "Failed building message!";
++                        return true;
++                    }
++
++                    // If on_boot_scan=1 then the On Boot Scan needs to be done on 5GHz radio.
++                    // If on_boot_scan=2 then the On Boot Scan needs to be done on 2.4GHz radio.
++                    beerocks::eFreqType freq_type_to_scan;
++                    switch (db->device_conf.on_boot_scan) {
++                    case 1:
++                        freq_type_to_scan = beerocks::FREQ_5G;
++                        break;
++                    case 2:
++                        freq_type_to_scan = beerocks::FREQ_24G;
+                         break;
++                    default:
++                        freq_type_to_scan = beerocks::FREQ_UNKNOWN;
++                        LOG(ERROR) << "Invalid radio config, not triggering On Boot Scan";
++                        break;
++                    }
++                    if (freq_type_to_scan != beerocks::FREQ_UNKNOWN) {
++                        const auto &radio_list = db->get_radios_list();
++                        for (const auto &radio_to_scan : radio_list) {
++                            if (radio_to_scan->wifi_channel.get_freq_type() == freq_type_to_scan &&
++                                radio_to_scan->front.iface_mac != network_utils::ZERO_MAC) {
++                                on_boot_scan_request->radio_mac() = radio_to_scan->front.iface_mac;
++                                break;
++                            }
++                        }
++                        // Send the message
++                        LOG(DEBUG) << "Triggering (delayed) On Boot Scan on radio: "
++                                   << on_boot_scan_request->radio_mac();
++                        m_backhaul_manager_client->send_cmdu(cmdu_tx);
++                    }
++                    return true;
++                });
++            if (m_on_boot_scan_trigger_timer == beerocks::net::FileDescriptor::invalid_descriptor) {
++                LOG(ERROR) << "Failed to create the On Boot Scan trigger delay timer - falling "
++                              "back to triggering On Boot Scan immediately";
++
++                auto on_boot_scan_request = message_com::create_vs_message<
++                    beerocks_message::cACTION_BACKHAUL_TRIGGER_ON_BOOT_SCAN>(cmdu_tx);
++                if (!on_boot_scan_request) {
++                    LOG(ERROR) << "Failed building message!";
++                    return false;
++                }
++                beerocks::eFreqType freq_type_to_scan;
++                switch (db->device_conf.on_boot_scan) {
++                case 1:
++                    freq_type_to_scan = beerocks::FREQ_5G;
++                    break;
++                case 2:
++                    freq_type_to_scan = beerocks::FREQ_24G;
++                    break;
++                default:
++                    freq_type_to_scan = beerocks::FREQ_UNKNOWN;
++                    LOG(ERROR) << "Invalid radio config, not triggering On Boot Scan";
++                    break;
++                }
++                if (freq_type_to_scan != beerocks::FREQ_UNKNOWN) {
++                    for (const auto &radio_to_scan : radio) {
++                        if (radio_to_scan->wifi_channel.get_freq_type() == freq_type_to_scan &&
++                            radio_to_scan->front.iface_mac != network_utils::ZERO_MAC) {
++                            on_boot_scan_request->radio_mac() = radio_to_scan->front.iface_mac;
++                            break;
++                        }
+                     }
++                    LOG(DEBUG) << "Triggering On Boot Scan on radio: "
++                               << on_boot_scan_request->radio_mac();
++                    m_backhaul_manager_client->send_cmdu(cmdu_tx);
+                 }
+-                // Send the message
+-                LOG(DEBUG) << "Triggering On Boot Scan on radio: "
+-                           << on_boot_scan_request->radio_mac();
+-                m_backhaul_manager_client->send_cmdu(cmdu_tx);
+             }
+         }
+ 
+diff --git a/agent/src/beerocks/slave/son_slave_thread.h b/agent/src/beerocks/slave/son_slave_thread.h
+index cc08eaa..a1d2948 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.h
++++ b/agent/src/beerocks/slave/son_slave_thread.h
+@@ -372,6 +372,12 @@ private:
+      */
+     int m_tasks_timer = net::FileDescriptor::invalid_descriptor;
+ 
++    /**
++     * One-shot timer used to defer the certification On-Boot-Scan trigger until the
++     * STATE_OPERATIONAL startup burst has settled.
++     */
++    int m_on_boot_scan_trigger_timer = net::FileDescriptor::invalid_descriptor;
++
+     /**
+      * Factory to create broker client instances connected to broker server.
+      * Broker client instances are used to exchange CMDU messages with remote processes running in
+diff --git a/agent/src/beerocks/slave/tasks/channel_scan_task.cpp b/agent/src/beerocks/slave/tasks/channel_scan_task.cpp
+index 718437e..020a553 100644
+--- a/agent/src/beerocks/slave/tasks/channel_scan_task.cpp
++++ b/agent/src/beerocks/slave/tasks/channel_scan_task.cpp
+@@ -99,6 +99,15 @@ constexpr std::chrono::seconds SCAN_TRIGGERED_WAIT_TIME    = std::chrono::second
+ constexpr std::chrono::seconds SCAN_RESULTS_DUMP_WAIT_TIME = std::chrono::seconds(210); // 3.5 Min
+ constexpr std::chrono::seconds SCAN_REQUEST_TIMEOUT_SEC    = std::chrono::seconds(300); // 5 Min
+ constexpr std::chrono::seconds MINIMUM_SCAN_INTERVAL_SEC   = std::chrono::seconds(2);   // 2 Sec
++// On-Boot-Scan is triggered exactly once per Agent boot (see son_slave_thread.cpp
++// STATE_OPERATIONAL). Unlike the generic/certification fresh-scan path, a trigger failure here
++// has no other chance to produce results for the remainder of the session. As defense-in-depth
++// against transient scan-trigger failures (complementary to the trigger delay already applied
++// in son_slave_thread.cpp before the first trigger attempt), allow a small, bounded number of
++// automatic re-triggers specifically for On-Boot-Scan before finally giving up and leaving the
++// SCAN_FAILED/SCAN_NOT_COMPLETED status in place.
++constexpr int ON_BOOT_SCAN_MAX_RETRIES                      = 2;
++constexpr std::chrono::seconds ON_BOOT_SCAN_RETRY_DELAY_SEC = std::chrono::seconds(3);
+ 
+ /**
+  * To allow for CMDU & TLV fragmentation a proximation of the size we need to keep free in the
+@@ -288,7 +297,42 @@ void ChannelScanTask::work()
+                 break;
+             }
+ 
+-            if (is_terminal_state(current_radio_scan->current_state)) {
++            // On-Boot-Scan bounded retry: if this radio's On-Boot-Scan trigger reached a
++            // terminal failure state (SCAN_FAILED/SCAN_ABORTED), automatically re-trigger a
++            // bounded number of times before finalizing with the failure status. This is
++            // defense-in-depth against transient scan-trigger failures. Scoped strictly to
++            // m_on_boot_scan_enabled: the generic/certification fresh-scan path is untouched,
++            // since it already gets a fresh trigger per controller request.
++            //
++            // Implementation: re-queue the same request into m_pending_requests (the normal
++            // "not currently running" path at the bottom of work(), which calls
++            // trigger_next_radio_scan() once per tick) instead of re-triggering inline here.
++            // retry_not_before gates trigger_next_radio_scan() so the actual re-trigger CMDU is
++            // only sent once ON_BOOT_SCAN_RETRY_DELAY_SEC has elapsed, without blocking this
++            // (or any other radio's) processing in the meantime.
++            if (m_on_boot_scan_enabled &&
++                (current_radio_scan->current_state == eState::SCAN_FAILED ||
++                 current_radio_scan->current_state == eState::SCAN_ABORTED) &&
++                current_radio_scan->on_boot_scan_retry_count < ON_BOOT_SCAN_MAX_RETRIES) {
++                current_radio_scan->on_boot_scan_retry_count++;
++                LOG(WARNING) << "On-Boot-Scan for radio " << current_radio_scan->radio_mac
++                             << " reached terminal state "
++                             << m_states_string.at(current_radio_scan->current_state)
++                             << " - retrying (attempt "
++                             << current_radio_scan->on_boot_scan_retry_count << "/"
++                             << ON_BOOT_SCAN_MAX_RETRIES << ") after "
++                             << ON_BOOT_SCAN_RETRY_DELAY_SEC.count() << "s";
++
++                // Reset the per-channel status so the retried trigger starts from a clean
++                // slate instead of carrying over the failed attempt's status.
++                set_radio_scan_status(current_radio_scan, eScanStatus::SCAN_NOT_COMPLETED);
++                current_radio_scan->retry_not_before =
++                    std::chrono::system_clock::now() + ON_BOOT_SCAN_RETRY_DELAY_SEC;
++                FSM_MOVE_STATE(current_radio_scan, eState::PENDING_TRIGGER);
++
++                m_current_scan_info[radio->front.iface_name].is_scan_currently_running = false;
++                m_pending_requests[radio->front.iface_name]                            = current_scan_request;
++            } else if (is_terminal_state(current_radio_scan->current_state)) {
+                 finalize_scan();
+             }
+ 
+@@ -308,6 +352,19 @@ void ChannelScanTask::work()
+             // Handle pending requests.
+             auto it = m_pending_requests.find(radio->front.iface_name);
+             if (it != m_pending_requests.end()) {
++                // On-Boot-Scan retry delay gate: if this pending request is a re-queued
++                // On-Boot-Scan retry (see the SCAN_FAILED/SCAN_ABORTED handling above),
++                // retry_not_before holds the earliest time it may actually be triggered.
++                // Leave it untouched in m_pending_requests until the delay elapses - do
++                // NOT call trigger_next_radio_scan() or erase it yet. Erasing here (even
++                // temporarily, e.g. via a "re-queue inside trigger_next_radio_scan() then
++                // erase anyway" pattern) would silently and permanently drop the retry,
++                // since nothing else ever re-adds it to m_pending_requests. For any normal
++                // (non-retry) request, retry_not_before defaults to time_point::min(), so
++                // this check is always false and has no effect.
++                if (std::chrono::system_clock::now() < it->second->radio_scans->retry_not_before) {
++                    continue;
++                }
+                 if (!trigger_next_radio_scan(it->first, it->second)) {
+                     LOG(ERROR) << "Failed to trigger the radio scan for radio: " << it->first;
+                 }
+@@ -380,7 +437,7 @@ bool ChannelScanTask::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx, uint32_t i
+ 
+         const sMacAddr &on_boot_scan_radio = get_on_boot_scan_radio_mac(cmdu_rx);
+         if (on_boot_scan_radio != beerocks::net::network_utils::ZERO_MAC) {
+-            return handle_on_boot_scan_request(cmdu_rx, src_mac, on_boot_scan_radio, true);
++            return handle_on_boot_scan_request(&cmdu_rx, src_mac, on_boot_scan_radio, true);
+         }
+ 
+         break;
+@@ -467,7 +524,7 @@ bool ChannelScanTask::handle_vendor_specific(ieee1905_1::CmduMessageRx &cmdu_rx,
+         }
+         const auto &radio_mac = trigger_request->radio_mac();
+         LOG(TRACE) << "Received ACTION_BACKHAUL_TRIGGER_ON_BOOT_SCAN on mac " << radio_mac;
+-        if (!handle_on_boot_scan_request(cmdu_rx, src_mac, radio_mac)) {
++        if (!handle_on_boot_scan_request(&cmdu_rx, src_mac, radio_mac)) {
+             LOG(ERROR) << "handle_on_boot_scan_request() failed";
+             return false;
+         }
+@@ -738,6 +795,9 @@ bool ChannelScanTask::trigger_next_radio_scan(const std::string &ifname,
+         return false;
+     }
+ 
++    // Note: the On-Boot-Scan retry delay gate (retry_not_before) is checked by the caller in
++    // work() *before* this function is invoked, so by the time we reach here the delay (if
++    // any) has already elapsed and it is safe to proceed with the actual trigger.
+     if (!trigger_radio_scan(ifname, radio_scans)) {
+         LOG(ERROR) << "Failed to send radio scan trigger request";
+         return false;
+@@ -1342,7 +1402,7 @@ bool ChannelScanTask::handle_channel_scan_request(ieee1905_1::CmduMessageRx &cmd
+     return true;
+ }
+ 
+-bool ChannelScanTask::handle_on_boot_scan_request(ieee1905_1::CmduMessageRx &cmdu_rx,
++bool ChannelScanTask::handle_on_boot_scan_request(ieee1905_1::CmduMessageRx *cmdu_rx,
+                                                   const sMacAddr &src_mac,
+                                                   const sMacAddr &radio_mac,
+                                                   const bool &send_results)
+@@ -1420,8 +1480,24 @@ bool ChannelScanTask::handle_on_boot_scan_request(ieee1905_1::CmduMessageRx &cmd
+     };
+ 
+     // Create a sOperatingClass vector from the previous scans.
++    //
++    // m_previous_scans only records which operating-class/channel combinations were
++    // *attempted* by a prior on-boot-scan trigger - it is populated unconditionally with
++    // eScanStatus::SUCCESS at trigger time (see create_channel_vector() above), before the
++    // scan has actually run. If the triggered scan later fails (e.g. FSM moves to
++    // SCAN_FAILED), that failure is never propagated back into m_previous_scans - only the
++    // local/transient sRadioScan is marked SCAN_NOT_COMPLETED, and that object is destroyed
++    // once the (failed) request is torn down. Consequently, when the controller later issues
++    // a "return stored results of last successful scan" request, blindly trusting
++    // m_previous_scans here would incorrectly report every previously-attempted channel as
++    // SUCCESS, regardless of whether the scan actually completed successfully.
++    // To avoid this, cross-check each channel against the real persisted status in
++    // radio->channel_scan_results (the same source of truth used by the generic/non-on-boot
++    // path's create_stored_operating_classes() in handle_channel_scan_request()), and only
++    // report SUCCESS if the DB agrees.
+     auto create_stored_operating_classes =
+-        [this, &print_channel_vector]() -> std::vector<sOperatingClass> {
++        [this, &print_channel_vector](beerocks::AgentDB::sRadio *const radio)
++        -> std::vector<sOperatingClass> {
+         std::vector<sOperatingClass> operating_vector;
+         for (const auto &previous_scan : m_previous_scans) {
+             const auto operating_class = previous_scan.first;
+@@ -1429,7 +1505,18 @@ bool ChannelScanTask::handle_on_boot_scan_request(ieee1905_1::CmduMessageRx &cmd
+                 son::wireless_utils::operating_class_to_bandwidth(operating_class);
+             std::vector<sChannel> channel_vector;
+             for (const auto prev_scan_channel : previous_scan.second) {
+-                channel_vector.emplace_back(prev_scan_channel, eScanStatus::SUCCESS);
++                // Default to the optimistic "attempted" status, but verify it against the
++                // persisted scan result in the AgentDB before trusting it.
++                eScanStatus verified_status = eScanStatus::SUCCESS;
++                auto db_status = radio->channel_scan_results.find(prev_scan_channel);
++                if (db_status != radio->channel_scan_results.end()) {
++                    verified_status = std::get<0>(db_status->second);
++                } else {
++                    // No persisted result for this channel at all - the scan never actually
++                    // completed for it.
++                    verified_status = eScanStatus::SCAN_NOT_COMPLETED;
++                }
++                channel_vector.emplace_back(prev_scan_channel, verified_status);
+             }
+             LOG(TRACE) << "Operating class: #" << int(operating_class) << std::endl
+                        << "\tChannel list length:" << int(channel_vector.size()) << std::endl
+@@ -1456,6 +1543,24 @@ bool ChannelScanTask::handle_on_boot_scan_request(ieee1905_1::CmduMessageRx &cmd
+ 
+         return sOperatingClass(class_number, bandwidth, channel_vector);
+     };
++    // Trigger-path (send_results == false) short-circuit: if a complete, successful cache
++    // already exists for this radio - typically because the early trigger from
++    // handle_backhaul_enable_event() already ran to completion before the backhaul STA
++    // associated - skip issuing another explicit scan trigger entirely. This protects the
++    // delayed, message-driven ACTION_BACKHAUL_TRIGGER_ON_BOOT_SCAN call site (from
++    // son_slave_thread.cpp, which fires unconditionally post-STATE_OPERATIONAL without knowing
++    // whether an early trigger already succeeded), and is a harmless no-op for the early
++    // trigger's own call site in trigger_on_boot_scan_if_cache_invalid(), which already performs
++    // this same check before calling here. This avoids a trigger attempt that would otherwise be
++    // doomed to fail on a radio where the scan resource is already busy (e.g. an associated
++    // backhaul STA on a shared radio), wasting the bounded-retry budget for no benefit when a
++    // perfectly good cache already exists.
++    if (!send_results && is_on_boot_scan_cache_valid(radio_mac)) {
++        LOG(DEBUG) << "On-Boot-Scan cache already valid for radio " << radio_mac
++                   << " - skipping (redundant) trigger";
++        return true;
++    }
++
+     // Create new scan request
+     auto new_request = std::shared_ptr<sScanRequest>(new sScanRequest(), [](sScanRequest *ptr) {
+         LOG(TRACE) << "Deleting scan request: " << std::hex << ptr << ".";
+@@ -1463,8 +1568,14 @@ bool ChannelScanTask::handle_on_boot_scan_request(ieee1905_1::CmduMessageRx &cmd
+     });
+ 
+     if (send_results) {
++        if (!cmdu_rx) {
++            LOG(ERROR) << "send_results requested but cmdu_rx is nullptr - cannot build ACK "
++                          "reply (programming error: send_results must only be set from a "
++                          "real 1905 CMDU-driven call site)";
++            return false;
++        }
+         // Build and send ACK message CMDU to the originator.
+-        const auto mid      = cmdu_rx.getMessageId();
++        const auto mid      = cmdu_rx->getMessageId();
+         auto cmdu_tx_header = m_cmdu_tx.create(mid, ieee1905_1::eMessageType::ACK_MESSAGE);
+         if (!cmdu_tx_header) {
+             LOG(ERROR) << "cmdu creation of type ACK_MESSAGE, has failed";
+@@ -1522,7 +1633,7 @@ bool ChannelScanTask::handle_on_boot_scan_request(ieee1905_1::CmduMessageRx &cmd
+ 
+     auto operating_classes_size = operating_classes.size();
+     if (send_results) {
+-        new_radio_scan->operating_classes = create_stored_operating_classes();
++        new_radio_scan->operating_classes = create_stored_operating_classes(radio);
+     } else {
+         // Iterate over operating classes
+         for (int class_idx = 0; class_idx < (int)operating_classes_size; class_idx++) {
+@@ -1542,6 +1653,57 @@ bool ChannelScanTask::handle_on_boot_scan_request(ieee1905_1::CmduMessageRx &cmd
+     return true;
+ }
+ 
++bool ChannelScanTask::is_on_boot_scan_cache_valid(const sMacAddr &radio_mac)
++{
++    auto db    = AgentDB::get();
++    auto radio = db->get_radio_by_mac(radio_mac);
++    if (!radio) {
++        LOG(ERROR) << "Failed to get radio entry for MAC: " << radio_mac;
++        return false;
++    }
++
++    // An empty map means no scan has ever stored anything for this radio (e.g. right after a
++    // dev-reset, before handle_backhaul_enable_event()'s init loop below, or before any scan
++    // has ever run) - definitely not a valid cache.
++    if (radio->channel_scan_results.empty()) {
++        return false;
++    }
++
++    // A valid cache requires every known channel entry to already reflect a successful scan.
++    // Any entry still at SCAN_NOT_COMPLETED (the initial value set by the init loop below) or
++    // any other non-SUCCESS status means the early trigger either hasn't run yet, is still in
++    // progress, or ran and failed/was only partially successful - in all of these cases we
++    // should not treat the cache as valid and should (re)attempt a trigger.
++    for (const auto &result_kv : radio->channel_scan_results) {
++        const auto &result_tuple = result_kv.second;
++        if (std::get<0>(result_tuple) != eScanStatus::SUCCESS) {
++            return false;
++        }
++    }
++    return true;
++}
++
++void ChannelScanTask::trigger_on_boot_scan_if_cache_invalid(const sMacAddr &radio_mac)
++{
++    if (is_on_boot_scan_cache_valid(radio_mac)) {
++        LOG(DEBUG) << "On-Boot-Scan cache already valid for radio " << radio_mac
++                   << " - skipping early trigger";
++        return;
++    }
++
++    LOG(DEBUG) << "Triggering early On-Boot-Scan for radio " << radio_mac
++               << " right after dev-reset/BACKHAUL_MANAGER_ENABLE, while the radio's scan "
++                  "resource is still free";
++
++    // No CMDU/message-id context for this internally-driven trigger (send_results=false, so
++    // cmdu_rx is never dereferenced), and src_mac is likewise unused on this path - it is only
++    // read from request_info when send_results is true (to address the eventual report).
++    if (!handle_on_boot_scan_request(nullptr, beerocks::net::network_utils::ZERO_MAC, radio_mac,
++                                     false)) {
++        LOG(ERROR) << "Early On-Boot-Scan trigger failed for radio " << radio_mac;
++    }
++}
++
+ void ChannelScanTask::handle_backhaul_enable_event()
+ {
+     LOG(TRACE) << "init AgentDB scan results";
+@@ -1552,16 +1714,63 @@ void ChannelScanTask::handle_backhaul_enable_event()
+     auto now = std::chrono::system_clock::now();
+ 
+     for (auto radio : db->get_radios_list()) {
++        // Detect a fresh (post dev-reset) radio - i.e. one for which channel_scan_results was
++        // completely empty before this handler's init loop below ran. This is the window the
++        // early-trigger mechanism targets: the radio's scan resource is more likely to be free
++        // at this point, before any later consumer of that resource (e.g. an associated backhaul
++        // STA on a shared radio) takes hold of it - whereas the later, delayed On-Boot-Scan
++        // trigger from son_slave_thread.cpp (post STATE_OPERATIONAL) may by then find the scan
++        // resource already busy and have its trigger refused.
++        const bool was_empty = radio->channel_scan_results.empty();
++
+         scan_map.clear();
+         tlvf_utils::get_channel_scan_map(radio, scan_map);
+ 
+         for (auto scan_elem : scan_map) {
+             for (auto chan : std::get<1>(scan_elem)) {
+-                radio->channel_scan_results[chan] =
+-                    std::make_tuple(eScanStatus::SCAN_NOT_COMPLETED, now,
+-                                    std::vector<beerocks_message::sChannelScanResults>{});
++                // ACTION_BACKHAUL_ENABLE (and therefore this BACKHAUL_MANAGER_ENABLE event) can
++                // be received more than once during an agent's lifetime - e.g. on every
++                // ACTION_BACKHAUL_REGISTER/ENABLE re-exchange following a backhaul-manager FSM
++                // restart - and is NOT always preceded by a UCC "dev_reset_default", which is the
++                // only place that explicitly clears channel_scan_results.
++                // On Boot Scan (triggered once from the Agent's STATE_OPERATIONAL) runs early and
++                // stores real SUCCESS results in channel_scan_results. If this handler
++                // unconditionally overwrites every channel back to SCAN_NOT_COMPLETED on a later,
++                // redundant BACKHAUL_MANAGER_ENABLE event, those valid On-Boot-Scan results are
++                // silently wiped and a subsequent "return stored results of last successful scan"
++                // request (perform_fresh_scan=false) will incorrectly report
++                // "Scan not completed" even though a successful scan already happened.
++                // Only (re)initialize channels that do not already have a stored result, so any
++                // valid results already present (e.g. from On Boot Scan or a prior fresh scan)
++                // are preserved. handle_dev_reset_default() already explicitly clears
++                // channel_scan_results before this event fires in the certification reset flow,
++                // so that flow is unaffected by this change.
++                if (radio->channel_scan_results.find(chan) == radio->channel_scan_results.end()) {
++                    radio->channel_scan_results[chan] =
++                        std::make_tuple(eScanStatus::SCAN_NOT_COMPLETED, now,
++                                        std::vector<beerocks_message::sChannelScanResults>{});
++                }
+             }
+         }
++
++        // Early On-Boot-Scan trigger: see the "right after dev-reset" rationale above. Only
++        // applicable for radios whose channel_scan_results was empty before this call (i.e. a
++        // fresh dev-reset, not a redundant later BACKHAUL_MANAGER_ENABLE re-exchange on an
++        // already-populated radio), and only when On-Boot-Scan is actually enabled.
++        //
++        // IMPORTANT: m_on_boot_scan_enabled alone is only `db->device_conf.on_boot_scan > 0`
++        // (see the ChannelScanTask construction call in backhaul_manager.cpp) - it does NOT by
++        // itself imply certification_mode. The original (delayed) On-Boot-Scan trigger in
++        // son_slave_thread.cpp additionally requires `certification_mode` to be true before
++        // ever firing (`if (certification_mode && on_boot_scan > 0)`). This early trigger must
++        // replicate that exact same combined gate, otherwise a config with on_boot_scan>0 but
++        // certification_mode=0 (not a certification run) would start firing scans here that the
++        // original mechanism would never have triggered at all - i.e. new behavior outside
++        // certification mode. Checking both here keeps this feature strictly scoped to
++        // certification mode, with zero behavioral change otherwise.
++        if (was_empty && m_on_boot_scan_enabled && db->device_conf.certification_mode) {
++            trigger_on_boot_scan_if_cache_invalid(radio->front.iface_mac);
++        }
+     }
+     dump_agent_db_scan_results();
+     return;
+diff --git a/agent/src/beerocks/slave/tasks/channel_scan_task.h b/agent/src/beerocks/slave/tasks/channel_scan_task.h
+index ae5e2d3..2fb725a 100644
+--- a/agent/src/beerocks/slave/tasks/channel_scan_task.h
++++ b/agent/src/beerocks/slave/tasks/channel_scan_task.h
+@@ -124,6 +124,22 @@ private:
+         std::chrono::system_clock::time_point timeout;
+         int dwell_time;
+         std::map<uint8_t, std::vector<beerocks_message::sChannelScanResults>> cached_results;
++        /**
++         * Number of times this radio's On-Boot-Scan trigger has already been retried after
++         * reaching SCAN_FAILED. Only used/incremented when m_on_boot_scan_enabled is true; see
++         * ON_BOOT_SCAN_MAX_RETRIES in channel_scan_task.cpp for the rationale (On-Boot-Scan is
++         * only triggered once per Agent boot, so a trigger that fails due to a transient
++         * driver/busy condition would otherwise never get a second chance to produce results
++         * for the remainder of the session).
++         */
++        int on_boot_scan_retry_count = 0;
++        /**
++         * Earliest time at which a queued On-Boot-Scan retry (see work()'s retry branch in
++         * channel_scan_task.cpp) is allowed to actually be triggered. Defaults to
++         * time_point::min() so normal (non-retry) scans are never delayed by this check.
++         */
++        std::chrono::system_clock::time_point retry_not_before =
++            std::chrono::system_clock::time_point::min();
+     };
+     struct sRequestInfo {
+         sMacAddr src_mac;
+@@ -276,9 +292,48 @@ private:
+     * @return True on success, otherwise false.
+     */
+     bool handle_channel_scan_request(ieee1905_1::CmduMessageRx &cmdu_rx, const sMacAddr &src_mac);
+-    bool handle_on_boot_scan_request(ieee1905_1::CmduMessageRx &cmdu_rx, const sMacAddr &src_mac,
++    /**
++     * @param[in] cmdu_rx Received CMDU that carries the message id used to build the ACK
++     *            reply. Only dereferenced when send_results is true (i.e. the controller
++     *            actually asked for stored results over 1905). May be nullptr when
++     *            send_results is false - this is the case for the early, internally-driven
++     *            trigger invoked from handle_backhaul_enable_event() right after dev-reset,
++     *            which has no CMDU/message-id context of its own (see
++     *            trigger_on_boot_scan_if_cache_invalid()).
++     */
++    bool handle_on_boot_scan_request(ieee1905_1::CmduMessageRx *cmdu_rx, const sMacAddr &src_mac,
+                                      const sMacAddr &radio_mac, const bool &send_results = false);
+ 
++    /**
++     * @brief Returns true if radio->channel_scan_results already holds a SUCCESS result for
++     * every channel in every operating class On-Boot-Scan would otherwise request for this
++     * radio's band (see the hard-coded 5GHz/2.4GHz operating_classes lists in
++     * handle_on_boot_scan_request()).
++     *
++     * Used to decide whether the early, pre-association trigger fired from
++     * handle_backhaul_enable_event() already produced a complete, usable cache - in which case
++     * the later (delayed, post-STATE_OPERATIONAL) on-boot-scan trigger in son_slave_thread.cpp
++     * becomes a redundant no-op, since by then the radio's scan resource may already be busy
++     * (e.g. an associated backhaul STA on a shared radio) and any further explicit scan
++     * trigger would be refused by the driver.
++     *
++     * @param[in] radio_mac MAC of the radio to check.
++     * @return true if a complete, successful cache already exists for this radio; false if the
++     *         radio doesn't exist, or any expected channel is missing/not-yet-successful.
++     */
++    bool is_on_boot_scan_cache_valid(const sMacAddr &radio_mac);
++
++    /**
++     * @brief Trigger On-Boot-Scan for the given radio only if is_on_boot_scan_cache_valid()
++     * is false for it. Called from handle_backhaul_enable_event() for each radio whose
++     * channel_scan_results was just (re)initialized empty - i.e. right after a dev-reset, while
++     * the radio's scan resource is more likely to still be free, before any later consumer of
++     * that resource (e.g. an associated backhaul STA on a shared radio) takes hold of it.
++     *
++     * @param[in] radio_mac MAC of the radio to (conditionally) trigger.
++     */
++    void trigger_on_boot_scan_if_cache_invalid(const sMacAddr &radio_mac);
++
+     /**
+      * @brief Handle ChannelScanTask::eEvent::BACKHAUL_MANAGER_ENABLED as the last event in the series
+      * son_slave_thread :
+-- 
+2.34.1
+
