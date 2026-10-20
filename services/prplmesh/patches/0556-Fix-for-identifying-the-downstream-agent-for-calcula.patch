@@ -1,0 +1,161 @@
+From b39868528f9c6d5d1c0303015e5bd73dc7e23b97 Mon Sep 17 00:00:00 2001
+From: mpaluri <mpaluri@qti.qualcomm.com>
+Date: Thu, 15 Oct 2026 17:56:46 -0700
+Subject: [PATCH] Fix for identifying the downstream agent for calculating bSTA
+
+Instead of relying on interface name for identifying the downstream
+agent, check if the transmitter mac address is an associated client to
+the Backhaul BSS
+
+Signed-off-by: Manaswini Paluri <mpaluri@qti.qualcomm.com>
+
+diff --git a/agent/src/beerocks/slave/tasks/topology_task.cpp b/agent/src/beerocks/slave/tasks/topology_task.cpp
+index 734784db0..656309314 100644
+--- a/agent/src/beerocks/slave/tasks/topology_task.cpp
++++ b/agent/src/beerocks/slave/tasks/topology_task.cpp
+@@ -322,50 +322,104 @@ void TopologyTask::handle_topology_discovery(ieee1905_1::CmduMessageRx &cmdu_rx,
+     neighbor_devices_by_al_mac[tlvAlMac->mac()] = neighbor_device;
+ 
+     /*
+-     * Only store in downstream_agent_bsta when the discovery was received on
+-     * a backhaul BSS (bBSS) interface — the sender is a downstream agent whose
+-     * bSTA is connecting to our bBSS.  If received on any other interface
+-     * (fronthaul BSS, bSTA uplink, Ethernet) the sender is an upstream device
+-     * and must not be treated as a downstream agent.
++     * Determine whether this Topology Discovery came from a downstream agent
++     * (i.e. a device whose bSTA is connected to one of our backhaul BSSes).
++     *
++     * The tlvMacAddress carries the sender's transmitting interface MAC — for a
++     * downstream agent this is its bSTA MAC, which was already recorded in
++     * radio->associated_clients when the bSTA associated to our bBSS.
++     *
++     * We match on MAC rather than on the kernel interface name because interface
++     * naming is fragile: the WDS peer sub-interface created by the driver may
++     * use a shortened prefix (e.g. "wlan20mld7" → "w20mld7"), acquire a VLAN
++     * suffix, or carry a numeric peer-ID (e.g. "w20mld7.s1.4091") that does not
++     * match any simple pattern derived from the bBSS name stored in the DB.
++     * The bSTA MAC, by contrast, is stable and unambiguous.
+      */
+-    bool is_received_on_backhaul_bss = false;
+-    for (const auto radio : db->get_radios_list()) {
++    const sMacAddr &sender_iface_mac = tlvMac->mac();
++    bool is_downstream_agent         = false;
++    sMacAddr matched_bssid           = net::network_utils::ZERO_MAC;
++
++    LOG(DEBUG) << "Checking if sender iface_mac=" << sender_iface_mac
++               << " (AL MAC=" << tlvAlMac->mac() << ") is a bSTA on one of our bBSSes";
++
++    for (const auto *radio : db->get_radios_list()) {
+         if (!radio) {
+             continue;
+         }
++
++        /* Primary lookup: for SLO bSTAs the map key IS the bSTA MAC. */
++        auto client_it = radio->associated_clients.find(sender_iface_mac);
++
++        /* Fallback for MLD bSTAs: associated_clients is keyed by the STA MLD
++         * MAC, but tlvMacAddress carries the per-link bSTA MAC (the actual
++         * kernel interface MAC).  Scan link_mac of every entry on this radio. */
++        if (client_it == radio->associated_clients.end()) {
++            for (auto it = radio->associated_clients.begin();
++                 it != radio->associated_clients.end(); ++it) {
++                if (it->second.link_mac == sender_iface_mac) {
++                    LOG(DEBUG) << "sender iface_mac=" << sender_iface_mac
++                               << " matched via MLD link_mac fallback"
++                               << " (STA MLD MAC=" << it->first << ")"
++                               << " on radio=" << radio->front.iface_name;
++                    client_it = it;
++                    break;
++                }
++            }
++        }
++
++        if (client_it == radio->associated_clients.end()) {
++            continue;
++        }
++
++        /* The sender's MAC is an associated client on this radio (either by
++         * direct key match for SLO or link_mac fallback for MLD).
++         * Verify it is associated to a backhaul BSS specifically. */
++        const sMacAddr &client_bssid = client_it->second.bssid;
++        LOG(DEBUG) << "sender iface_mac=" << sender_iface_mac
++                   << " found in associated_clients on radio=" << radio->front.iface_name
++                   << " with bssid=" << client_bssid
++                   << " is_mlo=" << client_it->second.is_mlo;
++
+         for (const auto &bssid : radio->front.bssids) {
+             if (!bssid.backhaul_bss) {
+                 continue;
+             }
+-
+-            /* Derive the base radio interface name by stripping any _link<N>
+-             * suffix (MLO per-link naming, e.g. "wlan4_link0" → "wlan4").
+-             * The WDS peer interface created by the driver uses the base radio
+-             * name as its prefix (e.g. "wlan4.sta1"). */
+-            std::string base_iface = bssid.iface_name;
+-            auto link_pos = base_iface.rfind("_link");
+-            if (link_pos != std::string::npos) {
+-                base_iface = base_iface.substr(0, link_pos);
+-            }
+-
+-            /* Match exact bBSS name, exact base name, or any WDS
+-             * per-peer sub-interface of the base (e.g. "wlan4.sta1"). */
+-            if (bssid.iface_name == local_receiving_iface_name ||
+-                base_iface == local_receiving_iface_name ||
+-                local_receiving_iface_name.substr(0, base_iface.size() + 1) ==
+-                    base_iface + ".") {
+-                is_received_on_backhaul_bss = true;
++            if (bssid.mac == client_bssid) {
++                is_downstream_agent = true;
++                matched_bssid       = bssid.mac;
++                LOG(INFO) << "Topology Discovery from AL MAC=" << tlvAlMac->mac()
++                          << " identified as downstream agent: bSTA=" << sender_iface_mac
++                          << " is associated to local bBSS=" << matched_bssid
++                          << " on radio=" << radio->front.iface_name
++                          << " is_mlo=" << client_it->second.is_mlo
++                          << " — adding to downstream_agent_bsta";
+                 break;
+             }
+         }
+-        if (is_received_on_backhaul_bss) {
++
++        if (!is_downstream_agent) {
++            LOG(DEBUG) << "sender iface_mac=" << sender_iface_mac
++                       << " found in associated_clients but bssid=" << client_bssid
++                       << " does not match any bBSS on radio=" << radio->front.iface_name
++                       << " (client is on a fronthaul BSS)";
++        }
++
++        if (is_downstream_agent) {
+             break;
+         }
+     }
+ 
+-    if (is_received_on_backhaul_bss) {
+-        db->downstream_agent_bsta[tlvAlMac->mac()] = tlvMac->mac();
+-    } else {
++    if (!is_downstream_agent) {
++        LOG(DEBUG) << "Topology Discovery from AL MAC=" << tlvAlMac->mac()
++                   << " (sender iface_mac=" << sender_iface_mac << ")"
++                   << " — sender is NOT a downstream agent (bSTA not found on any local bBSS)"
++                   << ", received on iface=" << local_receiving_iface_name
++                   << " — NOT adding to downstream_agent_bsta";
++    }
++
++    if (is_downstream_agent) {
++        db->downstream_agent_bsta[tlvAlMac->mac()] = sender_iface_mac;
+     }
+ 
+     /* If it is a new device our 1905.1 neighbor list changed; send a
+@@ -374,7 +428,7 @@ void TopologyTask::handle_topology_discovery(ieee1905_1::CmduMessageRx &cmdu_rx,
+     if (new_device) {
+         LOG(INFO) << "Sending Topology Notification on newly discovered 1905.1 device";
+         send_topology_notification();
+-        if (is_received_on_backhaul_bss) {
++        if (is_downstream_agent) {
+             send_topology_query(tlvAlMac->mac());
+         }
+     }
+-- 
+2.34.1
+
