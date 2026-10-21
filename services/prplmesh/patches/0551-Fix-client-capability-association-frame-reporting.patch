@@ -1,0 +1,122 @@
+From 04f08cefcb3331cef2d8e32fddb0c394ae0b9667 Mon Sep 17 00:00:00 2001
+From: Sudharsan Eswaran <eswaran@qti.qualcomm.com>
+Date: Tue, 20 Oct 2026 11:19:07 +0530
+Subject: [PATCH] Fix incorrect Association Request content in MAUT Client
+ Capability Reports.
+
+The AP manager may generate duplicate association notifications, and the first notification can reach the agent before the latest Association Request frame is available in memory. This caused the Client
+Capability Report to contain stale data, such as an incorrect first supported channel.
+
+Changes:
+   - Prefer the persisted raw Association Request frame for SLO clients when generating Client Capability Reports.
+   - Fall back to the in-memory frame if the persisted frame is unavailable.
+   - Refresh the cached Association Request when duplicate legacy or MLO association notifications arrive.
+   - Preserve existing WDS/interface state during duplicate-notification handling.
+   - Add bounds checking when copying refreshed association frames.
+This ensures the Client Capability Report carries the exact Association Request received over the air.
+
+Signed-off-by: Sudharsan Eswaran <eswaran@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/son_slave_thread.cpp | 36 +++++++++++++++++--
+ .../slave/tasks/capability_reporting_task.cpp | 20 +++++++++--
+ 2 files changed, 52 insertions(+), 4 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index d3aea3ee6..591226574 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -30,6 +30,7 @@
+ #include "tasks/vbss_task.h"
+ #include "traffic_separation/traffic_separation_utils.h"
+ 
++#include <algorithm>
+ #include <bcl/beerocks_cmdu_client_factory_factory.h>
+ #include <bcl/beerocks_cmdu_server_factory.h>
+ #include <bcl/beerocks_timer_factory_impl.h>
+@@ -3502,9 +3503,24 @@ bool slave_thread::process_client_association(
+             existing_client_it->second.is_mlo == static_cast<bool>(notification_in->is_mlo());
+ 
+         if (is_duplicate_notification) {
++            // A duplicate notification can be generated for the same association by
++            // nl80211 and hostapd.  Keep the existing entry (and its WDS state), but
++            // refresh the association frame: the first notification may contain an
++            // incomplete or stale frame while the later notification contains the
++            // frame that was most recently received over the air.
++            auto &existing                 = existing_client_it->second;
++            const size_t new_frame_length  = notification_in->association_frame_length();
++            const size_t frame_length      =
++                std::min(new_frame_length, existing.association_frame.size());
++            if (frame_length > 0) {
++                existing.association_frame_length = frame_length;
++                std::copy_n(notification_in->association_frame(), frame_length,
++                            existing.association_frame.begin());
++            }
++
+             LOG(DEBUG) << "Duplicate MLO client association notification for client_mac="
+                        << client_mac << " bssid=" << link_bssid
+-                       << " - client already associated on this link, skipping re-emplace";
++                       << " - refreshed association frame (" << frame_length << " bytes)";
+         } else if (has_existing_entry) {
+             // Same client already tracked (e.g. is_mlo classification changed since
+             // the last notification) - update the entry in place. emplace() would be
+@@ -3623,9 +3639,25 @@ bool slave_thread::process_client_association(
+             existing_client_it->second.bssid == bssid;
+ 
+         if (is_duplicate_notification) {
++            // Preserve the existing entry so that a freshly assigned WDS interface is
++            // not lost, but always replace the cached association frame with the
++            // newest notification.  Client Capability Report must contain the latest
++            // over-the-air Association Request, not a frame from an earlier attempt.
++            auto &existing                = existing_client_it->second;
++            const size_t new_frame_length = notification_in->association_frame_length();
++            const size_t frame_length =
++                std::min(new_frame_length, existing.association_frame.size());
++            if (frame_length > 0) {
++                existing.association_frame_length = frame_length;
++                existing.supports_11v = notification_in->capabilities().btm_supported;
++                existing.link_mac     = link_mac;
++                std::copy_n(notification_in->association_frame(), frame_length,
++                            existing.association_frame.begin());
++            }
++
+             LOG(DEBUG) << "Duplicate legacy client association notification for client_mac="
+                        << client_mac << " bssid=" << bssid
+-                       << " - client already associated, skipping erase+re-emplace";
++                       << " - refreshed association frame (" << frame_length << " bytes)";
+         } else {
+             // Erase client details to clear any previous association information.
+             // This is needed during steering and roaming operations to ensure clean state.
+diff --git a/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp b/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp
+index 22c644a72..701d0b8f5 100644
+--- a/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp
++++ b/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp
+@@ -173,8 +173,24 @@ void CapabilityReportingTask::handle_client_capability_query(ieee1905_1::CmduMes
+     auto &client_info = radio->associated_clients.at(client_info_tlv_r->client_mac());
+     bool association_frame_found = client_info.association_frame_length > 0;
+ 
+-    if (association_frame_found) {
+-        // Frame is in memory — normal path for SLO clients and MLO clients where
++    if (!client_info.is_mlo) {
++        // The AP manager persists the raw frame as soon as AP-MGMT-FRAME-RECEIVED
++        // arrives.  For SLO clients this is the authoritative frame: the first
++        // AP-STA-CONNECTED notification can reach the agent before a later duplicate
++        // notification refreshes the in-memory client entry.
++        const auto sta_mac_str = tlvf::mac_to_string(client_info_tlv_r->client_mac());
++        auto persisted_frame   = bwl::restore_assoc_frame_from_db(sta_mac_str);
++        if (!persisted_frame.empty()) {
++            client_capability_report_tlv->set_association_frame(persisted_frame.data(),
++                                                                persisted_frame.size());
++            LOG(DEBUG) << "Capability report: using persisted assoc frame for SLO STA "
++                       << sta_mac_str << " (" << persisted_frame.size() << " bytes)";
++        } else if (client_info.association_frame_length > 0) {
++            client_capability_report_tlv->set_association_frame(
++                client_info.association_frame.data(), client_info.association_frame_length);
++        }
++    } else if (association_frame_found) {
++        // Frame is in memory — normal path for MLO clients where
+         // AP-MGMT-FRAME-RECEIVED arrived before AP-STA-CONNECTED.
+         client_capability_report_tlv->set_association_frame(client_info.association_frame.data(),
+                                                             client_info.association_frame_length);
+-- 
+2.34.1
+
