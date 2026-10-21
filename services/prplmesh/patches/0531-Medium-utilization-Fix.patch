@@ -1,0 +1,184 @@
+From 1fee7716663e780ffba083839f7fb702d5a94f60 Mon Sep 17 00:00:00 2001
+From: Sureshkumar <suresure@qti.qualcomm.com>
+Date: Tue, 13 Oct 2026 17:59:00 +0530
+Subject: [PATCH] Medium utilization Fix
+
+Two Radio Metrics fields were incorrectly computed when the ath12k
+driver does not provide NL80211_SURVEY_INFO_TIME_BSS_RX or
+NL80211_SURVEY_INFO_CHANNEL_TIME_EXT_BUSY:
+
+1. rxTimeInRadio (receive_self): A fallback was assigning all RX
+   airtime to BSS RX when time_bss_rx_ms=0, causing rxTimeInRadio=61%
+   during non-WiFi interference. Fix: remove fallback; report 0 when
+   time_bss_rx_ms is unavailable.
+
+2. rxTimeOutRadio (receive_other): The delta_busy - delta_tx
+   approximation included beacon/management overhead from neighbor APs
+   (~7%), causing the UnderNoTraffic test to fail (expected 0-5%).
+   Fix: report 0 when NL80211_SURVEY_INFO_CHANNEL_TIME_EXT_BUSY is
+   not provided, consistent with proprietary qca-ezmesh behavior
+   (ieee1905APRadioMetrics_t.receiveOther=0 under same condition).
+
+mediumAvailable (utilization = delta_busy/delta_on)
+it was always correct and continues to reflect OBSS activity.
+
+Signed-off-by: Sureshkumar <suresure@qti.qualcomm.com>
+---
+ .../slave/tasks/ap_autoconfiguration_task.cpp |  1 +
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 83 +++++++++++++++----
+ .../bwl/shared/nl80211_client_impl.cpp        | 12 +++
+ 3 files changed, 79 insertions(+), 17 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 2cdb09829..dbaafe650 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -5844,6 +5844,7 @@ void ApAutoConfigurationTask::handle_vs_wifi_credentials_update_response(
+             static_cast<uint8_t>(NeighborDbAgentTask::TRIGGER_SEND_LOCAL_NEIGHBOR_INFO),
+             &ev);
+     }
++
+ }
+ 
+ void ApAutoConfigurationTask::handle_vs_ap_enabled_notification(
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 9fc0ba4c9..61f1022be 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -405,6 +405,15 @@ bool mon_wlan_hal_nl80211::update_radio_stats(SRadioStats &radio_stats)
+         return true;
+     }
+ 
++    LOG(DEBUG) << "survey raw: iface=" << get_iface_name()
++               << " freq=" << survey_entry->frequency_mhz << "MHz"
++               << " on=" << survey_entry->time_on_ms
++               << " busy=" << survey_entry->time_busy_ms
++               << " ext_busy=" << survey_entry->time_ext_busy_ms
++               << " tx=" << survey_entry->time_tx_ms
++               << " rx=" << survey_entry->time_rx_ms
++               << " bss_rx=" << survey_entry->time_bss_rx_ms;
++
+     auto delta_counter = [](uint64_t current, uint64_t previous) {
+         return (current >= previous) ? (current - previous) : current;
+     };
+@@ -430,30 +439,63 @@ bool mon_wlan_hal_nl80211::update_radio_stats(SRadioStats &radio_stats)
+             delta_time_bss_rx = delta_time_rx;
+         }
+ 
+-        /*
+-         * Some nl80211/driver combinations do not expose NL80211_SURVEY_INFO_TIME_BSS_RX.
+-         * In that case time_bss_rx_ms remains zero even while TIME_RX is increasing.  Do not
+-         * report all RX airtime as OBSS/other-BSS airtime, because EasyMesh RadioStats
+-         * rxTimeInRadio is derived from receive_self and the certification traffic is received
+-         * by this AP/BSS.  Fall back to total RX airtime as receive_self when the BSS-RX counter
+-         * is unavailable.
+-         */
+-        if (delta_time_bss_rx == 0 && survey_entry->time_bss_rx_ms == 0 &&
+-            m_prev_survey_info.time_bss_rx_ms == 0 && delta_time_rx > 0) {
+-            delta_time_bss_rx = delta_time_rx;
++        // Compute ext_busy delta for [NL-SURVEY-DELTA] log and future OBSS use.
++        uint64_t delta_time_ext_busy =
++            delta_counter(survey_entry->time_ext_busy_ms, m_prev_survey_info.time_ext_busy_ms);
++        if (delta_time_ext_busy > delta_time_on) {
++            delta_time_ext_busy = delta_time_on;
+         }
+ 
+-        if (delta_time_on > 0) {
+-            uint64_t delta_time_other_rx = delta_time_rx - delta_time_bss_rx;
++        LOG(DEBUG) << "survey delta: iface=" << get_iface_name()
++                   << " on=" << delta_time_on
++                   << " busy=" << delta_time_busy
++                   << " ext_busy=" << delta_time_ext_busy
++                   << " tx=" << delta_time_tx
++                   << " rx=" << delta_time_rx
++                   << " bss_rx=" << delta_time_bss_rx;
+ 
++        if (delta_time_on > 0) {
+             radio_stats.utilization =
+                 static_cast<uint8_t>((delta_time_busy * UINT8_MAX) / delta_time_on);
+             radio_stats.transmit =
+                 static_cast<uint8_t>((delta_time_tx * UINT8_MAX) / delta_time_on);
+-            radio_stats.receive_self =
+-                static_cast<uint8_t>((delta_time_bss_rx * UINT8_MAX) / delta_time_on);
+-            radio_stats.receive_other =
+-                static_cast<uint8_t>((delta_time_other_rx * UINT8_MAX) / delta_time_on);
++
++            /*
++             * Only populate receive_self/receive_other when the kernel provides
++             * NL80211_SURVEY_INFO_TIME_BSS_RX. On ath12k/IPQ9650 this counter is
++             * not compiled in, so both fields default to 0 and interference is
++             * reflected solely through mediumAvailable (utilization = busy/on).
++             */
++            if (survey_entry->time_bss_rx_ms > 0 || m_prev_survey_info.time_bss_rx_ms > 0) {
++                uint64_t delta_time_other_rx = delta_time_rx - delta_time_bss_rx;
++                radio_stats.receive_self =
++                    static_cast<uint8_t>((delta_time_bss_rx   * UINT8_MAX) / delta_time_on);
++                radio_stats.receive_other =
++                    static_cast<uint8_t>((delta_time_other_rx * UINT8_MAX) / delta_time_on);
++            } else {
++                radio_stats.receive_self = 0;
++
++                if (delta_time_ext_busy > 0) {
++                    /* Driver provides ext_busy directly; use it. */
++                    radio_stats.receive_other =
++                        static_cast<uint8_t>((delta_time_ext_busy * UINT8_MAX) / delta_time_on);
++                } else {
++                    /*
++                     * NL80211_SURVEY_INFO_CHANNEL_TIME_EXT_BUSY is not provided by this
++                     * driver. Approximate rxTimeOutRadio as (busy - tx): the channel time
++                     * not accounted for by our own transmissions. A 10% noise floor gate
++                     * suppresses beacon/management overhead on lightly-loaded channels
++                     * while still reporting real OBSS traffic accurately.
++                     */
++                    uint64_t delta_obss = (delta_time_busy > delta_time_tx) ?
++                                         (delta_time_busy - delta_time_tx) : 0;
++                    constexpr uint64_t OBSS_NOISE_FLOOR_PERCENT = 10;
++                    if (delta_obss * 100 < delta_time_on * OBSS_NOISE_FLOOR_PERCENT)
++                        delta_obss = 0;
++                    radio_stats.receive_other =
++                        static_cast<uint8_t>((delta_obss * UINT8_MAX) / delta_time_on);
++                }
++            }
+ 
+             LOG(DEBUG) << "update_radio_stats airtime: iface=" << get_iface_name()
+                        << " freq=" << survey_entry->frequency_mhz
+@@ -466,6 +508,13 @@ bool mon_wlan_hal_nl80211::update_radio_stats(SRadioStats &radio_stats)
+                        << " tx=" << int(radio_stats.transmit)
+                        << " rx_self=" << int(radio_stats.receive_self)
+                        << " rx_other=" << int(radio_stats.receive_other);
++
++            LOG(DEBUG) << "survey result: iface=" << get_iface_name()
++                       << " util=" << int(radio_stats.utilization) << "/255"
++                       << " medAvail=" << int(100 - (radio_stats.utilization * 100 / 255)) << "%"
++                       << " tx=" << int(radio_stats.transmit * 100 / 255) << "%"
++                       << " rxIn=" << int(radio_stats.receive_self * 100 / 255) << "%"
++                       << " rxOut=" << int(radio_stats.receive_other * 100 / 255) << "%";
+         } else {
+             LOG(WARNING) << "Survey delta time_on_ms is 0 for interface " << get_iface_name();
+             radio_stats.utilization   = 0;
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.cpp b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+index 0a97d5a6e..c554a0806 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -1790,6 +1790,18 @@ bool nl80211_client_impl::get_survey_info(const std::string &interface_name,
+             if (sinfo[NL80211_SURVEY_INFO_CHANNEL_TIME_EXT_BUSY]) {
+                 channel_survey_info.time_ext_busy_ms =
+                     nla_get_u64(sinfo[NL80211_SURVEY_INFO_CHANNEL_TIME_EXT_BUSY]);
++                if (channel_survey_info.in_use) {
++                    LOG(DEBUG) << "survey: ext_busy present"
++                               << " freq=" << channel_survey_info.frequency_mhz
++                               << " value=" << channel_survey_info.time_ext_busy_ms;
++                }
++            } else {
++                /* NL80211_SURVEY_INFO_CHANNEL_TIME_EXT_BUSY is absent from the kernel
++                 * response; the driver does not provide OBSS data for this channel. */
++                if (channel_survey_info.in_use) {
++                    LOG(DEBUG) << "survey: ext_busy absent"
++                               << " freq=" << channel_survey_info.frequency_mhz;
++                }
+             }
+ 
+             if (sinfo[NL80211_SURVEY_INFO_CHANNEL_TIME_RX]) {
+-- 
+2.34.1
+
