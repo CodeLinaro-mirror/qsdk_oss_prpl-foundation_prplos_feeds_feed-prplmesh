@@ -1,0 +1,196 @@
+From 0a2336978a82194476285da566b54bcedd20e87c Mon Sep 17 00:00:00 2001
+From: Sudharsan Eswaran <eswaran@qti.qualcomm.com>
+Date: Mon, 12 Oct 2026 22:59:49 +0530
+Subject: [PATCH] OCCN and EIRP certification Fix
+
+Signed-off-by: Sudharsan Eswaran <eswaran@qti.qualcomm.com>
+---
+ controller/src/beerocks/master/controller.cpp | 105 +++++++++++++++++-
+ 1 file changed, 99 insertions(+), 6 deletions(-)
+
+diff --git a/controller/src/beerocks/master/controller.cpp b/controller/src/beerocks/master/controller.cpp
+index 13884cc61..252345f8a 100755
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -59,6 +59,9 @@ extern "C" void set_qca_wifi_compat_entries(const char **ssids, const uint8_t *m
+ 
+ #include <easylogging++.h>
+ 
++#include <set>
++#include <tuple>
++
+ #include <beerocks/tlvf/beerocks_message_1905_vs.h>
+ #include <beerocks/tlvf/beerocks_message_control.h>
+ 
+@@ -4037,6 +4040,8 @@ bool Controller::handle_cmdu_1905_operating_channel_report(const sMacAddr &src_m
+         sMacAddr radio_uid;
+         uint8_t tx_power;
+         std::vector<std::pair<uint8_t, uint8_t>> op_classes; // (operating_class, channel_number)
++        //only relevant in certification mode - see use at OCCN broadcast gating.
++        bool channel_changed = false;
+     };
+     std::vector<sOcrEntry> ocr_entries;
+ 
+@@ -4050,6 +4055,22 @@ bool Controller::handle_cmdu_1905_operating_channel_report(const sMacAddr &src_m
+         entry.radio_uid = ruid;
+         entry.tx_power  = tx_power;
+ 
++        // snapshot the radio's previously known channel/bandwidth/freq-type and
++        // per-operating-class (op_class, channel, tx_power) state before it gets overwritten
++        // below, so we can later tell whether this OCR actually changed anything for this
++        // radio. Only used to gate the OCCN broadcast in certification mode.
++        auto previous_wifi_channel = database.get_radio_wifi_channel(ruid);
++        std::set<std::tuple<uint8_t, uint8_t, int8_t>> previous_op_class_profile;
++        auto radio_for_snapshot = database.get_radio(src_mac, ruid);
++        if (radio_for_snapshot) {
++            for (const auto &profile : radio_for_snapshot->current_operating_class_profile) {
++                if (profile.op_class != 0) {
++                    previous_op_class_profile.emplace(profile.op_class, profile.channel,
++                                                      profile.tx_power);
++                }
++            }
++        }
++
+         /*
+             Here need to remove the CurrentOperatingClass data from the Controller Data Model which
+             was set in previous OPERATING_CHANNEL_REPORT_MESSAGE.
+@@ -4093,8 +4114,6 @@ bool Controller::handle_cmdu_1905_operating_channel_report(const sMacAddr &src_m
+             database.handle_current_op_class(ruid, operating_class, channel, tx_power);
+         }
+ 
+-        ocr_entries.push_back(std::move(entry));
+-
+         if (operating_classes_list_length != 0) {
+             if (beacon_channel != 0) {
+                 auto tmp_bw = wireless_utils::get_bandwidth_from_channel_and_op_class(
+@@ -4118,6 +4137,47 @@ bool Controller::handle_cmdu_1905_operating_channel_report(const sMacAddr &src_m
+         }
+ 
+         database.dm_clear_empty_current_op_classes(ruid);
++
++        // decide whether anything actually changed for this radio - the primary
++        // channel/bandwidth/freq-type (via the wifi channel we just (maybe) set above), or the
++        // tx_power/operating-class set reported in this OCR (via the op-class profile snapshot).
++        // Comparing with a set makes this independent of op-class/bandwidth-slot ordering.
++        //
++        // new_op_class_profile is read back from the same lossy per-bandwidth
++        // current_operating_class_profile[] array as previous_op_class_profile (rather than from
++        // entry.op_classes, which preserves every TLV entry including multiple operating classes
++        // that collapse into the same bandwidth slot). Comparing against entry.op_classes would
++        // make the comparison asymmetric: previous_op_class_profile can hold at most one entry per
++        // bandwidth while new_op_class_profile could hold more, so the sets would never compare
++        // equal - even when nothing changed - for a radio reporting multiple operating classes in
++        // one bandwidth. Reading both sides from current_operating_class_profile[] keeps the
++        // comparison apples-to-apples; by this point handle_current_op_class() has already updated
++        // it for every operating class in this OCR, via the same radio_for_snapshot object.
++        auto new_wifi_channel = database.get_radio_wifi_channel(ruid);
++        bool wifi_channel_changed =
++            (new_wifi_channel.get_channel() != previous_wifi_channel.get_channel()) ||
++            (new_wifi_channel.get_bandwidth() != previous_wifi_channel.get_bandwidth()) ||
++            (new_wifi_channel.get_freq_type() != previous_wifi_channel.get_freq_type());
++
++        std::set<std::tuple<uint8_t, uint8_t, int8_t>> new_op_class_profile;
++        if (radio_for_snapshot) {
++            for (const auto &profile : radio_for_snapshot->current_operating_class_profile) {
++                if (profile.op_class != 0) {
++                    new_op_class_profile.emplace(profile.op_class, profile.channel,
++                                                 profile.tx_power);
++                }
++            }
++        }
++
++        entry.channel_changed =
++            wifi_channel_changed || (new_op_class_profile != previous_op_class_profile);
++
++        LOG(DEBUG) << "ruid=" << ruid << " previous_channel="
++                   << int(previous_wifi_channel.get_channel())
++                   << " new_channel=" << int(new_wifi_channel.get_channel())
++                   << " channel_changed=" << entry.channel_changed;
++
++        ocr_entries.push_back(std::move(entry));
+     }
+ 
+     for (const auto &spatial_reuse_report_tlv :
+@@ -4151,8 +4211,20 @@ bool Controller::handle_cmdu_1905_operating_channel_report(const sMacAddr &src_m
+ 
+     // Broadcast OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE to all agents
+     // so they are informed about the channel change of the reporting agent.
++    //
++    // in certification mode, a WFA sniffer observes the LAST OCCN sent for a
++    // multi-radio OCR burst. Unconditionally broadcasting an OCCN for every OCR - even when
++    // the reported radio did not actually change channel/bandwidth/tx_power/operating-classes -
++    // can make the sniffer see a stale/unrelated radio's info instead of the radio that really
++    // changed. Outside certification mode, preserve the original unconditional-broadcast
++    // behavior unchanged.
++    bool any_channel_changed =
++        std::any_of(ocr_entries.begin(), ocr_entries.end(),
++                   [](const sOcrEntry &e) { return e.channel_changed; });
++    bool should_broadcast_occn = !database.setting_certification_mode() || any_channel_changed;
++
+     auto reporting_agent = database.m_agents.get(src_mac);
+-    if (reporting_agent) {
++    if (reporting_agent && should_broadcast_occn) {
+         if (!cmdu_tx.create(0, ieee1905_1::eMessageType::OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE)) {
+             LOG(ERROR) << "Failed to create OPERATING_CHANNEL_CHANGE_NOTIFICATION_MESSAGE for broadcast";
+             return true; // ACK was already sent successfully
+@@ -4177,6 +4249,14 @@ bool Controller::handle_cmdu_1905_operating_channel_report(const sMacAddr &src_m
+                 continue;
+             }
+ 
++            // in certification mode, only include radios whose channel/tx_power/
++            // operating-classes actually changed in this OCR.
++            if (database.setting_certification_mode() && !entry.channel_changed) {
++                LOG(DEBUG) << "ruid=" << entry.radio_uid
++                           << " unchanged, excluding from OCCN broadcast (certification mode)";
++                continue;
++            }
++
+             auto op_chan_tlv = cmdu_tx.addClass<wfa_map::tlvOperatingChannelReport>();
+             if (!op_chan_tlv) {
+                 LOG(ERROR) << "Failed to add tlvOperatingChannelReport to OCCN broadcast";
+@@ -9374,15 +9454,19 @@ bool Controller::handle_cmdu_1905_operating_channel_query(const sMacAddr &src_ma
+             return false;
+         }
+ 
+-        op_chan_tlv->radio_uid()             = radio->radio_uid;
+-        op_chan_tlv->current_transmit_power() = static_cast<uint8_t>(radio->tx_power);
++        op_chan_tlv->radio_uid() = radio->radio_uid;
+ 
+         if (!op_chan_tlv->alloc_operating_classes_list(num_op_classes)) {
+             LOG(ERROR) << "Failed to allocate operating_classes_list";
+             return false;
+         }
+ 
+-        uint8_t oc_idx = 0;
++        // radio->tx_power is a stale scalar that is never populated for
++        // non-beerocks agents. Source the current transmit power from the
++        // operating-class profile entry matching the radio's current
++        // channel instead, which is the data OCR handling keeps up to date.
++        int8_t  current_tx_power = 0;
++        uint8_t oc_idx           = 0;
+         for (int i = 0; i < Agent::operatingClassProfileIndex::OPERATING_CLASS_MAX_BW; i++) {
+             if (radio->current_operating_class_profile[i].op_class == 0) {
+                 continue;
+@@ -9395,10 +9479,19 @@ bool Controller::handle_cmdu_1905_operating_channel_query(const sMacAddr &src_ma
+             auto &op_class_struct           = std::get<1>(op_class_tuple);
+             op_class_struct.operating_class = radio->current_operating_class_profile[i].op_class;
+             op_class_struct.channel_number  = radio->current_operating_class_profile[i].channel;
++
++            if (radio->current_operating_class_profile[i].channel ==
++                radio->wifi_channel.get_channel()) {
++                current_tx_power = radio->current_operating_class_profile[i].tx_power;
++            }
++
+             LOG(DEBUG) << "OCQ: radio " << radio->radio_uid
+                        << " op_class=" << int(op_class_struct.operating_class)
+                        << " channel=" << int(op_class_struct.channel_number);
+         }
++        LOG(DEBUG) << "OCQ: radio " << radio->radio_uid
++                   << " current_tx_power=" << int(current_tx_power);
++        op_chan_tlv->current_transmit_power() = static_cast<uint8_t>(current_tx_power);
+     }
+ 
+     // Send OCCN back to the requesting agent
+-- 
+2.34.1
+
