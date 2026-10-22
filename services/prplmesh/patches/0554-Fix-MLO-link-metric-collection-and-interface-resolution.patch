@@ -1,0 +1,657 @@
+From bcc27762a8c05d05e8f7dd754ad9043ccae9a3f8 Mon Sep 17 00:00:00 2001
+From: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+Date: Tue, 20 Oct 2026 19:29:11 +0530
+Subject: [PATCH] Fix MLO link metric collection and interface resolution
+
+Link metric responses could miss valid wired or wireless neighbors when interface names, MAC addresses, or MLO parent/child relationships differed between AgentDB, the topology database, and the runtime network state.
+
+- Use targeted NL80211 station requests so responses are tied to the requested station instead of relying on station dumps.
+
+- Resolve interface parent links through sysfs and support MLO/VLAN topology mappings.
+
+- Refresh runtime interface MAC addresses before building link metrics.
+
+- Add topology-discovered fallback interfaces and handle missing MLO backhaul STA interfaces using active BSS information.
+
+- Reject invalid or unknown interfaces and avoid classifying uninitialized VAP configuration data.
+
+- Add diagnostics covering candidate interfaces, neighbor matching, collected metrics, and generated response TLVs.
+
+Signed-off-by: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+---
+ .../src/beerocks/slave/helpers/media_type.cpp |  25 +-
+ .../tasks/link_metrics_collection_task.cpp    | 248 ++++++++++++++++--
+ .../beerocks/slave/tasks/topology_task.cpp    |  21 +-
+ .../bcl/include/bcl/network/network_utils.h   |  11 +
+ .../bcl/source/network/network_utils.cpp      |  14 +
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     |  32 ++-
+ .../bwl/shared/nl80211_client_impl.cpp        |  75 +-----
+ 7 files changed, 325 insertions(+), 101 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/helpers/media_type.cpp b/agent/src/beerocks/slave/helpers/media_type.cpp
+index 1d5003e7c..ee3313132 100644
+--- a/agent/src/beerocks/slave/helpers/media_type.cpp
++++ b/agent/src/beerocks/slave/helpers/media_type.cpp
+@@ -42,16 +42,31 @@ bool MediaType::get_media_type(const std::string &interface_name,
+     media_type  = ieee1905_1::eMediaType::UNKNOWN_MEDIA;
+ 
+     if (ieee1905_1::eMediaTypeGroup::IEEE_802_3 == media_type_group) {
+-        uint32_t link_speed;
+-        uint32_t max_speed;
+-        bool is_full_duplex;
++        uint32_t link_speed     = SPEED_UNKNOWN;
++        uint32_t max_speed      = SPEED_UNKNOWN;
++        bool is_full_duplex     = false;
+         if (net::network_utils::linux_iface_get_link_settings(interface_name, link_speed, max_speed,
+                                                               is_full_duplex)) {
+-            if (SPEED_100 == max_speed) {
++            // SPEED_UNKNOWN is defined as -1, while the API exposes speeds as uint32_t.
++            // Check it explicitly before comparing with the regular Ethernet speeds; otherwise
++            // an unknown speed would compare greater than SPEED_1000 and be reported as Gigabit.
++            const auto speed_unknown = static_cast<uint32_t>(SPEED_UNKNOWN);
++
++            // Some Ethernet-like interfaces, such as veth, do not report a maximum advertised
++            // speed. Use the current link speed when it is available instead of classifying a
++            // valid Ethernet interface as UNKNOWN_MEDIA.
++            const uint32_t effective_speed =
++                (max_speed == speed_unknown && link_speed != speed_unknown) ? link_speed
++                                                                              : max_speed;
++
++            if (speed_unknown == effective_speed) {
++                media_type = ieee1905_1::eMediaType::UNKNOWN_MEDIA;
++            } else if (SPEED_100 == effective_speed) {
+                 media_type = ieee1905_1::eMediaType::IEEE_802_3U_FAST_ETHERNET;
+-            } else if (SPEED_1000 <= max_speed) {
++            } else if (SPEED_1000 <= effective_speed) {
+                 media_type = ieee1905_1::eMediaType::IEEE_802_3AB_GIGABIT_ETHERNET;
+             }
++
+         }
+         result = true;
+     } else if (ieee1905_1::eMediaTypeGroup::IEEE_802_11 == media_type_group) {
+diff --git a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+index 467b1fcc5..5e548982e 100644
+--- a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+@@ -63,6 +63,7 @@
+ #include <bwl/nl80211_client_factory.h>
+ 
+ #include <algorithm>
++#include <vector>
+ 
+ namespace {
+ 
+@@ -384,8 +385,6 @@ void LinkMetricsCollectionTask::handle_link_metric_query(ieee1905_1::CmduMessage
+             }
+         }
+     }
+-
+-    LOG(DEBUG) << "Sending LINK_METRIC_RESPONSE_MESSAGE, mid: " << std::hex << mid;
+     m_btl_ctx.send_cmdu_to_controller({}, m_cmdu_tx);
+ }
+ 
+@@ -2293,10 +2292,41 @@ bool LinkMetricsCollectionTask::get_neighbor_links(
+     // received through.
+     auto db = AgentDB::get();
+ 
++    std::vector<std::string> wired_candidate_ifaces;
+     auto add_eth_neighbor = [&](const std::string &iface_name, const sMacAddr &iface_mac) {
++        if (iface_name.empty()) {
++            return true;
++        }
++
++        // The interface may have been created or renamed after AgentDB was initialized. Use the
++        // current kernel MAC for the response, while retaining the supplied MAC for matching the
++        // topology database. This prevents zero/stale local-interface MACs in the TLV.
++        sMacAddr current_iface_mac = iface_mac;
++        std::string runtime_iface_mac;
++        if (net::network_utils::linux_iface_get_mac(iface_name, runtime_iface_mac)) {
++            const auto refreshed_iface_mac = tlvf::mac_from_string(runtime_iface_mac);
++            current_iface_mac = refreshed_iface_mac;
++        }
++
++        if (current_iface_mac != net::network_utils::ZERO_MAC) {
++            if (iface_name == db->ethernet.wan.iface_name) {
++                db->ethernet.wan.mac = current_iface_mac;
++            }
++            for (auto &lan_iface_info : db->ethernet.lan) {
++                if (lan_iface_info.iface_name == iface_name) {
++                    lan_iface_info.mac = current_iface_mac;
++                    break;
++                }
++            }
++        }
++
+         sLinkInterface wired_interface;
+         wired_interface.iface_name = iface_name;
+-        wired_interface.iface_mac  = iface_mac;
++        wired_interface.iface_mac  = current_iface_mac;
++
++        if (wired_interface.iface_mac == net::network_utils::ZERO_MAC) {
++            return true;
++        }
+ 
+         if (!MediaType::get_media_type(wired_interface.iface_name,
+                                        ieee1905_1::eMediaTypeGroup::IEEE_802_3,
+@@ -2305,14 +2335,35 @@ bool LinkMetricsCollectionTask::get_neighbor_links(
+                        << wired_interface.iface_name;
+             return false;
+         }
++        if (wired_interface.media_type == ieee1905_1::eMediaType::UNKNOWN_MEDIA) {
++            return true;
++        }
++
++        if (std::find(wired_candidate_ifaces.begin(), wired_candidate_ifaces.end(), iface_name) ==
++            wired_candidate_ifaces.end()) {
++            wired_candidate_ifaces.push_back(iface_name);
++        }
+ 
+         for (const auto &neighbors_on_local_iface : db->neighbor_devices) {
+-            auto &neighbors = neighbors_on_local_iface.second;
++            const auto &local_topology_iface_mac = neighbors_on_local_iface.first;
++            const auto &neighbors                  = neighbors_on_local_iface.second;
+             for (const auto &neighbor_entry : neighbors) {
+-                if (neighbor_entry.second.receiving_iface_name == iface_name) {
++                // Prefer the interface name, but also match the local interface MAC stored as the
++                // neighbor_devices key. The latter handles transports which report a bridge/port
++                // alias instead of the configured WAN name.
++                const bool receiving_iface_matches =
++                    neighbor_entry.second.receiving_iface_name == iface_name ||
++                    (iface_mac != net::network_utils::ZERO_MAC &&
++                     local_topology_iface_mac == iface_mac) ||
++                    local_topology_iface_mac == wired_interface.iface_mac;
++                if (receiving_iface_matches) {
+                     sLinkNeighbor neighbor;
+                     neighbor.al_mac    = neighbor_entry.first;
+                     neighbor.iface_mac = neighbor_entry.second.transmitting_iface_mac;
++                    if (neighbor.al_mac == net::network_utils::ZERO_MAC ||
++                        neighbor.iface_mac == net::network_utils::ZERO_MAC) {
++                        continue;
++                    }
+                     if ((neighbor_mac_filter == net::network_utils::ZERO_MAC) ||
+                         (neighbor_mac_filter == neighbor.al_mac)) {
+                         neighbor_links_map[wired_interface].insert(neighbor);
+@@ -2323,7 +2374,61 @@ bool LinkMetricsCollectionTask::get_neighbor_links(
+         return true;
+     };
+ 
++    auto is_wireless_iface = [&](const std::string &iface_name) {
++        for (const auto radio : db->get_radios_list()) {
++            if (!radio) {
++                continue;
++            }
++            if (radio->front.iface_name == iface_name || radio->back.iface_name == iface_name) {
++                return true;
++            }
++            for (const auto &bssid : radio->front.bssids) {
++                if (bssid.iface_name == iface_name) {
++                    return true;
++                }
++            }
++        }
++        return false;
++    };
++
++    auto get_parent_iface = [](const std::string &iface_name) {
++        const auto iface_index = net::network_utils::linux_get_iface_index(iface_name);
++        const auto link_index  = net::network_utils::linux_get_iface_link(iface_name);
++
++        if (iface_index == 0 || link_index == 0 || iface_index == link_index) {
++            return std::string {};
++        }
++
++        return net::network_utils::linux_get_iface_name(link_index);
++    };
++
++    auto resolve_wireless_iface = [&](const std::string &iface_name,
++                                      std::string &wireless_iface) {
++        std::string current_iface = iface_name;
++        std::vector<std::string> visited;
++
++        while (!current_iface.empty()) {
++            if (is_wireless_iface(current_iface)) {
++                wireless_iface = current_iface;
++                return true;
++            }
++
++            if (std::find(visited.begin(), visited.end(), current_iface) != visited.end()) {
++                break;
++            }
++            visited.push_back(current_iface);
++
++            current_iface = get_parent_iface(current_iface);
++        }
++
++        return false;
++    };
++
+     auto add_wifi_neighbor = [&](const std::string &iface_name, const sMacAddr &iface_mac) {
++        if (iface_name.empty() || iface_mac == net::network_utils::ZERO_MAC) {
++            return true;
++        }
++
+         sLinkInterface wireless_interface;
+         wireless_interface.iface_name = iface_name;
+         wireless_interface.iface_mac  = iface_mac;
+@@ -2331,22 +2436,52 @@ bool LinkMetricsCollectionTask::get_neighbor_links(
+         if (!MediaType::get_media_type(wireless_interface.iface_name,
+                                        ieee1905_1::eMediaTypeGroup::IEEE_802_11,
+                                        wireless_interface.media_type)) {
+-            LOG(ERROR) << "Unable to compute media type for interface "
+-                       << wireless_interface.iface_name;
+-            return false;
++            /*
++             * MLO backhaul links can use a synthetic link interface (for example,
++             * wlan1_1_link0) which is not stored as the radio's front/back interface
++             * name in AgentDB. The interface MAC is the active BSSID, so use it to
++             * resolve the owning radio and derive the media type from the radio
++             * capabilities.
++             */
++            const auto radio =
++                db->get_radio_by_mac(wireless_interface.iface_mac, AgentDB::eMacType::BSSID);
++            if (!radio) {
++                LOG(ERROR) << "Unable to compute media type for interface "
++                           << wireless_interface.iface_name;
++                return false;
++            }
++
++            wireless_interface.media_type = MediaType::get_802_11_media_type(*radio);
+         }
+ 
+         for (const auto &neighbors_on_local_iface : db->neighbor_devices) {
+-            auto &neighbors = neighbors_on_local_iface.second;
++            const auto &topology_iface_mac = neighbors_on_local_iface.first;
++            const auto &neighbors           = neighbors_on_local_iface.second;
+             for (const auto &neighbor_entry : neighbors) {
+-                if (neighbor_entry.second.receiving_iface_name == iface_name) {
+-                    sLinkNeighbor neighbor;
+-                    neighbor.al_mac    = neighbor_entry.first;
+-                    neighbor.iface_mac = neighbor_entry.second.transmitting_iface_mac;
+-                    if ((neighbor_mac_filter == net::network_utils::ZERO_MAC) ||
+-                        (neighbor_mac_filter == neighbor.al_mac)) {
+-                        neighbor_links_map[wireless_interface].insert(neighbor);
+-                    }
++                std::string resolved_iface;
++                const bool name_matches =
++                    neighbor_entry.second.receiving_iface_name == iface_name;
++                const bool parent_matches =
++                    resolve_wireless_iface(neighbor_entry.second.receiving_iface_name,
++                                           resolved_iface) &&
++                    resolved_iface == iface_name;
++                const bool mac_matches = topology_iface_mac != net::network_utils::ZERO_MAC &&
++                                         topology_iface_mac == iface_mac;
++
++                if (!name_matches && !parent_matches && !mac_matches) {
++                    continue;
++                }
++
++                sLinkNeighbor neighbor;
++                neighbor.al_mac    = neighbor_entry.first;
++                neighbor.iface_mac = neighbor_entry.second.transmitting_iface_mac;
++                if (neighbor.al_mac == net::network_utils::ZERO_MAC ||
++                    neighbor.iface_mac == net::network_utils::ZERO_MAC) {
++                    continue;
++                }
++                if ((neighbor_mac_filter == net::network_utils::ZERO_MAC) ||
++                    (neighbor_mac_filter == neighbor.al_mac)) {
++                    neighbor_links_map[wireless_interface].insert(neighbor);
+                 }
+             }
+         }
+@@ -2382,6 +2517,38 @@ bool LinkMetricsCollectionTask::get_neighbor_links(
+         }
+     }
+ 
++    // If an interface was not present in AgentDB when the platform configuration was read, the
++    // topology database still contains the interface on which a discovery was received. Add it as
++    // a fallback candidate. This is important for co-located controller/Agent veth interfaces
++    // which are often attached to the bridge after the Agent starts.
++    for (const auto &neighbors_on_local_iface : db->neighbor_devices) {
++        const auto &neighbors = neighbors_on_local_iface.second;
++        if (neighbors.empty()) {
++            continue;
++        }
++
++        std::string topology_iface_name;
++        for (const auto &neighbor_entry : neighbors) {
++            if (!neighbor_entry.second.receiving_iface_name.empty()) {
++                topology_iface_name = neighbor_entry.second.receiving_iface_name;
++                break;
++            }
++        }
++        if (topology_iface_name.empty() ||
++            std::find(wired_candidate_ifaces.begin(), wired_candidate_ifaces.end(),
++                      topology_iface_name) != wired_candidate_ifaces.end()) {
++            continue;
++        }
++        std::string resolved_wireless_iface;
++        if (resolve_wireless_iface(topology_iface_name, resolved_wireless_iface)) {
++            continue;
++        }
++
++        if (!add_eth_neighbor(topology_iface_name, neighbors_on_local_iface.first)) {
++            return false;
++        }
++    }
++
+     for (const auto &bh_wifi_info : db->backhaul.backhaul_links) {
+         auto radio = db->radio(bh_wifi_info.iface_name);
+         if (!radio) {
+@@ -2389,11 +2556,54 @@ bool LinkMetricsCollectionTask::get_neighbor_links(
+             continue;
+         }
+         if (radio->back.iface_name.empty()) {
+-            LOG(WARNING) << "Found empty backhaul link name!";
++            /*
++             * In MLO mode AgentDB may not contain a backhaul STA interface.
++             * The topology database still identifies the active local BSSID.
++             * Use that BSSID's runtime interface for link metrics without
++             * modifying the backhaul state.
++             */
++            for (const auto &bssid : radio->front.bssids) {
++                if (bssid.iface_name.empty() ||
++                    bssid.mac == net::network_utils::ZERO_MAC ||
++                    !bssid.backhaul_bss) {
++                    continue;
++                }
++
++                const bool has_topology_neighbor = std::any_of(
++                    db->neighbor_devices.begin(), db->neighbor_devices.end(),
++                    [&](const auto &topology_entry) {
++                        return topology_entry.first == bssid.mac &&
++                               !topology_entry.second.empty();
++                    });
++
++                if (!has_topology_neighbor) {
++                    LOG(ERROR) << "No topology neighbor for MLO backhaul BSSID " << bssid.mac
++                               << ", iface=" << bssid.iface_name;
++                    continue;
++                }
++
++                if (!add_wifi_neighbor(bssid.iface_name, bssid.mac)) {
++                    return false;
++                }
++            }
+             continue;
+         }
+ 
+-        if (!add_wifi_neighbor(radio->back.iface_name, radio->back.iface_mac)) {
++        // The backhaul interface can be created or receive its MAC after AgentDB is initialized.
++        // Refresh it here so a valid wireless/VLAN topology entry is not discarded because the
++        // cached radio MAC is still ZERO_MAC.
++        sMacAddr backhaul_iface_mac = radio->back.iface_mac;
++        std::string runtime_backhaul_mac;
++        if (net::network_utils::linux_iface_get_mac(radio->back.iface_name,
++                                                     runtime_backhaul_mac)) {
++            const auto refreshed_backhaul_mac = tlvf::mac_from_string(runtime_backhaul_mac);
++            if (refreshed_backhaul_mac != backhaul_iface_mac) {
++                radio->back.iface_mac = refreshed_backhaul_mac;
++            }
++            backhaul_iface_mac = refreshed_backhaul_mac;
++        }
++
++        if (!add_wifi_neighbor(radio->back.iface_name, backhaul_iface_mac)) {
+             // Error message inside the lambda function.
+             return false;
+         }
+diff --git a/agent/src/beerocks/slave/tasks/topology_task.cpp b/agent/src/beerocks/slave/tasks/topology_task.cpp
+index 0b34fec1f..d3580fc98 100644
+--- a/agent/src/beerocks/slave/tasks/topology_task.cpp
++++ b/agent/src/beerocks/slave/tasks/topology_task.cpp
+@@ -612,12 +612,20 @@ void TopologyTask::send_topology_discovery()
+ 
+     // Make list of ifaces Macs to send on the message.
+     auto ifaces = network_utils::linux_get_iface_list_from_bridge(db->bridge.iface_name);
++    LOG(DEBUG) << "Preparing topology discovery: bridge=" << db->bridge.iface_name
++               << ", bridge_mac=" << db->bridge.mac << ", member_count=" << ifaces.size();
++    size_t sent_discovery_count = 0;
+     for (const auto &iface_name : ifaces) {
+         if (!network_utils::linux_iface_is_up_and_running(iface_name)) {
++            LOG(DEBUG) << "Skipping topology discovery on interface that is not up: iface="
++                       << iface_name;
+             continue;
+         }
+-        if (network_utils::linux_get_iface_state_from_bridge(db->bridge.iface_name, iface_name) !=
+-            BR_STATE_FORWARDING) {
++        const auto bridge_state =
++            network_utils::linux_get_iface_state_from_bridge(db->bridge.iface_name, iface_name);
++        if (bridge_state != BR_STATE_FORWARDING) {
++            LOG(DEBUG) << "Skipping topology discovery on non-forwarding interface: iface="
++                       << iface_name << ", bridge_state=" << bridge_state;
+             continue;
+         }
+         std::string iface_mac_str;
+@@ -649,9 +657,16 @@ void TopologyTask::send_topology_discovery()
+         tlvMacAddress->mac() = iface_mac;
+ 
+         LOG(DEBUG) << "send_1905_topology_discovery_message, bridge_mac=" << db->bridge.mac
+-                   << ", iface=" << iface_name;
++                   << ", iface=" << iface_name << ", iface_mac=" << iface_mac;
+         m_btl_ctx.send_cmdu_to_broker(m_cmdu_tx, network_utils::MULTICAST_1905_MAC_ADDR,
+                                       db->bridge.mac, iface_name);
++        ++sent_discovery_count;
++    }
++
++    if (sent_discovery_count == 0) {
++        LOG(WARNING) << "Topology discovery was not sent on any forwarding bridge interface:"
++                     << " bridge=" << db->bridge.iface_name
++                     << ", member_count=" << ifaces.size();
+     }
+ }
+ 
+diff --git a/common/beerocks/bcl/include/bcl/network/network_utils.h b/common/beerocks/bcl/include/bcl/network/network_utils.h
+index a02051b03..73f9e91f4 100644
+--- a/common/beerocks/bcl/include/bcl/network/network_utils.h
++++ b/common/beerocks/bcl/include/bcl/network/network_utils.h
+@@ -163,6 +163,17 @@ public:
+      */
+     static uint32_t linux_get_iface_index(const std::string &iface_name);
+ 
++    /**
++     * @brief Gets the lower/linked interface index from sysfs iflink.
++     *
++     * For a VLAN interface this is the index of the parent interface. For a
++     * physical interface, iflink is normally equal to ifindex.
++     *
++     * @param iface_name The name of the network interface.
++     * @return linked interface index or 0 if it cannot be read.
++     */
++    static uint32_t linux_get_iface_link(const std::string &iface_name);
++
+     /**
+      * @brief Gets the interface name corresponding to a particular index.
+      *
+diff --git a/common/beerocks/bcl/source/network/network_utils.cpp b/common/beerocks/bcl/source/network/network_utils.cpp
+index 8c2e7b01f..eafaf3444 100644
+--- a/common/beerocks/bcl/source/network/network_utils.cpp
++++ b/common/beerocks/bcl/source/network/network_utils.cpp
+@@ -612,6 +612,20 @@ uint32_t network_utils::linux_get_iface_index(const std::string &iface_name)
+     return iface_index;
+ }
+ 
++uint32_t network_utils::linux_get_iface_link(const std::string &iface_name)
++{
++    std::ifstream iflink_file("/sys/class/net/" + iface_name + "/iflink");
++
++    uint32_t iflink = 0;
++    iflink_file >> iflink;
++
++    if (!iflink_file || iflink == 0) {
++        return 0;
++    }
++
++    return iflink;
++}
++
+ std::string network_utils::linux_get_iface_name(uint32_t iface_index)
+ {
+     char iface_name[IF_NAMESIZE] = {0};
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index cfbd96d73..46d3390bc 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -1633,15 +1633,22 @@ bool base_wlan_hal_nl80211::refresh_vaps_info(int id)
+         // When hostapd STATUS returns bss[N]=wlan1 (MLD parent name) instead of
+         // wlan1_link0 (link interface name), the wpa_ctrl socket for "wlan1" may
+         // not be registered. Fall back to the _link0 variant in that case.
+-        NetworkConfiguration network_configuration;
+-        if (!get_config(network_configuration, vap_element.bss)) {
+-            std::string link0_bss = vap_element.bss + "_link0";
+-            if (!get_config(network_configuration, link0_bss)) {
+-                LOG(ERROR) << "Failed to get network configuration for iface: " << vap_element.bss
+-                           << " (also tried " << link0_bss << ")";
++        NetworkConfiguration network_configuration{};
++        bool network_config_valid = get_config(network_configuration, vap_element.bss);
++
++        if (!network_config_valid) {
++            std::string base_bss;
++            extractLinkBaseInterface(vap_element.bss, base_bss);
++
++            // Only append _link0 to an MLD/parent interface.
++            // Do not generate wlan1_1_link0_link0.
++            if (base_bss == vap_element.bss) {
++                const std::string link0_bss = vap_element.bss + "_link0";
++                network_config_valid = get_config(network_configuration, link0_bss);
+             }
+         }
+-        {
++
++        if (network_config_valid) {
+             switch (network_configuration.multi_ap) {
+             case beerocks::eBssType::BSS_TYPE_BACKHAUL:
+                 vap_element.fronthaul = false;
+@@ -1662,6 +1669,10 @@ bool base_wlan_hal_nl80211::refresh_vaps_info(int id)
+                 vap_element.backhaul  = false;
+                 break;
+             }
++        } else {
++            // Do not classify from an invalid or uninitialized multi_ap value.
++            vap_element.fronthaul = false;
++            vap_element.backhaul  = false;
+         }
+ 
+         // Read vap_type from UCI custom_alias
+@@ -1687,6 +1698,13 @@ bool base_wlan_hal_nl80211::refresh_vaps_info(int id)
+                            << "), defaulting to OTHER";
+             }
+         }
++
++        // GET_CONFIG may be unavailable for an MLO link interface. Use the existing
++        // UCI classification only for the affected backhaul VAP in that case.
++        if (!network_config_valid && vap_element.vap_type == eVapType::BACKHAUL) {
++            vap_element.fronthaul = false;
++            vap_element.backhaul  = true;
++        }
+         // If reached here, assume that the BSS information is already exist on the container,
+         // therefore there is no need to update the information except the BSS mac that is not
+         // preset.
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.cpp b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+index 76094b9f8..b6fa254e5 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -1402,24 +1402,13 @@ bool nl80211_client_impl::get_sta_info(const std::string &interface_name,
+         return false;
+     }
+ 
+-    /* NLM_F_DUMP makes the kernel return *every* station on the netdev:
+-     * nl80211_dump_station() keys only off NL80211_ATTR_IFINDEX and the dump
+-     * cursor, so the NL80211_ATTR_MAC put below is NOT a request-side filter.
+-     * The response handler is therefore invoked once per associated station and
+-     * must discard the entries belonging to other stations itself — otherwise
+-     * the last station in the dump overwrites sta_info and every caller gets
+-     * that one station's stats no matter which MAC it asked for (symptom: all
+-     * associated MLDs reporting identical per-link RCPI and byte counters). */
++    /* Use a targeted GET_STATION request. The requested MAC identifies the station,
++     * while MLO-specific statistics are selected below from NL80211_ATTR_MLO_LINKS
++     * using the link ID encoded in interface_name. */
+     bool sta_found = false;
+-    /* DEBUG: number of station entries the dump actually returned, so a
+-     * "not found" can be attributed to an empty dump (no station associated on
+-     * this netdev at all - e.g. the BSSID was mapped to the wrong base
+-     * interface) rather than to a key mismatch against entries that are
+-     * present. */
+-    int dump_entries = 0;
+ 
+     const bool msg_ok = m_socket.get()->send_receive_msg(
+-        NL80211_CMD_GET_STATION, NLM_F_DUMP,
++        NL80211_CMD_GET_STATION, 0,
+         [&](struct nl_msg *msg) -> bool {
+             nla_put_u32(msg, NL80211_ATTR_IFINDEX, iface_index);
+             nla_put(msg, NL80211_ATTR_MAC, ETH_ALEN, sta_mac_address.oct);
+@@ -1437,52 +1426,14 @@ bool nl80211_client_impl::get_sta_info(const std::string &interface_name,
+                 return;
+             }
+ 
+-            /* Keep only the dump entry for the station that was asked for (see
+-             * the NLM_F_DUMP comment above). */
++            /* Validate the returned station identity defensively. */
+             if (!tb[NL80211_ATTR_MAC] || nla_len(tb[NL80211_ATTR_MAC]) < ETH_ALEN) {
+-                LOG(DEBUG) << "NL80211_ATTR_MAC attribute is missing, skipping dump entry";
+                 return;
+             }
+-            sMacAddr dump_sta_mac;
++            sMacAddr response_sta_mac;
+             tlvf::mac_from_array(static_cast<const uint8_t *>(nla_data(tb[NL80211_ATTR_MAC])),
+-                                 dump_sta_mac);
+-            ++dump_entries;
+-            if (dump_sta_mac != sta_mac_address) {
+-                /* DEBUG: report what the station dump actually contains. A 100%
+-                 * miss rate on affiliated-link MACs means the driver keys its
+-                 * station table by MLD MAC only, in which case the per-link
+-                 * data (if any) lives in this entry's NL80211_ATTR_MLO_LINKS.
+-                 * Logging the nested link IDs distinguishes "wrong lookup key,
+-                 * per-link data is present" from "driver exposes no per-link
+-                 * breakdown at all". */
+-                std::string mlo_dbg = "mlo_links=absent";
+-                if (tb[NL80211_ATTR_MLO_LINKS]) {
+-                    mlo_dbg              = "mlo_links=[";
+-                    struct nlattr *attrs = nullptr;
+-                    struct nlattr *link[NL80211_ATTR_MAX + 1];
+-                    int ret              = 0;
+-                    bool first           = true;
+-                    nla_for_each_nested(attrs, tb[NL80211_ATTR_MLO_LINKS], ret) {
+-                        if (nla_parse_nested(link, NL80211_ATTR_MAX, attrs, NULL)) {
+-                            continue;
+-                        }
+-                        if (!link[NL80211_ATTR_MLO_LINK_ID]) {
+-                            continue;
+-                        }
+-                        if (!first) {
+-                            mlo_dbg += ",";
+-                        }
+-                        first = false;
+-                        mlo_dbg +=
+-                            "id" + std::to_string(nla_get_u8(link[NL80211_ATTR_MLO_LINK_ID]));
+-                        mlo_dbg += link[NL80211_ATTR_STA_INFO] ? "(sta_info)" : "(no_sta_info)";
+-                    }
+-                    mlo_dbg += "]";
+-                }
+-                LOG(DEBUG) << "STA dump entry on '" << interface_name << "' (base_interface: "
+-                           << base_interface << "): entry_mac=" << dump_sta_mac
+-                           << " requested=" << sta_mac_address << " MISMATCH, " << mlo_dbg
+-                           << " flat_sta_info=" << (tb[NL80211_ATTR_STA_INFO] ? "yes" : "no");
++                                 response_sta_mac);
++            if (response_sta_mac != sta_mac_address) {
+                 return;
+             }
+             sta_found = true;
+@@ -1686,16 +1637,6 @@ bool nl80211_client_impl::get_sta_info(const std::string &interface_name,
+             }
+         });
+ 
+-    /* A successful netlink transaction that did not contain the requested
+-     * station is a failure for the caller: reporting success here would hand
+-     * back an all-zero (or stale-looking) sta_info that callers cannot
+-     * distinguish from a real reading. */
+-    if (msg_ok && !sta_found) {
+-        LOG(DEBUG) << "STA " << sta_mac_address << " not found in station dump of interface '"
+-                   << interface_name << "' (base_interface: " << base_interface
+-                   << "), dump_entries=" << dump_entries;
+-    }
+-
+     return msg_ok && sta_found;
+ }
+ 
+-- 
+2.34.1
+
