@@ -1,0 +1,210 @@
+From bcefc1275cf43e7c240291d7c7d78f0c81f690a1 Mon Sep 17 00:00:00 2001
+From: Nirmal Raj S <nirm@qti.qualcomm.com>
+Date: Thu, 22 Oct 2026 16:51:56 +0530
+Subject: [PATCH] Add timeout-based radio reset for missing channel information
+
+Signed-off-by: Nirmal Raj S <nirm@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/son_slave_thread.cpp | 31 +++++++++++++
+ agent/src/beerocks/slave/son_slave_thread.h   | 10 +++++
+ .../slave/tasks/ap_autoconfiguration_task.cpp | 43 +++++++++++++++++--
+ .../slave/tasks/ap_autoconfiguration_task.h   |  6 +++
+ 4 files changed, 86 insertions(+), 4 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 85cd4b496..cfe8d4187 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -1150,6 +1150,14 @@ void slave_thread::handle_client_disconnected(int fd)
+             found_fd = true;
+         }
+         if (found_fd) {
++            if (m_radio_restarts_in_progress.erase(fronthaul_iface) > 0) {
++                radio_manager.fronthaul_started = false;
++                m_restarting_fronthaul_ifaces.insert(fronthaul_iface);
++                LOG(INFO) << "Fronthaul restart requested for " << fronthaul_iface
++                          << " - suppressing global agent reset";
++                return true;
++            }
++
+             auto db = AgentDB::get();
+             // During DPP BSS credential application, hostapd reloads which causes
+             // the ap_manager to disconnect and reconnect. Suppressing agent_reset()
+@@ -7272,6 +7280,29 @@ bool slave_thread::agent_fsm()
+     return true;
+ }
+ 
++void slave_thread::restart_fronthaul(const std::string &fronthaul_iface)
++{
++    auto radio_it = m_radio_managers.get().find(fronthaul_iface);
++    if (radio_it == m_radio_managers.get().end()) {
++        const auto &zwdfs_radio = m_radio_managers.get_zwdfs();
++        if (!zwdfs_radio || zwdfs_radio->first != fronthaul_iface) {
++            LOG(WARNING) << "Cannot restart unknown fronthaul " << fronthaul_iface;
++            return;
++        }
++        m_radio_restarts_in_progress.insert(fronthaul_iface);
++        m_restarting_fronthaul_ifaces.insert(fronthaul_iface);
++        fronthaul_stop(fronthaul_iface);
++        fronthaul_start(fronthaul_iface);
++        return;
++    }
++
++    m_radio_restarts_in_progress.insert(fronthaul_iface);
++    m_restarting_fronthaul_ifaces.insert(fronthaul_iface);
++    radio_it->second.fronthaul_started = false;
++    fronthaul_stop(fronthaul_iface);
++    fronthaul_start(fronthaul_iface);
++}
++
+ void slave_thread::fronthaul_stop(const std::string &fronthaul_iface)
+ {
+     LOG(INFO) << "fronthaul stop " << fronthaul_iface;
+diff --git a/agent/src/beerocks/slave/son_slave_thread.h b/agent/src/beerocks/slave/son_slave_thread.h
+index 5c58246b9..7d7158531 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.h
++++ b/agent/src/beerocks/slave/son_slave_thread.h
+@@ -257,6 +257,13 @@ public:
+     bool send_cmdu_to_controller(const std::string &fronthaul_iface,
+                                  ieee1905_1::CmduMessageTx &cmdu_tx);
+ 
++    /**
++     * @brief Restart one fronthaul without resetting the complete agent.
++     *
++     * @param fronthaul_iface Front radio interface to restart.
++     */
++    void restart_fronthaul(const std::string &fronthaul_iface);
++
+     /**
+      * @brief Sends CMDU to transport for dispatching.
+      *
+@@ -433,6 +440,9 @@ private:
+      */
+     std::set<std::string> m_restarting_fronthaul_ifaces;
+ 
++    // Radios whose expected socket disconnects must not trigger global agent_reset().
++    std::set<std::string> m_radio_restarts_in_progress;
++
+     /**
+      * @brief Physical L2 backhaul connection state as reported by the Backhaul Manager.
+      */
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index da3f13625..06220d0ec 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -345,6 +345,7 @@ template <typename BssConfig> static inline std::string dump_bssconfig_compact(c
+ } // namespace
+ 
+ static constexpr uint8_t AUTOCONFIG_DISCOVERY_TIMEOUT_SECONDS = 3;
++static constexpr uint8_t CHANNEL_INFO_WAIT_TIMEOUT_SECONDS    = 10;
+ static constexpr uint8_t kMaxSequentialM2Retries              = 20;
+ 
+ // Minimum spacing between two DPP BSS-configuration sends to ap_manager, so that
+@@ -420,6 +421,30 @@ void ApAutoConfigurationTask::start_next_sequential_radio()
+     m_sequential_active_radio.clear();
+ }
+ 
++bool ApAutoConfigurationTask::wait_for_valid_channel(const std::string &radio_iface,
++                                                       sConfigurationParams &conf_params,
++                                                       const char *phase)
++{
++    const auto now = std::chrono::steady_clock::now();
++    if (conf_params.channel_wait_armed == false) {
++        conf_params.channel_wait_deadline =
++            now + std::chrono::seconds(CHANNEL_INFO_WAIT_TIMEOUT_SECONDS);
++        conf_params.channel_wait_armed = true;
++        LOG(DEBUG) << "Waiting for valid channel information before " << phase << " on "
++                   << radio_iface;
++        return false;
++    }
++    if (now >= conf_params.channel_wait_deadline &&
++        conf_params.channel_wait_reset_requested == false) {
++        conf_params.channel_wait_reset_requested = true;
++        LOG(WARNING) << "No valid channel information for " << CHANNEL_INFO_WAIT_TIMEOUT_SECONDS
++                     << " seconds on " << radio_iface << " during " << phase
++                     << "; restarting fronthaul";
++        m_btl_ctx.restart_fronthaul(radio_iface);
++    }
++    return false;
++}
++
+ void ApAutoConfigurationTask::work()
+ {
+     if (!m_task_is_active) {
+@@ -455,10 +480,11 @@ void ApAutoConfigurationTask::work()
+             // Keep the radio in this state; work() will retry once the channel metadata
+             // has been populated.
+             if (radio->wifi_channel.is_empty()) {
+-                LOG(DEBUG) << "Waiting for valid channel information before AP"
+-                           << " autoconfiguration discovery on " << radio_iface;
++                wait_for_valid_channel(radio_iface, conf_params, "AP autoconfiguration discovery");
+                 break;
+             }
++            conf_params.channel_wait_armed = false;
++            conf_params.channel_wait_reset_requested = false;
+ 
+             // If another radio with same band already finished the discovery phase, we can skip
+             // directly to next phase (AP_CONFIGURATION).
+@@ -580,10 +606,11 @@ void ApAutoConfigurationTask::work()
+             // WSC M1 contains the radio band.  Holding here prevents an invalid M1
+             // from being built while AP-manager/HAL channel information is pending.
+             if (radio->wifi_channel.is_empty()) {
+-                LOG(DEBUG) << "Waiting for valid channel information before sending WSC M1 on "
+-                           << radio_iface;
++                wait_for_valid_channel(radio_iface, conf_params, "sending WSC M1");
+                 break;
+             }
++            conf_params.channel_wait_armed = false;
++            conf_params.channel_wait_reset_requested = false;
+ 
+             // If TS is active but the initial VLAN interface has not yet been created,
+             // hold M1 here. The early AP capability report must reach the controller
+@@ -778,6 +805,10 @@ void ApAutoConfigurationTask::handle_event(uint8_t event_enum_value, const void
+         }
+         m_sequential_radio_order.clear();
+         m_sequential_active_radio.clear();
++        for (auto &radio_conf : m_radios_conf_params) {
++            radio_conf.second.channel_wait_armed = false;
++            radio_conf.second.channel_wait_reset_requested = false;
++        }
+         m_task_is_active = false;
+         break;
+     }
+@@ -850,6 +881,10 @@ void ApAutoConfigurationTask::handle_event(uint8_t event_enum_value, const void
+             //change early capability report sent to false so that it is sent again
+             db->controller_info.early_ap_capability_report_sent = false;
+ 
++            auto &channel_wait = m_radios_conf_params[radio->front.iface_name];
++            channel_wait.channel_wait_armed = false;
++            channel_wait.channel_wait_reset_requested = false;
++
+             LOG(DEBUG) << "starting discovery sequence on radio_iface=" << radio->front.iface_name;
+             requested_radios.push_back(radio->front.iface_name);
+             if (db->device_conf.sequential_ap_autoconfig) {
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+index a976e9e81..880801f29 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+@@ -122,6 +122,9 @@ private:
+     struct sConfigurationParams {
+         eState state = eState::UNCONFIGURED;
+         std::chrono::steady_clock::time_point timeout;
++        std::chrono::steady_clock::time_point channel_wait_deadline{};
++        bool channel_wait_armed          = false;
++        bool channel_wait_reset_requested = false;
+         uint8_t m2_timeout_retry_count = 0;
+         std::unique_ptr<mapf::encryption::diffie_hellman> dh = nullptr;
+         //copy of M1 message used for authentication
+@@ -604,6 +607,9 @@ private:
+      */
+     void drain_pending_bss_config_send();
+ 
++    bool wait_for_valid_channel(const std::string &radio_iface,
++                                sConfigurationParams &conf_params, const char *phase);
++
+     bool send_ap_mld_configuration_response_message();
+ 
+     bool send_ap_autoconfiguration_search_message(const std::string &radio_iface);
+-- 
+2.34.1
+
