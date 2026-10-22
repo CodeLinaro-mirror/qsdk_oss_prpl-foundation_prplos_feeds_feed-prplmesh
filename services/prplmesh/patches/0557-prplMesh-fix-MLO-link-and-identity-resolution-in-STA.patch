@@ -1,0 +1,249 @@
+From 4e74aba82c1ad044cd6440194035b3fc18e4f776 Mon Sep 17 00:00:00 2001
+From: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+Date: Tue, 20 Oct 2026 16:31:03 +0530
+Subject: [PATCH] prplMesh: fix MLO link and identity resolution in STA
+ association lookup
+
+MLO clients are keyed by STA MLD MAC, with per-link entries stored across
+radios. Exact-MAC lookup and first-radio selection could misidentify
+affiliated-link requests, omit ACL Error Code TLVs, or select the wrong BTM
+radio.
+
+Resolve affiliated MACs to the MLD, select the requested link deterministically,
+retain the map key for steering, and add diagnostic logging. Preserve SLO
+behavior.
+
+Signed-off-by: Gnanaprakash Elumalai <gelumala@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/agent_db.cpp         | 145 +++++++++++++-----
+ agent/src/beerocks/slave/agent_db.h           |   5 +
+ agent/src/beerocks/slave/son_slave_thread.cpp |  25 ++-
+ 3 files changed, 132 insertions(+), 43 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/agent_db.cpp b/agent/src/beerocks/slave/agent_db.cpp
+index c8bb0ddc9..47b0842da 100644
+--- a/agent/src/beerocks/slave/agent_db.cpp
++++ b/agent/src/beerocks/slave/agent_db.cpp
+@@ -357,50 +357,119 @@ AgentDB::StaAssociationInfo AgentDB::get_sta_association_details(const sMacAddr&
+ {
+     StaAssociationInfo info;
+ 
+-    bool is_wildcard = (tlv_bssid == sMacAddr({0xff, 0xff, 0xff, 0xff, 0xff, 0xff}));
++    const sMacAddr wildcard_mac = sMacAddr({0xff, 0xff, 0xff, 0xff, 0xff, 0xff});
++
++    bool is_wildcard = (tlv_bssid == wildcard_mac);
++
++    // A request may name a per-link (affiliated) STA MAC rather than the STA MLD MAC.
++    // associated_clients is keyed by the MLD MAC only, so such a request misses the scan
++    // below entirely and the STA is reported as not associated anywhere on this agent.
++    // Resolve it here. The matching associated_sta_mlds entry already records the exact
++    // link bssid that affiliated MAC belongs to, so select that link directly instead of
++    // re-deriving one from tlv_bssid: the named identity determines the link, and it is
++    // precisely the mismatch between that link and tlv_bssid that callers need to see.
++    // Skipped when sta_mac already names an association in its own right. Either it keys an
++    // associated_sta_mlds entry - an MLD MAC may coincide with one of its own affiliated link
++    // MACs, and must keep resolving through tlv_bssid - or it keys an associated_clients entry
++    // directly, in which case that association is the subject of the query and an affiliated
++    // record naming the same MAC elsewhere must not divert the answer onto another client.
++    sMacAddr lookup_mac      = sta_mac;
++    sMacAddr preferred_bssid = tlv_bssid;
++
++    const bool sta_mac_is_mld_key = associated_sta_mlds.find(sta_mac) != associated_sta_mlds.end();
++    const bool sta_mac_is_client_key =
++        get_radio_by_mac(sta_mac, eMacType::CLIENT) != nullptr;
++
++    if (!sta_mac_is_mld_key && !sta_mac_is_client_key) {
++        for (const auto &mld_entry : associated_sta_mlds) {
++            const auto &affiliated_stas = mld_entry.second.affiliated_stas;
++            auto affiliated_it =
++                std::find_if(affiliated_stas.begin(), affiliated_stas.end(),
++                             [&sta_mac](const auto &affiliated) {
++                                 return affiliated.affiliated_sta_mac == sta_mac;
++                             });
++            if (affiliated_it == affiliated_stas.end()) {
++                continue;
++            }
++
++            lookup_mac      = mld_entry.first;
++            preferred_bssid = affiliated_it->bssid;
++            LOG(DEBUG) << "STA " << sta_mac << " is an affiliated link MAC of STA MLD "
++                       << lookup_mac << " on link " << preferred_bssid;
++            break;
++        }
++    }
++
++    // An MLO STA is registered in EVERY radio that holds one of its links, and in all of
++    // them under the same STA MLD MAC key: the client-connected handler stores the
++    // association in radio->associated_clients[sta_mld_mac] for the radio owning the link
++    // being notified, so a 2-link MLD produces two entries that differ only in their
++    // per-link bssid/link_mac. Taking whichever radio happens to come first in m_radios
++    // would therefore make associated_link_mac - and with it every downstream comparison
++    // against tlv_bssid - depend on radio enumeration order instead of on the link the
++    // controller actually named. Resolve the requested link explicitly, and keep the
++    // first match only as the fallback for when no link matches (wildcard request, or a
++    // request naming a partner BSSID this STA does not hold a link on).
++    const sRadio::sClient *matched_client = nullptr;
+ 
+-    // Search across ALL radios to find where the STA is actually associated
+     for (const auto &radio : m_radios) {
+-        auto client_it = radio.associated_clients.find(sta_mac);
+-        if (client_it != radio.associated_clients.end()) {
+-            // Found the STA - it's associated
+-            info.is_associated = true;
+-            info.actual_associated_bssid = client_it->second.bssid;
+-            info.associated_link_mac = client_it->second.link_mac;
+-
+-            // Determine if this is an MLD association based on the STA's own MLO capability,
+-            // NOT the AP's apmld_mac.  On an MLO AP every BSSID has a non-zero apmld_mac,
+-            // so using get_ap_mld_mac_for_bssid() would incorrectly mark legacy SLO clients
+-            // (e.g. non-11be STAs) as MLO.  sClient.is_mlo is set from notification_in->is_mlo()
+-            // which reflects the HAL's APMLDMacAddress field for the STA itself.
+-            info.is_mld_client_association = client_it->second.is_mlo;
+-
+-            if (info.is_mld_client_association) {
++        auto client_it = radio.associated_clients.find(lookup_mac);
++        if (client_it == radio.associated_clients.end()) {
++            continue;
++        }
++
++        // bssid and link_mac are both the link-specific BSSID; they diverge only on the
++        // affiliated-STA fallback path of the client-connected handler, so match either.
++        const bool is_requested_link = (preferred_bssid != wildcard_mac) &&
++                                       (client_it->second.bssid == preferred_bssid ||
++                                        client_it->second.link_mac == preferred_bssid);
++
++        if (matched_client == nullptr || is_requested_link) {
++            matched_client = &client_it->second;
++        }
++
++        if (is_requested_link) {
++            break; // Found the link the request names, no need to keep searching
++        }
++    }
++
++    if (matched_client) {
++        // Found the STA - it's associated
++        info.is_associated = true;
++        info.actual_associated_bssid = matched_client->bssid;
++        info.associated_link_mac = matched_client->link_mac;
++        info.associated_clients_key = lookup_mac;
++
++        // Determine if this is an MLD association based on the STA's own MLO capability,
++        // NOT the AP's apmld_mac.  On an MLO AP every BSSID has a non-zero apmld_mac,
++        // so using get_ap_mld_mac_for_bssid() would incorrectly mark legacy SLO clients
++        // (e.g. non-11be STAs) as MLO.  sClient.is_mlo is set from notification_in->is_mlo()
++        // which reflects the HAL's APMLDMacAddress field for the STA itself.
++        info.is_mld_client_association = matched_client->is_mlo;
++
++        if (info.is_mld_client_association) {
++            if (is_wildcard) {
++                // Wildcard case - consider it as a valid partner for MLO
++                info.is_requested_bssid_mld_partner = true;
++            } else {
+                 // Check if tlv_bssid is a partner of the actual associated BSSID.
+                 // Both BSSIDs must belong to the same AP MLD (same non-zero apmld_mac).
+-                if (!is_wildcard) {
+-                    sMacAddr actual_ap_mld_mac = get_ap_mld_mac_for_bssid(info.actual_associated_bssid);
+-                    sMacAddr tlv_ap_mld_mac    = get_ap_mld_mac_for_bssid(tlv_bssid);
+-                    info.is_requested_bssid_mld_partner = (tlv_ap_mld_mac == actual_ap_mld_mac) &&
+-                        (tlv_ap_mld_mac != net::network_utils::ZERO_MAC);
+-                } else {
+-                    // Wildcard case - consider it as a valid partner for MLO
+-                    info.is_requested_bssid_mld_partner = true;
+-                }
+-            } else {
+-                // Non-MLD case: check if tlv_bssid matches actual_associated_bssid (or is wildcard)
+-                info.is_requested_bssid_mld_partner = is_wildcard || (tlv_bssid == info.actual_associated_bssid);
++                sMacAddr actual_ap_mld_mac = get_ap_mld_mac_for_bssid(info.actual_associated_bssid);
++                sMacAddr tlv_ap_mld_mac    = get_ap_mld_mac_for_bssid(tlv_bssid);
++                info.is_requested_bssid_mld_partner = (tlv_ap_mld_mac == actual_ap_mld_mac) &&
++                    (tlv_ap_mld_mac != net::network_utils::ZERO_MAC);
+             }
+-
+-            LOG(DEBUG) << "STA association check: sta=" << sta_mac
+-                << ", requested_bssid=" << tlv_bssid
+-                << ", actual_bssid=" << info.actual_associated_bssid
+-                << ", associated_link_mac=" << info.associated_link_mac
+-                << ", is_mld=" << info.is_mld_client_association
+-                << ", is_partner=" << info.is_requested_bssid_mld_partner;
+-
+-            break; // Found the STA, no need to continue searching
++        } else {
++            // Non-MLD case: check if tlv_bssid matches actual_associated_bssid (or is wildcard)
++            info.is_requested_bssid_mld_partner = is_wildcard || (tlv_bssid == info.actual_associated_bssid);
+         }
++
++        LOG(DEBUG) << "STA association check: sta=" << sta_mac
++            << ", requested_bssid=" << tlv_bssid
++            << ", actual_bssid=" << info.actual_associated_bssid
++            << ", associated_link_mac=" << info.associated_link_mac
++            << ", is_mld=" << info.is_mld_client_association
++            << ", is_partner=" << info.is_requested_bssid_mld_partner;
+     }
+ 
+     if (!info.is_associated) {
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index da6a3fbbc..787ea9be1 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -1067,6 +1067,11 @@ public:
+         sMacAddr associated_link_mac = net::network_utils::ZERO_MAC;  // Link MAC (BSSID) where STA is associated
+         bool is_mld_client_association = false;
+         bool is_requested_bssid_mld_partner = false;
++        // Key the association was found under in sRadio::associated_clients. Equal to the
++        // queried MAC, except when the query named a per-link affiliated STA MAC, where it
++        // is the STA MLD MAC that map is actually keyed by. Callers that go back to
++        // associated_clients (or get_radio_by_mac with eMacType::CLIENT) must use this.
++        sMacAddr associated_clients_key = net::network_utils::ZERO_MAC;
+     };
+ 
+     /**
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index d3aea3ee6..4eb40bbd5 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -7795,6 +7795,15 @@ bool slave_thread::handle_client_association_request(ieee1905_1::CmduMessageRx &
+                                << sta_info.associated_link_mac << " on radio " << ack_radio_iface
+                                << " (requested BSSID: " << bssid << ")";
+                 }
++            } else {
++                // Mirrors the BTM path's rejection log: without this, a missing Error Code
++                // TLV is indistinguishable from the TLV having been dropped on the wire.
++                LOG(DEBUG) << "AssocCtrl - no Error Code TLV for STA " << sta_mac
++                           << ": is_associated=" << sta_info.is_associated
++                           << ", associated_link_mac=" << sta_info.associated_link_mac
++                           << " (requested BSSID: " << bssid
++                           << "), is_mld=" << sta_info.is_mld_client_association
++                           << ", is_partner=" << sta_info.is_requested_bssid_mld_partner;
+             }
+         }
+         if (error_count > 0) {
+@@ -7940,14 +7949,20 @@ bool slave_thread::handle_client_steering_request(ieee1905_1::CmduMessageRx &cmd
+         LOG(DEBUG) << "BTM Steering: Validation passed for STA " << sta_mac
+                    << ", forwarding request to driver";
+ 
+-        // Find the radio where the STA is actually associated (MLD-safe)
+-        auto sta_radio = db->get_radio_by_mac(sta_mac, AgentDB::eMacType::CLIENT);
++        // Resolve the radio holding the link the STA is actually associated on. Going via
++        // eMacType::CLIENT would be ambiguous: associated_clients is keyed by the STA MLD MAC,
++        // so a multi-link STA matches in every radio holding one of its links and whichever
++        // comes first in m_radios wins - the same enumeration-order dependence the lookup
++        // above was made deterministic to remove, and supports_11v below is recorded per
++        // link. associated_link_mac is a BSSID, so it is unique to exactly one radio.
++        auto sta_radio =
++            db->get_radio_by_mac(sta_info.associated_link_mac, AgentDB::eMacType::BSSID);
+         if (!sta_radio) {
+-            LOG(ERROR) << "BTM Steering: STA " << sta_mac
+-                       << " not found in any radio's associated_clients";
++            LOG(ERROR) << "BTM Steering: STA " << sta_mac << " - no radio owns associated link "
++                       << sta_info.associated_link_mac;
+             return false;
+         }
+-        auto associated_sta = sta_radio->associated_clients.find(sta_mac);
++        auto associated_sta = sta_radio->associated_clients.find(sta_info.associated_clients_key);
+ 
+         /* Skip BTM steering if:
+          * 1. The STA is explicitly listed in the BTM steering disallowed set.
+-- 
+2.34.1
+
