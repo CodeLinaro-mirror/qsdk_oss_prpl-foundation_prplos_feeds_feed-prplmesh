@@ -1,0 +1,109 @@
+From 6fbcdb2435f89e962a2cffddf856788683b0f29c Mon Sep 17 00:00:00 2001
+From: Sudharsan Eswaran <eswaran@qti.qualcomm.com>
+Date: Sun, 18 Oct 2026 11:39:43 +0530
+Subject: [PATCH] certification issue cloning and ucc time out fix
+
+assign propre MLD index
+open proper control interface for new iface
+
+Signed-off-by: Sudharsan Eswaran <eswaran@qti.qualcomm.com>
+---
+ .../slave/tasks/ap_autoconfiguration_task.cpp    | 12 +++++++-----
+ .../beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp |  8 ++++++++
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp        | 16 ++++++++++++++++
+ .../beerocks/bwl/nl80211/base_wlan_hal_nl80211.h |  9 +++++++++
+ 4 files changed, 40 insertions(+), 5 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index 2472eac71..303e64d55 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -7641,12 +7641,14 @@ bool ApAutoConfigurationTask::populate_mld_id_in_bss_infos(const std::string &ra
+             eRadioType radio_type = determine_radio_type(freq_type, is_multi_link);
+             eVapType vap_type = bss_info.m2_config.vap_type;
+ 
+-            // NLHAL has no WHM MLDUnit range restriction. Use the alias/radio lookup
+-            // value for both the MLD identity and the MLD interface name so M2 matching
+-            // remains consistent with the controller's custom VAP labels.
+-            bss_info.mld_name_id = get_mld_name_id_from_lookup_table(vap_type, radio_type);
+-            int8_t mld_unit = bss_info.mld_name_id;
++            // mld_id is the MLDUnit grouping key: allocate one stable value per SSID/group.
++            // It must remain independent from mld_name_id. In particular, OTHER (255) is a
++            // valid controller VAP type without a naming-table row, so its mld_name_id is -1
++            // even when the BSS is part of a valid multi-link AP MLD.
++            int8_t mld_unit = allocate_mld_unit(ssid);
+             bss_info.mld_id = mld_unit;
++            // mld_name_id is used only to construct the MLD interface name (e.g. mld<N>).
++            bss_info.mld_name_id = get_mld_name_id_from_lookup_table(vap_type, radio_type);
+             bss_info.whm_mld_unit = allocate_whm_mld_unit(ssid, mld_unit);
+ 
+             LOG(DEBUG) << "Populated BSS config for SSID " << ssid
+diff --git a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+index 792149eaa..dce7a7f11 100644
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -9837,6 +9837,14 @@ bool ap_wlan_hal_nl80211::add_mld_link(std::string &new_iface,std::string &prev_
+                     auto state_it = status.find("state");
+                     target_ready = state_it != status.end() &&
+                                    state_it->second == "ENABLED";
++                } else if (is_wpa_ctrl_interface_registered(new_iface)) {
++                    // The reset path can recreate hostapd's socket at the same
++                    // pathname. Reusing the old wpa_ctrl context then makes
++                    // STATUS fail forever even though the socket file exists.
++                    // Reopen the context before the next readiness probe.
++                    LOG(WARNING) << "STATUS failed for MLD target " << new_iface
++                                 << "; reconnecting its WPA ctrl socket";
++                    reconnect_interface(new_iface);
+                 }
+             }
+         }
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index cfbd96d73..6e9be9f76 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -2584,6 +2584,22 @@ int base_wlan_hal_nl80211::add_interface(const std::string &interface)
+     return event_socket->fd();
+ }
+ 
++bool base_wlan_hal_nl80211::reconnect_interface(const std::string &interface)
++{
++    if (!m_wpa_ctrl_client.has_interface(interface)) {
++        return add_interface(interface) >= 0;
++    }
++
++    // Keep active_BSSs and the cached ifindex intact. Only the control
++    // contexts are stale when hostapd recreated the socket at the same path.
++    if (!m_wpa_ctrl_client.del_interface(interface)) {
++        LOG(WARNING) << "Failed to discard stale WPA ctrl mapping for " << interface;
++        return false;
++    }
++
++    return add_interface(interface) >= 0;
++}
++
+ bool base_wlan_hal_nl80211::remove_interface(const std::string &interface)
+ {
+     if (!m_wpa_ctrl_client.del_interface(interface)) {
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
+index 7ee7e4f87..43a872a8f 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
+@@ -282,6 +282,15 @@ protected:
+      */
+     int add_interface(const std::string &interface);
+ 
++    /**
++     * @brief Reopen an already registered WPA control interface.
++     *
++     * hostapd may recreate a control socket at the same pathname during a
++     * radio/VAP reset. In that case the cached wpa_ctrl context still points
++     * at the old socket and an otherwise valid STATUS request fails.
++     */
++    bool reconnect_interface(const std::string &interface);
++
+     bool remove_interface(const std::string &interface);
+ 
+     /**
+-- 
+2.34.1
+
