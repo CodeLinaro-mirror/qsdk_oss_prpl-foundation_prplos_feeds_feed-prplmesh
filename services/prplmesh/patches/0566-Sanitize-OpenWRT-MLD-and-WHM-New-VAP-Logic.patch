@@ -1,0 +1,326 @@
+From 3c7cfadce28d7726e4891df262eb6ab7e91c43b8 Mon Sep 17 00:00:00 2001
+From: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+Date: Fri, 23 Oct 2026 16:16:54 +0530
+Subject: [PATCH] Sanitize OpenWRT MLD and WHM New VAP Logic
+
+Signed-off-by: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/agent_db.h           |   5 +
+ .../slave/tasks/ap_autoconfiguration_task.cpp | 129 ++++++++++++++----
+ .../slave/tasks/ap_autoconfiguration_task.h   |   8 +-
+ common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp   |   7 +-
+ .../platform/bpl/cfg/uci/bpl_cfg_wifi.cpp     |  24 ++--
+ 5 files changed, 133 insertions(+), 40 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 73c722ddab..5635146731 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -1464,6 +1464,11 @@ public:
+      */
+     std::unordered_map<std::string, int8_t> ssid_mld_unit_registry;
+     std::unordered_map<std::string, int8_t> whm_mld_unit_registry;
++    /**
++     * @brief Per-SSID VAP type registry for AP MLDs whose role could not be resolved from M2
++     * attributes.  Maintains SSID role consistency across radios for MLD grouping logic.
++     */
++    std::unordered_map<std::string, eVapType> untyped_ssid_vap_type_registry;
+ 
+     /**
+      * @brief Flag indicating that wpa_supplicant restart is required.
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+index da3f136254..bb8f0caa05 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -1202,10 +1202,10 @@ bool ApAutoConfigurationTask::handle_ap_mld_configuration_request(
+     // Send AP MLD Configuration as Reconfig Flow True
+     for (auto radio : db->get_radios_list()) {
+         for (auto &ap_mld_request : m_ap_mld_requests_infos[radio->front.iface_name]) {
+-            if (ap_mld_request.second.mld_unit == DISABLED_MLDUNIT) {
++            if (ap_mld_request.second.whm_mld_unit == DISABLED_MLDUNIT) {
+                 LOG(WARNING) << "Skipping AP MLD Configuration for SSID " << ap_mld_request.first
+                              << " on " << radio->front.iface_name
+-                             << " because MLD unit is not resolved";
++                             << " because WHM MLD unit is not resolved";
+                 continue;
+             }
+             send_ap_mld_configuration(radio->front.iface_name, ap_mld_request.first,
+@@ -4655,6 +4655,62 @@ bool ApAutoConfigurationTask::handle_wsc_m2_tlv(
+         }
+ #endif // BEEROCKS_RDKB
+ 
++        // Generic fallback: infer vap_type from SSID mapping or BSS type bits if still OTHER.
++        if (info.m2_config.vap_type == eVapType::OTHER) {
++            const auto bss_type = info.payload_config.bss_type;
++            if (bss_type & WSC::eWscVendorExtSubelementBssType::BACKHAUL_BSS) {
++                info.m2_config.vap_type = eVapType::BACKHAUL;
++            } else if (!info.payload_config.ssid.empty()) {
++                const auto it = db->traffic_separation.ssid_vid_mapping.find(info.payload_config.ssid);
++                if (it != db->traffic_separation.ssid_vid_mapping.end() &&
++                    db->traffic_separation.secondary_vlans_ids.count(it->second)) {
++                    info.m2_config.vap_type = eVapType::GUEST;
++                }
++            }
++        }
++
++        // Sequential allocation for untyped fronthaul VAPs: HOME -> VIDEO -> HOTSPOT -> STAFF -> ISOLATED.
++        // To ensure logical grouping in NLHAL (stable mld_id via lookup table), the same SSID
++        // must get the same VAP type across all radios, and different SSIDs on the same
++        // radio must get different VAP types.
++        if (info.m2_config.vap_type == eVapType::OTHER &&
++            (info.payload_config.bss_type & WSC::eWscVendorExtSubelementBssType::FRONTHAUL_BSS)) {
++
++            static const std::vector<eVapType> sequential_types = {
++                eVapType::HOME, eVapType::VIDEO, eVapType::HOTSPOT, eVapType::STAFF, eVapType::ISOLATED};
++
++            auto type_it = db->untyped_ssid_vap_type_registry.find(info.payload_config.ssid);
++            if (type_it != db->untyped_ssid_vap_type_registry.end()) {
++                info.m2_config.vap_type = type_it->second;
++                LOG(INFO) << "Reusing derived vap_type=" << eVapType_str(info.m2_config.vap_type)
++                          << " from registry for untyped SSID: " << info.payload_config.ssid;
++            } else {
++                // Find the first type in the sequence not yet used on this radio by any SSID.
++                // (Note: this is a best-effort classification for unlabelled VAPs).
++                for (auto candidate_type : sequential_types) {
++                    bool type_already_in_use = false;
++                    for (const auto &processed_info : infos) {
++                        if (processed_info.m2_config.vap_type == candidate_type) {
++                            type_already_in_use = true;
++                            break;
++                        }
++                    }
++                    if (!type_already_in_use) {
++                        info.m2_config.vap_type = candidate_type;
++                        db->untyped_ssid_vap_type_registry[info.payload_config.ssid] = candidate_type;
++                        LOG(INFO) << "Assigned sequential vap_type=" << eVapType_str(info.m2_config.vap_type)
++                                  << " to untyped SSID: " << info.payload_config.ssid;
++                        break;
++                    }
++                }
++            }
++        }
++
++        // Sync vap_label with derived vap_type for persistence in UCI custom_alias.
++        if (info.m2_config.vap_label.empty() && info.m2_config.vap_type != eVapType::OTHER) {
++            info.m2_config.vap_label = son::wireless_utils::vap_type_to_string(info.m2_config.vap_type);
++        }
++
+         info.m2_config.hidden_ssid = m2.hidden_ssid();
+ 
+         uint8_t airties_bss_profile = 0;
+@@ -5142,7 +5198,8 @@ bool ApAutoConfigurationTask::handle_agent_ap_mld_configuration_tlv(
+                 current_ap_mld_conf.mld_config.mld_unit,
+                 allocate_whm_mld_unit(current_ap_mld_conf.mld_config.mld_ssid,
+                                       current_ap_mld_conf.mld_config.mld_unit),
+-                current_ap_mld_conf.mld_config.mld_mode, smd_mac};
++                current_ap_mld_conf.mld_config.mld_mode, smd_mac,
++                (ap_mld.num_affiliated_ap() > 1)};
+         }
+ 
+         LOG(DEBUG) << "Storing MLD configuration for AP MLD " << ssid
+@@ -5186,6 +5243,7 @@ bool ApAutoConfigurationTask::handle_agent_ap_mld_configuration_tlv(
+                 db->ap_mld_configurations.begin(), db->ap_mld_configurations.end(),
+                 [&](const AgentDB::sAPMLDConfiguration &conf) {
+                     return conf.mld_config.mld_ssid == ssid &&
++                           !conf.affiliated_aps.empty() &&
+                            std::to_string(conf.mld_config.mld_unit) == mld_id;
+                 });
+         }
+@@ -7700,27 +7758,32 @@ bool ApAutoConfigurationTask::populate_mld_id_in_bss_infos(const std::string &ra
+         }
+ 
+         if (is_mlo_grouped) {
+-            bool is_multi_link = false;
+-            for (const auto &ap_mld_conf : db->ap_mld_configurations) {
+-                if (ap_mld_conf.mld_config.mld_ssid == ssid) {
+-                    if (ap_mld_conf.affiliated_aps.size() > 1) {
+-                        is_multi_link = true;
+-                    }
+-                    break;
+-                }
+-            }
++            const bool is_multi_link = radio_it->second.at(ssid).is_multi_link;
+             eRadioType radio_type = determine_radio_type(freq_type, is_multi_link);
+             eVapType vap_type = bss_info.m2_config.vap_type;
+ 
+-            // mld_id is the MLDUnit grouping key: allocate one stable value per SSID/group.
+-            // It must remain independent from mld_name_id. In particular, OTHER (255) is a
+-            // valid controller VAP type without a naming-table row, so its mld_name_id is -1
+-            // even when the BSS is part of a valid multi-link AP MLD.
+-            int8_t mld_unit = allocate_mld_unit(ssid);
+-            bss_info.mld_id = mld_unit;
+-            // mld_name_id is used only to construct the MLD interface name (e.g. mld<N>).
++            // NLHAL has no WHM MLDUnit range restriction. Use the alias/radio lookup
++            // value for both the MLD identity and the MLD interface name so M2 matching
++            // remains consistent with the controller's custom VAP labels.
+             bss_info.mld_name_id = get_mld_name_id_from_lookup_table(vap_type, radio_type);
+-            bss_info.whm_mld_unit = allocate_whm_mld_unit(ssid, mld_unit);
++            int8_t mld_unit = bss_info.mld_name_id;
++
++            if (db->device_conf.certification_mode ||
++                (mld_unit == DISABLED_MLDUNIT && is_mlo_grouped && vap_type == eVapType::OTHER)) {
++                // mld_id is the MLDUnit grouping key: allocate one stable value per SSID/group.
++                // Certification controllers and unclassified VAPs (OTHER) may lack a
++                // naming-table row, so we use a stable dynamic unit to ensure grouping.
++                mld_unit = allocate_mld_unit(ssid);
++            }
++            bss_info.mld_id = mld_unit;
++
++            // Keep the resolved identities for subsequent MLD update requests. The
++            // controller request may initially carry DISABLED_MLDUNIT and is resolved
++            // from the lookup/registry during BSS configuration processing.
++            auto &mld_request = m_ap_mld_requests_infos[radio_iface][ssid];
++            mld_request.mld_unit     = mld_unit;
++            bss_info.whm_mld_unit    = allocate_whm_mld_unit(ssid, mld_unit);
++            mld_request.whm_mld_unit = bss_info.whm_mld_unit;
+ 
+             LOG(DEBUG) << "Populated BSS config for SSID " << ssid
+                        << ": vap_type=" << static_cast<int>(vap_type)
+@@ -7730,9 +7793,6 @@ bool ApAutoConfigurationTask::populate_mld_id_in_bss_infos(const std::string &ra
+                        << ", whm_mld_unit=" << int(bss_info.whm_mld_unit)
+                        << ", is_multi_link=" << is_multi_link;
+ 
+-            // Keep the same grouping identity for subsequent MLD update requests.
+-            m_ap_mld_requests_infos[radio_iface][ssid].mld_unit = mld_unit;
+-
+             for (auto &ap_mld_conf : db->ap_mld_configurations) {
+                 if (ap_mld_conf.mld_config.mld_ssid == ssid) {
+                     ap_mld_conf.mld_config.mld_unit = mld_unit;
+@@ -8214,7 +8274,10 @@ int8_t ApAutoConfigurationTask::allocate_mld_unit(const std::string &ssid)
+         used_units.insert(registry_entry.second);
+     }
+ 
+-    for (int8_t candidate = 1; candidate <= MLD_UNIT_MAX; ++candidate) {
++    // Lookup-table MLO identities occupy 3..9. Keep fallback identities separate
++    // so an unclassified controller-grouped VAP cannot collide with them.
++    constexpr int8_t FALLBACK_MLD_UNIT_MIN = 10;
++    for (int8_t candidate = FALLBACK_MLD_UNIT_MIN; candidate <= MLD_UNIT_MAX; ++candidate) {
+         if (used_units.find(candidate) == used_units.end()) {
+             db->ssid_mld_unit_registry[ssid] = candidate;
+             LOG(DEBUG) << "allocate_mld_unit: allocated new mld_unit="
+@@ -8241,10 +8304,6 @@ void ApAutoConfigurationTask::release_mld_unit(const std::string &ssid)
+ 
+ int8_t ApAutoConfigurationTask::allocate_whm_mld_unit(const std::string &ssid, int8_t mld_id)
+ {
+-    if (mld_id == DISABLED_MLDUNIT) {
+-        return DISABLED_MLDUNIT;
+-    }
+-
+     auto db = AgentDB::get();
+     const std::string key = ssid + "\x1f" + std::to_string(mld_id);
+ 
+@@ -8253,6 +8312,20 @@ int8_t ApAutoConfigurationTask::allocate_whm_mld_unit(const std::string &ssid, i
+         return existing_it->second;
+     }
+ 
++    // WHM needs a sequential unit before the BSS VAP type is available. Reuse
++    // the provisional single-link allocation when the lookup identity is
++    // resolved later during BSS configuration.
++    if (mld_id != DISABLED_MLDUNIT) {
++        const std::string provisional_key = ssid + "\x1f" + std::to_string(DISABLED_MLDUNIT);
++        auto provisional_it              = db->whm_mld_unit_registry.find(provisional_key);
++        if (provisional_it != db->whm_mld_unit_registry.end()) {
++            const int8_t whm_mld_unit = provisional_it->second;
++            db->whm_mld_unit_registry.erase(provisional_it);
++            db->whm_mld_unit_registry[key] = whm_mld_unit;
++            return whm_mld_unit;
++        }
++    }
++
+     std::set<int8_t> used_units;
+     for (const auto &entry : db->whm_mld_unit_registry) {
+         used_units.insert(entry.second);
+diff --git a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+index a976e9e817..ed266b2647 100644
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+@@ -318,6 +318,7 @@ private:
+         int8_t whm_mld_unit;
+         uint8_t mld_mode;
+         sMacAddr smd_mac;
++        bool is_multi_link;
+     };
+ 
+     // <iface, <ssid, sApMldRequestInfo>>
+@@ -836,12 +837,13 @@ private:
+     int8_t get_mld_name_id_from_lookup_table(eVapType vap_type, eRadioType radio_type) const;
+ 
+     /**
+-     * @brief Allocate a sequential MLDUnit fallback for an MLO-grouped SSID without a
+-     * controller-defined VAP type.
++     * @brief Allocate an MLD identity for an MLO-grouped SSID without a controller-defined
++     * VAP type. Fallback identities start at 10 because lookup-table MLO identities occupy
++     * 3..9.
+      *
+      * @param ssid SSID identifying the MLO grouping to allocate a unit for.
+      *
+-     * @return MLDUnit value in [1, MLD_UNIT_MAX], or DISABLED_MLDUNIT if no free slot is available.
++     * @return MLDUnit value in [10, MLD_UNIT_MAX], or DISABLED_MLDUNIT if no free slot is available.
+      */
+     int8_t allocate_mld_unit(const std::string &ssid);
+ 
+diff --git a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+index 88626ef3ef..cc865bbe3f 100644
+--- a/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
++++ b/common/beerocks/bwl/whm/ap_wlan_hal_whm.cpp
+@@ -892,7 +892,12 @@ bool ap_wlan_hal_whm::update_vap_credentials(
+ 
+             auto freq_name = wbapi_utils::band_short_name(m_radio_info.frequency_band);
+ 
+-            std::string new_vap_name = "vap" + freq_name + std::to_string(new_vap_index++);
++            std::string new_vap_name;
++            if (!bss_info_conf.vap_label.empty()) {
++                new_vap_name = bss_info_conf.vap_label;
++            } else {
++                new_vap_name = "vap" + freq_name + std::to_string(new_vap_index++);
++            }
+ 
+             const int8_t mld_name_id_val = bss_info_conf.mld_name_id.empty()
+                                                 ? DISABLED_MLDUNIT
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+index 40f312abac..51e0f613ad 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi.cpp
+@@ -1503,11 +1503,15 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+             }
+             // UNSET: leave options["hidden"] unset → existing UCI value is preserved
+ 
+-	    // Set custom_alias based on vap_type (skip for OTHER/unknown)
++	    // Set custom_alias based on vap_label (prefer label, fallback to type string)
+ 	    {
+-		    std::string vap_type_str = son::wireless_utils::vap_type_to_string(configuration.vap_type);
+-		    if (!vap_type_str.empty()) {
+-			    options["custom_alias"] = vap_type_str;
++		    if (!configuration.vap_label.empty()) {
++			    options["custom_alias"] = configuration.vap_label;
++		    } else {
++			    std::string vap_type_str = son::wireless_utils::vap_type_to_string(configuration.vap_type);
++			    if (!vap_type_str.empty()) {
++				    options["custom_alias"] = vap_type_str;
++			    }
+ 		    }
+ 	    }
+ 
+@@ -1836,11 +1840,15 @@ bool bpl_cfg_set_wifi_credentials(const std::string &iface,
+                 options["hidden"] = "0";
+             }
+ 
+-            // Set custom_alias based on vap_type (skip for OTHER/unknown)
++            // Set custom_alias based on vap_label (prefer label, fallback to type string)
+             {
+-                std::string vap_type_str = son::wireless_utils::vap_type_to_string(config.vap_type);
+-                if (!vap_type_str.empty()) {
+-                    options["custom_alias"] = vap_type_str;
++                if (!config.vap_label.empty()) {
++                    options["custom_alias"] = config.vap_label;
++                } else {
++                    std::string vap_type_str = son::wireless_utils::vap_type_to_string(config.vap_type);
++                    if (!vap_type_str.empty()) {
++                        options["custom_alias"] = vap_type_str;
++                    }
+                 }
+             }
+ 
+-- 
+2.34.1
+
