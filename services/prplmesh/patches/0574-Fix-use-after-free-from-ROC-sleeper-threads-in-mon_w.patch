@@ -1,0 +1,115 @@
+From 6a5ba862a25d57b6c90a58cf3a301fbc59a5458d Mon Sep 17 00:00:00 2001
+From: Suvidh Subodh Hegde <suvidhsu@qti.qualcomm.com>
+Date: Tue, 27 Oct 2026 12:18:54 +0530
+Subject: [PATCH] Fix use-after-free from ROC sleeper threads in mon_wlan_hal_nl80211
+
+trigger_roc_scan() starts a detached sleeper thread that calls back into
+process_roc_expired_event() on `this`. If the monitor HAL is destroyed
+while a sleeper is pending, the callback runs on a freed object.
+
+Track the sleeper threads with a shared RocSleeperState (mutex, condvar,
+stopping flag, active count). The destructor sets `stopping`, wakes all
+sleepers and waits until none is left. A sleeper that is woken early
+skips the callback. The state is held by shared_ptr, so a sleeper's final
+"--active; notify" never touches freed memory.
+
+Signed-off-by: Suvidh Subodh Hegde <suvidhsu@qti.qualcomm.com>
+---
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 37 ++++++++++++++++---
+ .../bwl/nl80211/mon_wlan_hal_nl80211.h        | 15 ++++++++
+ 2 files changed, 46 insertions(+), 6 deletions(-)
+
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 2b1faaffd..bb9363d0d 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -326,7 +326,15 @@ mon_wlan_hal_nl80211::mon_wlan_hal_nl80211(const std::string &iface_name, hal_ev
+     m_filtered_events.insert({});
+ }
+ 
+-mon_wlan_hal_nl80211::~mon_wlan_hal_nl80211() {}
++mon_wlan_hal_nl80211::~mon_wlan_hal_nl80211()
++{
++    // Stop the ROC sleeper threads and wait for any in-flight
++    // process_roc_expired_event() to finish while this object is still fully alive.
++    std::unique_lock<std::mutex> lock(m_roc_sleeper->mtx);
++    m_roc_sleeper->stopping = true;
++    m_roc_sleeper->cv.notify_all();
++    m_roc_sleeper->cv.wait(lock, [this] { return m_roc_sleeper->active == 0; });
++}
+ 
+ void extractBase1Interface(const std::string& interface_name, std::string& base_interface) {
+     size_t pos = interface_name.find("_link");
+@@ -2503,14 +2511,31 @@ bool mon_wlan_hal_nl80211::trigger_roc_scan(uint8_t channel, uint32_t duration_m
+     // is running on behalf of the monitor. Don't read that prefix as evidence that
+     // the wrong process ran the callback.
+     // -----------------------------------------------
+-    std::thread([this, duration_ms]() {
++    auto sleeper = m_roc_sleeper;
++    {
++        std::lock_guard<std::mutex> lock(sleeper->mtx);
++        ++sleeper->active;
++    }
++    std::thread([this, sleeper, duration_ms]() {
+             constexpr uint32_t buffer_period_ms = 500;
+             LOG(DEBUG) << "[ROC] Sleeper thread started for " << duration_ms << "ms + buffer "
+             << buffer_period_ms << "ms";
+-            std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms + buffer_period_ms));
+-            LOG(INFO) << "[ROC] Sleeper thread expired after " << (duration_ms + buffer_period_ms)
+-            << "ms. Triggering process_roc_expired_event().";
+-            this->process_roc_expired_event();
++            bool run;
++            {
++                std::unique_lock<std::mutex> lock(sleeper->mtx);
++                run = !sleeper->cv.wait_for(lock,
++                                            std::chrono::milliseconds(duration_ms + buffer_period_ms),
++                                            [&sleeper] { return sleeper->stopping; });
++            }
++            if (run) {
++                LOG(INFO) << "[ROC] Sleeper thread expired after "
++                          << (duration_ms + buffer_period_ms)
++                          << "ms. Triggering process_roc_expired_event().";
++                this->process_roc_expired_event();
++            }
++            std::lock_guard<std::mutex> lock(sleeper->mtx);
++            --sleeper->active;
++            sleeper->cv.notify_all();
+             }).detach();
+     // -----------------------------------------------
+ 
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
+index 32eb9f343..7f0f56859 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
+@@ -14,6 +14,8 @@
+ #include <hostapd/configuration.h>
+ 
+ #include <atomic>
++#include <condition_variable>
++#include <memory>
+ #include <mutex>
+ #include <unordered_map>
+ 
+@@ -159,6 +161,19 @@ protected:
+      std::mutex m_pending_unassoc_mutex;
+      int m_roc_timeout_timer_fd = -1;
+ 
++     /* Lifetime tracking for the ROC sleeper threads started by trigger_roc_scan().
++      * Each sleeper calls back into this object, so the destructor must wake them
++      * and wait until none is left before the object (and its base classes) are
++      * torn down. Held by shared_ptr so a sleeper's final "--active; notify" never
++      * touches freed memory after the destructor returns. */
++     struct RocSleeperState {
++         std::mutex mtx;
++         std::condition_variable cv;
++         bool stopping = false;
++         int active    = 0;
++     };
++     std::shared_ptr<RocSleeperState> m_roc_sleeper = std::make_shared<RocSleeperState>();
++
+      /* Per-(link_iface, STA) baseline for sta_beacon_11k_request()'s link
+       * resolution: NL80211 TX_BYTES is a cumulative counter, so without a
+       * stored baseline "tx_bytes > 0" would stay true forever once a link
+-- 
+2.34.1
+
