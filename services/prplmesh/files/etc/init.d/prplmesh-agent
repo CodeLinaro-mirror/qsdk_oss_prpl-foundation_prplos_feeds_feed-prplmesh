@@ -319,6 +319,59 @@ FREQ_5GL=5170
 FREQ_6G=5945
 FREQ_5GH=5490
 
+# Slot indices matching freq_list order in _update_radio_hostap_iface_once
+PRPL_SLOT_2G=0
+PRPL_SLOT_5GL=1
+PRPL_SLOT_6G=2
+PRPL_SLOT_5GH=3
+
+get_disabled_prplmesh_slots() {
+    # Count total 5G radios to distinguish triband (1x5G) from quadband (2x5G)
+    local num_5g=0
+    for dev in $(uci -q show wireless | grep "=wifi-device$" | cut -d. -f2 | cut -d= -f1); do
+        [ "$(uci -q get "wireless.$dev.band")" = "5g" ] && num_5g=$((num_5g + 1))
+    done
+
+    for dev in $(uci -q show wireless | grep "=wifi-device$" | cut -d. -f2 | cut -d= -f1); do
+        [ "$(uci -q get "wireless.$dev.disabled")" = "1" ] || continue
+        band="$(uci -q get "wireless.$dev.band")"
+        case "$band" in
+            2g) echo "$PRPL_SLOT_2G" ;;
+            6g) echo "$PRPL_SLOT_6G" ;;
+            5g)
+                if [ "$num_5g" -le 1 ]; then
+                    # Triband: single 5G radio covers both slots
+                    echo "$PRPL_SLOT_5GL"
+                    echo "$PRPL_SLOT_5GH"
+                else
+                    # Quadband: each 5G radio maps to its own slot
+                    channel="$(uci -q get "wireless.$dev.channel")"
+                    case "$channel" in
+                        ''|*[!0-9]*) echo "$PRPL_SLOT_5GL" ;;
+                        *) if [ "$channel" -lt 100 ]; then
+                               echo "$PRPL_SLOT_5GL"
+                           else
+                               echo "$PRPL_SLOT_5GH"
+                           fi ;;
+                    esac
+                fi
+                ;;
+        esac
+    done
+}
+
+remove_disabled_radio_sections() {
+    disabled_slots="$(get_disabled_prplmesh_slots)"
+    for slot in $disabled_slots; do
+        if [ -n "$(uci -q show "prplmesh.radio${slot}")" ]; then
+            uci -q delete "prplmesh.radio${slot}"
+            logger -t "${NAME}" -p daemon.info \
+                "wireless radio for prplmesh.radio${slot} is disabled; removed prplmesh.radio${slot}"
+        fi
+    done
+    uci commit prplmesh
+}
+
 derive_radio_macaddr() {
     local idx="$1"        # numeric phy sub-index, e.g. 0/1/2
     local section="$2"    # e.g. radio0
@@ -394,7 +447,16 @@ _update_radio_hostap_iface_once() {
     prplmesh_radio_6g=2
     prplmesh_radio_5gh=3
 
+    # Skip slots whose wireless radio is disabled or absent
+    disabled_slots="$(get_disabled_prplmesh_slots)"
+
     for freq in $freq_list; do
+
+        if echo "$disabled_slots" | grep -qw "$i"; then
+            echo "freq=$freq: wireless radio for prplmesh.radio${i} is disabled; skipping" >&2
+            i=$((i + 1))
+            continue
+        fi
 
         #Call once; check exit status first
         if out="$(get_prim_ifname "$freq")"; then
@@ -438,7 +500,10 @@ _update_radio_hostap_iface_once() {
             ifname="dummy_ap"
         fi
 
-        [ "$ifname" = "dummy_ap" ] && dummy_ap_derived=1
+        # Only trigger polling for dummy_ap on enabled slots
+        if [ "$ifname" = "dummy_ap" ] && ! echo "$disabled_slots" | grep -qw "$i"; then
+            dummy_ap_derived=1
+        fi
 
         eval "radio${i}_ifname=\"$ifname\""
 
@@ -553,6 +618,11 @@ update_radio_sta_iface() {
 
         # Process only if mode=sta and disabled is NOT 1
         if [ "$mode" = "sta" ] && [ "$disabled" != "1" ] ; then
+                # Skip STA whose underlying wireless radio is disabled
+                if [ "$(uci -q get "wireless.$device.disabled")" = "1" ]; then
+                        echo "STA Interface: $ifname | Device: $device is disabled; skipping" >&2
+                        continue
+                fi
                 # Get corresponding radio value from wifi-device section
                 radio=$(uci get wireless.$device.radio 2>/dev/null)
 
@@ -566,8 +636,9 @@ update_radio_sta_iface() {
     done
 
 
-    # Add dummy sta_iface for radios not updated
+    # Add dummy sta_iface for radios not updated; skip absent sections
     for r in $(seq 0 $((num_of_bands-1))); do
+        [ -n "$(uci -q show "prplmesh.radio${r}")" ] || continue
         if ! echo "$updated_radios" | grep -qw "$r"; then
             uci set prplmesh.radio${r}.sta_iface="dummy_sta"
             echo "Added dummy STA for radio$r"
@@ -654,6 +725,8 @@ start_service() {
                                         exit 1
                                 }
 
+                                # Drop prplmesh sections for disabled wireless radios
+                                remove_disabled_radio_sections
                                 # prplmesh performs update_radio_hostap_iface() before
                                 # starting the transport and invoking this service.
                                 # Do not repeat its dummy_ap polling here; a radio
