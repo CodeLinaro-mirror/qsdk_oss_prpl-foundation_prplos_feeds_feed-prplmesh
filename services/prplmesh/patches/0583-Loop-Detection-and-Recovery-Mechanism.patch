@@ -1,0 +1,288 @@
+From 94d27cb4609ab7e0de0eac32e041a961c868966a Mon Sep 17 00:00:00 2001
+From: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+Date: Thu, 29 Oct 2026 16:20:23 +0530
+Subject: [PATCH] Loop Detection and Recovery Mechanism
+
+Signed-off-by: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+---
+ .../backhaul_manager/backhaul_manager.cpp     | 32 +++++++++++
+ .../slave/backhaul_manager/backhaul_manager.h |  2 +
+ agent/src/beerocks/slave/son_slave_thread.cpp |  4 +-
+ .../tasks/controller_connectivity_task.cpp    | 56 +++++++++++++++++++
+ .../tasks/controller_connectivity_task.h      |  4 ++
+ .../tlvf/beerocks_message_action.yaml         |  3 +-
+ .../tlvf/beerocks_message_backhaul.yaml       |  6 ++
+ 7 files changed, 105 insertions(+), 2 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 6080fa7c8f..26719d992f 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -2748,6 +2748,31 @@ bool BackhaulManager::handle_slave_backhaul_message(int fd, ieee1905_1::CmduMess
+         break;
+     }
+ 
++    case beerocks_message::ACTION_BACKHAUL_BSTA_LOOP_DISCONNECT_COMMAND: {
++        auto request = beerocks_header->addClass<
++            beerocks_message::cACTION_BACKHAUL_BSTA_LOOP_DISCONNECT_COMMAND>();
++        if (!request) {
++            LOG(ERROR) << "Failed to parse targeted loop bSTA disconnect command";
++            return false;
++        }
++
++        auto sta_wlan_hal = get_wireless_hal(request->radio_mac());
++        if (!sta_wlan_hal) {
++            LOG(ERROR) << "Cannot find local bSTA radio for loop isolation: "
++                       << request->radio_mac();
++            return false;
++        }
++
++        LOG(ERROR) << "Loop isolation: disconnecting local bSTA radio " << request->radio_mac();
++        m_loop_isolation_disconnect = true;
++        if (!sta_wlan_hal->disconnect()) {
++            LOG(ERROR) << "Failed to disconnect local bSTA radio " << request->radio_mac();
++            m_loop_isolation_disconnect = false;
++            return false;
++        }
++        break;
++    }
++
+     case beerocks_message::ACTION_BACKHAUL_RECONNECT_COMMAND: {
+         LOG(DEBUG) << "ACTION_BACKHAUL_RECONNECT_COMMAND is received, when active state is "
+                    << FSM_CURR_STATE_STR;
+@@ -3496,6 +3521,7 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+             if (bsta_notif) {
+                 bsta_notif->connected()       = 1;
+                 bsta_notif->backhaul_switch() = m_backhaul_switch ? 1 : 0;
++                bsta_notif->loop_isolation()  = 0;
+                 LOG(DEBUG) << "Sending ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION (connected)"
+                            << ", backhaul_switch=" << int(bsta_notif->backhaul_switch());
+                 send_cmdu(m_agent_fd, cmdu_tx);
+@@ -3504,6 +3530,11 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+             }
+         }
+ 
++        if (m_loop_isolation_disconnect && iface == db->backhaul.selected_iface_name) {
++            LOG(INFO) << "Loop-isolated bSTA reconnected on " << iface;
++            m_loop_isolation_disconnect = false;
++        }
++
+         if (FSM_IS_IN_STATE(WAIT_WPS)) {
+             db->backhaul.selected_iface_name = iface;
+             auto radio = db->radio(iface);
+@@ -3700,6 +3731,7 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+                 if (bsta_notif) {
+                     bsta_notif->connected()       = 0;
+                     bsta_notif->backhaul_switch() = m_backhaul_switch ? 1 : 0;
++                    bsta_notif->loop_isolation()  = m_loop_isolation_disconnect ? 1 : 0;
+                     LOG(DEBUG) << "Sending ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION (disconnected)"
+                                << ", backhaul_switch=" << int(bsta_notif->backhaul_switch());
+                     send_cmdu(m_agent_fd, cmdu_tx);
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+index 2459944b61..dbd31c38f0 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+@@ -785,6 +785,8 @@ private:
+     std::chrono::steady_clock::time_point eth_link_poll_timer;
+     bool m_eth_link_up  = false;
+     bool m_backhaul_switch  = false;
++    // A loop-isolation disconnect must not disable downstream fronthaul VAPs.
++    bool m_loop_isolation_disconnect = false;
+ #ifdef BEEROCKS_RDKB
+     std::shared_ptr<beerocks::net::BridgeStateManager> m_bridge_state_manager;
+ #endif
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 3cbaadd034..cd13d5dcf3 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -3084,8 +3084,10 @@ bool slave_thread::handle_cmdu_backhaul_manager_message(
+ 
+         m_backhaul_l2_connected  = notification_in->connected() != 0;
+         bool backhaul_switch     = notification_in->backhaul_switch() != 0;
++        bool loop_isolation      = notification_in->loop_isolation() != 0;
+         LOG(ERROR) << "Received ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION connected="
+                    << int(m_backhaul_l2_connected) << ", backhaul_switch=" << int(backhaul_switch)
++                   << ", loop_isolation=" << int(loop_isolation)
+                    << ", current m_controller_reachable=" << int(m_controller_reachable);
+ 
+         if (!m_backhaul_l2_connected) {
+@@ -3098,7 +3100,7 @@ bool slave_thread::handle_cmdu_backhaul_manager_message(
+         // During a backhaul switch (wired<->wireless), FH VAP toggling is handled separately
+         // via ACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION. Only call send_fh_vap_state_to_ap_managers
+         // for normal (non-switch) bSTA connect/disconnect events.
+-        if (!backhaul_switch) {
++        if (!backhaul_switch && !loop_isolation) {
+             send_fh_vap_state_to_ap_managers(m_backhaul_l2_connected);
+         }
+         break;
+diff --git a/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp b/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp
+index 64225cd6b4..1ff568e17f 100644
+--- a/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp
++++ b/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp
+@@ -11,6 +11,7 @@
+ #include "../agent_db.h"
+ #include "../son_slave_thread.h"
+ 
++#include <bcl/network/network_utils.h>
+ #include <bwl/base_wlan_hal_types.h>
+ #include <tlvf/WSC/m1.h>
+ #include <tlvf/wfa_map/tlvHigherLayerData.h>
+@@ -236,6 +237,28 @@ void ControllerConnectivityTask::handle_event(uint8_t event_enum_value, const vo
+         FSM_MOVE_STATE(BACKHAUL_LINK_DISCONNECTED);
+         break;
+     }
++    case LOOP_DETECTED: {
++        if (m_loop_disconnect_in_progress) {
++            break;
++        }
++
++        auto db = AgentDB::get();
++        if (db->backhaul.connection_type != AgentDB::sBackhaul::eConnectionType::Wireless ||
++            db->backhaul.selected_iface_radio_mac == net::network_utils::ZERO_MAC) {
++            LOG(WARNING) << "Ignoring loop detection without an active wireless bSTA";
++            break;
++        }
++
++        m_loop_disconnect_in_progress = true;
++        LOG(ERROR) << "Loop detected: disconnecting only local bSTA on radio "
++                   << db->backhaul.selected_iface_radio_mac;
++        m_btl_ctx.notify_controller_reachability(false);
++        if (!send_loop_disconnect_to_backhaul_manager()) {
++            LOG(ERROR) << "Failed to request targeted loop bSTA disconnect";
++            m_loop_disconnect_in_progress = false;
++        }
++        break;
++    }
+     case CONTROLLER_DISCOVERED: {
+         LOG(ERROR) << "CONTROLLER_DISCOVERED is received";
+         // Discovery establishes a new monitoring epoch. Prevent a stale
+@@ -246,6 +269,7 @@ void ControllerConnectivityTask::handle_event(uint8_t event_enum_value, const vo
+         m_last_indirect_probe_contact_time = now;
+         m_indirect_probe_waiting           = false;
+         m_indirect_probe_failed            = false;
++        m_loop_disconnect_in_progress      = false;
+         m_btl_ctx.notify_controller_reachability(true);
+         FSM_MOVE_STATE(CONTROLLER_MONITORING);
+         break;
+@@ -262,6 +286,20 @@ bool ControllerConnectivityTask::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx,
+                                              const sMacAddr &src_mac, int fd,
+                                              std::shared_ptr<beerocks_header> beerocks_header)
+ {
++    auto db = AgentDB::get();
++    const auto ingress_iface = net::network_utils::linux_get_iface_name(iface_index);
++    const bool received_on_active_bsta =
++        !ingress_iface.empty() && ingress_iface == db->backhaul.selected_iface_name;
++    if (src_mac != net::network_utils::ZERO_MAC && src_mac == db->bridge.mac &&
++        db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wireless &&
++        received_on_active_bsta) {
++        LOG(ERROR) << "Received locally originated IEEE 1905 frame; loop detected, src_mac="
++                   << src_mac << ", dst_mac=" << dst_mac << ", ingress_iface="
++                   << ingress_iface;
++        handle_event(LOOP_DETECTED, nullptr);
++        return true;
++    }
++
+     switch (cmdu_rx.getMessageType()) {
+     case ieee1905_1::eMessageType::TOPOLOGY_DISCOVERY_MESSAGE: {
+ 
+@@ -469,6 +507,24 @@ bool ControllerConnectivityTask::send_disconnect_to_backhaul_manager()
+     return backhaul_manager_cmdu_client->send_cmdu(m_cmdu_tx);
+ }
+ 
++bool ControllerConnectivityTask::send_loop_disconnect_to_backhaul_manager()
++{
++    auto command = message_com::create_vs_message<
++        beerocks_message::cACTION_BACKHAUL_BSTA_LOOP_DISCONNECT_COMMAND>(m_cmdu_tx);
++    if (!command) {
++        LOG(ERROR) << "Failed building targeted loop bSTA disconnect command";
++        return false;
++    }
++
++    command->radio_mac() = AgentDB::get()->backhaul.selected_iface_radio_mac;
++    auto backhaul_manager_cmdu_client = m_btl_ctx.get_backhaul_manager_cmdu_client();
++    if (!backhaul_manager_cmdu_client) {
++        LOG(ERROR) << "Failed to get backhaul manager cmdu client";
++        return false;
++    }
++    return backhaul_manager_cmdu_client->send_cmdu(m_cmdu_tx);
++}
++
+ void ControllerConnectivityTask::init_task_configuration()
+ {
+     // Local Controller's agent does not need to check backhaul connectivity
+diff --git a/agent/src/beerocks/slave/tasks/controller_connectivity_task.h b/agent/src/beerocks/slave/tasks/controller_connectivity_task.h
+index 5649a9221f..e4db1c167b 100644
+--- a/agent/src/beerocks/slave/tasks/controller_connectivity_task.h
++++ b/agent/src/beerocks/slave/tasks/controller_connectivity_task.h
+@@ -48,6 +48,7 @@ public:
+         BACKHAUL_MANAGER_CONNECTED,
+         BACKHAUL_DISCONNECTED_NOTIFICATION,
+         CONTROLLER_DISCOVERED,
++        LOOP_DETECTED,
+     };
+ 
+     void work() override;
+@@ -141,6 +142,7 @@ private:
+     // Latches one failure sequence so hop-count updates happen only on
+     // failure entry and on the first successful recovery response.
+     bool m_indirect_probe_failed  = false;
++    bool m_loop_disconnect_in_progress = false;
+ 
+     /**
+      * @brief Time point when waiting for reconnection exceeds
+@@ -257,6 +259,8 @@ private:
+      */
+     bool send_disconnect_to_backhaul_manager();
+ 
++    bool send_loop_disconnect_to_backhaul_manager();
++
+     /**
+      * @brief Sends BACKHAUL_RECONNECT_COMMAND to Backhaul Manager
+      *
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
+index 183d3f6c86..e958fe44e9 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_action.yaml
+@@ -172,6 +172,7 @@ eActionOp_BACKHAUL:
+   ACTION_BACKHAUL_HOSTAP_SET_ACS_BLOCK_LIST: 92
+   ACTION_BACKHAUL_RADIO_STATE_NOTIFICATION: 93
+   ACTION_BACKHAUL_DPP_CREDENTIALS_NOTIFICATION: 94
++  ACTION_BACKHAUL_BSTA_LOOP_DISCONNECT_COMMAND: 102
+   ACTION_BACKHAUL_DPP_1905_CREDENTIALS_NOTIFICATION: 95
+   ACTION_BACKHAUL_CONNECTION_TYPE_CHANGED_NOTIFICATION: 96
+   ACTION_BACKHAUL_RADIO_POWERSAVE_ENABLE_REQUEST: 97
+@@ -180,7 +181,7 @@ eActionOp_BACKHAUL:
+   ACTION_BACKHAUL_RADIO_TEARDOWN_CONFIRMED_NOTIFICATION: 100
+   ACTION_BACKHAUL_CLI_RADIO_POWERSAVE_REQUEST: 101
+ 
+-  ACTION_BACKHAUL_ENUM_END: 102
++  ACTION_BACKHAUL_ENUM_END: 103
+ 
+ ####################################################
+ ####################################################
+diff --git a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
+index 0b7ec27d38..3ff3ac5ea7 100755
+--- a/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
++++ b/common/beerocks/tlvf/yaml/beerocks/tlvf/beerocks_message_backhaul.yaml
+@@ -201,6 +201,11 @@ cACTION_BACKHAUL_RADIO_TEAR_DOWN_REQUEST:
+ cACTION_BACKHAUL_DISCONNECT_COMMAND:
+   _type: class
+ 
++cACTION_BACKHAUL_BSTA_LOOP_DISCONNECT_COMMAND:
++  _type: class
++  radio_mac:
++    _type: sMacAddr
++
+ cACTION_BACKHAUL_RECONNECT_COMMAND:
+   _type: class
+ 
+@@ -307,6 +312,7 @@ cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION:
+   _type: class
+   connected: uint8_t  # 1 = bSTA connected, 0 = bSTA disconnected
+   backhaul_switch: uint8_t  # 1 = backhaul switch in progress, 0 = normal connection/disconnection
++  loop_isolation: uint8_t  # 1 = keep downstream fronthaul VAPs enabled
+ 
+ cACTION_BACKHAUL_FH_VAPS_STATE_NOTIFICATION:
+   _type: class
+-- 
+2.34.1
