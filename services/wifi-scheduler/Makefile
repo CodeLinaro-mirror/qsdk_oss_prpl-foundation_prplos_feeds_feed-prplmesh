@@ -3,13 +3,14 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=wifi-scheduler
-PKG_VERSION:=v0.11.1
+PKG_VERSION:=FEAT-334-apparmor
 SHORT_DESCRIPTION:=WiFi Scheduler
 
-PKG_SOURCE:=wifi-scheduler-v0.11.1.tar.gz
-PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/wifi-scheduler/-/archive/v0.11.1
-PKG_HASH:=c388850a36cbfad67e045591d9a43c880984b61ed78a857238dd70cec3105179
-PKG_BUILD_DIR:=$(BUILD_DIR)/wifi-scheduler-v0.11.1
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_VERSION:=FEAT-334-apparmor
+PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/wifi-scheduler.git
+PKG_MIRROR_HASH:=skip
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 PKG_MAINTAINER:=Soft At Home <support.opensource@softathome.com>
 PKG_LICENSE:=BSD-2-Clause-Patent
 PKG_LICENSE_FILES:=LICENSE
@@ -72,6 +73,7 @@ define Package/$(PKG_NAME)/install
 	find $(1) -name *.a -exec rm {} +;
 	find $(1) -name *.h -exec rm {} +;
 	find $(1) -name *.pc -exec rm {} +;
+	rm $(1)/usr/bin/$(PKG_NAME)
 endef
 
 define Package/$(PKG_NAME)/config
