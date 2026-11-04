@@ -1,0 +1,223 @@
+From 3f63f0b206be8afca08cfc996e419feeedb78e54 Mon Sep 17 00:00:00 2001
+From: Sandeep Tomer <stomer@qti.qualcomm.com>
+Date: Wed, 4 Nov 2026 16:33:02 +0530
+Subject: [PATCH] prplMesh: fix RX airtime classification and interval
+ validation
+
+An #ifdef on an nl80211 enum hid BSS RX data, causing fallback estimates
+to misclassify local reception and channel energy as other-BSS RX.
+Missing channel-on time could also produce invalid airtime intervals.
+
+Read BSS RX directly, validate TIME/RX attributes as u64, track presence,
+and require valid interval endpoints. Reject resets, bound RX deltas,
+and calculate local RX from BSS RX and other RX from total minus BSS RX.
+Retain the current sample as the next baseline for interval recovery.
+
+Apply after 0577. Bounded diagnostics are provided separately by 0579.
+
+Signed-off-by: Sandeep Tomer <stomer@qti.qualcomm.com>
+---
+ .../beerocks/bwl/include/bwl/nl80211_client.h | 20 ++++++
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 68 +++++++++----------
+ .../bwl/shared/nl80211_client_impl.cpp        | 15 ++--
+ 3 files changed, 63 insertions(+), 40 deletions(-)
+
+diff --git a/common/beerocks/bwl/include/bwl/nl80211_client.h b/common/beerocks/bwl/include/bwl/nl80211_client.h
+index 2b58a49..684bd1e 100644
+--- a/common/beerocks/bwl/include/bwl/nl80211_client.h
++++ b/common/beerocks/bwl/include/bwl/nl80211_client.h
+@@ -479,6 +479,12 @@ public:
+          */
+         uint64_t time_on_ms = 0;
+ 
++        /**
++         * CHANNEL_TIME was present, including a valid zero value. A missing
++         * attribute cannot be used as an RX airtime denominator endpoint.
++         */
++        bool time_on_present = false;
++
+         /**
+          * Amount of the time (in ms) the primary channel was sensed busy (either due to activity
+          * or energy detect).
+@@ -495,11 +501,25 @@ public:
+          */
+         uint64_t time_rx_ms = 0;
+ 
++        /**
++         * TIME_RX was present in the survey reply. A present zero is a valid
++         * idle counter; a missing attribute cannot be used to derive an RX
++         * airtime interval.
++         */
++        bool time_rx_present = false;
++
+         /**
+          * Amount of time (in ms) the radio spent receiving frames destined to the local BSS.
+          */
+         uint64_t time_bss_rx_ms = 0;
+ 
++        /**
++         * TIME_BSS_RX was present in the survey reply, including a valid zero
++         * value. Total RX alone cannot distinguish local-BSS reception from
++         * other-BSS reception.
++         */
++        bool time_bss_rx_present = false;
++
+         /**
+          * Amount of time (in ms) the radio spent transmitting data (on channel or globally).
+          */
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index 5fb687e..79fd56e 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -425,10 +425,25 @@ bool mon_wlan_hal_nl80211::update_radio_stats(SRadioStats &radio_stats)
+         uint64_t delta_time_on   = delta_counter(survey_entry->time_on_ms, m_prev_survey_info.time_on_ms);
+         uint64_t delta_time_busy = delta_counter(survey_entry->time_busy_ms, m_prev_survey_info.time_busy_ms);
+         uint64_t delta_time_tx   = delta_counter(survey_entry->time_tx_ms, m_prev_survey_info.time_tx_ms);
+-        uint64_t delta_time_rx   = delta_counter(survey_entry->time_rx_ms, m_prev_survey_info.time_rx_ms);
++        // Missing/reset counters cannot form an interval. Require a measured
++        // denominator at both endpoints and retain the current sample as baseline.
++        const bool time_on_interval_valid =
++            survey_entry->time_on_present && m_prev_survey_info.time_on_present &&
++            survey_entry->time_on_ms >= m_prev_survey_info.time_on_ms;
++        const bool rx_interval_valid = time_on_interval_valid && survey_entry->time_rx_present &&
++                                       m_prev_survey_info.time_rx_present &&
++                                       survey_entry->time_rx_ms >= m_prev_survey_info.time_rx_ms;
++        const bool bss_rx_interval_valid =
++            time_on_interval_valid && survey_entry->time_bss_rx_present &&
++            m_prev_survey_info.time_bss_rx_present &&
++            survey_entry->time_bss_rx_ms >= m_prev_survey_info.time_bss_rx_ms;
++        uint64_t delta_time_rx =
++            rx_interval_valid ? survey_entry->time_rx_ms - m_prev_survey_info.time_rx_ms : 0;
+         uint64_t delta_time_bss_rx =
+-            delta_counter(survey_entry->time_bss_rx_ms, m_prev_survey_info.time_bss_rx_ms);
++            bss_rx_interval_valid ? survey_entry->time_bss_rx_ms - m_prev_survey_info.time_bss_rx_ms
++                                  : 0;
+ 
++        // Bound RX to the interval and local RX to total RX before subtraction.
+         if (delta_time_busy > delta_time_on) {
+             delta_time_busy = delta_time_on;
+         }
+@@ -438,11 +453,14 @@ bool mon_wlan_hal_nl80211::update_radio_stats(SRadioStats &radio_stats)
+         if (delta_time_rx > delta_time_on) {
+             delta_time_rx = delta_time_on;
+         }
+-        if (delta_time_bss_rx > delta_time_rx) {
++        if (delta_time_bss_rx > delta_time_on) {
++            delta_time_bss_rx = delta_time_on;
++        }
++        if (rx_interval_valid && bss_rx_interval_valid && delta_time_bss_rx > delta_time_rx) {
+             delta_time_bss_rx = delta_time_rx;
+         }
+ 
+-        // Compute ext_busy delta for [NL-SURVEY-DELTA] log and future OBSS use.
++        // Retain EXT_BUSY only for existing diagnostics, not RX classification.
+         uint64_t delta_time_ext_busy =
+             delta_counter(survey_entry->time_ext_busy_ms, m_prev_survey_info.time_ext_busy_ms);
+         if (delta_time_ext_busy > delta_time_on) {
+@@ -463,40 +481,18 @@ bool mon_wlan_hal_nl80211::update_radio_stats(SRadioStats &radio_stats)
+             radio_stats.transmit =
+                 static_cast<uint8_t>((delta_time_tx * UINT8_MAX) / delta_time_on);
+ 
+-            /*
+-             * Only populate receive_self/receive_other when the kernel provides
+-             * NL80211_SURVEY_INFO_TIME_BSS_RX. On ath12k/IPQ9650 this counter is
+-             * not compiled in, so both fields default to 0 and interference is
+-             * reflected solely through mediumAvailable (utilization = busy/on).
+-             */
+-            if (survey_entry->time_bss_rx_ms > 0 || m_prev_survey_info.time_bss_rx_ms > 0) {
+-                uint64_t delta_time_other_rx = delta_time_rx - delta_time_bss_rx;
++            // Busy - TX includes local RX/noise; EXT_BUSY is extension activity.
++            // Use BSS RX for local reception and total RX - BSS RX for other BSSs.
++            // Missing measurements stay zero because their split is unknown.
++            radio_stats.receive_self  = 0;
++            radio_stats.receive_other = 0;
++            if (bss_rx_interval_valid) {
+                 radio_stats.receive_self =
+-                    static_cast<uint8_t>((delta_time_bss_rx   * UINT8_MAX) / delta_time_on);
+-                radio_stats.receive_other =
+-                    static_cast<uint8_t>((delta_time_other_rx * UINT8_MAX) / delta_time_on);
+-            } else {
+-                radio_stats.receive_self = 0;
+-
+-                if (delta_time_ext_busy > 0) {
+-                    /* Driver provides ext_busy directly; use it. */
+-                    radio_stats.receive_other =
+-                        static_cast<uint8_t>((delta_time_ext_busy * UINT8_MAX) / delta_time_on);
+-                } else {
+-                    /*
+-                     * NL80211_SURVEY_INFO_CHANNEL_TIME_EXT_BUSY is not provided by this
+-                     * driver. Approximate rxTimeOutRadio as (busy - tx): the channel time
+-                     * not accounted for by our own transmissions. A 10% noise floor gate
+-                     * suppresses beacon/management overhead on lightly-loaded channels
+-                     * while still reporting real OBSS traffic accurately.
+-                     */
+-                    uint64_t delta_obss = (delta_time_busy > delta_time_tx) ?
+-                                         (delta_time_busy - delta_time_tx) : 0;
+-                    constexpr uint64_t OBSS_NOISE_FLOOR_PERCENT = 10;
+-                    if (delta_obss * 100 < delta_time_on * OBSS_NOISE_FLOOR_PERCENT)
+-                        delta_obss = 0;
++                    static_cast<uint8_t>((delta_time_bss_rx * UINT8_MAX) / delta_time_on);
++                if (rx_interval_valid) {
++                    const uint64_t delta_time_other_rx = delta_time_rx - delta_time_bss_rx;
+                     radio_stats.receive_other =
+-                        static_cast<uint8_t>((delta_obss * UINT8_MAX) / delta_time_on);
++                        static_cast<uint8_t>((delta_time_other_rx * UINT8_MAX) / delta_time_on);
+                 }
+             }
+ 
+diff --git a/common/beerocks/bwl/shared/nl80211_client_impl.cpp b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+index a7ae855..a7ef1b7 100644
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -1683,6 +1683,10 @@ bool nl80211_client_impl::get_survey_info(const std::string &interface_name,
+ 
+                     survey_policy[NL80211_SURVEY_INFO_FREQUENCY] = {NLA_U32, 0, 0};
+                     survey_policy[NL80211_SURVEY_INFO_NOISE]     = {NLA_U8, 0, 0};
++                    // Validate the denominator and RX counters before reading their payloads.
++                    survey_policy[NL80211_SURVEY_INFO_CHANNEL_TIME]    = {NLA_U64, 0, 0};
++                    survey_policy[NL80211_SURVEY_INFO_CHANNEL_TIME_RX] = {NLA_U64, 0, 0};
++                    survey_policy[NL80211_SURVEY_INFO_TIME_BSS_RX]     = {NLA_U64, 0, 0};
+                 }
+ 
+                 return survey_policy;
+@@ -1713,6 +1717,7 @@ bool nl80211_client_impl::get_survey_info(const std::string &interface_name,
+             if (sinfo[NL80211_SURVEY_INFO_CHANNEL_TIME]) {
+                 channel_survey_info.time_on_ms =
+                     nla_get_u64(sinfo[NL80211_SURVEY_INFO_CHANNEL_TIME]);
++                channel_survey_info.time_on_present = true;
+             }
+ 
+             if (sinfo[NL80211_SURVEY_INFO_CHANNEL_TIME_BUSY]) {
+@@ -1729,8 +1734,8 @@ bool nl80211_client_impl::get_survey_info(const std::string &interface_name,
+                                << " value=" << channel_survey_info.time_ext_busy_ms;
+                 }
+             } else {
+-                /* NL80211_SURVEY_INFO_CHANNEL_TIME_EXT_BUSY is absent from the kernel
+-                 * response; the driver does not provide OBSS data for this channel. */
++                // EXT_BUSY measures extension-channel activity, not other-BSS RX
++                // airtime.
+                 if (channel_survey_info.in_use) {
+                     LOG(DEBUG) << "survey: ext_busy absent"
+                                << " freq=" << channel_survey_info.frequency_mhz;
+@@ -1740,14 +1745,16 @@ bool nl80211_client_impl::get_survey_info(const std::string &interface_name,
+             if (sinfo[NL80211_SURVEY_INFO_CHANNEL_TIME_RX]) {
+                 channel_survey_info.time_rx_ms =
+                     nla_get_u64(sinfo[NL80211_SURVEY_INFO_CHANNEL_TIME_RX]);
++                channel_survey_info.time_rx_present = true;
+             }
+ 
+-#ifdef NL80211_SURVEY_INFO_TIME_BSS_RX
++            // TIME_BSS_RX is an enum; #ifdef hid valid driver measurements.
++            // Read it directly and preserve presence even when its value is zero.
+             if (sinfo[NL80211_SURVEY_INFO_TIME_BSS_RX]) {
+                 channel_survey_info.time_bss_rx_ms =
+                     nla_get_u64(sinfo[NL80211_SURVEY_INFO_TIME_BSS_RX]);
++                channel_survey_info.time_bss_rx_present = true;
+             }
+-#endif
+ 
+             if (sinfo[NL80211_SURVEY_INFO_CHANNEL_TIME_TX]) {
+                 channel_survey_info.time_tx_ms =
+-- 
+2.34.1
+
