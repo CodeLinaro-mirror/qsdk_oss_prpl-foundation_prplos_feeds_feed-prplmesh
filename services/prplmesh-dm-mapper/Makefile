@@ -1,13 +1,14 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=prplmesh-dm-mapper
-PKG_VERSION:=v0.4.8
+PKG_VERSION:=feature_FEAT-686-add-80211bn-uhr-support
 PKG_RELEASE:=1
 
-PKG_SOURCE:=prplmesh-dm-mapper-$(PKG_VERSION).tar.gz
-PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/prplmesh-dm-mapper/-/archive/$(PKG_VERSION)
-PKG_HASH:=1fc49e3ecb6817f206e52b76c36e357d99d5cbceecfcf026e451fe0b1bc1d505
-PKG_BUILD_DIR:=$(BUILD_DIR)/prplmesh-dm-mapper-$(PKG_VERSION)
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_VERSION:=feature/FEAT-686-add-80211bn-uhr-support
+PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/prplmesh-dm-mapper.git
+PKG_HASH:=skip
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
