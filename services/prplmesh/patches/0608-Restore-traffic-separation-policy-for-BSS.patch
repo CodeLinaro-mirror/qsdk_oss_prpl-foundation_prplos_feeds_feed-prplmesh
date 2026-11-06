@@ -1,0 +1,255 @@
+From 984eecf8601d800f8cb000b3a683f369ebe2dcc7 Mon Sep 17 00:00:00 2001
+From: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+Date: Fri, 6 Nov 2026 15:46:12 +0530
+Subject: [PATCH] Restore traffic separation policy for rediscovered BSSes
+
+Reconcile pure fronthaul BSSes on the unchanged-config fast path so
+interfaces registered after the last full apply are configured.
+
+Reapply VLAN filters when an already managed access interface is
+rediscovered after its kernel state is lost.
+
+Signed-off-by: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+---
+ .../slave/tasks/traffic_separation_task.cpp   | 44 ++++++++++++++-----
+ .../slave/tasks/traffic_separation_task.h     |  8 ++++
+ .../access_port_plumbing_8021q.cpp            | 12 ++---
+ .../traffic_separation_manager.cpp            |  9 ++++
+ .../bcl/include/bcl/network/network_utils.h   | 13 +++++-
+ .../bcl/source/network/network_utils.cpp      | 42 ++++++++++++++++++
+ 6 files changed, 108 insertions(+), 20 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp b/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
+index 41ca345ae..6ec3ab845 100644
+--- a/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
++++ b/agent/src/beerocks/slave/tasks/traffic_separation_task.cpp
+@@ -362,6 +362,13 @@ bool TrafficSeparationTask::reset()
+             }
+         }
+ 
++        // Reconcile pure-FH BSSes too. A BSS can become available in AgentDB
++        // after the last full apply without changing the config/trunk snapshot
++        // that selects this fast path.
++        if (!restore_fh_access_ports_from_db()) {
++            success = false;
++        }
++
+         // Config/ports didn't change, but a BSS's vap_type classification may
+         // have been resolved (e.g. GUEST) since the last apply - re-check
+         // bridge membership even though the VLAN/trunk rebuild is skipped.
+@@ -519,8 +526,7 @@ bool TrafficSeparationTask::restore_exact_ports_from_db()
+ {
+     auto db = AgentDB::get();
+ 
+-    bool success = true;
+-    std::unordered_set<std::string> restored_fh_ifaces;
++    bool success = restore_fh_access_ports_from_db();
+     std::unordered_set<std::string> restored_wds_ifaces;
+ 
+     for (const auto *radio : db->get_radios_list()) {
+@@ -528,31 +534,47 @@ bool TrafficSeparationTask::restore_exact_ports_from_db()
+             continue;
+         }
+ 
+-        for (const auto &bss : radio->front.bssids) {
+-            if (!bss.enabled || !bss.fronthaul_bss || bss.backhaul_bss || bss.iface_name.empty()) {
++        for (const auto &client_kv : radio->associated_clients) {
++            const auto &client = client_kv.second;
++            if (client.wds_iface_name.empty()) {
+                 continue;
+             }
+ 
+-            if (!restored_fh_ifaces.emplace(bss.iface_name).second) {
++            if (!restored_wds_ifaces.emplace(client.wds_iface_name).second) {
+                 continue;
+             }
+ 
+-            if (!handle_new_fh_iface(bss.iface_name)) {
++            if (!handle_new_wds_iface(client.wds_iface_name)) {
+                 success = false;
+             }
+         }
++    }
+ 
+-        for (const auto &client_kv : radio->associated_clients) {
+-            const auto &client = client_kv.second;
+-            if (client.wds_iface_name.empty()) {
++    return success;
++}
++
++bool TrafficSeparationTask::restore_fh_access_ports_from_db()
++{
++    auto db = AgentDB::get();
++
++    bool success = true;
++    std::unordered_set<std::string> restored_fh_ifaces;
++
++    for (const auto *radio : db->get_radios_list()) {
++        if (!radio) {
++            continue;
++        }
++
++        for (const auto &bss : radio->front.bssids) {
++            if (!bss.enabled || !bss.fronthaul_bss || bss.backhaul_bss || bss.iface_name.empty()) {
+                 continue;
+             }
+ 
+-            if (!restored_wds_ifaces.emplace(client.wds_iface_name).second) {
++            if (!restored_fh_ifaces.emplace(bss.iface_name).second) {
+                 continue;
+             }
+ 
+-            if (!handle_new_wds_iface(client.wds_iface_name)) {
++            if (!handle_new_fh_iface(bss.iface_name)) {
+                 success = false;
+             }
+         }
+diff --git a/agent/src/beerocks/slave/tasks/traffic_separation_task.h b/agent/src/beerocks/slave/tasks/traffic_separation_task.h
+index d9c695d9b..ec6825346 100644
+--- a/agent/src/beerocks/slave/tasks/traffic_separation_task.h
++++ b/agent/src/beerocks/slave/tasks/traffic_separation_task.h
+@@ -125,6 +125,14 @@ private:
+    */
+     bool restore_exact_ports_from_db();
+ 
++    /**
++     * @brief Reconcile enabled pure-fronthaul access ports from the current DB snapshot.
++     *
++     * Used by the unchanged-config fast path to recover BSSes that were not
++     * registered when the last full TS apply ran.
++     */
++    bool restore_fh_access_ports_from_db();
++
+     /**
+    * @brief Resolve one exact WDS trunk from current DB state.
+    *
+diff --git a/agent/src/beerocks/slave/traffic_separation/access_port_plumbing_8021q.cpp b/agent/src/beerocks/slave/traffic_separation/access_port_plumbing_8021q.cpp
+index 03ebd82d5..8ac76ab39 100644
+--- a/agent/src/beerocks/slave/traffic_separation/access_port_plumbing_8021q.cpp
++++ b/agent/src/beerocks/slave/traffic_separation/access_port_plumbing_8021q.cpp
+@@ -36,14 +36,10 @@ bool AccessPortPlumbing8021q::apply(const sTrafficSeparationConfig &cfg)
+         return true;
+     }
+ 
+-    if (m_is_applied) {
+-        LOG(TRACE) << "iface=" << m_access_port.iface_name << " already applied";
+-        return true;
+-    }
+-
+-    // In 802.1Q subifaces design, access ports only need a VLAN traffic filter
+-    // to block tagged and double-tagged traffic from fronthaul STAs.
+-    if (!network_utils::set_vlan_packet_filter(true, m_access_port.iface_name)) {
++    // Full apply removes and recreates the filters. Reapply on an already-applied
++    // port uses tc filter replace to restore them without the full delete/add path.
++    if (!(m_is_applied ? network_utils::replace_vlan_packet_filter(m_access_port.iface_name)
++                       : network_utils::set_vlan_packet_filter(true, m_access_port.iface_name))) {
+         LOG(ERROR) << "failed to set VLAN filter iface=" << m_access_port.iface_name;
+         return false;
+     }
+diff --git a/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.cpp b/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.cpp
+index 528ae0503..40d95ae72 100644
+--- a/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.cpp
++++ b/agent/src/beerocks/slave/traffic_separation/traffic_separation_manager.cpp
+@@ -111,6 +111,15 @@ bool TrafficSeparationManager::add_access_port(const sAccessPort &access_port)
+ 
+     auto it = m_access_port_plumbing_map.find(access_port.iface_name);
+     if (it != m_access_port_plumbing_map.end()) {
++        // An interface can remain managed after its kernel TC state is lost
++        // (for example, after the netdev is recreated with the same name).
++        // Re-apply its policy whenever an applied manager rediscovers it.
++        if (is_applied()) {
++            if (!it->second || !it->second->apply(m_config)) {
++                LOG(ERROR) << "access re-apply failed iface=" << access_port.iface_name;
++                return false;
++            }
++        }
+         LOG(DEBUG) << "access iface=" << access_port.iface_name << " is already managed";
+         return true;
+     }
+diff --git a/common/beerocks/bcl/include/bcl/network/network_utils.h b/common/beerocks/bcl/include/bcl/network/network_utils.h
+index 73f9e91f4..08b6eeeed 100644
+--- a/common/beerocks/bcl/include/bcl/network/network_utils.h
++++ b/common/beerocks/bcl/include/bcl/network/network_utils.h
+@@ -358,7 +358,7 @@ public:
+     static bool tc_ensure_clsact_qdisc(const std::string &iface);
+ 
+     /**
+-     * @brief Set or clear a simple VLAN packet filter rule per BSS interface.
++     * @brief Set or clear VLAN packet filter rules using the full apply path.
+      *
+      * Adds ingress drop filters using tc for VLAN-tagged packets:
+      *   tc qdisc add dev <bss_iface> clsact
+@@ -373,6 +373,17 @@ public:
+      */
+     static bool set_vlan_packet_filter(bool set, const std::string &bss_iface);
+ 
++    /**
++     * @brief Replace VLAN packet filter rules in place for an already-applied access port.
++     *
++     * Ensures ingress drop filters with tc filter replace, without first deleting them.
++     * Intended for the fast reapply path; use set_vlan_packet_filter() for full apply/clear.
++     *
++     * @param bss_iface Interface name to update.
++     * @return true on success, false otherwise.
++     */
++    static bool replace_vlan_packet_filter(const std::string &bss_iface);
++
+     /**
+      * @brief Generate a locally administrated mac address
+      * for ethernet switch node (eth backhaul) derived from the bridge mac address.
+diff --git a/common/beerocks/bcl/source/network/network_utils.cpp b/common/beerocks/bcl/source/network/network_utils.cpp
+index eafaf3444..277cac89f 100644
+--- a/common/beerocks/bcl/source/network/network_utils.cpp
++++ b/common/beerocks/bcl/source/network/network_utils.cpp
+@@ -1815,6 +1815,48 @@ bool network_utils::set_vlan_packet_filter(bool set, const std::string &bss_ifac
+     return success;
+ }
+ 
++bool network_utils::replace_vlan_packet_filter(const std::string &bss_iface)
++{
++    static constexpr char TC_PROTO_8021Q[]    = "802.1Q";
++    static constexpr char TC_PROTO_8021AD[]   = "802.1ad";
++    static constexpr int FILTER_PREF_8021Q    = 1911;
++    static constexpr int FILTER_PREF_8021AD   = 1912;
++    static constexpr int FILTER_HANDLE_8021Q  = 1911;
++    static constexpr int FILTER_HANDLE_8021AD = 1912;
++
++    if (bss_iface.empty()) {
++        LOG(ERROR) << "Given BSS interface name is empty!";
++        return false;
++    }
++
++    bool success = tc_ensure_clsact_qdisc(bss_iface);
++
++    auto replace_drop_filter = [&](const char *proto, int pref, int handle) -> bool {
++        std::string replace_cmd;
++        replace_cmd.reserve(200);
++        replace_cmd.append("tc filter replace dev ")
++            .append(bss_iface)
++            .append(" ingress pref ")
++            .append(std::to_string(pref))
++            .append(" handle ")
++            .append(std::to_string(handle))
++            .append(" protocol ")
++            .append(proto)
++            .append(" flower action drop");
++        return tc_run_command(replace_cmd);
++    };
++
++    if (!replace_drop_filter(TC_PROTO_8021Q, FILTER_PREF_8021Q, FILTER_HANDLE_8021Q)) {
++        success = false;
++    }
++
++    if (!replace_drop_filter(TC_PROTO_8021AD, FILTER_PREF_8021AD, FILTER_HANDLE_8021AD)) {
++        success = false;
++    }
++
++    return success;
++}
++
+ sMacAddr network_utils::get_eth_sw_mac_from_bridge_mac(const sMacAddr &bridge_mac)
+ {
+     sMacAddr mac = bridge_mac;
+-- 
+2.34.1
+
