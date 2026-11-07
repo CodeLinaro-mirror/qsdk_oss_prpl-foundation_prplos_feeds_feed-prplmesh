@@ -1,0 +1,171 @@
+From 7563a1ec5976e1978a3b43e767e7dd201b8085d5 Mon Sep 17 00:00:00 2001
+From: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+Date: Fri, 6 Nov 2026 17:55:21 +0530
+Subject: [PATCH 598/598] Persist fronthaul VAP state across AP-manager
+ restarts
+
+Retain the desired FH VAP state in the agent when AP-manager sockets are unavailable, and replay it when an AP manager joins. Record the disconnected state before agent_reset() stops the AP managers.
+
+Signed-off-by: Stephan Raj Ignatious Durairaj <signatio@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/son_slave_thread.cpp | 71 +++++++++++++------
+ agent/src/beerocks/slave/son_slave_thread.h   | 18 +++--
+ 2 files changed, 65 insertions(+), 24 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 4d57a93c0..609a567b1 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -2315,6 +2315,9 @@ bool slave_thread::handle_cmdu_backhaul_manager_message(
+ 
+         m_is_backhaul_disconnected = true;
+ 
++        // Save the disconnected FH state before agent_reset() stops the AP managers.
++        send_fh_vap_state_to_ap_managers(false);
++
+         m_stopped |= bool(notification->stopped());
+ 
+         agent_reset();
+@@ -4274,6 +4277,12 @@ bool slave_thread::handle_cmdu_ap_manager_message(const std::string &fronthaul_i
+             }
+         }
+ 
++#if defined(USE_PRPLMESH_NLHAL) || defined(USE_PRPLMESH_WHM)
++        if (!send_fh_vap_state_to_ap_managers(m_fh_vaps_enabled, true, fd, fronthaul_iface)) {
++            LOG(ERROR) << "Failed to replay FH VAP state to " << fronthaul_iface;
++        }
++#endif
++
+         break;
+     }
+     case beerocks_message::ACTION_APMANAGER_HOSTAP_SET_RESTRICTED_FAILSAFE_CHANNEL_RESPONSE: {
+@@ -7567,25 +7576,52 @@ void slave_thread::update_bsta_state_to_ap_managers()
+         });
+ }
+ 
+-void slave_thread::send_fh_vap_state_to_ap_managers(bool enable)
++bool slave_thread::send_fh_vap_state_to_ap_managers(bool enable, bool target_requested,
++                                                    int target_fd, std::string target_iface)
+ {
+-#ifdef USE_PRPLMESH_NLHAL
+-    {
+-        auto db = AgentDB::get();
+-        if (!db->device_conf.fh_vaps_state_control) {
+-            LOG(DEBUG) << "send_fh_vap_state_to_ap_managers: fh_vaps_state_control disabled, skipping";
+-            return;
+-        }
++    // Retain the latest state even if the AP-manager sockets are unavailable.
++    m_fh_vaps_enabled = enable;
++
++#if defined(USE_PRPLMESH_NLHAL) || defined(USE_PRPLMESH_WHM)
++    auto db = AgentDB::get();
++    if (!db->device_conf.fh_vaps_state_control) {
++        LOG(DEBUG) << "send_fh_vap_state_to_ap_managers: fh_vaps_state_control disabled, skipping";
++        return true;
+     }
+ 
+     if (bpl::cfg_is_master() > 0) {
+         LOG(DEBUG) << "send_fh_vap_state_to_ap_managers: skipping for CONTROLLER mode";
+-        return;
++        return true;
++    }
++
++    auto send_state = [&](int fd, const std::string &iface) {
++        auto request_out = message_com::create_vs_message<
++            beerocks_message::cACTION_APMANAGER_SET_FH_VAPS_STATE>(cmdu_tx);
++        if (!request_out) {
++            LOG(ERROR) << "Failed building cACTION_APMANAGER_SET_FH_VAPS_STATE for " << iface;
++            return false;
++        }
++
++        request_out->enable() = enable ? 1 : 0;
++        LOG(DEBUG) << "send_fh_vap_state_to_ap_managers: sending SET_FH_VAPS_STATE("
++                   << (enable ? "enable" : "disable") << ") to " << iface;
++        return send_cmdu(fd, cmdu_tx);
++    };
++
++    if (target_requested) {
++        if (target_fd == beerocks::net::FileDescriptor::invalid_descriptor) {
++            LOG(ERROR) << "Cannot send FH VAP state to " << target_iface
++                       << ": AP-manager fd is invalid";
++            return false;
++        }
++
++        return send_state(target_fd, target_iface);
+     }
+ 
+     LOG(DEBUG) << "send_fh_vap_state_to_ap_managers: "
+                << (enable ? "enabling" : "disabling") << " FH VAPs on all radios";
+ 
++    bool send_succeeded = true;
+     m_radio_managers.do_on_each_radio_manager(
+         [&](sManagedRadio &radio_manager, const std::string &fronthaul_iface) {
+             if (radio_manager.ap_manager_fd == beerocks::net::FileDescriptor::invalid_descriptor) {
+@@ -7594,20 +7630,15 @@ void slave_thread::send_fh_vap_state_to_ap_managers(bool enable)
+                 return true;
+             }
+ 
+-            auto request_out = message_com::create_vs_message<
+-                beerocks_message::cACTION_APMANAGER_SET_FH_VAPS_STATE>(cmdu_tx);
+-            if (!request_out) {
+-                LOG(ERROR) << "Failed building cACTION_APMANAGER_SET_FH_VAPS_STATE for "
+-                           << fronthaul_iface;
+-                return true;
++            if (!send_state(radio_manager.ap_manager_fd, fronthaul_iface)) {
++                LOG(ERROR) << "Failed to send FH VAP state to " << fronthaul_iface;
++                send_succeeded = false;
+             }
+-
+-            request_out->enable() = enable ? 1 : 0;
+-            LOG(DEBUG) << "send_fh_vap_state_to_ap_managers: sending SET_FH_VAPS_STATE("
+-                       << (enable ? "enable" : "disable") << ") to " << fronthaul_iface;
+-            send_cmdu(radio_manager.ap_manager_fd, cmdu_tx);
+             return true;
+         });
++    return send_succeeded;
++#else
++    return true;
+ #endif
+ }
+ 
+diff --git a/agent/src/beerocks/slave/son_slave_thread.h b/agent/src/beerocks/slave/son_slave_thread.h
+index a1d29482b..ab8db46b4 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.h
++++ b/agent/src/beerocks/slave/son_slave_thread.h
+@@ -469,6 +469,11 @@ private:
+      */
+     bool m_controller_reachable = false;
+ 
++    /**
++     * @brief Desired FH VAP state retained across AP-manager restarts.
++     */
++    bool m_fh_vaps_enabled = true;
++
+     TaskPool m_task_pool;
+ 
+     // Global FSM members:
+@@ -718,12 +723,17 @@ private:
+     void update_bsta_state_to_ap_managers();
+ 
+     /**
+-     * @brief Sends a SET_FH_VAPS_STATE request to all AP managers to enable or disable FH VAPs.
+-     * Called when controller reachability changes or when the backhaul L2 link is lost.
++     * @brief Sends a SET_FH_VAPS_STATE request to all AP managers or one targeted manager.
+      *
+      * @param enable true to enable FH VAPs, false to disable them.
+-     */
+-    void send_fh_vap_state_to_ap_managers(bool enable);
++     * @param target_requested true to send only to target_fd; false to broadcast to all managers.
++     * @param target_fd AP-manager FD for a targeted send.
++     * @param target_iface Interface name used for targeted-send logging.
++     * @return true if all requested sends succeed or sending is skipped; false on send failure.
++     */
++    bool send_fh_vap_state_to_ap_managers(
++        bool enable, bool target_requested = false,
++        int target_fd = net::FileDescriptor::invalid_descriptor, std::string target_iface = {});
+ 
+     bool read_platform_configuration();
+     bool load_dpp_provisioned_keys();
+-- 
+2.34.1
+
