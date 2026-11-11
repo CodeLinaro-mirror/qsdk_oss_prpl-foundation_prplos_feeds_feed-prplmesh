@@ -1,0 +1,131 @@
+From 17e63cb7636496f93fff644bec0787e20902189e Mon Sep 17 00:00:00 2001
+From: Vinu Bharath R <vinubhar@qti.qualcomm.com>
+Date: Fri, 6 Nov 2026 12:26:14 +0530
+Subject: [PATCH] backhaul: update selected iface when ETH is UP during
+ WAIT_WPS
+
+Add a helper to select wired backhaul consistently in AgentDB and use it
+across wired transition paths. This updates the WAN iface, connection type,
+selected iface, and clears the selected radio MAC together.
+
+Also update the WAIT_WPS and recovery-cycle stop paths to select a reachable
+Ethernet interface before forcing the FSM to CONNECTED, avoiding a CONNECTED
+state with stale or incomplete wired backhaul state.
+
+Signed-off-by: Vinu Bharath R <vinubhar@qti.qualcomm.com>
+---
+ .../backhaul_manager/backhaul_manager.cpp     | 49 ++++++++++++-------
+ 1 file changed, 30 insertions(+), 19 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index def28b7a5..f0755d362 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -129,6 +129,16 @@ const std::string dev_set_config_bss_info_param = "bss_info";
+ const std::string dev_set_config_mscs_param     = "mscs";
+ const std::string dev_set_config_scs_param      = "scs";
+ 
++static void select_wired_backhaul_iface(const std::string &iface)
++{
++    auto db = AgentDB::get();
++
++    db->ethernet.wan.iface_name           = iface;
++    db->backhaul.connection_type          = AgentDB::sBackhaul::eConnectionType::Wired;
++    db->backhaul.selected_iface_name      = iface;
++    db->backhaul.selected_iface_radio_mac = net::network_utils::ZERO_MAC;
++}
++
+ //////////////////////////////////////////////////////////////////////////////
+ ////////////////////////// Local Module Definitions //////////////////////////
+ //////////////////////////////////////////////////////////////////////////////
+@@ -1093,9 +1103,7 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+             }
+ 
+             // Mark the connection as WIRED
+-            db->backhaul.connection_type          = AgentDB::sBackhaul::eConnectionType::Wired;
+-            db->backhaul.selected_iface_name      = db->ethernet.wan.iface_name;
+-            db->backhaul.selected_iface_radio_mac = net::network_utils::ZERO_MAC;
++            select_wired_backhaul_iface(db->ethernet.wan.iface_name);
+ 
+         } else {
+             // If no wired backhaul is configured, or it is down, we get into this else branch.
+@@ -1185,6 +1193,10 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+         // - If already in wired_backhaul FSM: simply disconnect the STA interface.
+         // - If currently in wireless_backhaul FSM: disconnect the STA interface and transition to wired_backhaul FSM.
+         if ((!db->device_conf.local_gw) && m_eth_link_up) {
++            // Mark the connection as WIRED before handle_backhaul_connect() validates AgentDB.
++            select_wired_backhaul_iface(db->ethernet.wan.iface_name);
++            LOG(DEBUG) << " Moved to WIRED BACKHAUL";
++
+             for (auto &radio_info : m_radios_info) {
+                 auto radio = db->radio(radio_info->sta_iface);
+                 if (!radio) {
+@@ -1203,13 +1215,6 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+ 
+                     // Enable all AP VAPS in the radio
+                     send_slaves_enable();
+-
+-                    // Mark the connection as WIRED
+-                    db->backhaul.connection_type          = AgentDB::sBackhaul::eConnectionType::Wired;
+-                    db->backhaul.selected_iface_name      = db->ethernet.wan.iface_name;
+-                    db->backhaul.selected_iface_radio_mac = net::network_utils::ZERO_MAC;
+-                    LOG(DEBUG) << " Moved to WIRED BACKHAUL";
+-
+                 }
+             }
+         }
+@@ -1422,9 +1427,7 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+                     send_slaves_enable();
+ 
+                     // Mark the connection as WIRED
+-                    db->backhaul.connection_type          = AgentDB::sBackhaul::eConnectionType::Wired;
+-                    db->backhaul.selected_iface_name      = db->ethernet.wan.iface_name;
+-                    db->backhaul.selected_iface_radio_mac = net::network_utils::ZERO_MAC;
++                    select_wired_backhaul_iface(db->ethernet.wan.iface_name);
+                     LOG(DEBUG) << "Moved to WIRED BACKHAUL";
+ 
+                     reset_1905_security_for_connection_switch();
+@@ -1982,6 +1985,7 @@ bool BackhaulManager::backhaul_fsm_wireless(bool &skip_select)
+ 
+                         LOG(INFO) << "Ethernet link became available during WAIT_WPS on interface "
+                                   << db->ethernet.wan.iface_name << " - switch to wired backhaul";
++                        select_wired_backhaul_iface(selected_eth_iface);
+                         FSM_MOVE_STATE(CONNECTED);
+                         break;
+                     }
+@@ -5672,9 +5676,18 @@ void BackhaulManager::recovery_cycle_stop()
+     if (m_eFSMState != EState::CONNECTED && m_eFSMState != EState::OPERATIONAL) {
+         LOG(INFO) << "Backhaul recovery cycle: forcing FSM to CONNECTED (wired backhaul "
+                      "recovered while FSM was paused)";
+-        auto db                       = AgentDB::get();
+-        db->backhaul.connection_type = AgentDB::sBackhaul::eConnectionType::Wired;
+-        FSM_MOVE_STATE(CONNECTED);
++        auto db                        = AgentDB::get();
++        std::string selected_eth_iface = db->ethernet.wan.iface_name;
++        if ((selected_eth_iface.empty() ||
++             !beerocks::net::network_utils::linux_iface_is_up_and_running(selected_eth_iface) ||
++             !is_gateway_reachable_via_interface(selected_eth_iface)) &&
++            !select_gateway_reachable_eth_interface(selected_eth_iface)) {
++            LOG(ERROR) << "Backhaul recovery cycle: cannot force CONNECTED, no wired backhaul "
++                          "interface is available";
++        } else {
++            select_wired_backhaul_iface(selected_eth_iface);
++            FSM_MOVE_STATE(CONNECTED);
++        }
+     }
+ 
+     for (auto &radio_info : m_radios_info) {
+@@ -7002,9 +7015,7 @@ bool BackhaulManager::try_switch_to_wired_backhaul()
+     m_eth_link_up                         = true;
+     m_backhaul_switch                     = true;
+     m_prev_bh_connection                  = backhaul_connection::Wireless;
+-    db->backhaul.connection_type          = AgentDB::sBackhaul::eConnectionType::Wired;
+-    db->backhaul.selected_iface_name      = selected_eth_iface;
+-    db->backhaul.selected_iface_radio_mac = net::network_utils::ZERO_MAC;
++    select_wired_backhaul_iface(selected_eth_iface);
+ 
+     send_slaves_enable();
+ 
+-- 
+2.34.1
+
