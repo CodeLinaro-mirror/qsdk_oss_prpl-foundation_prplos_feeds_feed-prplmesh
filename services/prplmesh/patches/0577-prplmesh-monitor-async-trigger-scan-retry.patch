@@ -1,0 +1,800 @@
+From fb8c7ce5ce5cd4bbac15455f1ff3ef941486bc78 Mon Sep 17 00:00:00 2001
+From: Sandeep Tomer <stomer@qti.qualcomm.com>
+Date: Sun, 1 Nov 2026 19:45:49 +0530
+Subject: [PATCH] prplMesh: monitor: keep AP Metrics responsive and allow local
+ STA ARP control
+
+Replace the 300 ms blocking scan-trigger retry delay with a Monitor
+event-loop timer. Preserve pending parameters, reject overlapping requests,
+and cancel pending retries during abort and shutdown. Explicitly invalidate
+the timer handle after cancellation so subsequent requests can arm retries.
+Abort pending work and report initial trigger failure if a retry timer
+cannot be created.
+
+Refresh cumulative station traffic counters through the HAL when preparing
+AP Metrics. Use a separate response snapshot to preserve periodic polling
+deltas and RSSI measurements, with cached fallback on read failure. Reuse
+snapshots for duplicate BSSIDs and use them for MLO per-link traffic TLVs.
+Emit one timestamped counter trace per station during response preparation.
+Expose the existing measurement-window poll count in Agent configuration.
+
+Prefer native 64-bit TX/RX byte counters using the stable nl80211 ABI IDs
+RX=23 and TX=24. Include both IDs in parser bounds, supporting headers that
+omit the enum names without preprocessor checks or macro shadowing. Extend
+32-bit-only counters across rollover before AP Metrics unit conversion.
+Fallback totals belong to one association; reads must be less than 4 GiB
+apart and cannot distinguish an unannounced driver reset from rollover.
+
+Read monitor_disable_initiative_arp as an optional local Agent override.
+Keep the generated default at 0 so automatic STA probing remains enabled
+under Controller policy. The test team can set the local option to 1 to
+disable automatic probes and prevent Controller updates from re-enabling
+them. Preserve ARP for explicit RSSI requests.
+
+Signed-off-by: Sandeep Tomer <stomer@qti.qualcomm.com>
+---
+ agent/config/beerocks_agent.conf.in           |   4 +
+ .../fronthaul_manager/monitor/monitor.cpp     | 104 +++++-
+ .../fronthaul_manager/monitor/monitor.h       |   5 +
+ .../monitor/monitor_stats.cpp                 |   6 +-
+ .../fronthaul_manager/monitor/monitor_stats.h |   4 +-
+ .../bcl/include/bcl/beerocks_config_file.h    |   1 +
+ .../bcl/source/beerocks_config_file.cpp       |   2 +
+ .../beerocks/bwl/include/bwl/mon_wlan_hal.h   |  16 +
+ .../bwl/nl80211/mon_wlan_hal_nl80211.cpp      | 298 +++++++++++-------
+ .../bwl/nl80211/mon_wlan_hal_nl80211.h        |  21 ++
+ 10 files changed, 342 insertions(+), 119 deletions(-)
+
+diff --git a/agent/config/beerocks_agent.conf.in b/agent/config/beerocks_agent.conf.in
+index 6fdb28b..420cccd 100644
+--- a/agent/config/beerocks_agent.conf.in
++++ b/agent/config/beerocks_agent.conf.in
+@@ -14,9 +14,13 @@ model=prplMesh
+ ucc_listener_port=8002 # 0 - disabled
+ enable_arp_monitor=0
+ disable_gw_arping=0 # 0 - arping enabled (default), 1 - skip arping gateway reachability check (rely on link status only)
++# Set to 1 to disable automatic STA ARP probes; explicit RSSI requests still work.
++monitor_disable_initiative_arp=0
+ bridge_iface=@BEEROCKS_BRIDGE_IFACE@
+ enable_system_hang_test=0 # 0 - disabled
+ monitor_polling_rate_msec=@BEEROCKS_MONITOR_POLLING_RATE_MSEC@
++# Number of polling cycles in one internal measurement window. Default: 4.
++monitor_measurement_window_poll_count=4
+ enable_auto_chansel_handling=0 # 0 - disabled
+ 
+ # channel_selection_use_radio_preference:
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+index 064d07e..29e3f26 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.cpp
+@@ -34,6 +34,7 @@
+ #include <tlvf/wfa_map/tlvMetricReportingPolicy.h>
+ 
+ #include <cmath>
++#include <unordered_map>
+ #include <vector>
+ 
+ using namespace beerocks;
+@@ -90,6 +91,13 @@ Monitor::Monitor(const std::string &monitor_iface_,
+     auto radio_node = mon_db.get_radio_node();
+     radio_node->set_iface(monitor_iface);
+ 
++    // The Agent can disable automatic STA probing independently of the Controller.
++    mon_rssi.conf_disable_initiative_arp =
++        (beerocks_slave_conf.monitor_disable_initiative_arp == "1");
++    if (mon_rssi.conf_disable_initiative_arp) {
++        LOG(INFO) << "Automatic STA ARP probing disabled by Agent configuration";
++    }
++
+     // set polling-rate(msec)
+     auto polling_rate_msec = string_utils::stoi(beerocks_slave_conf_.monitor_polling_rate_msec);
+     if (polling_rate_msec != 0) {
+@@ -474,6 +482,7 @@ void Monitor::on_thread_stop()
+     if (!m_timer_manager->remove_timer(m_fsm_timer)) {
+         LOG(ERROR) << "Failed to remove timer";
+     }
++    cancel_channel_scan_trigger_retry();
+ 
+     if (mon_wlan_hal) {
+         if (m_arp_fd != beerocks::net::FileDescriptor::invalid_descriptor) {
+@@ -511,6 +520,52 @@ void Monitor::on_thread_stop()
+     return;
+ }
+ 
++bool Monitor::schedule_channel_scan_trigger_retry()
++{
++    constexpr auto trigger_scan_retry_delay = std::chrono::milliseconds(300);
++
++    if (!mon_wlan_hal || !mon_wlan_hal->is_channel_scan_retry_pending()) {
++        return true;
++    }
++    if (m_channel_scan_trigger_retry_timer != beerocks::net::FileDescriptor::invalid_descriptor) {
++        LOG(ERROR) << "Channel scan retry timer is already armed";
++        return false;
++    }
++
++    m_channel_scan_trigger_retry_timer = m_timer_manager->add_timer(
++        "Channel Scan Trigger Retry", trigger_scan_retry_delay, std::chrono::milliseconds::zero(),
++        [this](int fd, beerocks::EventLoop &loop) {
++            m_timer_manager->remove_timer(fd);
++            m_channel_scan_trigger_retry_timer = beerocks::net::FileDescriptor::invalid_descriptor;
++
++            if (!mon_wlan_hal || !mon_wlan_hal->is_channel_scan_retry_pending()) {
++                return true;
++            }
++
++            mon_wlan_hal->retry_pending_channel_scan_trigger();
++            if (mon_wlan_hal->is_channel_scan_retry_pending() &&
++                !schedule_channel_scan_trigger_retry()) {
++                LOG(ERROR) << "Failed to schedule channel scan retry";
++                mon_wlan_hal->channel_scan_abort();
++            }
++            return true;
++        });
++
++    if (m_channel_scan_trigger_retry_timer == beerocks::net::FileDescriptor::invalid_descriptor) {
++        LOG(ERROR) << "Failed to create channel scan retry timer";
++        return false;
++    }
++    return true;
++}
++
++void Monitor::cancel_channel_scan_trigger_retry()
++{
++    if (m_channel_scan_trigger_retry_timer != beerocks::net::FileDescriptor::invalid_descriptor) {
++        m_timer_manager->remove_timer(m_channel_scan_trigger_retry_timer);
++        m_channel_scan_trigger_retry_timer = beerocks::net::FileDescriptor::invalid_descriptor;
++    }
++}
++
+ bool Monitor::monitor_fsm()
+ {
+     if (!m_logger_configured) {
+@@ -1094,6 +1149,11 @@ bool Monitor::create_ap_metrics_response(uint16_t mid, const std::vector<sMacAdd
+         LOG(ERROR) << "Failed creating AP_METRICS_RESPONSE_MESSAGE";
+         return false;
+     }
++
++    // Keep response-time reads separate from the periodic polling baseline and RSSI/PHY
++    // measurement window. Reuse each snapshot if a BSSID occurs more than once in the query.
++    std::unordered_map<std::string, bwl::SStaStats> traffic_snapshots;
++
+     for (const auto &bssid : bssid_list) {
+         auto vap_node = mon_db.get_vap_node(tlvf::mac_to_string(bssid));
+         if (!vap_node) {
+@@ -1138,15 +1198,42 @@ bool Monitor::create_ap_metrics_response(uint16_t mid, const std::vector<sMacAdd
+                 }
+ 
+                 if (include_sta_traffic_stats_tlv) {
++                    auto snapshot =
++                        traffic_snapshots.emplace(sta_mac, sta_node->get_stats().hal_stats);
++                    auto &traffic_stats = snapshot.first->second;
++                    if (snapshot.second) {
++                        const auto read_start = std::chrono::steady_clock::now();
++                        const bool fresh = mon_wlan_hal->update_stations_stats(
++                            vap_node->get_iface(), sta_mac, traffic_stats,
++                            mon_db.get_clients_unicast_measurements());
++                        if (!fresh) {
++                            // A failed HAL read may have partially modified the output.
++                            traffic_stats = sta_node->get_stats().hal_stats;
++                            LOG(WARNING) << "AP Metrics STA counter read failed for " << sta_mac
++                                         << "; using cached counters";
++                        }
++                        LOG(TRACE) << "[AP-METRICS-COUNTERS] timestamp_ms="
++                                   << std::chrono::duration_cast<std::chrono::milliseconds>(
++                                          std::chrono::system_clock::now().time_since_epoch())
++                                          .count()
++                                   << " sta=" << sta_mac << " fresh=" << fresh
++                                   << " read_us="
++                                   << std::chrono::duration_cast<std::chrono::microseconds>(
++                                          std::chrono::steady_clock::now() - read_start)
++                                          .count()
++                                   << " tx_total=" << traffic_stats.tx_bytes_cnt
++                                   << " rx_total=" << traffic_stats.rx_bytes_cnt;
++                    }
+                     LOG(TRACE) << "Include STA traffic stats for " << sta_node->get_mac();
+                     // TLV 3: MLD MAC (or STA MAC for non-MLO) — aggregate stats
+-                    if (!mon_stats.add_ap_assoc_sta_traffic_stat(cmdu_tx, *sta_node)) {
++                    if (!mon_stats.add_ap_assoc_sta_traffic_stat(cmdu_tx, *sta_node,
++                                                               traffic_stats)) {
+                         LOG(ERROR) << "Failed to add sta_traffic_stat tlv";
+                     }
+                     // TLV 4: Per-link traffic stats for MLO STAs (one TLV per affiliated link).
+                     // Only emitted when the HAL has populated per-link counters in link_stats[].
+                     if (sta_node->is_mlo()) {
+-                        for (const auto &link : sta_node->get_stats().hal_stats.link_stats) {
++                        for (const auto &link : traffic_stats.link_stats) {
+                             if (!mon_stats.add_ap_assoc_sta_traffic_stat_per_link(
+                                     cmdu_tx, *sta_node, link)) {
+                                 LOG(ERROR) << "Failed to add per-link sta_traffic_stat tlv for "
+@@ -1583,7 +1670,10 @@ void Monitor::handle_cmdu_vs_message(ieee1905_1::CmduMessageRx &cmdu_rx)
+             update->config().monitor_rx_rssi_notification_delta_db;
+         mon_rssi.conf_rx_rssi_notification_threshold_dbm =
+             update->config().monitor_rx_rssi_notification_threshold_dbm;
+-        mon_rssi.conf_disable_initiative_arp = update->config().monitor_disable_initiative_arp;
++        // A Controller update must not re-enable probing disabled locally on the Agent.
++        mon_rssi.conf_disable_initiative_arp =
++            (beerocks_slave_conf.monitor_disable_initiative_arp == "1") ||
++            update->config().monitor_disable_initiative_arp;
+ 
+         // Mark the enable flag as "false" to force update in hostapd status.
+         // The status is polled every "MONITOR_DB_AP_POLLING_RATE_SEC" and update the value.
+@@ -2105,6 +2195,13 @@ void Monitor::handle_cmdu_vs_message(ieee1905_1::CmduMessageRx &cmdu_rx)
+ 
+         response_out->success() =
+             mon_wlan_hal->channel_scan_trigger(int(dwell_time_ms), channel_pool_vector, cert_mode);
++        if (response_out->success() && mon_wlan_hal->is_channel_scan_retry_pending() &&
++            !schedule_channel_scan_trigger_retry()) {
++            // The request cannot be fulfilled safely without its retry timer. Reply failure rather
++            // than claiming it was accepted, and clear the stored retry context.
++            mon_wlan_hal->channel_scan_abort();
++            response_out->success() = false;
++        }
+         LOG_IF(!response_out->success(), ERROR) << "channel_scan_trigger Failed";
+ 
+         send_cmdu(cmdu_tx);
+@@ -2163,6 +2260,7 @@ void Monitor::handle_cmdu_vs_message(ieee1905_1::CmduMessageRx &cmdu_rx)
+             return;
+         }
+ 
++        cancel_channel_scan_trigger_retry();
+         response_out->success() = mon_wlan_hal->channel_scan_abort();
+         LOG_IF(!response_out->success(), ERROR) << "channel_scan_abort failed";
+ 
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor.h b/agent/src/beerocks/fronthaul_manager/monitor/monitor.h
+index fd9fb57..0616c5e 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor.h
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor.h
+@@ -248,6 +248,8 @@ private:
+     void handle_multi_ap_policy_config_request(ieee1905_1::CmduMessageRx &cmdu_rx);
+     void handle_ap_metrics_query(ieee1905_1::CmduMessageRx &cmdu_rx);
+     bool register_ext_events_handlers(int fd);
++    bool schedule_channel_scan_trigger_retry();
++    void cancel_channel_scan_trigger_retry();
+     /**
+      * Factory to create CMDU client instances connected to CMDU server running in slave.
+      */
+@@ -263,6 +265,9 @@ private:
+      */
+     int m_fsm_timer = beerocks::net::FileDescriptor::invalid_descriptor;
+ 
++    // One-shot retry timer for a channel scan whose NL80211_CMD_TRIGGER_SCAN returned -EBUSY.
++    int m_channel_scan_trigger_retry_timer = beerocks::net::FileDescriptor::invalid_descriptor;
++
+     /**
+      * CMDU client connected to the CMDU server running in slave.
+      * This object is dynamically created using the CMDU client factory for the slave provided in 
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor_stats.cpp b/agent/src/beerocks/fronthaul_manager/monitor/monitor_stats.cpp
+index 3d7db4a..7443d93 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor_stats.cpp
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor_stats.cpp
+@@ -524,14 +524,16 @@ bool monitor_stats::add_ap_extended_metrics(ieee1905_1::CmduMessageTx &cmdu_tx,
+ }
+ 
+ bool monitor_stats::add_ap_assoc_sta_traffic_stat(ieee1905_1::CmduMessageTx &cmdu_tx,
+-                                                  const monitor_sta_node &sta_node)
++                                                const monitor_sta_node &sta_node,
++                                                const bwl::SStaStats &traffic_stats)
+ {
+     auto ap_assoc_sta_traffic_stat_tlv = cmdu_tx.addClass<wfa_map::tlvAssociatedStaTrafficStats>();
+     if (!ap_assoc_sta_traffic_stat_tlv) {
+         LOG(ERROR) << "Couldn't addClass tlvAssociatedStaTrafficStats";
+         return false;
+     }
+-    auto stat                                         = sta_node.get_stats().hal_stats;
++    const auto &stat = traffic_stats;
++
+     ap_assoc_sta_traffic_stat_tlv->sta_mac()          = tlvf::mac_from_string(sta_node.get_mac());
+     ap_assoc_sta_traffic_stat_tlv->byte_sent()        = recalculate_byte_units(stat.tx_bytes_cnt);
+     ap_assoc_sta_traffic_stat_tlv->byte_received()    = recalculate_byte_units(stat.rx_bytes_cnt);
+diff --git a/agent/src/beerocks/fronthaul_manager/monitor/monitor_stats.h b/agent/src/beerocks/fronthaul_manager/monitor/monitor_stats.h
+index b8e2aa7..93e7770 100644
+--- a/agent/src/beerocks/fronthaul_manager/monitor/monitor_stats.h
++++ b/agent/src/beerocks/fronthaul_manager/monitor/monitor_stats.h
+@@ -38,8 +38,10 @@ public:
+                         std::shared_ptr<bwl::mon_wlan_hal> &mon_wlan_hal) const;
+     bool add_ap_extended_metrics(ieee1905_1::CmduMessageTx &cmdu_tx,
+                                  monitor_vap_node &vap_node) const;
++    /** Serialize cumulative STA traffic counters from the supplied response snapshot. */
+     bool add_ap_assoc_sta_traffic_stat(ieee1905_1::CmduMessageTx &cmdu_tx,
+-                                       const monitor_sta_node &sta_node);
++                                      const monitor_sta_node &sta_node,
++                                      const bwl::SStaStats &traffic_stats);
+ 
+     /**
+      * @brief Add tlvAssociatedStaTrafficStats keyed by a per-link MAC (TLV 4).
+diff --git a/common/beerocks/bcl/include/bcl/beerocks_config_file.h b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+index 00bfffa..9d2deb0 100644
+--- a/common/beerocks/bcl/include/bcl/beerocks_config_file.h
++++ b/common/beerocks/bcl/include/bcl/beerocks_config_file.h
+@@ -113,6 +113,7 @@ public:
+         std::string ucc_listener_port;
+         std::string enable_arp_monitor;
+         std::string disable_gw_arping;
++        std::string monitor_disable_initiative_arp;
+         std::string bridge_iface;
+         std::string backhaul_preferred_bssid;
+         std::string enable_system_hang_test;
+diff --git a/common/beerocks/bcl/source/beerocks_config_file.cpp b/common/beerocks/bcl/source/beerocks_config_file.cpp
+index fadf879..4ba42cc 100644
+--- a/common/beerocks/bcl/source/beerocks_config_file.cpp
++++ b/common/beerocks/bcl/source/beerocks_config_file.cpp
+@@ -176,6 +176,8 @@ bool config_file::read_slave_config_file(const std::string &config_file_path, sC
+             std::make_tuple("ucc_listener_port=", &conf.ucc_listener_port, mandatory_slave),
+             std::make_tuple("enable_arp_monitor=", &conf.enable_arp_monitor, mandatory_slave),
+             std::make_tuple("disable_gw_arping=", &conf.disable_gw_arping, 0),
++            std::make_tuple("monitor_disable_initiative_arp=", &conf.monitor_disable_initiative_arp,
++                            0),
+             std::make_tuple("bridge_iface=", &conf.bridge_iface, 0),
+             std::make_tuple("enable_system_hang_test=", &conf.enable_system_hang_test, 0),
+             std::make_tuple("monitor_polling_rate_msec=", &conf.monitor_polling_rate_msec, 0),
+diff --git a/common/beerocks/bwl/include/bwl/mon_wlan_hal.h b/common/beerocks/bwl/include/bwl/mon_wlan_hal.h
+index 5b9bdfb..1b99453 100644
+--- a/common/beerocks/bwl/include/bwl/mon_wlan_hal.h
++++ b/common/beerocks/bwl/include/bwl/mon_wlan_hal.h
+@@ -98,6 +98,22 @@ public:
+      * HALs are unchanged.
+      */
+     virtual void drive_scan_result_poll() {}
++
++    /**
++     * @brief Returns whether an asynchronous channel-scan trigger retry is pending.
++     *
++     * Only HALs that implement asynchronous trigger retries override this method. The Monitor
++     * uses it to arm a one-shot retry timer on its event loop.
++     */
++    virtual bool is_channel_scan_retry_pending() const { return false; }
++
++    /**
++     * @brief Performs one pending asynchronous channel-scan trigger retry.
++     *
++     * Called by the Monitor's one-shot retry timer on the same event-loop thread as the HAL.
++     */
++    virtual void retry_pending_channel_scan_trigger() {}
++
+     /**
+      * @brief Abort the in-progress channel scan for the interface
+      *
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+index fcc3f8d..0a69f47 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.cpp
+@@ -48,6 +48,13 @@ extern "C" {
+ namespace bwl {
+ namespace nl80211 {
+ 
++// Stable nl80211 ABI IDs, including for headers that omit the *_BYTES64 enum members.
++// Enum members cannot be detected with #if defined(); keep the IDs local instead of
++// defining macros that shadow the system header. Size parsing tables for both IDs.
++constexpr int STA_INFO_RX_BYTES64 = 23;
++constexpr int STA_INFO_TX_BYTES64 = 24;
++constexpr int STA_INFO_MAX = std::max(int(NL80211_STA_INFO_MAX), STA_INFO_TX_BYTES64);
++
+ // Global configuration for beacon 11k measurement mode
+ static uint8_t g_beacon_11k_measurement_mode = BEACON_MEASUREMENT_MODE_PASSIVE;
+ 
+@@ -569,14 +576,12 @@ bool mon_wlan_hal_nl80211::update_stations_stats(const std::string &vap_iface_na
+     std::string base_interface;
+     extractBase1Interface(vap_iface_name, base_interface);
+ 
+-    static struct nla_policy stats_policy[NL80211_STA_INFO_MAX + 1];
++    static struct nla_policy stats_policy[STA_INFO_MAX + 1];
+     stats_policy[NL80211_STA_INFO_INACTIVE_TIME] = {NLA_U32, 0, 0};
+     stats_policy[NL80211_STA_INFO_RX_BYTES]      = {NLA_U32, 0, 0};
+     stats_policy[NL80211_STA_INFO_TX_BYTES]      = {NLA_U32, 0, 0};
+-#if defined(NL80211_STA_INFO_RX_BYTES64) && defined(NL80211_STA_INFO_TX_BYTES64)
+-    stats_policy[NL80211_STA_INFO_RX_BYTES64] = {NLA_U64, 0, 0};
+-    stats_policy[NL80211_STA_INFO_TX_BYTES64] = {NLA_U64, 0, 0};
+-#endif
++    stats_policy[STA_INFO_RX_BYTES64] = {NLA_U64, 0, 0};
++    stats_policy[STA_INFO_TX_BYTES64] = {NLA_U64, 0, 0};
+     stats_policy[NL80211_STA_INFO_RX_PACKETS]  = {NLA_U32, 0, 0};
+     stats_policy[NL80211_STA_INFO_TX_PACKETS]  = {NLA_U32, 0, 0};
+     stats_policy[NL80211_STA_INFO_SIGNAL]      = {NLA_U8, 0, 0};
+@@ -619,7 +624,7 @@ bool mon_wlan_hal_nl80211::update_stations_stats(const std::string &vap_iface_na
+         [&](struct nl_msg *msg) -> bool {
+             struct nlattr *tb[NL80211_ATTR_MAX + 1];
+             struct genlmsghdr *gnlh = (struct genlmsghdr *)nlmsg_data(nlmsg_hdr(msg));
+-            struct nlattr *sinfo[NL80211_STA_INFO_MAX + 1];
++            struct nlattr *sinfo[STA_INFO_MAX + 1];
+             struct nlattr *rinfo[NL80211_RATE_INFO_MAX + 1];
+ 
+             // Parse the netlink message
+@@ -632,7 +637,7 @@ bool mon_wlan_hal_nl80211::update_stations_stats(const std::string &vap_iface_na
+             }
+ 
+             // Parse nested station stats
+-            if (nla_parse_nested(sinfo, NL80211_STA_INFO_MAX, tb[NL80211_ATTR_STA_INFO],
++            if (nla_parse_nested(sinfo, STA_INFO_MAX, tb[NL80211_ATTR_STA_INFO],
+                                  stats_policy)) {
+                 LOG(ERROR) << "failed to parse nested attributes!";
+                 return false;
+@@ -695,8 +700,8 @@ bool mon_wlan_hal_nl80211::update_stations_stats(const std::string &vap_iface_na
+                             continue;
+                         }
+                         if (!link_tb[NL80211_ATTR_STA_INFO]) { continue; }
+-                        struct nlattr *link_sinfo[NL80211_STA_INFO_MAX + 1];
+-                        if (nla_parse_nested(link_sinfo, NL80211_STA_INFO_MAX,
++                        struct nlattr *link_sinfo[STA_INFO_MAX + 1];
++                        if (nla_parse_nested(link_sinfo, STA_INFO_MAX,
+                                              link_tb[NL80211_ATTR_STA_INFO],
+                                              stats_policy) != 0) {
+                             continue;
+@@ -842,27 +847,36 @@ bool mon_wlan_hal_nl80211::update_stations_stats(const std::string &vap_iface_na
+                 total = val;
+             };
+ 
+-        // TX Bytes
+-#if defined(NL80211_STA_INFO_TX_BYTES64)
+-            if (sinfo[NL80211_STA_INFO_TX_BYTES64]) {
+-                calc_curr_traffic(nla_get_u64(sinfo[NL80211_STA_INFO_TX_BYTES64]),
++            // A 32-bit-only driver reports the low bits of cumulative bytes. Extend
++            // them before AP Metrics converts units; replacing the total on a 4 GiB
++            // wrap would discard bytes sent before the wrap. Station statistics are
++            // recreated on reconnect, so the extended total belongs to one association.
++            // This requires less than 4 GiB between reads; an unannounced driver reset
++            // within the association cannot be distinguished from a wrap here.
++            auto calc_curr_bytes32 = [](uint32_t val, uint64_t &total, uint32_t &curr) {
++                const uint32_t previous = static_cast<uint32_t>(total);
++                const uint32_t delta    = static_cast<uint32_t>(val - previous);
++                curr                    = delta;
++                total += delta;
++            };
++
++            // Prefer native 64-bit totals so byte counters remain cumulative before
++            // conversion to the Byte Counter Units advertised in AP Metrics.
++            // TX Bytes
++            if (sinfo[STA_INFO_TX_BYTES64]) {
++                calc_curr_traffic(nla_get_u64(sinfo[STA_INFO_TX_BYTES64]),
+                                   sta_stats.tx_bytes_cnt, sta_stats.tx_bytes);
+-            } else
+-#endif
+-                if (sinfo[NL80211_STA_INFO_TX_BYTES]) {
+-                calc_curr_traffic(nla_get_u32(sinfo[NL80211_STA_INFO_TX_BYTES]),
++            } else if (sinfo[NL80211_STA_INFO_TX_BYTES]) {
++                calc_curr_bytes32(nla_get_u32(sinfo[NL80211_STA_INFO_TX_BYTES]),
+                                   sta_stats.tx_bytes_cnt, sta_stats.tx_bytes);
+             }
+ 
+-        // RX Bytes
+-#if defined(NL80211_STA_INFO_RX_BYTES64)
+-            if (sinfo[NL80211_STA_INFO_RX_BYTES64]) {
+-                calc_curr_traffic(nla_get_u64(sinfo[NL80211_STA_INFO_RX_BYTES64]),
++            // RX Bytes
++            if (sinfo[STA_INFO_RX_BYTES64]) {
++                calc_curr_traffic(nla_get_u64(sinfo[STA_INFO_RX_BYTES64]),
+                                   sta_stats.rx_bytes_cnt, sta_stats.rx_bytes);
+-            } else
+-#endif
+-                if (sinfo[NL80211_STA_INFO_RX_BYTES]) {
+-                calc_curr_traffic(nla_get_u32(sinfo[NL80211_STA_INFO_RX_BYTES]),
++            } else if (sinfo[NL80211_STA_INFO_RX_BYTES]) {
++                calc_curr_bytes32(nla_get_u32(sinfo[NL80211_STA_INFO_RX_BYTES]),
+                                   sta_stats.rx_bytes_cnt, sta_stats.rx_bytes);
+             }
+ 
+@@ -1402,118 +1416,150 @@ bool mon_wlan_hal_nl80211::channel_scan_trigger(int dwell_time_msec,
+     constexpr int SCAN_MAX_DWELL_MS = 110; // cap so a caller-provided huge dwell can't blow timing
+     int eff_dwell_ms                = std::max(dwell_time_msec, SCAN_MIN_DWELL_MS);
+     eff_dwell_ms                    = std::min(eff_dwell_ms, SCAN_MAX_DWELL_MS);
+-    const size_t num_channels       = channel_pool.size();
+     LOG(DEBUG) << "[CHAN-SCAN] channel_scan_trigger enter iface " << get_iface_name()
+                << " requested_dwell_ms=" << dwell_time_msec
+                << " effective_dwell_ms=" << eff_dwell_ms
+-               << " FLUSH=off active-scan(wildcard SSID) num_channels=" << num_channels
++               << " FLUSH=off active-scan(wildcard SSID) num_channels=" << channel_pool.size()
+                << " band=" << int(m_radio_info.frequency_band);
+ 
+-    // Build-message lambda for NL80211_CMD_TRIGGER_SCAN, factored out so it can be reused across
+-    // the retry attempts below.
+-    auto build_trigger_scan_msg = [&](struct nl_msg *msg) -> bool {
+-        // Do NOT request FLUSH (see above): flushing empties the BSS cache at scan start, so a
+-        // short/partial scan returns nothing; without FLUSH the dump can also return
+-        // recently-cached BSSes and retries accumulate rather than wipe.
+-
+-        // ACTIVE scan: a single wildcard (zero-length) SSID entry INSIDE the
+-        // NL80211_ATTR_SCAN_SSIDS nest makes the kernel transmit a broadcast Probe Request on
+-        // each channel; the AP replies with a Probe Response immediately. (The previous code
+-        // added a zero-LENGTH attribute OUTSIDE a nest, which the kernel treats as no SSID
+-        // list -> passive scan.)
+-        {
+-            struct nlattr *ssids = nla_nest_start(msg, NL80211_ATTR_SCAN_SSIDS);
+-            if (!ssids) {
+-                LOG(ERROR) << "Failed to start NL80211_ATTR_SCAN_SSIDS nest";
+-                return false;
+-            }
+-            if (nla_put(msg, 1, 0, "") < 0) { // wildcard SSID: attr index 1, len 0
+-                LOG(ERROR) << "Failed to add wildcard SSID to SCAN_SSIDS";
+-                return false;
+-            }
+-            nla_nest_end(msg, ssids);
+-        }
++    // Only one scan request can be pending or active on this radio. In particular, do not let a
++    // second request overwrite the parameters of a retry that has already been accepted.
++    if (m_trigger_retry.pending || m_scan_active.load()) {
++        LOG(WARNING) << "[CHAN-SCAN] rejecting trigger on " << get_iface_name()
++                     << ": a channel scan is already pending or active";
++        return false;
++    }
+ 
+-        if (!channel_pool.empty()) {
+-            auto *freqs = nla_nest_start(msg, NL80211_ATTR_SCAN_FREQUENCIES);
+-            if (!freqs) {
+-                LOG(ERROR) << "Failed to start NL80211_ATTR_SCAN_FREQUENCIES";
+-                return false;
+-            }
++    // Keep the scan parameters: a -EBUSY attempt is retried later from the Monitor's one-shot
++    // timer and must not depend on this call's stack.
++    clear_trigger_scan_retry();
++    m_trigger_retry.eff_dwell_ms = eff_dwell_ms;
++    m_trigger_retry.channel_pool = channel_pool;
+ 
+-            // Channel numbers are only unambiguous together with a band: 6GHz channel
+-            // numbers (1..233) overlap 2.4GHz (1..14) and 5GHz (36+) numbering. The
+-            // single-argument channel_to_freq() assumes 2.4/5GHz and therefore maps 6GHz
+-            // channels to the wrong band (or returns an invalid freq), so a 6GHz scan gets
+-            // triggered on bogus frequencies and never returns results. Pass this radio's
+-            // frequency band so the correct center frequency is computed for every band.
+-            const beerocks::eFreqType radio_band = m_radio_info.frequency_band;
+-            for (const auto channel : channel_pool) {
+-                int freq = 0;
+-                if (radio_band != beerocks::eFreqType::FREQ_UNKNOWN) {
+-                    freq = son::wireless_utils::channel_to_freq(static_cast<int>(channel),
+-                                                                radio_band);
+-                }
+-                // Fallback to the band-less conversion only if the band is unknown.
+-                if (freq <= 0 && radio_band == beerocks::eFreqType::FREQ_UNKNOWN) {
+-                    freq = son::wireless_utils::channel_to_freq(static_cast<int>(channel));
+-                }
+-                if (freq <= 0) {
+-                    LOG(WARNING) << "Skipping invalid scan channel " << channel
+-                                 << " (band=" << int(radio_band) << ")";
+-                    continue;
+-                }
+-                LOG(DEBUG) << "[CHAN-SCAN] scan channel " << channel << " band=" << int(radio_band)
+-                           << " -> freq=" << freq << " MHz";
+-                if (nla_put_u32(msg, 0, freq) < 0) {
+-                    LOG(ERROR) << "Failed to add scan frequency " << freq;
+-                    return false;
+-                }
+-            }
+-            nla_nest_end(msg, freqs);
++    return trigger_scan_attempt();
++}
++
++bool mon_wlan_hal_nl80211::build_trigger_scan_msg(struct nl_msg *msg)
++{
++    const auto &channel_pool = m_trigger_retry.channel_pool;
++    const int eff_dwell_ms   = m_trigger_retry.eff_dwell_ms;
++    // Do NOT request FLUSH (see above): flushing empties the BSS cache at scan start, so a
++    // short/partial scan returns nothing; without FLUSH the dump can also return
++    // recently-cached BSSes and retries accumulate rather than wipe.
++
++    // ACTIVE scan: a single wildcard (zero-length) SSID entry INSIDE the
++    // NL80211_ATTR_SCAN_SSIDS nest makes the kernel transmit a broadcast Probe Request on
++    // each channel; the AP replies with a Probe Response immediately. (The previous code
++    // added a zero-LENGTH attribute OUTSIDE a nest, which the kernel treats as no SSID
++    // list -> passive scan.)
++    {
++        struct nlattr *ssids = nla_nest_start(msg, NL80211_ATTR_SCAN_SSIDS);
++        if (!ssids) {
++            LOG(ERROR) << "Failed to start NL80211_ATTR_SCAN_SSIDS nest";
++            return false;
++        }
++        if (nla_put(msg, 1, 0, "") < 0) { // wildcard SSID: attr index 1, len 0
++            LOG(ERROR) << "Failed to add wildcard SSID to SCAN_SSIDS";
++            return false;
+         }
++        nla_nest_end(msg, ssids);
++    }
+ 
+-        // Per-channel dwell time in TUs (1 TU = 1024 us). Use the clamped effective dwell so a
+-        // completed scan stays on-channel long enough to hear a beacon / receive a probe resp.
+-        {
+-            const auto duration_tu = static_cast<uint16_t>((eff_dwell_ms * 1000) / 1024);
+-            if (nla_put_u16(msg, NL80211_ATTR_MEASUREMENT_DURATION, duration_tu) < 0) {
+-                LOG(ERROR) << "Failed to add NL80211_ATTR_MEASUREMENT_DURATION";
++    if (!channel_pool.empty()) {
++        auto *freqs = nla_nest_start(msg, NL80211_ATTR_SCAN_FREQUENCIES);
++        if (!freqs) {
++            LOG(ERROR) << "Failed to start NL80211_ATTR_SCAN_FREQUENCIES";
++            return false;
++        }
++
++        // Channel numbers are only unambiguous together with a band: 6GHz channel
++        // numbers (1..233) overlap 2.4GHz (1..14) and 5GHz (36+) numbering. The
++        // single-argument channel_to_freq() assumes 2.4/5GHz and therefore maps 6GHz
++        // channels to the wrong band (or returns an invalid freq), so a 6GHz scan gets
++        // triggered on bogus frequencies and never returns results. Pass this radio's
++        // frequency band so the correct center frequency is computed for every band.
++        const beerocks::eFreqType radio_band = m_radio_info.frequency_band;
++        for (const auto channel : channel_pool) {
++            int freq = 0;
++            if (radio_band != beerocks::eFreqType::FREQ_UNKNOWN) {
++                freq = son::wireless_utils::channel_to_freq(static_cast<int>(channel),
++                                                            radio_band);
++            }
++            // Fallback to the band-less conversion only if the band is unknown.
++            if (freq <= 0 && radio_band == beerocks::eFreqType::FREQ_UNKNOWN) {
++                freq = son::wireless_utils::channel_to_freq(static_cast<int>(channel));
++            }
++            if (freq <= 0) {
++                LOG(WARNING) << "Skipping invalid scan channel " << channel
++                             << " (band=" << int(radio_band) << ")";
++                continue;
++            }
++            LOG(DEBUG) << "[CHAN-SCAN] scan channel " << channel << " band=" << int(radio_band)
++                       << " -> freq=" << freq << " MHz";
++            if (nla_put_u32(msg, 0, freq) < 0) {
++                LOG(ERROR) << "Failed to add scan frequency " << freq;
+                 return false;
+             }
+-            LOG(DEBUG) << "[CHAN-SCAN] set MEASUREMENT_DURATION " << duration_tu << " TU ("
+-                       << eff_dwell_ms << " ms) for " << get_iface_name();
+         }
+-        return true;
+-    };
++        nla_nest_end(msg, freqs);
++    }
++
++    // Per-channel dwell time in TUs (1 TU = 1024 us). Use the clamped effective dwell so a
++    // completed scan stays on-channel long enough to hear a beacon / receive a probe resp.
++    {
++        const auto duration_tu = static_cast<uint16_t>((eff_dwell_ms * 1000) / 1024);
++        if (nla_put_u16(msg, NL80211_ATTR_MEASUREMENT_DURATION, duration_tu) < 0) {
++            LOG(ERROR) << "Failed to add NL80211_ATTR_MEASUREMENT_DURATION";
++            return false;
++        }
++        LOG(DEBUG) << "[CHAN-SCAN] set MEASUREMENT_DURATION " << duration_tu << " TU ("
++                   << eff_dwell_ms << " ms) for " << get_iface_name();
++    }
++    return true;
++}
+ 
+-    // Retry TRIGGER_SCAN with a short backoff before giving up. This applies identically in both
+-    // cert and non-cert mode: the same wiphy can be shared with another station that scans
++bool mon_wlan_hal_nl80211::trigger_scan_attempt()
++{
++    // Make ONE NL80211_CMD_TRIGGER_SCAN attempt; never sleep here (this runs on the monitor's
++    // single event-loop thread, so blocking would delay every other IPC request, e.g. AP Metrics
++    // queries).
++    //
++    // TRIGGER_SCAN is retried with a short backoff before giving up. This applies identically in
++    // both cert and non-cert mode: the same wiphy can be shared with another station that scans
+     // periodically and keeps retrying to (re)connect, so our AP-VAP TRIGGER_SCAN on this radio
+     // can lose the race and return -EBUSY (a scan already in flight on the wiphy). Retrying a
+     // few times spaced a few hundred ms apart allows winning the radio in a gap between the
+-    // other station's periodic scans and obtaining a fresh, channel-scoped scan result. Only if
+-    // every retry fails do we fall back to dumping the existing scan cache below.
++    // other station's periodic scans and obtaining a fresh, channel-scoped scan result. The
++    // backoff is driven by a one-shot timer in the Monitor event loop; a pending retry is reported
++    // to the caller as "accepted and queued". Only if every retry fails do we fall back to dumping
++    // the existing scan cache below.
+     constexpr int TRIGGER_SCAN_MAX_ATTEMPTS   = 4;
+     constexpr int TRIGGER_SCAN_RETRY_DELAY_MS = 300;
+-    bool ret = false;
+-    for (int attempt = 1; attempt <= TRIGGER_SCAN_MAX_ATTEMPTS; ++attempt) {
+-        ret = send_nl80211_msg(NL80211_CMD_TRIGGER_SCAN, 0, build_trigger_scan_msg,
+-                               [&](struct nl_msg *) -> bool { return true; });
+-        if (ret) {
+-            if (attempt > 1) {
+-                LOG(DEBUG) << "[CHAN-SCAN] TRIGGER_SCAN succeeded on " << get_iface_name()
+-                           << " on attempt " << attempt << "/" << TRIGGER_SCAN_MAX_ATTEMPTS;
+-            }
+-            break;
+-        }
++
++    const int eff_dwell_ms    = m_trigger_retry.eff_dwell_ms;
++    const size_t num_channels = m_trigger_retry.channel_pool.size();
++    const int attempt         = ++m_trigger_retry.attempt;
++
++    const bool ret = send_nl80211_msg(
++        NL80211_CMD_TRIGGER_SCAN, 0, [&](struct nl_msg *msg) { return build_trigger_scan_msg(msg); },
++        [&](struct nl_msg *) -> bool { return true; });
++    if (ret && attempt > 1) {
++        LOG(DEBUG) << "[CHAN-SCAN] TRIGGER_SCAN succeeded on " << get_iface_name()
++                   << " on attempt " << attempt << "/" << TRIGGER_SCAN_MAX_ATTEMPTS;
++    }
++
++    if (!ret) {
+         LOG(WARNING) << "[CHAN-SCAN] TRIGGER_SCAN attempt " << attempt << "/"
+                      << TRIGGER_SCAN_MAX_ATTEMPTS << " failed on " << get_iface_name()
+                      << " (likely -EBUSY: apsta/other scan in flight on this shared wiphy)";
+         if (attempt < TRIGGER_SCAN_MAX_ATTEMPTS) {
+-            std::this_thread::sleep_for(std::chrono::milliseconds(TRIGGER_SCAN_RETRY_DELAY_MS));
++            m_trigger_retry.pending = true;
++            LOG(DEBUG) << "[CHAN-SCAN] TRIGGER_SCAN busy; request accepted and retry queued in "
++                       << TRIGGER_SCAN_RETRY_DELAY_MS << " ms";
++            return true;
+         }
+     }
++    clear_trigger_scan_retry();
+ 
+     if (!ret) {
+         // GET_SCAN cache fallback when a fresh scan cannot be started.
+@@ -1589,10 +1635,30 @@ bool mon_wlan_hal_nl80211::channel_scan_trigger(int dwell_time_msec,
+     return true;
+ }
+ 
++void mon_wlan_hal_nl80211::retry_pending_channel_scan_trigger()
++{
++    if (!m_trigger_retry.pending) {
++        return;
++    }
++
++    m_trigger_retry.pending = false;
++    LOG(DEBUG) << "[CHAN-SCAN] retrying TRIGGER_SCAN on " << get_iface_name();
++    trigger_scan_attempt();
++}
++
++void mon_wlan_hal_nl80211::clear_trigger_scan_retry()
++{
++    m_trigger_retry.pending      = false;
++    m_trigger_retry.attempt      = 0;
++    m_trigger_retry.eff_dwell_ms = 0;
++    m_trigger_retry.channel_pool.clear();
++}
++
+ void mon_wlan_hal_nl80211::drive_scan_result_poll()
+ {
+     // Runs on the monitor's single event-loop thread (same thread as process_nl_events), so it is
+     // safe to issue NL80211_CMD_GET_SCAN on m_nl80211_sock here — no cross-thread netlink race.
++
+     if (!m_scan_result_poll_armed) {
+         return;
+     }
+@@ -2244,6 +2310,12 @@ bool mon_wlan_hal_nl80211::process_nl80211_event(parsed_obj_map_t &parsed_obj)
+ 
+ bool mon_wlan_hal_nl80211::channel_scan_abort()
+ {
++    // Cancel a TRIGGER_SCAN retry that is waiting for the Monitor timer; m_scan_active is still
++    // false in that state, so the early return below would otherwise leave the retry armed and
++    // start a stale scan after the scan was aborted.
++    clear_trigger_scan_retry();
++    m_scan_result_poll_armed = false;
++
+     if (!m_scan_active.load()) {
+         // Even when there is no active NL80211 scan to abort on this radio, still emit a
+         // Channel_Scan_Aborted event so the agent-side ChannelScanTask receives an
+diff --git a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
+index 32eb9f3..6825da8 100644
+--- a/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/mon_wlan_hal_nl80211.h
+@@ -66,6 +66,11 @@ public:
+     // Safe no-op if not armed or if the scan already completed via the real multicast.
+     void drive_scan_result_poll() override;
+ 
++    // A failed TRIGGER_SCAN is retried by the Monitor's one-shot event-loop timer. These methods
++    // are only called from that event-loop thread.
++    bool is_channel_scan_retry_pending() const override { return m_trigger_retry.pending; }
++    void retry_pending_channel_scan_trigger() override;
++
+     virtual bool process_scan_nl_event(struct nl_msg *msg, void *arg = nullptr) override;
+ 
+     /**
+@@ -143,6 +148,22 @@ protected:
+      bool m_scan_result_poll_armed = false;
+      std::chrono::steady_clock::time_point m_scan_result_poll_deadline;
+ 
++     // Asynchronous NL80211_CMD_TRIGGER_SCAN retry. The trigger can lose the race against another
++     // scan on the same wiphy (-EBUSY); instead of sleeping in the monitor event-loop thread
++     // between attempts (which delays every other IPC request, e.g. AP Metrics queries), the
++     // scan parameters are kept here until the Monitor's one-shot timer invokes the next attempt.
++     // Only touched from the event-loop thread.
++     struct sTriggerScanRetry {
++         bool pending = false; // a retry is armed and waiting for the Monitor timer
++         int attempt  = 0;     // number of TRIGGER_SCAN attempts made so far
++         int eff_dwell_ms = 0;
++         std::vector<unsigned int> channel_pool;
++     } m_trigger_retry;
++
++     bool build_trigger_scan_msg(struct nl_msg *msg);
++     bool trigger_scan_attempt();
++     void clear_trigger_scan_retry();
++
+      nl80211_client::sChannelSurveyInfo m_prev_survey_info = {};
+      bool m_prev_survey_info_valid                         = false;
+ 
+-- 
+2.34.1
+
