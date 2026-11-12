@@ -1,0 +1,370 @@
+From a1073314d27802e15e44036824aa267013ba590c Mon Sep 17 00:00:00 2001
+From: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+Date: Tue, 10 Nov 2026 14:33:41 +0530
+Subject: [PATCH] Regression Fix and Optimization of Loop Avoidance
+
+Signed-off-by: Tharunkumar Dhanasekaran <tdhanase@qti.qualcomm.com>
+---
+ agent/src/beerocks/slave/agent_db.h           |  1 +
+ .../backhaul_manager/backhaul_manager.cpp     | 25 +++++++++++
+ .../src/beerocks/slave/nbapi/odl/agent.odl.in |  6 +++
+ agent/src/beerocks/slave/son_slave_thread.cpp |  7 ++++
+ .../tasks/controller_connectivity_task.cpp    | 42 +++++++++++++------
+ .../tasks/controller_connectivity_task.h      |  6 +--
+ documentation/prplMesh-configuration.md       |  6 +++
+ framework/platform/bpl/cfg/dm/bpl_cfg.cpp     | 16 +++++++
+ framework/platform/bpl/cfg/linux/bpl_cfg.cpp  |  6 +++
+ framework/platform/bpl/cfg/rdk/bpl_cfg.cpp    |  6 +++
+ framework/platform/bpl/cfg/uci/bpl_cfg.cpp    | 22 ++++++++++
+ framework/platform/bpl/include/bpl/bpl_cfg.h  | 11 +++++
+ 12 files changed, 138 insertions(+), 16 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/agent_db.h b/agent/src/beerocks/slave/agent_db.h
+index 73abf056b5..50ab0a1728 100644
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -173,6 +173,7 @@ public:
+         std::chrono::seconds controller_discovery_timeout_seconds;
+         std::chrono::seconds controller_message_timeout_seconds;
+         std::chrono::seconds controller_heartbeat_state_timeout_seconds;
++        uint32_t indirect_controller_probe_miss_threshold;
+ 
+         int zwdfs_flag;
+         uint32_t best_channel_rank_threshold;
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 394bc65031..b8d2f7e964 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -1411,6 +1411,31 @@ bool BackhaulManager::backhaul_fsm_main(bool &skip_select)
+                         }
+                     }
+                 } else {
++                    // The wired path is no longer available. Mark the bSTA disconnected
++                    // immediately so AP managers advertise hop_count=255 while the STA
++                    // reconnects over the wireless backhaul.
++                    if (m_agent_fd != beerocks::net::FileDescriptor::invalid_descriptor) {
++                        auto bsta_notif = message_com::create_vs_message<
++                            beerocks_message::cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION>(cmdu_tx);
++                        if (bsta_notif) {
++                            bsta_notif->connected()       = 0;
++                            bsta_notif->backhaul_switch() = 1;
++                            bsta_notif->loop_isolation()  = 0;
++                            LOG(INFO) << "Sending ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION"
++                                         " (disconnected) during wired->wireless switch";
++                            if (!send_cmdu(m_agent_fd, cmdu_tx)) {
++                                LOG(ERROR) << "Failed sending ACTION_BACKHAUL_BSTA_STATE_NOTIFICATION"
++                                              " during wired->wireless switch";
++                            }
++                        } else {
++                            LOG(ERROR) << "Failed building cACTION_BACKHAUL_BSTA_STATE_NOTIFICATION"
++                                          " during wired->wireless switch";
++                        }
++                    } else {
++                        LOG(ERROR) << "Cannot notify AP managers of wired->wireless switch:"
++                                      " agent connection is not available";
++                    }
++
+                     // Wired to wireless switching - disable all FH VAPs after triggering STA reconnection
+                     if (m_agent_fd != beerocks::net::FileDescriptor::invalid_descriptor) {
+                         auto fh_vaps_notif_wired_to_wireless = message_com::create_vs_message<
+diff --git a/agent/src/beerocks/slave/nbapi/odl/agent.odl.in b/agent/src/beerocks/slave/nbapi/odl/agent.odl.in
+index 6db9b7aaf0..4a20aacc6e 100644
+--- a/agent/src/beerocks/slave/nbapi/odl/agent.odl.in
++++ b/agent/src/beerocks/slave/nbapi/odl/agent.odl.in
+@@ -60,6 +60,12 @@
+                 default 1;
+             }
+ 
++            /* Consecutive missed indirect controller HLE probes before hop-count reachability is cleared */
++            %persistent uint32 IndirectControllerProbeMissThreshold {
++                default 3;
++                on action validate call check_range [1, 255];
++            }
++
+             /* Bitwise flags controlling the Zero Wait DFS feature (On-Radar, On-Selection, Pre-CAC) */
+             %persistent uint32 ZeroWaitDFSFlag {
+                 default 0;
+diff --git a/agent/src/beerocks/slave/son_slave_thread.cpp b/agent/src/beerocks/slave/son_slave_thread.cpp
+index 9e6322c335..750082bc44 100644
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -934,6 +934,11 @@ bool slave_thread::read_platform_configuration()
+         LOG(WARNING) << "get_controller_heartbeat_state_timeout_seconds() failed!"
+                      << " using default configuration ";
+     }
++    if (!bpl::get_indirect_controller_probe_miss_threshold(
++            db->device_conf.indirect_controller_probe_miss_threshold)) {
++        LOG(WARNING) << "get_indirect_controller_probe_miss_threshold() failed!"
++                     << " using default configuration ";
++    }
+ 
+     // Set local_gw flag
+     db->device_conf.local_gw =
+@@ -1036,6 +1041,8 @@ bool slave_thread::read_platform_configuration()
+                << db->device_conf.check_connectivity_to_controller_enable;
+     LOG(DEBUG) << "check_indirect_connectivity_to_controller: "
+                << db->device_conf.check_indirect_connectivity_to_controller_enable;
++    LOG(DEBUG) << "indirect_controller_probe_miss_threshold: "
++               << db->device_conf.indirect_controller_probe_miss_threshold;
+     LOG(DEBUG) << "fh_vaps_state_control: " << db->device_conf.fh_vaps_state_control;
+ 
+     return true;
+diff --git a/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp b/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp
+index 1ff568e17f..8a4d949568 100644
+--- a/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp
++++ b/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp
+@@ -225,8 +225,10 @@ void ControllerConnectivityTask::handle_event(uint8_t event_enum_value, const vo
+         // discovery cycle. The first discovery frame is handled before the
+         // controller bridge MAC is stored, so it cannot refresh this value.
+         db->controller_info.last_controller_contact_time = m_backhaul_connected_time;
+-        m_indirect_probe_waiting = false;
+-        m_indirect_probe_failed  = false;
++        m_indirect_probe_waiting              = false;
++        m_indirect_probe_miss_count           = 0;
++        m_indirect_probe_failed               = false;
++        m_last_observed_controller_contact_time = m_backhaul_connected_time;
+         m_btl_ctx.notify_controller_reachability(false);
+         FSM_MOVE_STATE(WAIT_FOR_CONTROLLER_DISCOVERY);
+         break;
+@@ -266,8 +268,9 @@ void ControllerConnectivityTask::handle_event(uint8_t event_enum_value, const vo
+         auto now = std::chrono::steady_clock::now();
+         AgentDB::get()->controller_info.last_controller_contact_time = now;
+         m_last_indirect_probe_send_time    = now;
+-        m_last_indirect_probe_contact_time = now;
++        m_last_observed_controller_contact_time = now;
+         m_indirect_probe_waiting           = false;
++        m_indirect_probe_miss_count        = 0;
+         m_indirect_probe_failed            = false;
+         m_loop_disconnect_in_progress      = false;
+         m_btl_ctx.notify_controller_reachability(true);
+@@ -309,6 +312,12 @@ bool ControllerConnectivityTask::handle_cmdu(ieee1905_1::CmduMessageRx &cmdu_rx,
+             if (src_mac == db->controller_info.bridge_mac) {
+                 LOG_IF(!m_direct_link_to_controller, INFO) << "Agent has direct link to Controller";
+                 m_direct_link_to_controller = true;
++                m_indirect_probe_waiting      = false;
++                if (m_indirect_probe_failed) {
++                    LOG(INFO) << "Direct controller link recovered; restoring controller reachability";
++                    m_indirect_probe_failed = false;
++                    m_btl_ctx.notify_controller_reachability(true);
++                }
+             }
+         }
+ 
+@@ -358,14 +367,16 @@ bool ControllerConnectivityTask::check_indirect_controller_health()
+     auto now = std::chrono::steady_clock::now();
+     auto last_contact = db->controller_info.last_controller_contact_time;
+ 
+-    // Any controller traffic received after the probe was sent is treated as
+-    // a successful response for the current probe epoch.
+-    if (m_indirect_probe_waiting && last_contact > m_last_indirect_probe_contact_time) {
++    // Any fresh controller traffic proves reachability, including traffic received
++    // between probes. Track it independently of the current probe state.
++    if (last_contact > m_last_observed_controller_contact_time) {
++        m_last_observed_controller_contact_time = last_contact;
+         m_indirect_probe_waiting = false;
+-        // Restore hop count only when leaving a failed sequence. Successful
+-        // probes while already healthy do not update the AP managers.
++        m_indirect_probe_miss_count = 0;
++        // Restore hop count only when leaving a failed HLE sequence. Controller
++        // traffic while already healthy does not update the AP managers.
+         if (m_indirect_probe_failed) {
+-            LOG(INFO) << "Controller HLE probe recovered; restoring controller reachability";
++            LOG(INFO) << "Controller traffic recovered; restoring controller reachability";
+             m_btl_ctx.notify_controller_reachability(true);
+             m_indirect_probe_failed = false;
+         }
+@@ -375,9 +386,15 @@ bool ControllerConnectivityTask::check_indirect_controller_health()
+         std::chrono::duration_cast<std::chrono::seconds>(now - m_last_indirect_probe_send_time) >=
+             HEARTBEAT_RESPONSE_TIMEOUT_SEC) {
+         m_indirect_probe_waiting = false;
+-        // Advertise hop_count=255 only when entering a failed sequence.
+-        if (!m_indirect_probe_failed) {
+-            LOG(WARNING) << "First indirect controller HLE probe missed; advertising hop_count=255";
++        const auto miss_threshold = db->device_conf.indirect_controller_probe_miss_threshold;
++        if (m_indirect_probe_miss_count < miss_threshold) {
++            ++m_indirect_probe_miss_count;
++        }
++        // Advertise hop_count=255 only after the configured consecutive misses.
++        if (!m_indirect_probe_failed && m_indirect_probe_miss_count >= miss_threshold) {
++            LOG(WARNING) << "Indirect controller HLE probe miss threshold reached ("
++                         << m_indirect_probe_miss_count
++                         << "); advertising hop_count=255";
+             m_btl_ctx.notify_controller_reachability(false);
+             m_indirect_probe_failed = true;
+         }
+@@ -387,7 +404,6 @@ bool ControllerConnectivityTask::check_indirect_controller_health()
+         std::chrono::duration_cast<std::chrono::seconds>(now - m_last_indirect_probe_send_time) >=
+             HEARTBEAT_SENDING_PERIOD_SEC) {
+         m_last_indirect_probe_send_time    = now;
+-        m_last_indirect_probe_contact_time = last_contact;
+         m_indirect_probe_waiting           = true;
+         if (send_hle_to_controller()) {
+             LOG(DEBUG) << "Sending proactive controller HLE probe for indirect agent";
+diff --git a/agent/src/beerocks/slave/tasks/controller_connectivity_task.h b/agent/src/beerocks/slave/tasks/controller_connectivity_task.h
+index e4db1c167b..8511f51aff 100644
+--- a/agent/src/beerocks/slave/tasks/controller_connectivity_task.h
++++ b/agent/src/beerocks/slave/tasks/controller_connectivity_task.h
+@@ -137,10 +137,10 @@ private:
+     std::chrono::steady_clock::time_point m_last_heartbeat_send_time;
+ 
+     std::chrono::steady_clock::time_point m_last_indirect_probe_send_time;
+-    std::chrono::steady_clock::time_point m_last_indirect_probe_contact_time;
++    std::chrono::steady_clock::time_point m_last_observed_controller_contact_time;
+     bool m_indirect_probe_waiting = false;
+-    // Latches one failure sequence so hop-count updates happen only on
+-    // failure entry and on the first successful recovery response.
++    uint32_t m_indirect_probe_miss_count = 0;
++    // Latches a threshold-triggered HLE failure until controller traffic restores reachability.
+     bool m_indirect_probe_failed  = false;
+     bool m_loop_disconnect_in_progress = false;
+ 
+diff --git a/documentation/prplMesh-configuration.md b/documentation/prplMesh-configuration.md
+index 3b90cf58da..3c3b8e129f 100644
+--- a/documentation/prplMesh-configuration.md
++++ b/documentation/prplMesh-configuration.md
+@@ -91,6 +91,7 @@ All Agent config options are located in path:
+ | `BackhaulBand`             | string | auto          | Preferred band for wireless backhaul (`2.4GHz`, `5GHz`, `auto`).            |
+ | `BackhaulWireInterface`    | string | wan           | Network interface used for wired backhaul.                                  |
+ | `StopOnFailureAttempts`    | uint32 | 1             | Retry attempts before stopping agent due to failures. 0 disables retries.   |
++| `IndirectControllerProbeMissThreshold` | uint32 | 3 | Consecutive missed indirect HLE probes before hop-count reachability is cleared (1 preserves single-miss behavior; valid range 1-255). |
+ | `ZeroWaitDFSFlag`          | uint32 | 0             | Bitwise flags controlling Zero Wait DFS features.                           |
+ | `ClientsMeasurementMode`   | uint32 | 1             | Client measurement mode: 0-disabled, 1-enabled for all, 2-selected clients. |
+ | `MandatoryInterfaces`      | string |               | Comma-separated list of wireless interfaces (empty = use all).              |
+@@ -100,6 +101,11 @@ All Agent config options are located in path:
+ | `Passphrase`               | string | 123456789a    | Passphrase for network credentials.                                         |
+ | `WEPKey`                   | string | 123456789a    | WEP key for network credentials.                                            |
+ 
++On OpenWrt, configure the same setting with the UCI option
++`indirect_controller_probe_miss_threshold`. WHM reads
++`IndirectControllerProbeMissThreshold` from the Agent data model. The value is loaded during
++platform configuration, so restart the agent after changing it.
++
+ 
+ ### A short overview of controller tasks
+ 
+diff --git a/framework/platform/bpl/cfg/dm/bpl_cfg.cpp b/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
+index 61f745907b..2d1f3da9ab 100644
+--- a/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/dm/bpl_cfg.cpp
+@@ -559,6 +559,22 @@ bool get_check_indirect_connectivity_to_controller_enable(bool &check_indirect_c
+     return true;
+ }
+ 
++bool get_indirect_controller_probe_miss_threshold(uint32_t &threshold)
++{
++    threshold = DEFAULT_INDIRECT_CONTROLLER_PROBE_MISS_THRESHOLD;
++    if (!read_agent_config_param("IndirectControllerProbeMissThreshold", threshold)) {
++        MAPF_ERR("Failed to read IndirectControllerProbeMissThreshold; using default");
++        return false;
++    }
++
++    if (threshold < 1 || threshold > 255) {
++        MAPF_ERR("IndirectControllerProbeMissThreshold must be in [1, 255]; using default");
++        threshold = DEFAULT_INDIRECT_CONTROLLER_PROBE_MISS_THRESHOLD;
++        return false;
++    }
++    return true;
++}
++
+ bool get_controller_discovery_timeout_seconds(std::chrono::seconds &timeout_seconds)
+ {
+     timeout_seconds = std::chrono::seconds(DEFAULT_CONTROLLER_DISCOVERY_TIMEOUT_SEC);
+diff --git a/framework/platform/bpl/cfg/linux/bpl_cfg.cpp b/framework/platform/bpl/cfg/linux/bpl_cfg.cpp
+index 819ea2fba5..a1209137de 100644
+--- a/framework/platform/bpl/cfg/linux/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/linux/bpl_cfg.cpp
+@@ -962,6 +962,12 @@ bool get_check_indirect_connectivity_to_controller_enable(bool &check_indirect_c
+     return true;
+ }
+ 
++bool get_indirect_controller_probe_miss_threshold(uint32_t &threshold)
++{
++    threshold = DEFAULT_INDIRECT_CONTROLLER_PROBE_MISS_THRESHOLD;
++    return true;
++}
++
+ bool get_controller_discovery_timeout_seconds(std::chrono::seconds &timeout_seconds)
+ {
+     timeout_seconds = std::chrono::seconds{DEFAULT_CONTROLLER_DISCOVERY_TIMEOUT_SEC};
+diff --git a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+index e31e651f9b..46edb515f2 100644
+--- a/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/rdk/bpl_cfg.cpp
+@@ -1669,6 +1669,12 @@ bool get_check_indirect_connectivity_to_controller_enable(bool &check_indirect_c
+     return true;
+ }
+ 
++bool get_indirect_controller_probe_miss_threshold(uint32_t &threshold)
++{
++    threshold = DEFAULT_INDIRECT_CONTROLLER_PROBE_MISS_THRESHOLD;
++    return true;
++}
++
+ bool get_controller_discovery_timeout_seconds(std::chrono::seconds &timeout_seconds)
+ {
+     return true;
+diff --git a/framework/platform/bpl/cfg/uci/bpl_cfg.cpp b/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
+index c06883801b..800507b44b 100644
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
+@@ -1053,6 +1053,28 @@ bool get_check_indirect_connectivity_to_controller_enable(bool &check_indirect_c
+     return true;
+ }
+ 
++bool get_indirect_controller_probe_miss_threshold(uint32_t &threshold)
++{
++    int configured_threshold = DEFAULT_INDIRECT_CONTROLLER_PROBE_MISS_THRESHOLD;
++    if (cfg_get_prplmesh_param_int_default("indirect_controller_probe_miss_threshold",
++                                           &configured_threshold,
++                                           DEFAULT_INDIRECT_CONTROLLER_PROBE_MISS_THRESHOLD) ==
++        RETURN_ERR) {
++        MAPF_INFO("Failed to read indirect_controller_probe_miss_threshold parameter");
++        threshold = DEFAULT_INDIRECT_CONTROLLER_PROBE_MISS_THRESHOLD;
++        return false;
++    }
++
++    if (configured_threshold < 1 || configured_threshold > 255) {
++        MAPF_ERR("indirect_controller_probe_miss_threshold must be in [1, 255]");
++        threshold = DEFAULT_INDIRECT_CONTROLLER_PROBE_MISS_THRESHOLD;
++        return false;
++    }
++
++    threshold = static_cast<uint32_t>(configured_threshold);
++    return true;
++}
++
+ bool get_controller_discovery_timeout_seconds(std::chrono::seconds &timeout_seconds)
+ {
+     int retVal = -1;
+diff --git a/framework/platform/bpl/include/bpl/bpl_cfg.h b/framework/platform/bpl/include/bpl/bpl_cfg.h
+index bbb445a1d5..a44f8a5ecf 100644
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -208,6 +208,8 @@ constexpr int DEFAULT_BEACON_MEASUREMENT_TIMEOUT_MSEC = 6000;
+ constexpr bool DEFAULT_CHECK_CONNECTIVITY_TO_CONTROLLER_ENABLE = true;
+ // Default value in enabling checking indirect controller connectivity
+ constexpr bool DEFAULT_CHECK_INDIRECT_CONNECTIVITY_TO_CONTROLLER_ENABLE = true;
++// Default consecutive indirect HLE probe misses before advertising the controller unreachable.
++constexpr uint32_t DEFAULT_INDIRECT_CONTROLLER_PROBE_MISS_THRESHOLD = 3;
+ // Default value for controller discovery timeout in controller connectivity task
+ constexpr std::chrono::seconds DEFAULT_CONTROLLER_DISCOVERY_TIMEOUT_SEC{30};
+ // Default value for controller message timeout in controller connectivity task
+@@ -1651,6 +1653,15 @@ bool get_check_connectivity_to_controller_enable(bool &check_connectivity_enable
+  */
+ bool get_check_indirect_connectivity_to_controller_enable(bool &check_indirect_connectivity_enable);
+ 
++/**
++ * @brief Reads the number of consecutive missed indirect HLE probes before advertising the
++ * controller unreachable for hop-count updates.
++ *
++ * @param[out] threshold Consecutive probe-miss threshold, in the range [1, 255].
++ * @return true on success, otherwise false
++ */
++bool get_indirect_controller_probe_miss_threshold(uint32_t &threshold);
++
+ /**
+  * @brief Reads controller discovery timeout in seconds.
+  *
+-- 
+2.34.1
+
