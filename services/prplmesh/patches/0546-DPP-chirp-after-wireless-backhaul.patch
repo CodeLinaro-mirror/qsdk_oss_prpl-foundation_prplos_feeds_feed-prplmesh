@@ -1,0 +1,134 @@
+From 5ab89ba737b0575cc6dadb0b69ae88185addbbab Mon Sep 17 00:00:00 2001
+From: Parimalarengan Gururajan <gururaja@qti.qualcomm.com>
+Date: Fri, 16 Oct 2026 18:46:18 +0530
+Subject: [PATCH] backhaul: restart DPP chirp after wireless backhaul loss
+
+After a DPP-onboarded bSTA connects, dpp_provisioning_done stays latched
+until the backhaul FSM restarts, and maybe_start_dpp_chirp() is only
+called from OPERATIONAL and WAIT_WPS. When the Controller changes the
+backhaul SSID/passphrase the stored profile can no longer connect, so
+the agent does not chirp again until repeated scan failures eventually
+reach RESTART.
+
+Add restart_dpp_chirp_after_disconnect(), called from the Disconnected
+handler once the wired switch is ruled out and the disconnect is not
+steering-induced. It clears dpp_provisioning_done and
+dpp_recovery_attempts and arms the chirp timer after
+dpp_chirp_reconnect_delay (10s). The delay lets a transient drop
+reconnect on its own (Event::Connected cancels the timer) and keeps the
+chirp out of the event handler itself, which can race with scan/restart
+and fail with EBUSY.
+
+It does nothing unless onboarding is DPP, the bootstrap is valid and
+injected on the radio, the radio is enabled and the backhaul is
+Wireless. Existing chirp retry, Connected and RESTART handling is
+unchanged.
+
+Signed-off-by: Parimalarengan Gururajan <gururaja@qti.qualcomm.com>
+---
+ .../backhaul_manager/backhaul_manager.cpp     | 42 +++++++++++++++++--
+ .../slave/backhaul_manager/backhaul_manager.h | 14 +++++++
+ 2 files changed, 53 insertions(+), 3 deletions(-)
+
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+index 85e191a2b..53d9bba25 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -112,6 +112,14 @@ constexpr std::chrono::seconds BackhaulManager::DEV_SET_CONFIG_ETH_BACKHAUL_TIME
+  * ignores it instead of starting a fresh exchange.
+  */
+ constexpr auto dpp_chirp_fail_retry_delay = std::chrono::seconds(25);
++/**
++ * Delay before restarting the DPP chirp after an established wireless backhaul got
++ * disconnected. Long enough to let a transient drop reconnect on its own (the reconnect cancels
++ * the timer) and to stay clear of the disconnect/scan race that gives EBUSY, short enough that a
++ * persistent loss (e.g. the Controller changed the backhaul SSID/passphrase) is not left waiting
++ * for the FSM to reach WAIT_WPS via scan failures and RESTART.
++ */
++constexpr auto dpp_chirp_reconnect_delay  = std::chrono::seconds(10);
+ constexpr auto dpp_setup_retry_delay      = std::chrono::seconds(5);
+ constexpr auto dpp_progress_timeout       = std::chrono::seconds(120);
+ constexpr unsigned int dpp_setup_max_attempts = 3;
+@@ -3685,9 +3693,10 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+         }
+         if (iface == db->backhaul.selected_iface_name) {
+ 
+-            // The normal WAIT_WPS path owns chirp startup. Avoid arming a timer here,
+-            // because this event can race with scan/restart and produce EBUSY.
+-
++            // The normal WAIT_WPS path owns chirp startup after a RESTART. A chirp for a bSTA
++            // that was already provisioned is only armed below, once the wired switch has been
++            // ruled out, and always via a delayed timer (never sent from this event) because
++            // this event can race with scan/restart and produce EBUSY.
+ 
+             // If ethernet is available, switch to wired without sending bSTA disconnect
+             // notification or restarting — the backhaul path is still up via ethernet.
+@@ -3724,6 +3733,8 @@ bool BackhaulManager::hal_event_handler(bwl::base_wlan_hal::hal_event_ptr_t even
+                                           "Backhaul disconnected on operational state");
+                     stop_on_failure_attempts--;
+ 
++                    restart_dpp_chirp_after_disconnect(iface);
++
+                     // Start a fresh scan immediately after the physical disconnect.
+                     FSM_MOVE_STATE(INITIATE_SCAN);
+                 } else {
+@@ -7584,6 +7595,31 @@ void BackhaulManager::maybe_start_dpp_chirp()
+     }
+ }
+ 
++void BackhaulManager::restart_dpp_chirp_after_disconnect(const std::string &sta_iface)
++{
++    auto db = AgentDB::get();
++    if (db->dpp_extender_config.onboarding_type != AgentDB::OnboardingType::DPP ||
++        !db->dpp_bootstrap.valid ||
++        db->backhaul.connection_type != AgentDB::sBackhaul::eConnectionType::Wireless) {
++        return;
++    }
++
++    auto radio_info = get_radio_info_by_iface(sta_iface);
++    if (!radio_info || !radio_info->sta_wlan_hal || !radio_info->dpp_bootstrap_injected ||
++        radio_info->radio_disabled) {
++        return;
++    }
++
++    // Event::Connected latched dpp_provisioning_done, which only RESTART clears. Clear it so the
++    // chirp is allowed to run again, and give the new cycle a fresh set of recovery windows.
++    radio_info->dpp_provisioning_done = false;
++    radio_info->dpp_recovery_attempts = 0;
++
++    LOG(INFO) << "DPP: bSTA " << sta_iface << " lost its backhaul - restarting chirp in "
++              << dpp_chirp_reconnect_delay.count() << "s";
++    arm_dpp_chirp_timer(radio_info, dpp_chirp_reconnect_delay);
++}
++
+ void BackhaulManager::arm_dpp_chirp_timer(const std::shared_ptr<sRadioInfo> &radio_info,
+                                           std::chrono::seconds delay)
+ {
+diff --git a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+index 2459944b6..c721f3b3f 100644
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+@@ -609,6 +609,20 @@ private:
+      */
+     bool is_bsta_connected(const std::shared_ptr<sRadioInfo> &radio_info) const;
+ 
++    /**
++     * @brief Restarts the DPP chirp cycle for a bSTA that was provisioned and connected, but
++     *        lost its wireless backhaul without a switch to wired (e.g. the Controller changed
++     *        the backhaul SSID/passphrase, so the stored profile no longer connects).
++     *
++     * Clears dpp_provisioning_done and arms the chirp timer after a short delay. A reconnect
++     * before the timer fires cancels it (Event::Connected), and a RESTART tears it down and
++     * lets the WAIT_WPS path arm a new cycle. Does nothing unless onboarding is DPP with a
++     * valid bootstrap already injected on that radio and the backhaul is Wireless.
++     *
++     * @param sta_iface bSTA interface name that got disconnected.
++     */
++    void restart_dpp_chirp_after_disconnect(const std::string &sta_iface);
++
+     /**
+      * @brief Arms (or re-arms) the DPP chirp timer for the given radio, cancelling any
+      *        previously-armed timer for that radio first.
+-- 
+2.34.1
+
