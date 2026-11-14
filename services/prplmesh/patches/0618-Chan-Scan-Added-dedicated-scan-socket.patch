@@ -1,0 +1,179 @@
+From 938c7d275925fe58cddfd79bb2c62991e15df8e2 Mon Sep 17 00:00:00 2001
+From: Manoj Sekar <sekar@qti.qualcomm.com>
+Date: Sat, 14 Nov 2026 10:27:54 +0530
+Subject: [PATCH] bwl: nl80211: use a dedicated socket for scan
+ command/response traffic
+
+base_wlan_hal_nl80211's single nl80211 socket (m_nl80211_sock) served
+two unrelated purposes simultaneously:
+
+  1. Subscribed to the kernel's "scan" multicast group, so it receives
+     unsolicited scan-result/scan-aborted broadcasts for every
+     interface on the shared wiphy (not just this HAL's own
+     interface).
+  2. The socket send_nl80211_msg() uses for synchronous
+     command/response traffic (e.g. TRIGGER_SCAN, GET_SCAN), waiting
+     up to 3 seconds via poll()+nl_recvmsgs() for the kernel's
+     ACK/ERROR/FINISH/VALID reply to a specific request.
+
+Because both roles shared one socket, an unrelated multicast
+broadcast arriving while a command's response was being awaited could
+consume a poll()/nl_recvmsgs() cycle without resolving the pending
+request. libnl's default sequence-number check silently discards any
+message that does not match the awaited request's sequence number -
+so a sufficiently busy multicast stream on the shared wiphy could, in
+principle, make a request's response never get read within the
+response-wait deadline even though the kernel sent it immediately.
+
+Add a second, dedicated socket (m_nl80211_cmd_sock) used exclusively
+by send_nl80211_msg() for command/response traffic. It is allocated
+and connected alongside the existing event socket in the FSM's Init
+state, is NOT subscribed to any multicast group, and is torn down
+together with the event socket on FSM Detach.
+
+send_nl80211_msg() now sends the request, polls, and receives the
+response exclusively on m_nl80211_cmd_sock. process_nl_events() /
+process_scan_nl_event() are unchanged and continue to use
+m_nl80211_sock exclusively for multicast scan-event handling.
+
+Signed-off-by: Manoj Sekar <sekar@qti.qualcomm.com>
+---
+ .../bwl/nl80211/base_wlan_hal_nl80211.cpp     | 56 +++++++++++++++++--
+ .../bwl/nl80211/base_wlan_hal_nl80211.h       | 19 ++++++-
+ 2 files changed, 68 insertions(+), 7 deletions(-)
+
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+index 8624867..98bdc3a 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -442,6 +442,36 @@ bool base_wlan_hal_nl80211::fsm_setup()
+                                   << ", fd=" << m_fd_nl_events;
+                     }
+ 
++                    // Allocate a second, dedicated socket used exclusively for synchronous
++                    // command/response traffic (send_nl80211_msg()). This socket is NOT
++                    // subscribed to the "scan" multicast group, so it cannot receive the
++                    // unrelated broadcast notifications m_nl80211_sock does (from other
++                    // interfaces sharing this wiphy) - eliminating the possibility of those
++                    // broadcasts being silently dropped by libnl's default sequence-number
++                    // check while a command response is being awaited, which would otherwise
++                    // consume a poll()/nl_recvmsgs() cycle without resolving the pending
++                    // request.
++                    if (!(m_nl80211_cmd_sock = std::shared_ptr<struct nl_sock>(
++                              nl_socket_alloc(), [](struct nl_sock *obj) {
++                                  if (obj) {
++                                      nl_socket_free(obj);
++                                  }
++                              }))) {
++                        LOG(ERROR) << "Failed allocating dedicated nl80211 command socket!";
++                        return false;
++                    }
++
++                    nl_socket_set_buffer_size(m_nl80211_cmd_sock.get(), 8192, 8192);
++
++                    if (genl_connect(m_nl80211_cmd_sock.get()) != 0) {
++                        LOG(ERROR) << "Failed connecting dedicated nl80211 command socket!";
++                        m_nl80211_cmd_sock.reset();
++                        return false;
++                    }
++
++                    LOG(INFO) << "Dedicated nl80211 command socket ready, fd="
++                              << nl_socket_get_fd(m_nl80211_cmd_sock.get());
++
+                     // if_nametoindex requires a real Linux interface name; skip in no-VAP mode.
+                     if (!get_iface_name().empty()) {
+                         std::string iface_name = get_iface_name();
+@@ -678,11 +708,14 @@ bool base_wlan_hal_nl80211::fsm_setup()
+         .entry([&](const void *args) -> bool {
+             LOG(DEBUG) << "nl80211_attach_fsm - Detaching...";
+ 
+-            // Release the nl80211 socket
++            // Release the nl80211 sockets
+             if (m_nl80211_sock) {
+                 m_nl80211_sock.reset();
+                 m_nl80211_id = 0;
+             }
++            if (m_nl80211_cmd_sock) {
++                m_nl80211_cmd_sock.reset();
++            }
+ 
+             // Clear the WPA control interfaces:
+             // That will disconnects all opened wpa_ctrl sockets.
+@@ -2137,8 +2170,16 @@ bool base_wlan_hal_nl80211::send_nl80211_msg(uint8_t command, int flags,
+     nl_cb_set(nl_callback.get(), NL_CB_ACK, NL_CB_CUSTOM, nl_ack_cb, &err);
+     nl_cb_set(nl_callback.get(), NL_CB_VALID, NL_CB_CUSTOM, nl_handler_cb, &msg_handle);
+ 
+-    // Send the netlink message
+-    err = nl_send_auto_complete(m_nl80211_sock.get(), nl_message.get());
++    // Send the netlink message on the dedicated command socket (NOT m_nl80211_sock, which is
++    // subscribed to the nl80211 "scan" multicast group and can therefore receive unrelated
++    // broadcast notifications interleaved with this command's response - see m_nl80211_cmd_sock's
++    // declaration comment in the header for the full rationale).
++    if (!m_nl80211_cmd_sock) {
++        LOG(ERROR) << "Dedicated nl80211 command socket is not initialized; cannot send command "
++                   << int(command);
++        return false;
++    }
++    err = nl_send_auto_complete(m_nl80211_cmd_sock.get(), nl_message.get());
+     if (err < 0) {
+         LOG(ERROR) << "nl_send_auto_complete failed: " << err;
+         return false;
+@@ -2157,7 +2198,7 @@ bool base_wlan_hal_nl80211::send_nl80211_msg(uint8_t command, int flags,
+     // instead of blocking indefinitely.
+     {
+         constexpr int NL80211_RESPONSE_TIMEOUT_MS = 3000; // generous but bounded; see note above
+-        const int sock_fd = nl_socket_get_fd(m_nl80211_sock.get());
++        const int sock_fd = nl_socket_get_fd(m_nl80211_cmd_sock.get());
+         if (sock_fd < 0) {
+             LOG(ERROR) << "nl_socket_get_fd() failed; cannot bound nl80211 response wait for "
+                           "command "
+@@ -2201,8 +2242,11 @@ bool base_wlan_hal_nl80211::send_nl80211_msg(uint8_t command, int flags,
+                 continue;
+             }
+ 
+-            // Data is available - this single nl_recvmsgs() call will not block.
+-            nl_recvmsgs(m_nl80211_sock.get(), nl_callback.get());
++            // Data is available - this single nl_recvmsgs() call will not block. Must read
++            // from the same socket the command was sent on (m_nl80211_cmd_sock), not
++            // m_nl80211_sock - reading the wrong socket here would silently never retrieve
++            // this command's actual response.
++            nl_recvmsgs(m_nl80211_cmd_sock.get(), nl_callback.get());
+         }
+     }
+ 
+diff --git a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
+index fa60dbc..7173107 100644
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
+@@ -353,10 +353,27 @@ private:
+     // Manager of WPA Control Interface Objects
+     wpa_ctrl_client m_wpa_ctrl_client;
+ 
+-    // NL80211 Socket
++    // NL80211 event socket - subscribed to the "scan" multicast group, so it receives
++    // unsolicited scan-result/scan-aborted broadcasts for every interface sharing this
++    // wiphy (not just this HAL's own interface). Used exclusively by process_nl_events()
++    // for asynchronous multicast notifications.
+     std::shared_ptr<struct nl_sock> m_nl80211_sock;
+     int m_nl80211_id = 0;
+ 
++    // Dedicated NL80211 socket used exclusively for synchronous command/response traffic
++    // (send_nl80211_msg(), e.g. TRIGGER_SCAN/GET_SCAN). Kept separate from m_nl80211_sock
++    // because that socket's multicast "scan" group subscription means it can receive
++    // unrelated broadcast notifications (from other interfaces sharing the wiphy) at any
++    // time, including while a command's response is being awaited. libnl's default
++    // sequence-number checking silently discards any such unrelated message instead of
++    // delivering it to our registered callbacks - but doing so still consumes a
++    // poll()/nl_recvmsgs() cycle without resolving the pending request, so a sufficiently
++    // busy multicast stream can make a request's response never get read within the
++    // response-wait deadline, even though the kernel sent it immediately. A separate,
++    // non-multicast-subscribed socket for command/response traffic cannot interleave with
++    // that broadcast noise, eliminating the race entirely.
++    std::shared_ptr<struct nl_sock> m_nl80211_cmd_sock;
++
+     // File descriptor of the nl80211 event socket (m_nl80211_sock), subscribed to the "scan"
+     // multicast group. Exposed so it can be added to the event loop's fd set; consumed by
+     // process_nl_events() / process_scan_nl_event().
+-- 
+2.34.1
+
